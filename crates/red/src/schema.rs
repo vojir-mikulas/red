@@ -1375,13 +1375,14 @@ impl AppState {
             if a.active().is_some_and(|t| t.is_pristine(cx) || t.title == label));
         if reuse {
             if let Phase::Connected(active) = &mut self.phase {
-                // Repurpose the focused half's untouched tab in place (it stays in its
-                // pane); just relabel it to the previewed table.
-                let from = active.focused_tab_index();
-                if let Some(tab) = active.tabs.get_mut(from) {
-                    tab.title = label.clone();
+                // Repurpose the focused pane's untouched tab in place (it stays
+                // in its pane); just relabel it to the previewed table.
+                if let Some(from) = active.focused_tab_index() {
+                    if let Some(tab) = active.tabs.get_mut(from) {
+                        tab.title = label.clone();
+                    }
+                    active.scroll_tab_into_view(from);
                 }
-                active.tab_scroll.scroll_to_item(from);
             }
         } else {
             // No pristine tab to reuse (incl. the empty-strip case), so open one.

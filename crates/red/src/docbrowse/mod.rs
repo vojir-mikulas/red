@@ -22,17 +22,16 @@ use std::rc::Rc;
 
 use flint::prelude::*;
 use gpui::{
-    Context, Entity, FocusHandle, Focusable, ListAlignment, ListState, ScrollHandle,
-    UniformListScrollHandle, Window, prelude::*,
+    Context, Entity, FocusHandle, Focusable, ListAlignment, ListState, UniformListScrollHandle,
+    Window, prelude::*,
 };
 use red_core::doc::{
     CollectionInfo, DbInfo, DocPlan, DocSchema, DocSeek, DocValue, DocWrite, Document, IndexInfo,
 };
 use red_service::{Command, CommandSender, Epoch, SessionId};
 
-use crate::app::{
-    AppState, Pane, Phase, SplitHalf, SplitState, SplitWorkspace, TabWorkspace, WorkspaceTab,
-};
+use crate::app::{AppState, Pane, Phase, SplitWorkspace, TabWorkspace, WorkspaceTab};
+use crate::panes::{PaneId, PaneLayout};
 
 /// Which view the main area shows for the open collection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -105,9 +104,9 @@ pub(crate) struct MongoTab {
     id: u64,
     title: String,
     state: MongoTabState,
-    /// Which split half this tab belongs to; always `Primary` when unsplit.
-    pane: SplitHalf,
-    /// Pinned tabs sort ahead of the rest in their half's strip.
+    /// Which pane this tab belongs to.
+    pane: PaneId,
+    /// Pinned tabs sort ahead of the rest in their pane's strip.
     pinned: bool,
 }
 
@@ -141,17 +140,11 @@ pub(crate) struct MongoView {
     pending_pipeline: Option<(Epoch, String, String)>,
     /// The open tabs (one collection each, plus blank chooser tabs).
     tabs: Vec<MongoTab>,
-    /// Index into `tabs` of the Primary half's visible tab.
-    active_tab: usize,
     /// Monotonic id source for `MongoTab::id`.
     tab_seq: u64,
-    /// Horizontal scroll for the tab strip.
-    tab_scroll: ScrollHandle,
-    /// The gap a dragged tab would land in during a reorder, or `None`.
-    tab_drop_target: Option<usize>,
-    /// The side-by-side split (reuses the SQL/Redis [`SplitState`]); `None` is the
-    /// ordinary single-pane layout.
-    split: Option<SplitState>,
+    /// How the work area is divided, which pane has focus, and the per-pane
+    /// state. Shared with the SQL and Redis sides.
+    pub(crate) layout: PaneLayout,
     /// The tab whose right-click context menu is open, as `(id, position)`.
     tab_menu: Option<(u64, gpui::Point<gpui::Pixels>)>,
     /// The documents toolbar's "Actions" dropdown, anchored at the trigger while
@@ -494,11 +487,11 @@ fn new_doc_list_state(count: usize) -> ListState {
 }
 
 impl WorkspaceTab for MongoTab {
-    fn pane(&self) -> SplitHalf {
+    fn pane(&self) -> PaneId {
         self.pane
     }
-    fn set_pane(&mut self, half: SplitHalf) {
-        self.pane = half;
+    fn set_pane(&mut self, pane: PaneId) {
+        self.pane = pane;
     }
     fn pinned(&self) -> bool {
         self.pinned
@@ -516,23 +509,11 @@ impl TabWorkspace for MongoView {
     fn ws_tabs_mut(&mut self) -> &mut Vec<MongoTab> {
         &mut self.tabs
     }
-    fn ws_active(&self) -> usize {
-        self.active_tab
+    fn ws_layout(&self) -> &PaneLayout {
+        &self.layout
     }
-    fn ws_set_active(&mut self, i: usize) {
-        self.active_tab = i;
-    }
-    fn ws_split(&self) -> Option<&SplitState> {
-        self.split.as_ref()
-    }
-    fn ws_split_mut(&mut self) -> &mut Option<SplitState> {
-        &mut self.split
-    }
-    fn ws_drop_target(&self) -> Option<usize> {
-        self.tab_drop_target
-    }
-    fn ws_drop_target_mut(&mut self) -> &mut Option<usize> {
-        &mut self.tab_drop_target
+    fn ws_layout_mut(&mut self) -> &mut PaneLayout {
+        &mut self.layout
     }
     /// Like Redis, Mongo has no separate pinned strip section, so pinned tabs
     /// sort ahead within their pane's strip.
@@ -542,20 +523,17 @@ impl TabWorkspace for MongoView {
 }
 
 impl SplitWorkspace for MongoView {
-    fn push_blank_tab(&mut self, half: SplitHalf) -> usize {
+    fn push_blank_tab(&mut self, pane: PaneId) -> usize {
         let id = self.tab_seq;
         self.tab_seq += 1;
         self.tabs.push(MongoTab {
             id,
             title: "New tab".to_string(),
             state: MongoTabState::Empty,
-            pane: half,
+            pane,
             pinned: false,
         });
         self.tabs.len() - 1
-    }
-    fn split_default_width(&self) -> gpui::Pixels {
-        gpui::px(560.)
     }
     fn clear_tab_menu(&mut self) {
         self.tab_menu = None;
@@ -585,14 +563,11 @@ impl MongoView {
                 id: 0,
                 title: "New tab".to_string(),
                 state: MongoTabState::Empty,
-                pane: SplitHalf::Primary,
+                pane: PaneId::FIRST,
                 pinned: false,
             }],
-            active_tab: 0,
             tab_seq: 1,
-            tab_scroll: ScrollHandle::new(),
-            tab_drop_target: None,
-            split: None,
+            layout: PaneLayout::new(),
             tab_menu: None,
             actions_menu: None,
             tree_focus: cx.focus_handle(),
@@ -716,11 +691,11 @@ impl MongoView {
 
     /// The focused tab's collection (UI actions target the visible tab).
     fn focused_coll(&self) -> Option<&CollView> {
-        self.coll_at(self.focused_tab_index())
+        self.coll_at(self.focused_tab_index()?)
     }
 
     fn focused_coll_mut(&mut self) -> Option<&mut CollView> {
-        let i = self.focused_tab_index();
+        let i = self.focused_tab_index()?;
         match self.tabs.get_mut(i).map(|t| &mut t.state)? {
             MongoTabState::Collection(c) => Some(&mut **c),
             MongoTabState::Empty => None,

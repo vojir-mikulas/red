@@ -36,9 +36,17 @@ shortcuts-panes-cycle_focus_forward_back = [Çyçlé föçús förwárd / báçk
 
 shortcuts-panes-toggle_schema_sidebar = [Tögglé sçhémá sídébár]
 
-shortcuts-panes-split_view_two_tabs_side_by_side = [Splít víéw (twö tábs sídé by sídé)]
+shortcuts-panes-split_pane_right = [Splít páñé ríght]
 
-shortcuts-panes-focus_other_split_half = [Föçús öthér splít hálf]
+shortcuts-panes-split_pane_down = [Splít páñé döwñ]
+
+shortcuts-panes-focus_next_pane = [Föçús ñéxt páñé]
+
+shortcuts-panes-close_pane = [Çlösé páñé]
+
+shortcuts-panes-maximize_pane = [Máxímízé / réstöré páñé]
+
+shortcuts-panes-equalize_panes = [Éqúálízé páñé sízés]
 
 shortcuts-query_tabs-title = [Qúéry tábs]
 

@@ -208,15 +208,16 @@ impl AppState {
     }
 
     /// The results pane: an empty state, an error, or the live windowed grid.
-    /// Render the result pane for the tab at `tab_idx`, shown in split half `half`.
-    /// `is_focused` is whether this half currently has focus: only the focused half
-    /// hosts the shared single-instance overlays (inspector, filter/find bars, the
-    /// cell menu, the stats bar, inline + draft editing) so they never render twice.
+    /// Render the result pane for the tab at `tab_idx`, shown in pane `pane`.
+    /// `is_focused` is whether that pane currently has focus: only the focused
+    /// pane hosts the shared single-instance overlays (inspector, filter/find
+    /// bars, the cell menu, the stats bar, inline + draft editing) so they never
+    /// render twice.
     pub(crate) fn render_result(
         &self,
         active: &ActiveConn,
         tab_idx: usize,
-        half: crate::app::SplitHalf,
+        pane: crate::app::PaneId,
         is_focused: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -568,7 +569,7 @@ impl AppState {
         // the open find bar's term get a soft accent tint via the same `cell_bg`
         // hook. The focused match is *also* the grid selection, so the selection
         // highlight marks "current" on top of this. Keyed by `(ordinal, data col)`.
-        // Find/edit overlays belong to the focused half only; the find bar, the
+        // Find/edit overlays belong to the focused pane only; the find bar, the
         // inline editor and the stats/draft chrome are single-instance app state.
         let find_hits: std::collections::HashSet<(usize, usize)> = is_focused
             .then_some(self.find_bar.as_ref())
@@ -675,10 +676,14 @@ impl AppState {
             .track_scroll(&grid.scroll)
             .track_horizontal_scroll(&grid.h_scroll)
             .horizontal(true)
-            // Keyboard cell cursor: the grid pane's focus handle lives on the
-            // table, and arrow/Home/End/Page/⌘-arrow intents drive the selection.
-            // Each split half has its own handle so focus never lands on both.
-            .focus_handle(active.grid_focus_for(half).clone())
+            // Keyboard cell cursor: the grid's focus handle lives on the table,
+            // and arrow/Home/End/Page/⌘-arrow intents drive the selection. Each
+            // pane has its own handle so focus never lands on two grids. Absent
+            // only on the frame a pane is born (see `PaneUi::grid_focus`), where
+            // the grid simply isn't focusable yet.
+            .when_some(active.grid_focus_for(pane).cloned(), |t, handle| {
+                t.focus_handle(handle)
+            })
             // Vim motions (hjkl/g/G/0/$/Ctrl-d/Ctrl-u) ride alongside the arrow keys
             // when the user has turned vim navigation on.
             .vim_nav(self.vim_mode())
@@ -737,8 +742,8 @@ impl AppState {
                 let extend = mods.shift;
                 sort_view
                     .update(cx, |this, cx| {
-                        // Aim subsequent actions at this half before they resolve.
-                        this.set_split_focus(half, cx);
+                        // Aim subsequent actions at this pane before they resolve.
+                        this.set_split_focus(pane, cx);
                         if select_column {
                             // Focus the grid so the cell cursor + ⌘C land on this
                             // selection rather than a still-focused editor/field.
@@ -756,8 +761,8 @@ impl AppState {
                 let abs_row = base + row;
                 cell_view
                     .update(cx, |this, cx| {
-                        // Aim subsequent actions at this half before they resolve.
-                        this.set_split_focus(half, cx);
+                        // Aim subsequent actions at this pane before they resolve.
+                        this.set_split_focus(pane, cx);
                         // Focus the grid so the cell cursor + ⌘C land on this
                         // selection, not a still-focused editor/field.
                         this.focus_pane(Pane::Grid, window, cx);
@@ -780,7 +785,7 @@ impl AppState {
                 let abs_row = base + row;
                 sec_view
                     .update(cx, |this, cx| {
-                        this.set_split_focus(half, cx);
+                        this.set_split_focus(pane, cx);
                         this.focus_pane(Pane::Grid, window, cx);
                         this.result_select(abs_row, table_col, false, cx);
                         this.cell_menu = Some(pos);
@@ -947,7 +952,7 @@ impl AppState {
                 super::place_window(&scrub_window, &scrub_scroll, total, target, rh);
                 scrub_view
                     .update(cx, |this, cx| {
-                        this.set_split_focus(half, cx);
+                        this.set_split_focus(pane, cx);
                         cx.notify();
                     })
                     .ok();
@@ -959,7 +964,7 @@ impl AppState {
             // open; narrowing re-opens the result so the grid below just repaints.
             // The find bar sits alongside it and only highlights loaded
             // rows. Both are built at the top of this function (single-instance
-            // overlays, so they render in the focused half only).
+            // overlays, so they render in the focused pane only).
             .children(filter_bar)
             .children(find_bar)
             .child(

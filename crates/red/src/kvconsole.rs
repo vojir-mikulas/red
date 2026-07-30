@@ -781,7 +781,7 @@ impl AppState {
             let id = self
                 .conn_mut(Some(session))
                 .and_then(|a| a.kv_view.as_ref())
-                .and_then(|v| v.tabs.get(v.focused_tab_index()))
+                .and_then(|v| v.focused_tab_index().and_then(|i| v.tabs.get(i)))
                 .map(|t| t.id);
             if let Some(id) = id {
                 self.kv_set_tab_kind(session, id, KvPanel::Console, cx);

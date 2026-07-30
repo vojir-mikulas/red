@@ -17,8 +17,10 @@ use red_core::doc::{CollKind, DocPlan, Document};
 use red_service::SessionId;
 
 use super::window::{FetchCtx, place_window};
-use crate::app::{ActiveConn, AppState, Phase, SplitHalf, TabWorkspace};
+use crate::app::{ActiveConn, AppState, Phase, TabWorkspace};
+use crate::panes::{MIN_PANE_WEIGHT, drop_overlay, path_id};
 use crate::result::group_digits;
+use crate::tabstrip::{StripTab, TabStrip};
 
 use super::*;
 
@@ -417,8 +419,8 @@ impl AppState {
             .into_any_element()
     }
 
-    /// The tabbed work area: one half, or two side-by-side halves when split
-    /// (mirrors the Redis `render_kv_body`).
+    /// The Mongo work area: the pane tree, rendered as nested [`SplitStack`]s
+    /// whose leaves are panes (see [`Self::render_doc_pane`]).
     fn render_doc_work(
         &self,
         active: &ActiveConn,
@@ -428,356 +430,175 @@ impl AppState {
         let Some(v) = active.doc_view.as_ref() else {
             return div().flex_1().into_any_element();
         };
-        let Some(s) = v.split.as_ref() else {
-            let idx = v.pane_active(SplitHalf::Primary).unwrap_or(v.active_tab);
-            return self.render_doc_half(active, SplitHalf::Primary, idx, true, window, cx);
+        if let Some(zoomed) = v.layout.zoomed()
+            && let Some(tab_idx) = v.pane_active(zoomed)
+        {
+            return self.render_doc_pane(active, zoomed, tab_idx, true, window, cx);
+        }
+        self.render_doc_node(active, v.layout.tree().root(), &mut Vec::new(), window, cx)
+    }
+
+    /// One node of the Mongo pane tree (mirrors the SQL and Redis walks).
+    fn render_doc_node(
+        &self,
+        active: &ActiveConn,
+        node: &crate::panes::Node,
+        path: &mut crate::panes::SplitPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let session = active.session;
+        let (axis, children) = match node {
+            crate::panes::Node::Leaf(pane) => {
+                let tab_idx = active
+                    .doc_view
+                    .as_ref()
+                    .and_then(|v| v.pane_active(*pane))
+                    .unwrap_or(0);
+                let focused = active
+                    .doc_view
+                    .as_ref()
+                    .is_some_and(|v| v.layout.focus() == *pane);
+                return self.render_doc_pane(active, *pane, tab_idx, focused, window, cx);
+            }
+            crate::panes::Node::Split { axis, children } => (*axis, children),
         };
-        let (width, drag) = (s.width, s.drag);
-        let primary_focused = s.focus == SplitHalf::Primary;
-        let primary_tab = v.pane_active(SplitHalf::Primary).unwrap_or(v.active_tab);
-        let secondary_tab = v.pane_active(SplitHalf::Secondary).unwrap_or(s.secondary);
-        let first = self.render_doc_half(
-            active,
-            SplitHalf::Primary,
-            primary_tab,
-            primary_focused,
-            window,
-            cx,
-        );
-        let second = self.render_doc_half(
-            active,
-            SplitHalf::Secondary,
-            secondary_tab,
-            !primary_focused,
-            window,
-            cx,
-        );
+        let drag = active
+            .doc_view
+            .as_ref()
+            .and_then(|v| v.layout.divider_drag(path));
+        let mut stack = SplitStack::new(
+            format!("doc-panes-{}", path_id(path)),
+            match axis {
+                crate::panes::SplitAxis::Horizontal => Axis::Horizontal,
+                crate::panes::SplitAxis::Vertical => Axis::Vertical,
+            },
+        )
+        .gutter(px(1.))
+        .min(match axis {
+            crate::panes::SplitAxis::Horizontal => px(AppState::MIN_KV_PANE_W),
+            crate::panes::SplitAxis::Vertical => px(AppState::MIN_KV_PANE_H),
+        })
+        .drag(drag);
+        for (i, child) in children.iter().enumerate() {
+            path.push(i);
+            let element = self.render_doc_node(active, &child.node, path, window, cx);
+            path.pop();
+            stack = stack.child(child.weight, element);
+        }
+        let owned = path.clone();
+        let (start_path, resize_path) = (owned.clone(), owned);
         let start = cx.entity().downgrade();
         let resize = start.clone();
         let end = start.clone();
-        div()
-            .size_full()
-            .child(
-                SplitPane::new("doc-split-halves", Axis::Horizontal)
-                    .size(width)
-                    .gutter(px(1.))
-                    .drag(drag)
-                    .min_first(px(360.))
-                    .on_drag_start(move |anchor, _, cx| {
-                        start
-                            .update(cx, |this, cx| {
-                                if let Phase::Connected(a) = &mut this.phase
-                                    && let Some(v) = &mut a.doc_view
-                                    && let Some(s) = &mut v.split
-                                {
-                                    s.drag = Some(anchor);
-                                }
-                                cx.notify();
-                            })
-                            .ok();
+        stack
+            .on_drag_start(move |drag, _, cx| {
+                let path = start_path.clone();
+                start
+                    .update(cx, |this, cx| {
+                        if let Some(v) = this
+                            .conn_mut(Some(session))
+                            .and_then(|a| a.doc_view.as_mut())
+                        {
+                            v.layout.begin_divider_drag(path, drag);
+                        }
+                        cx.notify();
                     })
-                    .on_resize(move |size, _, cx| {
-                        resize
-                            .update(cx, |this, cx| {
-                                if let Phase::Connected(a) = &mut this.phase
-                                    && let Some(v) = &mut a.doc_view
-                                    && let Some(s) = &mut v.split
-                                {
-                                    s.width = size;
-                                }
-                                cx.notify();
-                            })
-                            .ok();
+                    .ok();
+            })
+            .on_resize(move |gutter, leading, _, cx| {
+                let path = resize_path.clone();
+                resize
+                    .update(cx, |this, cx| {
+                        if let Some(v) = this
+                            .conn_mut(Some(session))
+                            .and_then(|a| a.doc_view.as_mut())
+                        {
+                            v.layout.set_weight(&path, gutter, leading, MIN_PANE_WEIGHT);
+                        }
+                        cx.notify();
                     })
-                    .on_drag_end(move |_, cx| {
-                        end.update(cx, |this, cx| {
-                            if let Phase::Connected(a) = &mut this.phase
-                                && let Some(v) = &mut a.doc_view
-                                && let Some(s) = &mut v.split
-                            {
-                                s.drag = None;
-                            }
-                            cx.notify();
-                        })
-                        .ok();
-                    })
-                    .first(first)
-                    .second(second),
-            )
+                    .ok();
+            })
+            .on_drag_end(move |_, cx| {
+                end.update(cx, |this, cx| {
+                    if let Some(v) = this
+                        .conn_mut(Some(session))
+                        .and_then(|a| a.doc_view.as_mut())
+                    {
+                        v.layout.end_divider_drag();
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
             .into_any_element()
     }
 
-    /// One split half: its own tab strip (only this half's tabs, styled 1:1 with
-    /// the SQL/Redis strips) over the active tab's collection panel.
-    fn render_doc_half(
+    /// One Mongo pane: its own tab strip (only this pane's tabs) over the active
+    /// tab's collection panel, plus the drop zones that turn a tab drag into a
+    /// split.
+    fn render_doc_pane(
         &self,
         active: &ActiveConn,
-        half: SplitHalf,
+        pane: crate::app::PaneId,
         tab_idx: usize,
         focused: bool,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        use crate::editor::{TabDrag, TabDragPreview};
+        use crate::editor::TabDrag;
         let theme = cx.theme().clone();
-        let (bg_app, bg_panel, bg_elevated, bg_hover) = (
-            theme.bg_app,
-            theme.bg_panel,
-            theme.bg_elevated,
-            theme.bg_hover,
-        );
-        let border = theme.border;
-        let (text, muted, faint) = (theme.text, theme.text_muted, theme.text_faint);
-        let accent = theme.accent;
-        let icon_close = theme.scale(9.);
-        let ui_family = theme.font_family.clone();
-        let size_12 = theme.scale(12.);
+        let (border, accent, muted) = (theme.border, theme.accent, theme.text_faint);
         let view = cx.entity().downgrade();
         let session = active.session;
         let Some(v) = active.doc_view.as_ref() else {
             return div().flex_1().into_any_element();
         };
-        let is_split = v.split.is_some();
+        let is_split = v.layout.is_split();
 
-        let active_idx = v.pane_active(half);
-        let pane_indices = v.pane_tab_indices(half);
-        let last_in_pane = pane_indices.last().copied();
-        let drop_target = v.tab_drop_target;
-        let dragging = cx.has_active_drag();
-        let (pinned_indices, unpinned_indices): (Vec<usize>, Vec<usize>) = pane_indices
-            .iter()
-            .copied()
-            .partition(|&i| v.tabs[i].pinned);
-
-        let render_tab = |i: usize| {
-            let t = &v.tabs[i];
-            let is_active = Some(i) == active_idx;
-            let pinned = t.pinned;
-            let id = t.id;
-            let (tab_bg, tab_text) = if is_active {
-                (bg_app, text)
-            } else {
-                (bg_panel, muted)
-            };
-            let drag_title: SharedString = t.title.clone().into();
-            let move_view = view.clone();
-            let drop_view = view.clone();
-            let group = SharedString::from(format!("doc-tab-{i}"));
-            let bar_before = dragging && drop_target == Some(i);
-            let bar_after = dragging && Some(i) == last_in_pane && drop_target == Some(i + 1);
-            div()
-                .id(("doc-tab", i))
-                .group(group.clone())
-                .relative()
-                .flex()
-                .flex_shrink_0()
-                .items_center()
-                .justify_center()
-                .min_w(px(96.))
-                .max_w(px(200.))
-                .px(px(23.))
-                .bg(tab_bg)
-                .border_r_1()
-                .border_color(border)
-                .cursor_pointer()
-                .when(!is_active, |d| d.hover(|s| s.bg(bg_elevated)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.doc_set_split_focus(session, half, cx);
-                    this.doc_activate_tab(session, i, cx);
-                }))
-                .on_mouse_down(
-                    MouseButton::Middle,
-                    cx.listener(move |this, _, _, cx| {
-                        if !pinned {
-                            this.doc_close_tab(session, i, cx);
-                        }
-                    }),
-                )
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                        let pos = event.position;
-                        this.doc_open_tab_menu(session, id, pos, cx);
-                    }),
-                )
-                .on_drag(TabDrag(i), move |_, offset, _window, cx| {
-                    let title = drag_title.clone();
-                    cx.new(move |_| TabDragPreview {
-                        title,
-                        offset,
-                        bg: bg_elevated,
-                        border,
-                        text,
-                    })
-                })
-                .on_drag_move::<TabDrag>(move |e, _window, cx| {
-                    let b = e.bounds;
-                    let p = e.event.position;
-                    if p.x < b.origin.x
-                        || p.x >= b.origin.x + b.size.width
-                        || p.y < b.origin.y
-                        || p.y >= b.origin.y + b.size.height
-                    {
-                        return;
-                    }
-                    let gap = if p.x < b.origin.x + b.size.width / 2. {
-                        i
-                    } else {
-                        i + 1
-                    };
-                    move_view
-                        .update(cx, |this, cx| {
-                            this.doc_set_tab_drop_target(session, gap, cx)
-                        })
-                        .ok();
-                })
-                .on_drop::<TabDrag>(move |drag, _window, cx| {
-                    let from = drag.0;
-                    cx.stop_propagation();
-                    drop_view
-                        .update(cx, |this, cx| this.doc_drop_tab(session, from, half, cx))
-                        .ok();
-                })
-                .when(bar_before, |d| {
-                    d.child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .top_0()
-                            .bottom_0()
-                            .w(px(2.))
-                            .bg(accent),
-                    )
-                })
-                .when(bar_after, |d| {
-                    d.child(
-                        div()
-                            .absolute()
-                            .right_0()
-                            .top_0()
-                            .bottom_0()
-                            .w(px(2.))
-                            .bg(accent),
-                    )
-                })
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .gap_1()
-                        .min_w_0()
-                        .when(pinned, |d| {
-                            d.child(crate::icons::icon("pin", icon_close, faint))
-                        })
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .font_family(ui_family.clone())
-                                .text_size(size_12)
-                                .text_color(tab_text)
-                                .child(t.title.clone()),
-                        ),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .right(px(4.))
-                        .top_0()
-                        .bottom_0()
-                        .flex()
-                        .items_center()
-                        .invisible()
-                        .group_hover(group, |s| s.visible())
-                        .child(
-                            div()
-                                .id(("doc-tab-close", i))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .size(px(15.))
-                                .rounded(px(3.))
-                                .text_color(faint)
-                                .hover(|s| s.bg(bg_hover).text_color(text))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.doc_close_tab(session, i, cx);
-                                }))
-                                .child(crate::icons::icon("close", icon_close, faint)),
-                        ),
-                )
+        let active_idx = v.pane_active(pane);
+        let Some(ui) = v.layout.ui(pane) else {
+            return div().flex_1().into_any_element();
         };
-        let pinned_tabs: Vec<_> = pinned_indices.iter().map(|&i| render_tab(i)).collect();
-        let unpinned_tabs: Vec<_> = unpinned_indices.iter().map(|&i| render_tab(i)).collect();
-        let strip_move_view = view.clone();
-        let strip_drop_view = view.clone();
-        let tab_viewport = div()
-            .id("doc-tabstrip")
-            .flex_1()
-            .min_w(px(0.))
-            .h_full()
-            .flex()
-            .items_stretch()
-            .overflow_x_scroll()
-            .track_scroll(&v.tab_scroll)
-            .on_drag_move::<TabDrag>(move |e, _window, cx| {
-                let b = e.bounds;
-                let p = e.event.position;
-                let outside = p.y < b.origin.y || p.y >= b.origin.y + b.size.height;
-                if outside {
-                    strip_move_view
-                        .update(cx, |this, cx| this.doc_clear_tab_drop_target(session, cx))
-                        .ok();
-                }
+        let tabs: Vec<StripTab> = v
+            .pane_tab_indices(pane)
+            .into_iter()
+            .map(|i| StripTab {
+                index: i,
+                title: v.tabs[i].title.clone().into(),
+                pinned: v.tabs[i].pinned,
+                active: Some(i) == active_idx,
             })
-            .on_drop::<TabDrag>(move |drag, _window, cx| {
-                let from = drag.0;
-                cx.stop_propagation();
-                strip_drop_view
-                    .update(cx, |this, cx| this.doc_drop_tab(session, from, half, cx))
-                    .ok();
-            })
-            .children(unpinned_tabs);
-        let pinned_strip = (!pinned_tabs.is_empty()).then(|| {
-            div()
-                .id("doc-tabstrip-pinned")
-                .flex_shrink_0()
-                .h_full()
-                .flex()
-                .items_stretch()
-                .children(pinned_tabs)
+            .collect();
+        let menu_ids: Vec<u64> = v.tabs.iter().map(|t| t.id).collect();
+        let strip = TabStrip::new(
+            "doc",
+            pane,
+            ui.tab_scroll.clone(),
+            move |this, i, cx| {
+                this.doc_set_split_focus(session, pane, cx);
+                this.doc_activate_tab(session, i, cx);
+            },
+            move |this, i, cx| this.doc_close_tab(session, i, cx),
+            move |this, cx| {
+                this.doc_set_split_focus(session, pane, cx);
+                this.doc_new_empty_tab(session, cx);
+            },
+            move |this, from, cx| this.doc_drop_tab(session, from, pane, cx),
+            move |this, slot, cx| this.doc_set_tab_drop_target(session, pane, slot, cx),
+            move |this, cx| this.doc_clear_tab_drop_target(session, cx),
+        )
+        .tabs(tabs)
+        .gap(v.layout.gap_in(pane))
+        .new_tab_tooltip(crate::keymap::localize_hint("New tab  ⌘T"))
+        .on_menu(move |this, i, position, cx| {
+            // The menu addresses tabs by stable id, since positions shift.
+            if let Some(&id) = menu_ids.get(i) {
+                this.doc_open_tab_menu(session, id, position, cx);
+            }
         });
-        let strip = div()
-            .flex_shrink_0()
-            .h(px(35.))
-            .flex()
-            .items_stretch()
-            .bg(bg_panel)
-            .border_b_1()
-            .border_color(border)
-            .children(pinned_strip)
-            .child(tab_viewport)
-            .child(
-                div()
-                    .id("doc-new")
-                    .flex_shrink_0()
-                    .w(px(34.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .border_l_1()
-                    .border_color(border)
-                    .cursor_pointer()
-                    .tooltip(Tooltip::text(crate::keymap::localize_hint("New tab  ⌘T")))
-                    .text_color(faint)
-                    .hover(|s| s.bg(bg_elevated).text_color(text))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.doc_set_split_focus(session, half, cx);
-                        this.doc_new_empty_tab(session, cx);
-                    }))
-                    .child(crate::icons::icon("plus", theme.scale(13.), faint)),
-            );
+        let strip = self.render_tab_strip(strip, cx);
 
         let panel = match v.coll_at(tab_idx) {
             Some(current) => self.render_doc_collection(
@@ -792,8 +613,13 @@ impl AppState {
             None => render_doc_empty(&theme),
         };
 
-        let focus_view = view.clone();
+        let target = v
+            .layout
+            .drop_target()
+            .filter(|t| t.pane == pane && cx.has_active_drag());
         div()
+            .id(("doc-pane", pane.0 as usize))
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -801,15 +627,26 @@ impl AppState {
                 d.border_1().border_color(accent.opacity(0.5))
             })
             .when(is_split && !focused, |d| d.border_1().border_color(border))
-            .when(is_split, |d| {
-                d.on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    focus_view
-                        .update(cx, |this, cx| this.doc_set_split_focus(session, half, cx))
-                        .ok();
-                })
-            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.doc_set_split_focus(session, pane, cx)),
+            )
+            .on_drag_move::<TabDrag>(cx.listener(
+                move |this, e: &gpui::DragMoveEvent<TabDrag>, _, cx| {
+                    let Some(&TabDrag(from)) = e.dragged_item().downcast_ref::<TabDrag>() else {
+                        return;
+                    };
+                    this.doc_aim_tab_drop(session, from, pane, e.bounds, e.event.position, cx);
+                },
+            ))
+            .on_drop::<TabDrag>(cx.listener(move |this, drag: &TabDrag, _, cx| {
+                if let Some(zone) = this.doc_resolved_drop_zone(session, pane, cx) {
+                    this.doc_drop_tab_on_pane(session, drag.0, pane, zone, cx);
+                }
+            }))
             .child(strip)
             .child(div().flex_1().min_h(px(0.)).flex().child(panel))
+            .children(target.map(|t| drop_overlay(t.zone, t.allowed, accent, muted)))
             .into_any_element()
     }
 
@@ -843,7 +680,7 @@ impl AppState {
                         (p > 0, p + 1 < siblings.len(), siblings.len() > 1)
                     })
                     .unwrap_or((false, false, false));
-                (pinned, v.split.is_some(), has_left, has_right, has_others)
+                (pinned, v.layout.is_split(), has_left, has_right, has_others)
             })
             .unwrap_or((false, false, false, false, false));
         let closable = active

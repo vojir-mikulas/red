@@ -31,10 +31,10 @@ use flint::components::text_input::{
 use crate::Quit;
 use crate::i18n::tr;
 use crate::keymap::{
-    About, CloseTab, CycleFocusNext, CycleFocusPrev, FocusEditor, FocusGrid, FocusOtherHalf,
-    FocusSchema, FormatSql, NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, ReportBug,
-    RunQuery, SearchSchema, Settings, ShowChangelog, ShowErDiagram, ShowShortcuts,
-    SwitchConnection, ToggleSidebar, ToggleSplit,
+    About, ClosePane, CloseTab, CycleFocusNext, CycleFocusPrev, EqualizePanes, FocusEditor,
+    FocusGrid, FocusOtherHalf, FocusSchema, FormatSql, MaximizePane, NewConnection, NewTab,
+    NextTab, PrevTab, RefreshSchema, ReportBug, RunQuery, SearchSchema, Settings, ShowChangelog,
+    ShowErDiagram, ShowShortcuts, SplitDown, SwitchConnection, ToggleSidebar, ToggleSplit,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -94,16 +94,23 @@ pub(crate) fn build_menus() -> Vec<Menu> {
                 tr!("menu.view.toggle_sidebar", "Toggle Sidebar"),
                 ToggleSidebar,
             ),
+            MenuItem::action(tr!("menu.view.split_right", "Split Right"), ToggleSplit),
+            MenuItem::action(tr!("menu.view.split_down", "Split Down"), SplitDown),
+            MenuItem::action(tr!("menu.view.close_pane", "Close Pane"), ClosePane),
             MenuItem::action(
-                tr!("menu.view.toggle_split_view", "Toggle Split View"),
-                ToggleSplit,
+                tr!("menu.view.maximize_pane", "Maximize / Restore Pane"),
+                MaximizePane,
+            ),
+            MenuItem::action(
+                tr!("menu.view.equalize_panes", "Equalize Pane Sizes"),
+                EqualizePanes,
             ),
             MenuItem::separator(),
             MenuItem::action(tr!("menu.view.focus_schema", "Focus Schema"), FocusSchema),
             MenuItem::action(tr!("menu.view.focus_editor", "Focus Editor"), FocusEditor),
             MenuItem::action(tr!("menu.view.focus_grid", "Focus Grid"), FocusGrid),
             MenuItem::action(
-                tr!("menu.view.focus_other_split_half", "Focus Other Split Half"),
+                tr!("menu.view.focus_next_pane", "Focus Next Pane"),
                 FocusOtherHalf,
             ),
             MenuItem::separator(),

@@ -128,11 +128,25 @@ actions!(
         SetNull,
         /// Select the whole result: every row and data column (⌘A in the grid).
         SelectAll,
-        /// Toggle the side-by-side split (⌘\): open a second query pane to the right
-        /// of the active one, or collapse the split back to one pane.
+        /// Split the focused pane to the right (⌘\), putting a blank tab in the
+        /// new pane. Repeatable: four presses give four columns.
+        ///
+        /// Named `ToggleSplit` for the two-pane split it used to be, and kept that
+        /// way deliberately — the id is what a user's `keymap.toml` binds, so
+        /// renaming it would silently drop their binding.
         ToggleSplit,
-        /// Move focus to the other half of the split (⌥⌘\).
+        /// Split the focused pane downward (⌘⇧\), stacking a new pane under it.
+        SplitDown,
+        /// Move focus to the next pane in visual order, wrapping (⌥⌘\).
         FocusOtherHalf,
+        /// Close the focused pane, folding its tabs into the pane that takes its
+        /// space (⌥⌘W).
+        ClosePane,
+        /// Zoom the focused pane to fill the work area, or restore the layout
+        /// (⌘⇧↩).
+        MaximizePane,
+        /// Reset every pane divider to even shares (⌥⌘0).
+        EqualizePanes,
     ]
 );
 
@@ -223,12 +237,12 @@ static SHORTCUTS: &[ShortcutGroup] = &[
                 "Cycle focus forward / back",
             ),
             ("toggle_schema_sidebar", "⌘B", "Toggle schema sidebar"),
-            (
-                "split_view_two_tabs_side_by_side",
-                "⌘\\",
-                "Split view (two tabs side by side)",
-            ),
-            ("focus_other_split_half", "⌥⌘\\", "Focus other split half"),
+            ("split_pane_right", "⌘\\", "Split pane right"),
+            ("split_pane_down", "⌘⇧\\", "Split pane down"),
+            ("focus_next_pane", "⌥⌘\\", "Focus next pane"),
+            ("close_pane", "⌥⌘W", "Close pane"),
+            ("maximize_pane", "⌘⇧↩", "Maximize / restore pane"),
+            ("equalize_panes", "⌥⌘0", "Equalize pane sizes"),
         ],
     ),
     (
@@ -619,18 +633,33 @@ const DEFAULTS: &[ActionDef] = &[
     // item displays this accelerator by looking the action up here. About has no
     // shortcut; it's reachable only from the menu.
     def("cmd-,", "Settings", "Settings", Some("RedRoot")),
-    // Side-by-side split: ⌘\ toggles a second query pane (the Zed idiom); ⌥⌘\ jumps
-    // focus to the other half. `RedRoot`-scoped so they fire from any pane's focus.
+    // Panes: ⌘\ splits the focused pane to the right and ⌘⇧\ splits it downward
+    // (the Zed idiom), both repeatable; ⌥⌘\ cycles focus. `RedRoot`-scoped so they
+    // fire from any pane's focus.
+    def("cmd-\\", "ToggleSplit", "Split pane right", Some("RedRoot")),
     def(
-        "cmd-\\",
-        "ToggleSplit",
-        "Toggle split view",
+        "cmd-shift-\\",
+        "SplitDown",
+        "Split pane down",
         Some("RedRoot"),
     ),
     def(
         "cmd-alt-\\",
         "FocusOtherHalf",
-        "Focus other split half",
+        "Focus next pane",
+        Some("RedRoot"),
+    ),
+    def("cmd-alt-w", "ClosePane", "Close pane", Some("RedRoot")),
+    def(
+        "cmd-shift-enter",
+        "MaximizePane",
+        "Maximize / restore pane",
+        Some("RedRoot"),
+    ),
+    def(
+        "cmd-alt-0",
+        "EqualizePanes",
+        "Equalize pane sizes",
         Some("RedRoot"),
     ),
     // --- staged grid editing ---
@@ -1006,7 +1035,11 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
         "SetNull" => kb!(SetNull),
         "SelectAll" => kb!(SelectAll),
         "ToggleSplit" => kb!(ToggleSplit),
+        "SplitDown" => kb!(SplitDown),
         "FocusOtherHalf" => kb!(FocusOtherHalf),
+        "ClosePane" => kb!(ClosePane),
+        "MaximizePane" => kb!(MaximizePane),
+        "EqualizePanes" => kb!(EqualizePanes),
         other => return Err(format!("unknown action “{other}”; skipping")),
     })
 }

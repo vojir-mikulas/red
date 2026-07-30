@@ -107,10 +107,22 @@ keymap-Settings =
     .label = [Séttíñgs]
 
 keymap-ToggleSplit =
-    .label = [Tögglé splít víéw]
+    .label = [Splít páñé ríght]
+
+keymap-SplitDown =
+    .label = [Splít páñé döwñ]
 
 keymap-FocusOtherHalf =
-    .label = [Föçús öthér splít hálf]
+    .label = [Föçús ñéxt páñé]
+
+keymap-ClosePane =
+    .label = [Çlösé páñé]
+
+keymap-MaximizePane =
+    .label = [Máxímízé / réstöré páñé]
+
+keymap-EqualizePanes =
+    .label = [Éqúálízé páñé sízés]
 
 keymap-BeginEdit =
     .label = [Édít çéll]

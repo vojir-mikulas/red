@@ -28,11 +28,11 @@ kv-score_e_g_1_0 = score (e.g. 1.0)
 
 kv-seconds_optional = seconds (optional)
 
+kv-import_stopped = Import stopped after { $ok } command(s); { $failed } failed
+
 kv-imported_commands = Imported { $ok } command(s)
 
 kv-imported_with_failures = Imported { $ok }, { $failed } failed{ $detail }
-
-kv-import_stopped = Import stopped after { $ok } command(s); { $failed } failed
 
 kv-actions = Actions
 

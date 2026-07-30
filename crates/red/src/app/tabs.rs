@@ -29,21 +29,19 @@ impl AppState {
         if let Phase::Connected(active) = &mut self.phase
             && index < active.tabs.len()
         {
-            // Load the tab into the focused half; when split, picking the tab the
-            // other half already shows swaps the two (see `set_focused_tab`).
             active.set_focused_tab(index);
             // Selecting a partly off-screen tab scrolls it fully into view.
-            active.tab_scroll.scroll_to_item(index);
+            active.scroll_tab_into_view(index);
         }
         cx.notify();
     }
 
     /// Point the drop indicator at `gap` (an insertion index `0..=tabs.len()`)
-    /// while a tab drag hovers the strip. Notifies only on change to keep the
-    /// per-move churn cheap.
-    pub(crate) fn set_tab_drop_target(&mut self, gap: usize, cx: &mut Context<Self>) {
+    /// in `pane`'s strip while a tab drag hovers it. Notifies only on change to
+    /// keep the per-move churn cheap.
+    pub(crate) fn set_tab_drop_target(&mut self, pane: PaneId, gap: usize, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase
-            && active.set_drop_target(gap)
+            && active.set_drop_gap(pane, gap)
         {
             cx.notify();
         }
@@ -53,50 +51,106 @@ impl AppState {
     /// only when something was showing.
     pub(crate) fn clear_tab_drop_target(&mut self, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase
-            && active.clear_drop_target()
+            && active.clear_drop_gap()
         {
             cx.notify();
         }
     }
 
-    /// Finish a tab-strip drag onto half `half`'s strip: assign the dragged tab
-    /// (`from`) to that half and move it into the gap the indicator settled on. Lands
-    /// the tab in `half` and focuses it; `normalize_panes` collapses the split if the
-    /// drag emptied the source half. Clears the indicator regardless.
-    pub(crate) fn drop_tab(&mut self, from: usize, half: SplitHalf, cx: &mut Context<Self>) {
+    /// Finish a tab-strip drag onto `pane`'s strip: assign the dragged tab
+    /// (`from`) to that pane and move it into the gap the indicator settled on.
+    /// Focuses the pane; `normalize_panes` drops the source pane if the drag
+    /// emptied it. Clears the indicator regardless.
+    pub(crate) fn drop_tab(&mut self, from: usize, pane: PaneId, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase {
-            active.reorder_tab(from, half);
+            active.reorder_tab(from, pane);
+            active.scroll_tab_into_view(from);
         }
         cx.notify();
     }
 
-    /// Move tab `from` into split half `half` and focus that half: the drop target
-    /// for dragging a tab across the divider onto a half's body (no reorder). Lands
-    /// the tab in `half`; `normalize_panes` collapses the split if it emptied the
-    /// source half. No-op when not split or `from` is stale.
-    pub(crate) fn move_tab_to_half(
+    /// Track the cursor over `pane` during a tab drag and record which zone of it
+    /// the tab would land in, so the pane paints the matching highlight.
+    pub(crate) fn aim_tab_drop(
         &mut self,
         from: usize,
-        half: SplitHalf,
+        pane: PaneId,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        position: gpui::Point<gpui::Pixels>,
         cx: &mut Context<Self>,
     ) {
-        if let Phase::Connected(active) = &mut self.phase {
-            if active.split.is_none() || from >= active.tabs.len() {
-                return;
-            }
-            active.tabs[from].pane = half;
-            if let Some(s) = &mut active.split {
-                s.focus = half;
-            }
-            active.set_pane_active(half, from);
-            active.tab_scroll.scroll_to_item(from);
-            active.tab_drop_target = None;
-            active.normalize_panes();
-        } else {
+        let Phase::Connected(active) = &mut self.phase else {
             return;
+        };
+        let Some(dragged) = active.dragged_tab(from) else {
+            return;
+        };
+        if crate::panes::aim(
+            &mut active.layout,
+            pane,
+            bounds,
+            position,
+            Self::PANE_LIMITS,
+            dragged,
+        ) {
+            cx.notify();
         }
-        // Land focus in the half the tab moved to on the next paint.
-        self.pending_focus = Some(Pane::Editor);
+    }
+
+    /// The zone a drop on `pane` resolves to, or `None` when the drop is refused:
+    /// whatever the highlight settled on, a plain move when the drag never aimed
+    /// at a zone, and nothing at all when it aimed at a split too small to be
+    /// usable (which the muted highlight already said).
+    pub(crate) fn resolved_drop_zone(
+        &mut self,
+        pane: PaneId,
+        cx: &mut Context<Self>,
+    ) -> Option<DropZone> {
+        let target = match &self.phase {
+            Phase::Connected(active) => active.layout.drop_target().filter(|t| t.pane == pane),
+            _ => None,
+        };
+        match target {
+            Some(t) if t.allowed => Some(t.zone),
+            // The zone rendered muted, so the drop has to honour that: doing
+            // something else instead is the same broken promise as offering a
+            // split that never happens.
+            Some(t) if t.zone != DropZone::Center => {
+                if let Phase::Connected(active) = &mut self.phase {
+                    active.layout.clear_drag();
+                }
+                self.notify(
+                    flint::ToastVariant::Info,
+                    crate::i18n::tr!(
+                        "panes.too_small_to_split",
+                        "Not enough room to split that pane"
+                    ),
+                    cx,
+                );
+                None
+            }
+            _ => Some(DropZone::Center),
+        }
+    }
+
+    /// Finish a tab drag dropped on a pane's *body*: into that pane, or into a
+    /// new pane split off the edge the cursor was nearest (which is how a
+    /// single-pane workspace gets its second pane). No-op when nothing changed.
+    pub(crate) fn drop_tab_on_pane(
+        &mut self,
+        from: usize,
+        pane: PaneId,
+        zone: crate::panes::DropZone,
+        cx: &mut Context<Self>,
+    ) {
+        let moved = match &mut self.phase {
+            Phase::Connected(active) => active.drop_tab_into(from, pane, zone),
+            _ => return,
+        };
+        if moved {
+            // Land focus in the pane the tab moved to on the next paint.
+            self.pending_focus = Some(Pane::Editor);
+        }
         cx.notify();
     }
 
@@ -133,15 +187,15 @@ impl AppState {
     pub(crate) fn push_tab(&mut self, mut tab: QueryTab, cx: &mut Context<Self>) -> usize {
         let index = match &mut self.phase {
             Phase::Connected(active) => {
-                // The new tab joins the focused half and becomes its active tab.
-                let half = active.focused_half();
-                tab.pane = half;
+                // The new tab joins the focused pane and becomes its active tab.
+                let pane = active.focused_pane();
+                tab.pane = pane;
                 active.tabs.push(tab);
                 let index = active.tabs.len() - 1;
-                active.set_pane_active(half, index);
+                active.set_pane_active(pane, index);
                 // Scroll the freshly-focused tab into view on the next paint, in
                 // case the strip was already scrolled or crowded.
-                active.tab_scroll.scroll_to_item(index);
+                active.scroll_tab_into_view(index);
                 index
             }
             _ => return 0,
@@ -170,11 +224,11 @@ impl AppState {
         // A parked connection: append without touching focus. The user sees it
         // when they switch back; `set_pane_active` binds it as that half's tab.
         if let Some(active) = self.conn_mut(session) {
-            let half = active.focused_half();
-            tab.pane = half;
+            let pane = active.focused_pane();
+            tab.pane = pane;
             active.tabs.push(tab);
             let index = active.tabs.len() - 1;
-            active.set_pane_active(half, index);
+            active.set_pane_active(pane, index);
         }
         cx.notify();
     }
@@ -234,15 +288,17 @@ impl AppState {
     /// keyboard path knows when to chase focus.
     pub(crate) fn step_active_tab(&mut self, forward: bool, cx: &mut Context<Self>) -> bool {
         if let Phase::Connected(active) = &mut self.phase {
-            // Cycle within the focused pane's own tabs (each half has its own set).
-            let half = active.focused_half();
-            let pane_tabs = active.pane_tab_indices(half);
-            let cur = active.focused_tab_index();
+            // Cycle within the focused pane's own tabs (each pane has its own set).
+            let pane = active.focused_pane();
+            let pane_tabs = active.pane_tab_indices(pane);
+            let Some(cur) = active.focused_tab_index() else {
+                return false;
+            };
             let Some(next) = cycle_tab_index(&pane_tabs, cur, forward) else {
                 return false;
             };
             active.set_focused_tab(next);
-            active.tab_scroll.scroll_to_item(next);
+            active.scroll_tab_into_view(next);
             cx.notify();
             return true;
         }
@@ -256,7 +312,10 @@ impl AppState {
         if let Phase::Connected(a) = &self.phase
             && let Some(v) = &a.kv_view
         {
-            let (session, idx) = (a.session, v.focused_tab_index());
+            let Some(idx) = v.focused_tab_index() else {
+                return;
+            };
+            let session = a.session;
             self.kv_close_tab(session, idx, cx);
             return;
         }
@@ -264,12 +323,18 @@ impl AppState {
         if let Phase::Connected(a) = &self.phase
             && let Some(v) = &a.doc_view
         {
-            let (session, idx) = (a.session, v.focused_tab_index());
+            let Some(idx) = v.focused_tab_index() else {
+                return;
+            };
+            let session = a.session;
             self.doc_close_tab(session, idx, cx);
             return;
         }
         let index = match &self.phase {
-            Phase::Connected(active) if active.active().is_some() => active.active_tab,
+            Phase::Connected(active) => match active.focused_tab_index() {
+                Some(i) => i,
+                None => return,
+            },
             _ => return,
         };
         self.request_close_tab(index, cx);
@@ -499,18 +564,12 @@ impl AppState {
                     continue;
                 }
                 let removed = active.tabs.remove(index);
-                // Shift both panes' active indices left when they sat after the
-                // removed tab; `normalize_panes` then collapses the split if this
-                // emptied a half and re-points each pane's active at a tab it owns.
-                if active.active_tab >= index && active.active_tab > 0 {
-                    active.active_tab -= 1;
-                }
-                if let Some(s) = &mut active.split
-                    && s.secondary >= index
-                    && s.secondary > 0
-                {
-                    s.secondary -= 1;
-                }
+                // Shift every pane's active index left when it sat after the
+                // removed tab; `normalize_panes` then drops panes this emptied and
+                // re-points each remaining one at a tab it owns.
+                active
+                    .layout
+                    .remap_active_tabs(|i| if i >= index && i > 0 { i - 1 } else { i });
                 if let Some(g) = removed.result {
                     free_epochs.push(g.epoch);
                 }

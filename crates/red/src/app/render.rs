@@ -10,13 +10,13 @@ use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
 use crate::app::AiReviewState;
 use crate::app::PreflightCount;
 use crate::keymap::{
-    About, AddRow, BeginEdit, CloseInspector, CloseTab, CycleFocusNext, CycleFocusPrev, DeleteRow,
-    Explain, FindInResult, FocusEditor, FocusGrid, FocusOtherHalf, FocusSchema, FormatSql,
-    NewConnection, NewTab, NextTab, OpenSavedQueries, PrevTab, RefreshSchema, ReportBug,
-    RevertChanges, RunQuery, SaveQuery, SearchSchema, SelectAll, SetNull, Settings, ShowChangelog,
-    ShowErDiagram, ShowShortcuts, SubmitChanges, SwitchConnection, SwitchToConnectionSlot,
-    SwitchToPreviousConnection, ToggleAssistant, ToggleColumnsPanel, ToggleFilter, ToggleHistory,
-    ToggleInspector, ToggleSidebar, ToggleSplit,
+    About, AddRow, BeginEdit, CloseInspector, ClosePane, CloseTab, CycleFocusNext, CycleFocusPrev,
+    DeleteRow, EqualizePanes, Explain, FindInResult, FocusEditor, FocusGrid, FocusOtherHalf,
+    FocusSchema, FormatSql, MaximizePane, NewConnection, NewTab, NextTab, OpenSavedQueries,
+    PrevTab, RefreshSchema, ReportBug, RevertChanges, RunQuery, SaveQuery, SearchSchema, SelectAll,
+    SetNull, Settings, ShowChangelog, ShowErDiagram, ShowShortcuts, SplitDown, SubmitChanges,
+    SwitchConnection, SwitchToConnectionSlot, SwitchToPreviousConnection, ToggleAssistant,
+    ToggleColumnsPanel, ToggleFilter, ToggleHistory, ToggleInspector, ToggleSidebar, ToggleSplit,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 use red_core::sql::RiskLevel;
@@ -578,10 +578,32 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &CycleFocusPrev, window, cx| {
                 this.cycle_focus(false, window, cx)
             }))
-            // Side-by-side split (⌘\ toggles it, ⌥⌘\ jumps to the other half).
+            // Panes: ⌘\ splits the focused pane to the right (repeatable), ⌥⌘\
+            // cycles focus. `ToggleSplit` keeps its action id so an existing user
+            // keymap binding it still splits.
             .on_action(cx.listener(|this, _: &ToggleSplit, _, cx| {
                 if this.globals_enabled() {
-                    this.toggle_split(cx);
+                    this.split_right(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SplitDown, _, cx| {
+                if this.globals_enabled() {
+                    this.split_down(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &ClosePane, _, cx| {
+                if this.globals_enabled() {
+                    this.close_pane(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &MaximizePane, _, cx| {
+                if this.globals_enabled() {
+                    this.zoom_pane(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &EqualizePanes, _, cx| {
+                if this.globals_enabled() {
+                    this.equalize_panes(cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &FocusOtherHalf, _, cx| {

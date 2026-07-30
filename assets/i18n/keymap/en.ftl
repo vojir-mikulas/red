@@ -107,10 +107,22 @@ keymap-Settings =
     .label = Settings
 
 keymap-ToggleSplit =
-    .label = Toggle split view
+    .label = Split pane right
+
+keymap-SplitDown =
+    .label = Split pane down
 
 keymap-FocusOtherHalf =
-    .label = Focus other split half
+    .label = Focus next pane
+
+keymap-ClosePane =
+    .label = Close pane
+
+keymap-MaximizePane =
+    .label = Maximize / restore pane
+
+keymap-EqualizePanes =
+    .label = Equalize pane sizes
 
 keymap-BeginEdit =
     .label = Edit cell

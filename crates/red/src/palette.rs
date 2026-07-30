@@ -128,12 +128,18 @@ pub(crate) enum Cmd {
     AssistantNewChatWith(usize),
     /// Reveal the conversations directory in the OS file manager.
     RevealConversationStorage,
-    /// Open the side-by-side split (a second query pane on the right).
+    /// Split the focused pane to the right (a new pane beside it).
     SplitRight,
-    /// Collapse the split back to a single pane.
+    /// Split the focused pane downward (a new pane under it).
+    SplitDown,
+    /// Fold every pane back into a single one.
     Unsplit,
-    /// Move focus to the other half of the split.
+    /// Move focus to the next pane in visual order.
     FocusOtherHalf,
+    /// Zoom the focused pane to fill the work area, or restore the layout.
+    MaximizePane,
+    /// Reset every pane divider to even shares.
+    EqualizePanes,
     /// Open the "What's New" changelog overlay.
     ShowChangelog,
     // --- Redis (KV) commands, offered only on a Redis connection ---
@@ -381,7 +387,10 @@ impl AppState {
             }
             Cmd::RevealConversationStorage => self.reveal_conversation_storage(cx),
             Cmd::SplitRight => self.split_right(cx),
+            Cmd::SplitDown => self.split_down(cx),
             Cmd::Unsplit => self.unsplit(cx),
+            Cmd::MaximizePane => self.zoom_pane(cx),
+            Cmd::EqualizePanes => self.equalize_panes(cx),
             Cmd::FocusOtherHalf => self.focus_other_half(cx),
             Cmd::KvNewTab => {
                 if let Some(s) = self.kv_active_session() {
@@ -530,20 +539,32 @@ impl AppState {
                         Cmd::PrevTab,
                     ));
                 }
-                // Side-by-side split: offer open/focus while split, else open.
-                if active.split.is_some() {
+                // Panes: splitting is always on offer; the rest only once the
+                // work area is actually divided.
+                out.push((
+                    item("cmd:split-right", "view: split pane right").hint("⌘\\"),
+                    Cmd::SplitRight,
+                ));
+                out.push((
+                    item("cmd:split-down", "view: split pane down").hint("⌘⇧\\"),
+                    Cmd::SplitDown,
+                ));
+                if active.layout.is_split() {
                     out.push((
-                        item("cmd:unsplit", "view: unsplit").hint("⌘\\"),
-                        Cmd::Unsplit,
-                    ));
-                    out.push((
-                        item("cmd:focus-other-half", "view: focus other split half").hint("⌥⌘\\"),
+                        item("cmd:focus-other-half", "view: focus next pane").hint("⌥⌘\\"),
                         Cmd::FocusOtherHalf,
                     ));
-                } else if active.active().is_some() {
                     out.push((
-                        item("cmd:split-right", "view: split right").hint("⌘\\"),
-                        Cmd::SplitRight,
+                        item("cmd:maximize-pane", "view: maximize / restore pane").hint("⌘⇧↩"),
+                        Cmd::MaximizePane,
+                    ));
+                    out.push((
+                        item("cmd:equalize-panes", "view: equalize pane sizes").hint("⌥⌘0"),
+                        Cmd::EqualizePanes,
+                    ));
+                    out.push((
+                        item("cmd:unsplit", "view: unsplit (fold panes back into one)"),
+                        Cmd::Unsplit,
                     ));
                 }
                 // Whole-schema migration, offered only when the selected/only schema

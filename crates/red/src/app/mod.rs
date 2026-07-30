@@ -2558,7 +2558,7 @@ impl AppState {
                 Pane::Schema => Some(active.schema_focus.clone()),
                 // The focused half's grid: the second half has its own handle so
                 // the cell cursor never lands on both grids at once.
-                Pane::Grid => Some(active.grid_focus_for(active.focused_half()).clone()),
+                Pane::Grid => active.grid_focus_for(active.focused_pane()).cloned(),
                 Pane::Editor => active.active().map(|t| t.editor.focus_handle(cx)),
             },
             _ => return,
@@ -2626,44 +2626,29 @@ impl AppState {
         self.focus_pane(order[next], window, cx);
     }
 
-    // --- split view (two query tabs side by side) ---
+    // --- panes (N query tabs side by side, or stacked) ---
 
-    /// Default left-half width when a split first opens; the user drags from here.
-    const SPLIT_DEFAULT_WIDTH: f32 = 560.;
-
-    /// Toggle the side-by-side split: open it (the ⌘\ / palette action) or, when
-    /// it's already open, collapse it. Routes to the Redis shell's own split for
-    /// a Redis connection (which has tabs but no SQL editor/result panes).
-    pub(crate) fn toggle_split(&mut self, cx: &mut Context<Self>) {
+    /// Split the focused pane and put a fresh blank tab in the new one: ⌘\
+    /// (right) and ⌘⇧\ (down), and the palette. Repeatable — four presses give
+    /// four columns. Routes to the Redis / Mongo shells' own split for those
+    /// connections (they have tabs but no SQL editor/result panes).
+    pub(crate) fn split_pane(&mut self, zone: DropZone, cx: &mut Context<Self>) {
         if let Phase::Connected(a) = &self.phase
             && a.kv_view.is_some()
         {
             let session = a.session;
-            self.kv_toggle_split(session, cx);
+            self.kv_split_pane(session, zone, cx);
             return;
         }
         if let Phase::Connected(a) = &self.phase
             && a.doc_view.is_some()
         {
             let session = a.session;
-            self.doc_toggle_split(session, cx);
+            self.doc_split_pane(session, zone, cx);
             return;
         }
-        let split = matches!(&self.phase, Phase::Connected(a) if a.split.is_some());
-        if split {
-            self.unsplit(cx);
-        } else {
-            self.split_right(cx);
-        }
-    }
-
-    /// Open the split: a second query pane to the right, focused, holding a fresh
-    /// blank tab. The left pane keeps all its tabs (each half owns its own tabs, so
-    /// nothing is duplicated); drag a tab across the divider to move it over. No-op
-    /// unless connected with a tab open, or when already split.
-    pub(crate) fn split_right(&mut self, cx: &mut Context<Self>) {
         match &self.phase {
-            Phase::Connected(active) if active.split.is_none() && active.active().is_some() => {}
+            Phase::Connected(active) if active.active().is_some() => {}
             _ => return,
         }
         // Mint the blank tab's title (bumps the seq) outside the build, since
@@ -2676,41 +2661,64 @@ impl AppState {
             _ => return,
         };
         let mut tab = QueryTab::new(title, self.active_dialect(), cx);
-        tab.pane = SplitHalf::Secondary;
         if let Phase::Connected(active) = &mut self.phase {
+            let at = active.focused_pane();
+            let Some(new) = active.layout.insert(at, zone) else {
+                return;
+            };
+            tab.pane = new;
             active.tabs.push(tab);
-            let secondary = active.tabs.len() - 1;
-            active.split = Some(SplitState {
-                secondary,
-                focus: SplitHalf::Secondary,
-                width: px(Self::SPLIT_DEFAULT_WIDTH),
-                drag: None,
-            });
+            let idx = active.tabs.len() - 1;
+            active.layout.set_focus(new);
+            active.set_pane_active(new, idx);
             active.normalize_panes();
         }
-        // The new half is now focused; seed its editor's completions and focus it.
+        // The new pane is now focused; seed its editor's completions and focus it.
         self.refresh_completions(cx);
         self.pending_focus = Some(Pane::Editor);
         cx.notify();
     }
 
-    /// Collapse the split back to one pane: every tab folds into the single strip,
-    /// keeping whichever half was focused on screen. No-op when not split.
-    pub(crate) fn unsplit(&mut self, cx: &mut Context<Self>) {
+    /// Split the focused pane to the right (the ⌘\ action and the palette's
+    /// "split right").
+    pub(crate) fn split_right(&mut self, cx: &mut Context<Self>) {
+        self.split_pane(DropZone::Right, cx);
+    }
+
+    /// Split the focused pane downward (the ⌘⇧\ action).
+    pub(crate) fn split_down(&mut self, cx: &mut Context<Self>) {
+        self.split_pane(DropZone::Bottom, cx);
+    }
+
+    /// Close the focused pane, folding its tabs into the pane that takes its
+    /// space (⌥⌘W). No-op with a single pane — the shell always shows one.
+    pub(crate) fn close_pane(&mut self, cx: &mut Context<Self>) {
+        if let Phase::Connected(a) = &self.phase
+            && let Some(v) = &a.kv_view
+        {
+            let (session, pane) = (a.session, v.layout.focus());
+            self.kv_close_pane(session, pane, cx);
+            return;
+        }
+        if let Phase::Connected(a) = &self.phase
+            && let Some(v) = &a.doc_view
+        {
+            let (session, pane) = (a.session, v.layout.focus());
+            self.doc_close_pane(session, pane, cx);
+            return;
+        }
         if let Phase::Connected(active) = &mut self.phase {
-            if let Some(s) = active.split.take() {
-                let keep = if s.focus == SplitHalf::Secondary {
-                    s.secondary
-                } else {
-                    active.active_tab
-                };
-                for t in &mut active.tabs {
-                    t.pane = SplitHalf::Primary;
-                }
-                active.active_tab = keep.min(active.tabs.len().saturating_sub(1));
-            } else {
+            let pane = active.focused_pane();
+            let Some(heir) = active.layout.remove(pane) else {
                 return;
+            };
+            for t in &mut active.tabs {
+                if t.pane == pane {
+                    t.pane = heir;
+                }
             }
+            active.layout.set_focus(heir);
+            active.normalize_panes();
         } else {
             return;
         }
@@ -2718,23 +2726,98 @@ impl AppState {
         cx.notify();
     }
 
-    /// Set the focused half (the strip click / a per-half interaction picks this so
-    /// run/export/filter target the half the user just touched). Notifies only on a
-    /// change; a no-op when not split.
-    pub(crate) fn set_split_focus(&mut self, half: SplitHalf, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(s) = &mut active.split
-            && s.focus != half
+    /// Fold every pane back into one, keeping the focused pane's tabs on screen
+    /// (the palette's "unsplit").
+    pub(crate) fn unsplit(&mut self, cx: &mut Context<Self>) {
+        if let Phase::Connected(a) = &self.phase
+            && a.kv_view.is_some()
         {
-            s.focus = half;
+            let session = a.session;
+            self.kv_unsplit(session, cx);
+            return;
+        }
+        if let Phase::Connected(a) = &self.phase
+            && a.doc_view.is_some()
+        {
+            let session = a.session;
+            self.doc_unsplit(session, cx);
+            return;
+        }
+        if let Phase::Connected(active) = &mut self.phase {
+            let keep = active.focused_pane();
+            let others: Vec<crate::panes::PaneId> = active
+                .layout
+                .panes()
+                .into_iter()
+                .filter(|&p| p != keep)
+                .collect();
+            if others.is_empty() {
+                return;
+            }
+            for t in &mut active.tabs {
+                t.pane = keep;
+            }
+            for pane in others {
+                active.layout.remove(pane);
+            }
+            active.layout.set_focus(keep);
+            active.normalize_panes();
+        } else {
+            return;
+        }
+        self.pending_focus = Some(Pane::Editor);
+        cx.notify();
+    }
+
+    /// Zoom the focused pane to fill the work area, or restore the layout when it
+    /// is already zoomed (⌘⇧↩). No-op with a single pane.
+    pub(crate) fn zoom_pane(&mut self, cx: &mut Context<Self>) {
+        let Phase::Connected(active) = &mut self.phase else {
+            return;
+        };
+        if let Some(v) = &mut active.kv_view {
+            let pane = v.layout.focus();
+            v.layout.zoom_toggle(pane);
+        } else if let Some(v) = &mut active.doc_view {
+            let pane = v.layout.focus();
+            v.layout.zoom_toggle(pane);
+        } else {
+            let pane = active.layout.focus();
+            active.layout.zoom_toggle(pane);
+        }
+        cx.notify();
+    }
+
+    /// Reset every divider to even shares (⌥⌘0).
+    pub(crate) fn equalize_panes(&mut self, cx: &mut Context<Self>) {
+        let Phase::Connected(active) = &mut self.phase else {
+            return;
+        };
+        if let Some(v) = &mut active.kv_view {
+            v.layout.equalize();
+        } else if let Some(v) = &mut active.doc_view {
+            v.layout.equalize();
+        } else {
+            active.layout.equalize();
+        }
+        cx.notify();
+    }
+
+    /// Set the focused pane (a strip click or a per-pane interaction picks this,
+    /// so run/export/filter target the pane the user just touched). Notifies only
+    /// on a change.
+    pub(crate) fn set_split_focus(&mut self, pane: crate::panes::PaneId, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase
+            && active.layout.set_focus(pane)
+        {
             cx.notify();
         }
     }
 
-    /// Move focus to the other half of the split, keeping the same pane within it
-    /// (the ⌥⌘\ / palette action). No-op when not split. The actual keyboard focus
-    /// move is deferred to the next render via `pending_focus`, so this needs no
-    /// `Window` and works from the palette too.
+    /// Move focus to the next pane in visual order, wrapping, and keep the same
+    /// area (editor / grid) within it (the ⌥⌘\ / palette action). No-op with a
+    /// single pane. The actual keyboard focus move is deferred to the next render
+    /// via `pending_focus`, so this needs no `Window` and works from the palette.
     pub(crate) fn focus_other_half(&mut self, cx: &mut Context<Self>) {
         if let Phase::Connected(a) = &self.phase
             && a.kv_view.is_some()
@@ -2750,58 +2833,59 @@ impl AppState {
             self.doc_focus_other_half(session, cx);
             return;
         }
-        let pane = match &self.phase {
-            Phase::Connected(active) if active.split.is_some() => active.active_pane,
+        let area = match &self.phase {
+            Phase::Connected(active) if active.layout.is_split() => active.active_pane,
             _ => return,
         };
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(s) = &mut active.split
-        {
-            s.focus = s.focus.other();
+        if let Phase::Connected(active) = &mut self.phase {
+            let cur = active.layout.focus();
+            if let Some(next) = active.layout.cycle(cur, true) {
+                active.layout.set_focus(next);
+            }
         }
-        // Editor focus lives on the tab's own entity, the grid on the half's handle;
-        // re-focusing the current pane lands it in the now-focused half.
-        self.pending_focus = Some(pane);
+        // Editor focus lives on the tab's own entity, the grid on the pane's
+        // handle; re-focusing the current area lands it in the now-focused pane.
+        self.pending_focus = Some(area);
         cx.notify();
     }
 
-    /// Reconcile the split's focused half with where keyboard focus actually sits,
-    /// so clicking into either half's editor or grid lights it as active (and aims
-    /// run/export/filter there). Called at the top of `render`; no-op when not split
-    /// or when focus is elsewhere (schema, assistant, a modal); the last half stays.
+    /// Reconcile the layout's focused pane with where keyboard focus actually
+    /// sits, so clicking into any pane's editor or grid lights it as active (and
+    /// aims run/export/filter there). Called at the top of `render`; no-op with a
+    /// single pane or when focus is elsewhere (schema, assistant, a modal), where
+    /// the last focused pane stays.
+    ///
+    /// Also mints the focus handle of any pane born since the last frame — this is
+    /// the first point after a layout change that holds an `App`, and the pane
+    /// bodies rendered below need their handles (see [`crate::panes::PaneUi`]).
     pub(crate) fn sync_split_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase {
+            active.layout.ensure_focus_handles(cx);
+            if let Some(v) = &mut active.kv_view {
+                v.layout.ensure_focus_handles(cx);
+            }
+            if let Some(v) = &mut active.doc_view {
+                v.layout.ensure_focus_handles(cx);
+            }
+        }
         let detected = match &self.phase {
-            Phase::Connected(active) => match &active.split {
-                Some(s) => {
-                    let prim_editor = active
-                        .tabs
-                        .get(active.active_tab)
+            Phase::Connected(active) if active.layout.is_split() => {
+                active.layout.panes().into_iter().find(|&pane| {
+                    let editor = active
+                        .pane_active(pane)
+                        .and_then(|i| active.tabs.get(i))
                         .map(|t| t.editor.focus_handle(cx));
-                    let sec_editor = active
-                        .tabs
-                        .get(s.secondary)
-                        .map(|t| t.editor.focus_handle(cx));
-                    let prim = prim_editor.is_some_and(|h| h.contains_focused(window, cx))
-                        || active.grid_focus.contains_focused(window, cx);
-                    let sec = sec_editor.is_some_and(|h| h.contains_focused(window, cx))
-                        || active.secondary_grid_focus.contains_focused(window, cx);
-                    if sec && s.focus != SplitHalf::Secondary {
-                        Some(SplitHalf::Secondary)
-                    } else if prim && s.focus != SplitHalf::Primary {
-                        Some(SplitHalf::Primary)
-                    } else {
-                        None
-                    }
-                }
-                None => None,
-            },
+                    let grid = active.grid_focus_for(pane);
+                    editor.is_some_and(|h| h.contains_focused(window, cx))
+                        || grid.is_some_and(|h| h.contains_focused(window, cx))
+                })
+            }
             _ => None,
         };
-        if let Some(half) = detected
+        if let Some(pane) = detected
             && let Phase::Connected(active) = &mut self.phase
-            && let Some(s) = &mut active.split
         {
-            s.focus = half;
+            active.layout.set_focus(pane);
         }
     }
 }

@@ -40,7 +40,15 @@ menu-view-title = View
 
 menu-view-toggle_sidebar = Toggle Sidebar
 
-menu-view-toggle_split_view = Toggle Split View
+menu-view-split_right = Split Right
+
+menu-view-split_down = Split Down
+
+menu-view-close_pane = Close Pane
+
+menu-view-maximize_pane = Maximize / Restore Pane
+
+menu-view-equalize_panes = Equalize Pane Sizes
 
 menu-view-focus_schema = Focus Schema
 
@@ -48,7 +56,7 @@ menu-view-focus_editor = Focus Editor
 
 menu-view-focus_grid = Focus Grid
 
-menu-view-focus_other_split_half = Focus Other Split Half
+menu-view-focus_next_pane = Focus Next Pane
 
 menu-view-cycle_focus_next = Cycle Focus Next
 

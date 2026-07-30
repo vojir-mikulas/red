@@ -28,11 +28,11 @@ kv-score_e_g_1_0 = [sçöré (é.g. 1.0)]
 
 kv-seconds_optional = [séçöñds (öptíöñál)]
 
+kv-import_stopped = [Ímpört stöppéd áftér { $ok } çömmáñd(s); { $failed } fáíléd]
+
 kv-imported_commands = [Ímpörtéd { $ok } çömmáñd(s)]
 
 kv-imported_with_failures = [Ímpörtéd { $ok }, { $failed } fáíléd{ $detail }]
-
-kv-import_stopped = [Ímpört stöppéd áftér { $ok } çömmáñd(s); { $failed } fáíléd]
 
 kv-actions = [Áçtíöñs]
 

@@ -6,12 +6,12 @@
 use gpui::Context;
 use red_service::{Command, SessionId};
 
-use crate::app::{AppState, SplitHalf, SplitWorkspace, TabWorkspace};
+use crate::app::{AppState, DropZone, PaneId, SplitWorkspace, TabWorkspace};
 
 use super::*;
 
 impl AppState {
-    /// Open a new blank tab in the focused half (the ＋ / ⌘T action). Its body
+    /// Open a new blank tab in the focused pane (the ＋ / ⌘T action). Its body
     /// shows the "pick a collection" hint; clicking a collection in the sidebar
     /// fills it. Mirrors the SQL side's `new_query` / Redis `kv_new_empty_tab`.
     pub(crate) fn doc_new_empty_tab(&mut self, session: SessionId, cx: &mut Context<Self>) {
@@ -21,19 +21,19 @@ impl AppState {
         else {
             return;
         };
-        let half = view.focused_half();
+        let pane = view.focused_pane();
         let id = view.tab_seq;
         view.tab_seq += 1;
         view.tabs.push(MongoTab {
             id,
             title: "New tab".to_string(),
             state: MongoTabState::Empty,
-            pane: half,
+            pane,
             pinned: false,
         });
         let new_idx = view.tabs.len() - 1;
-        view.set_pane_active(half, new_idx);
-        view.tab_scroll.scroll_to_item(new_idx);
+        view.set_pane_active(pane, new_idx);
+        view.scroll_tab_into_view(new_idx);
         cx.notify();
     }
 
@@ -55,8 +55,8 @@ impl AppState {
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_ref())
             .map(|v| {
-                v.tabs
-                    .get(v.focused_tab_index())
+                v.focused_tab_index()
+                    .and_then(|i| v.tabs.get(i))
                     .is_some_and(|t| matches!(t.state, MongoTabState::Empty))
             })
             .unwrap_or(false);
@@ -93,18 +93,18 @@ impl AppState {
         else {
             return;
         };
-        let half = view.focused_half();
+        let pane = view.focused_pane();
         let focused_idx = view.focused_tab_index();
         // Fill a focused blank tab (unless forcing a new tab), else append.
-        let idx = if !new_tab
-            && view
-                .tabs
-                .get(focused_idx)
+        let blank = focused_idx.filter(|_| !new_tab).filter(|&i| {
+            view.tabs
+                .get(i)
                 .is_some_and(|t| matches!(t.state, MongoTabState::Empty))
-        {
-            view.tabs[focused_idx].state = MongoTabState::Collection(Box::new(coll_view));
-            view.tabs[focused_idx].title = coll.clone();
-            focused_idx
+        });
+        let idx = if let Some(i) = blank {
+            view.tabs[i].state = MongoTabState::Collection(Box::new(coll_view));
+            view.tabs[i].title = coll.clone();
+            i
         } else {
             let id = view.tab_seq;
             view.tab_seq += 1;
@@ -112,13 +112,13 @@ impl AppState {
                 id,
                 title: coll.clone(),
                 state: MongoTabState::Collection(Box::new(coll_view)),
-                pane: half,
+                pane,
                 pinned: false,
             });
             view.tabs.len() - 1
         };
-        view.set_pane_active(half, idx);
-        view.tab_scroll.scroll_to_item(idx);
+        view.set_pane_active(pane, idx);
+        view.scroll_tab_into_view(idx);
         cx.notify();
     }
 
@@ -170,19 +170,19 @@ impl AppState {
         else {
             return;
         };
-        let half = view.focused_half();
+        let pane = view.focused_pane();
         let tab_id = view.tab_seq;
         view.tab_seq += 1;
         view.tabs.push(MongoTab {
             id: tab_id,
             title: coll.clone(),
             state: MongoTabState::Collection(Box::new(coll_view)),
-            pane: half,
+            pane,
             pinned: false,
         });
         let idx = view.tabs.len() - 1;
-        view.set_pane_active(half, idx);
-        view.tab_scroll.scroll_to_item(idx);
+        view.set_pane_active(pane, idx);
+        view.scroll_tab_into_view(idx);
         cx.notify();
     }
 
@@ -201,20 +201,22 @@ impl AppState {
         else {
             return;
         };
-        let half = view.focused_half();
-        let pane_tabs = view.pane_tab_indices(half);
-        let cur = view.focused_tab_index();
+        let pane = view.focused_pane();
+        let pane_tabs = view.pane_tab_indices(pane);
+        let Some(cur) = view.focused_tab_index() else {
+            return;
+        };
         let Some(next) = crate::app::tabs::cycle_tab_index(&pane_tabs, cur, forward) else {
             return;
         };
-        view.set_pane_active(half, next);
-        view.tab_scroll.scroll_to_item(next);
+        view.set_pane_active(pane, next);
+        view.scroll_tab_into_view(next);
         view.tab_menu = None;
         cx.notify();
     }
 
-    /// Activate the tab at `index`: make it its half's active tab and focus that
-    /// half (each strip shows only its own tabs, so a click never crosses).
+    /// Activate the tab at `index`: make it its pane's active tab and focus that
+    /// pane (each strip shows only its own tabs, so a click never crosses).
     pub(crate) fn doc_activate_tab(
         &mut self,
         session: SessionId,
@@ -227,13 +229,11 @@ impl AppState {
         else {
             return;
         };
-        let Some(half) = view.tabs.get(index).map(|t| t.pane) else {
+        let Some(pane) = view.tabs.get(index).map(|t| t.pane) else {
             return;
         };
-        view.set_pane_active(half, index);
-        if let Some(s) = &mut view.split {
-            s.focus = half;
-        }
+        view.set_pane_active(pane, index);
+        view.set_focused_pane(pane);
         view.tab_menu = None;
         cx.notify();
     }
@@ -275,14 +275,10 @@ impl AppState {
             return;
         }
         view.tabs.remove(index);
-        if view.active_tab > index {
-            view.active_tab -= 1;
-        }
-        if let Some(s) = &mut view.split
-            && s.secondary > index
-        {
-            s.secondary -= 1;
-        }
+        // Shift every pane's stored active index past the removed slot, then let
+        // `normalize_panes` drop panes this emptied and re-point the rest.
+        view.layout
+            .remap_active_tabs(|i| if i > index { i - 1 } else { i });
         view.tab_menu = None;
         view.normalize_panes();
         if let Some(epoch) = close_epoch {
@@ -358,20 +354,113 @@ impl AppState {
 
     // --- drag reorder (mirrors the Redis drop helpers) ---
 
-    /// Move the dragged tab (`from`) into `half` and reorder it to the current
-    /// drop-target gap. Clears the gap indicator.
+    /// Move the dragged tab (`from`) into `pane`'s strip and reorder it to the
+    /// current drop-target gap. Clears the gap indicator.
     pub(crate) fn doc_drop_tab(
         &mut self,
         session: SessionId,
         from: usize,
-        half: SplitHalf,
+        pane: PaneId,
         cx: &mut Context<Self>,
     ) {
         if let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
         {
-            view.reorder_tab(from, half);
+            view.reorder_tab(from, pane);
+            view.scroll_tab_into_view(from);
+            cx.notify();
+        }
+    }
+
+    /// Track the cursor over `pane` during a tab drag and record which zone of it
+    /// the tab would land in, so the pane paints the matching highlight.
+    pub(crate) fn doc_aim_tab_drop(
+        &mut self,
+        session: SessionId,
+        from: usize,
+        pane: PaneId,
+        bounds: gpui::Bounds<gpui::Pixels>,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+        else {
+            return;
+        };
+        let Some(dragged) = view.dragged_tab(from) else {
+            return;
+        };
+        if crate::panes::aim(
+            &mut view.layout,
+            pane,
+            bounds,
+            position,
+            Self::KV_PANE_LIMITS,
+            dragged,
+        ) {
+            cx.notify();
+        }
+    }
+
+    /// The zone a drop on `pane` resolves to, or `None` when the drop is refused:
+    /// whatever the highlight settled on, a plain move when the drag never aimed
+    /// at a zone, and nothing at all when it aimed at a split too small to be
+    /// usable (which the muted highlight already said).
+    pub(crate) fn doc_resolved_drop_zone(
+        &mut self,
+        session: SessionId,
+        pane: PaneId,
+        cx: &mut Context<Self>,
+    ) -> Option<DropZone> {
+        let target = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_ref())
+            .and_then(|v| v.layout.drop_target())
+            .filter(|t| t.pane == pane);
+        match target {
+            Some(t) if t.allowed => Some(t.zone),
+            // The zone rendered muted, so the drop has to honour that: doing
+            // something else instead is the same broken promise as offering a
+            // split that never happens.
+            Some(t) if t.zone != DropZone::Center => {
+                if let Some(v) = self
+                    .conn_mut(Some(session))
+                    .and_then(|a| a.doc_view.as_mut())
+                {
+                    v.layout.clear_drag();
+                }
+                self.notify(
+                    flint::ToastVariant::Info,
+                    crate::i18n::tr!(
+                        "panes.too_small_to_split",
+                        "Not enough room to split that pane"
+                    ),
+                    cx,
+                );
+                None
+            }
+            _ => Some(DropZone::Center),
+        }
+    }
+
+    /// Finish a tab drag dropped on a pane's body: into that pane, or into a new
+    /// pane split off the edge the cursor was nearest.
+    pub(crate) fn doc_drop_tab_on_pane(
+        &mut self,
+        session: SessionId,
+        from: usize,
+        pane: PaneId,
+        zone: DropZone,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+        {
+            view.drop_tab_into(from, pane, zone);
             cx.notify();
         }
     }
@@ -379,13 +468,14 @@ impl AppState {
     pub(crate) fn doc_set_tab_drop_target(
         &mut self,
         session: SessionId,
+        pane: PaneId,
         gap: usize,
         cx: &mut Context<Self>,
     ) {
         if let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
-            && view.set_drop_target(gap)
+            && view.set_drop_gap(pane, gap)
         {
             cx.notify();
         }
@@ -395,7 +485,7 @@ impl AppState {
         if let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
-            && view.clear_drop_target()
+            && view.clear_drop_gap()
         {
             cx.notify();
         }
@@ -403,49 +493,82 @@ impl AppState {
 
     // --- split panes ---
 
-    /// Toggle the side-by-side split (⌘\, routed here for a Mongo connection).
-    /// The split mechanics live in [`SplitWorkspace`], shared with the Redis
-    /// workspace; this wrapper only resolves the view and notifies.
-    pub(crate) fn doc_toggle_split(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        if let Some(view) = self
-            .conn_mut(Some(session))
-            .and_then(|a| a.doc_view.as_mut())
-        {
-            view.split_toggle();
-            cx.notify();
-        }
-    }
-
-    /// Set the focused half (a per-half mouse-down picks this). No-op when not
-    /// split or unchanged.
-    pub(crate) fn doc_set_split_focus(
+    /// Split the focused pane (⌘\ right / ⌘⇧\ down, routed here for a Mongo
+    /// connection): a fresh pane with a blank tab, which takes focus. The
+    /// mechanics live in [`SplitWorkspace`], shared with the Redis workspace;
+    /// this wrapper only resolves the view and notifies.
+    pub(crate) fn doc_split_pane(
         &mut self,
         session: SessionId,
-        half: SplitHalf,
+        zone: DropZone,
         cx: &mut Context<Self>,
     ) {
         if let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
-            && view.split_set_focus(half)
+        {
+            view.split_focused(zone);
+            cx.notify();
+        }
+    }
+
+    /// Close `pane`, folding its tabs into the pane that takes its space.
+    pub(crate) fn doc_close_pane(
+        &mut self,
+        session: SessionId,
+        pane: PaneId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+            && view.close_pane(pane)
         {
             cx.notify();
         }
     }
 
-    /// Move focus to the other half (the ⌥⌘\ action). No-op when not split.
+    /// Fold every pane back into one, keeping the focused pane's tabs on screen.
+    pub(crate) fn doc_unsplit(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+            && view.unsplit()
+        {
+            cx.notify();
+        }
+    }
+
+    /// Set the focused pane (a per-pane mouse-down picks this). No-op when
+    /// unchanged.
+    pub(crate) fn doc_set_split_focus(
+        &mut self,
+        session: SessionId,
+        pane: PaneId,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+            && view.set_focused_pane(pane)
+        {
+            cx.notify();
+        }
+    }
+
+    /// Move focus to the next pane in visual order (the ⌥⌘\ action).
     pub(crate) fn doc_focus_other_half(&mut self, session: SessionId, cx: &mut Context<Self>) {
         if let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
-            && view.split_focus_other()
+            && view.focus_pane_step(true)
         {
             cx.notify();
         }
     }
 
-    /// Move the tab with `id` to the other split half (tab context menu). If not
-    /// split, opens the split first so there's a half to move to.
+    /// Move the tab with `id` to the next pane (tab context menu), splitting off
+    /// a new one when it is the only pane.
     pub(crate) fn doc_move_tab_to_other_half(
         &mut self,
         session: SessionId,

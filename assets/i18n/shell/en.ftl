@@ -10,10 +10,9 @@
 #      *[other] { $n } rows
 #   }
 
+shell-stop_write = Stop
+    .help = Ask the server to stop the running statement
+
 shell-disconnect = Disconnect
 
 shell-tab_chooser_hint = Choose what to open in this tab  ·  press 1–6 or ↵
-
-shell-stop_write = Stop
-
-shell-stop_write.help = Ask the server to stop the running statement

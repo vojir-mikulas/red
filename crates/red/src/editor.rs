@@ -16,6 +16,7 @@ use crate::app::PreflightCount;
 use crate::app::{ActiveConn, AppState, Phase, TabCloseScope, TabWorkspace};
 use crate::app::{AiReview, AiReviewState};
 use crate::sql::CompletionContext;
+use crate::tabstrip::{StripTab, TabStrip};
 use red_core::ConnEnv;
 use red_core::sql::RiskLevel;
 
@@ -25,9 +26,9 @@ use crate::app::ConfirmInput;
 /// we hand it a few more so prefix-narrowing has headroom.
 const MAX_CANDIDATES: usize = 20;
 
-/// In-app drag payload for the tab strip: the source tab's index. A strip drop
-/// reorders via [`AppState::drop_tab`]; a drop onto the *other* split half moves
-/// the tab across via [`AppState::move_tab_to_half`].
+/// In-app drag payload for the tab strip: the source tab's index. A drop on a
+/// strip reorders via [`AppState::drop_tab`]; a drop on a pane *body* moves the
+/// tab there — or splits off a new pane — via [`AppState::drop_tab_on_pane`].
 #[derive(Clone, Copy)]
 pub(crate) struct TabDrag(pub usize);
 
@@ -728,335 +729,74 @@ pub(crate) fn history_label(sql: &str) -> String {
 }
 
 impl AppState {
-    /// This half's tab strip: one tab per open query in the pane, plus the "＋".
+    /// This pane's tab strip: one tab per open query in the pane, plus the ＋.
     ///
     /// Split out of [`AppState::render_editor`] because an ER tab replaces the
-    /// editor entirely (see `render_half`) yet still needs its strip — a diagram
+    /// editor entirely (see `render_pane`) yet still needs its strip — a diagram
     /// you cannot tab away from, and whose own tab you cannot see, is a trap.
-    pub(crate) fn render_tab_strip(
+    pub(crate) fn render_sql_tab_strip(
         &self,
         active: &ActiveConn,
-        half: crate::app::SplitHalf,
+        pane: crate::app::PaneId,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let theme = cx.theme().clone();
-        let (bg_app, bg_panel, bg_elevated, bg_hover) = (
-            theme.bg_app,
-            theme.bg_panel,
-            theme.bg_elevated,
-            theme.bg_hover,
-        );
-        let border = theme.border;
-        let (text, muted, faint) = (theme.text, theme.text_muted, theme.text_faint);
-        let accent = theme.accent;
-        let icon_close = theme.scale(9.);
-        let ui_family = theme.font_family.clone();
-        let size_12 = theme.scale(12.);
-        let view = cx.entity().downgrade();
-
-        // --- tab strip: one tab per open query + a "new query" affordance ---
-        // This half's strip shows only the tabs that belong to it (Zed-style); the
-        // other half (when split) has its own strip. The highlighted one is the
-        // pane's active tab (which is the `tab_idx` the body renders).
-        let active_idx = active.pane_active(half);
-        let pane_indices = active.pane_tab_indices(half);
-        let last_in_pane = pane_indices.last().copied();
-        // Drop-indicator state: the gap a dragged tab would land in, gated on an
-        // actual drag so a stale target never paints once the drag ends.
-        let drop_target = active.tab_drop_target;
-        let dragging = cx.has_active_drag();
-        // Pinned tabs render in their own fixed (non-scrolling) section ahead of
-        // the scrollable strip, so they stay on screen no matter how far the rest
-        // of the strip is scrolled; they keep their relative order otherwise.
-        let (pinned_indices, unpinned_indices): (Vec<usize>, Vec<usize>) = pane_indices
-            .iter()
-            .copied()
-            .partition(|&i| active.tabs[i].pinned);
-        let render_tab = |i: usize| {
-            let t = &active.tabs[i];
-            let is_active = Some(i) == active_idx;
-            let pinned = t.pinned;
-            let (tab_bg, tab_text) = if is_active {
-                (bg_app, text)
-            } else {
-                (bg_panel, muted)
-            };
-            let drag_title: SharedString = t.title.clone().into();
-            let drop_view = view.clone();
-            let move_view = view.clone();
-            // Group so the close button reveals only on this tab's hover.
-            let group = SharedString::from(format!("sql-tab-{i}"));
-            // The dragged tab lands before this tab (gap == i) or after it
-            // (gap == i+1); the bar paints on whichever edge the gap names. The
-            // after-bar shows only on this pane's last tab.
-            let bar_before = dragging && drop_target == Some(i);
-            let bar_after = dragging && Some(i) == last_in_pane && drop_target == Some(i + 1);
-            div()
-                .id(("sql-tab", i))
-                .group(group.clone())
-                .relative()
-                .flex()
-                .flex_shrink_0()
-                .items_center()
-                .justify_center()
-                // Stretch with the title between a comfortable min and a cap;
-                // past the cap the label ellipsizes (see the title's `truncate`).
-                .min_w(px(96.))
-                .max_w(px(200.))
-                // Symmetric horizontal room: the hover close button lives in the
-                // right inset (right: 4px + 15px wide); mirror it on the left so
-                // the centered title clears the button and stays balanced.
-                .px(px(23.))
-                .bg(tab_bg)
-                .border_r_1()
-                .border_color(border)
-                .cursor_pointer()
-                .when(!is_active, |d| d.hover(|s| s.bg(bg_elevated)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    // Clicking a tab in this half's strip aims it at this half.
-                    this.set_split_focus(half, cx);
-                    this.set_active_tab(i, cx);
-                }))
-                // Middle-click closes the tab, like a browser tab strip. Pinned
-                // tabs are protected: unpin (or use the context menu) to close.
-                .on_mouse_down(
-                    MouseButton::Middle,
-                    cx.listener(move |this, _, _, cx| {
-                        if !pinned {
-                            this.request_close_tab(i, cx);
-                        }
-                    }),
-                )
-                // Right-click opens the Close/Pin context menu at the cursor.
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                        this.tab_context_menu = Some((i, event.position));
-                        cx.notify();
-                    }),
-                )
-                // Drag this tab to reorder; the chip below tracks the cursor.
-                .on_drag(TabDrag(i), move |_, offset, _window, cx| {
-                    let title = drag_title.clone();
-                    cx.new(move |_| TabDragPreview {
-                        title,
-                        offset,
-                        bg: bg_elevated,
-                        border,
-                        text,
-                    })
-                })
-                // Track the cursor across this tab to aim the drop gap at the
-                // nearer edge, then commit the reorder on release. GPUI fires
-                // this on *every* tab per mouse move (capture phase, no hover
-                // gate), so we ignore moves whose cursor isn't over this tab;
-                // only the hovered tab gets to set the gap.
-                .on_drag_move::<TabDrag>(move |e, _window, cx| {
-                    let b = e.bounds;
-                    let p = e.event.position;
-                    // Must be over this tab in *both* axes, since checking x alone
-                    // would keep re-setting the gap while dragging straight down
-                    // off the strip, leaving a stale indicator.
-                    if p.x < b.origin.x
-                        || p.x >= b.origin.x + b.size.width
-                        || p.y < b.origin.y
-                        || p.y >= b.origin.y + b.size.height
-                    {
-                        return;
-                    }
-                    let gap = if p.x < b.origin.x + b.size.width / 2. {
-                        i
-                    } else {
-                        i + 1
-                    };
-                    move_view
-                        .update(cx, |this, cx| this.set_tab_drop_target(gap, cx))
-                        .ok();
-                })
-                .on_drop::<TabDrag>(move |drag, _window, cx| {
-                    let from = drag.0;
-                    // Handle it here so it doesn't also bubble to the half wrapper's
-                    // cross-half drop (which would double-move). Dropping on a half's
-                    // strip lands the tab in that half, then reorders to the gap.
-                    cx.stop_propagation();
-                    drop_view
-                        .update(cx, |this, cx| this.drop_tab(from, half, cx))
-                        .ok();
-                })
-                .when(bar_before, |d| {
-                    d.child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .top_0()
-                            .bottom_0()
-                            .w(px(2.))
-                            .bg(accent),
-                    )
-                })
-                .when(bar_after, |d| {
-                    d.child(
-                        div()
-                            .absolute()
-                            .right_0()
-                            .top_0()
-                            .bottom_0()
-                            .w(px(2.))
-                            .bg(accent),
-                    )
-                })
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .gap_1()
-                        .min_w_0()
-                        .when(pinned, |d| {
-                            d.child(crate::icons::icon("pin", icon_close, faint))
-                        })
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .font_family(ui_family.clone())
-                                .text_size(size_12)
-                                .text_color(tab_text)
-                                .child(t.title.clone()),
-                        ),
-                )
-                // Close button: pinned to the right, revealed only on tab hover
-                // so it never crowds the centered title at rest. The outer div
-                // positions + vertically centers; the inner one is the hitbox.
-                .child(
-                    div()
-                        .absolute()
-                        .right(px(4.))
-                        .top_0()
-                        .bottom_0()
-                        .flex()
-                        .items_center()
-                        .invisible()
-                        .group_hover(group, |s| s.visible())
-                        .child(
-                            div()
-                                .id(("sql-tab-close", i))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .size(px(15.))
-                                .rounded(px(3.))
-                                .text_color(faint)
-                                .hover(|s| s.bg(bg_hover).text_color(text))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.request_close_tab(i, cx);
-                                }))
-                                .child(crate::icons::icon("close", icon_close, faint)),
-                        ),
-                )
+        let Some(ui) = active.layout.ui(pane) else {
+            return div().into_any_element();
         };
-        let pinned_tabs: Vec<_> = pinned_indices.iter().map(|&i| render_tab(i)).collect();
-        let unpinned_tabs: Vec<_> = unpinned_indices.iter().map(|&i| render_tab(i)).collect();
-        let strip_drop_view = view.clone();
-        let strip_move_view = view.clone();
-        // The tabs live in a horizontally scrollable viewport, so a crowded
-        // strip scrolls instead of squashing the tabs. `min_w(0)` lets the
-        // flex child shrink below its content width so the overflow engages.
-        let tab_viewport = div()
-            .id("sql-tabstrip")
-            .flex_1()
-            .min_w(px(0.))
-            .h_full()
-            .flex()
-            .items_stretch()
-            .overflow_x_scroll()
-            .track_scroll(&active.tab_scroll)
-            // Clear the gap indicator when the drag leaves the strip *vertically*
-            // (down into the editor/result body, where the cross-half drop takes
-            // over). We deliberately ignore horizontal exit: with two side-by-side
-            // strips, a drag crossing to the other strip stays at the same Y, and
-            // clearing on horizontal exit would race the other strip's gap set.
-            .on_drag_move::<TabDrag>(move |e, _window, cx| {
-                let b = e.bounds;
-                let p = e.event.position;
-                let outside = p.y < b.origin.y || p.y >= b.origin.y + b.size.height;
-                if outside {
-                    strip_move_view
-                        .update(cx, |this, cx| this.clear_tab_drop_target(cx))
-                        .ok();
-                }
+        let active_idx = active.pane_active(pane);
+        let tabs: Vec<StripTab> = active
+            .pane_tab_indices(pane)
+            .into_iter()
+            .map(|i| StripTab {
+                index: i,
+                title: active.tabs[i].title.clone().into(),
+                pinned: active.tabs[i].pinned,
+                active: Some(i) == active_idx,
             })
-            // Release anywhere in the strip (incl. the trailing space) commits
-            // using the gap the hovered tab last set, landing the tab in this half.
-            // `stop_propagation` keeps it off the half wrapper's cross-half drop.
-            .on_drop::<TabDrag>(move |drag, _window, cx| {
-                let from = drag.0;
-                cx.stop_propagation();
-                strip_drop_view
-                    .update(cx, |this, cx| this.drop_tab(from, half, cx))
-                    .ok();
-            })
-            .children(unpinned_tabs);
-        // Pinned tabs sit in their own fixed section ahead of the scrollable
-        // strip (not `overflow_x_scroll`), so they never leave view.
-        let pinned_strip = (!pinned_tabs.is_empty()).then(|| {
-            div()
-                .id("sql-tabstrip-pinned")
-                .flex_shrink_0()
-                .h_full()
-                .flex()
-                .items_stretch()
-                .children(pinned_tabs)
+            .collect();
+        let strip = TabStrip::new(
+            "sql",
+            pane,
+            ui.tab_scroll.clone(),
+            move |this, i, cx| {
+                // Clicking a tab in this pane's strip aims actions at this pane.
+                this.set_split_focus(pane, cx);
+                this.set_active_tab(i, cx);
+            },
+            |this, i, cx| this.request_close_tab(i, cx),
+            move |this, cx| {
+                this.set_split_focus(pane, cx);
+                this.new_query(cx);
+            },
+            move |this, from, cx| this.drop_tab(from, pane, cx),
+            move |this, slot, cx| this.set_tab_drop_target(pane, slot, cx),
+            |this, cx| this.clear_tab_drop_target(cx),
+        )
+        .tabs(tabs)
+        .gap(active.layout.gap_in(pane))
+        // SQL keeps pinned tabs in their own fixed section rather than sorting
+        // them first inline.
+        .pinned_section(true)
+        .new_tab_tooltip(crate::keymap::localize_hint(&format!(
+            "{}  ⌘T",
+            crate::i18n::tr!("editor.new_tab", "New tab")
+        )))
+        .on_menu(|this, i, position, cx| {
+            this.tab_context_menu = Some((i, position));
+            cx.notify();
         });
-        // The "＋" stays pinned right of the scrolling tabs, always reachable.
-        let tabstrip = div()
-            .flex_shrink_0()
-            .h(px(35.))
-            .flex()
-            .items_stretch()
-            .bg(bg_panel)
-            .border_b_1()
-            .border_color(border)
-            .children(pinned_strip)
-            .child(tab_viewport)
-            .child(
-                div()
-                    .id("sql-new")
-                    .flex_shrink_0()
-                    .w(px(34.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .border_l_1()
-                    .border_color(border)
-                    .cursor_pointer()
-                    .tooltip(Tooltip::text(crate::keymap::localize_hint(&format!(
-                        "{}  ⌘T",
-                        crate::i18n::tr!("editor.new_tab", "New tab")
-                    ))))
-                    .text_color(faint)
-                    .hover(|s| s.bg(bg_elevated).text_color(text))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        // Open the new tab in this half.
-                        this.set_split_focus(half, cx);
-                        this.new_query(cx);
-                    }))
-                    .child(crate::icons::icon("plus", theme.scale(13.), faint)),
-            );
-
-        tabstrip.into_any_element()
+        self.render_tab_strip(strip, cx)
     }
 
-    /// The editor pane for the tab at `tab_idx`, shown in split half `half`: the tab
+    /// The editor area for the tab at `tab_idx`, shown in pane `pane`: the tab
     /// strip + breadcrumb + the `CodeEditor` surface + run bar. `is_focused` is
-    /// whether this half holds focus; the (single-instance) find bar renders only in
-    /// the focused half.
+    /// whether that pane holds focus; the (single-instance) find bar renders only
+    /// in the focused pane.
     pub(crate) fn render_editor(
         &self,
         active: &ActiveConn,
         tab_idx: usize,
-        half: crate::app::SplitHalf,
+        pane: crate::app::PaneId,
         is_focused: bool,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
@@ -1080,7 +820,7 @@ impl AppState {
         let (size_11, size_12) = (theme.scale(11.), theme.scale(12.));
 
         // The strip is shared with the ER-diagram path, which has no editor.
-        let tabstrip = self.render_tab_strip(active, half, cx);
+        let tabstrip = self.render_sql_tab_strip(active, pane, cx);
 
         // No open tab (user closed the last one): keep the strip (its ＋ opens
         // a new query) over an empty pane, and skip the editor/run/breadcrumb.
@@ -1212,7 +952,7 @@ impl AppState {
                 // Aim the action at the half this bar lives in, not whichever
                 // half currently holds focus (mirrors the tab/＋ handlers).
                 .on_click(cx.listener(move |this, _, _, cx| {
-                    this.set_split_focus(half, cx);
+                    this.set_split_focus(pane, cx);
                     this.run_editor_query(cx);
                 })),
             )
@@ -1221,7 +961,7 @@ impl AppState {
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Sm)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_split_focus(half, cx);
+                        this.set_split_focus(pane, cx);
                         this.explain_query(false, cx);
                     })),
             )
@@ -1230,11 +970,11 @@ impl AppState {
                     .variant(ButtonVariant::Ghost)
                     .size(ButtonSize::Sm)
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        this.set_split_focus(half, cx);
+                        this.set_split_focus(pane, cx);
                         this.open_save_prompt(cx);
                     })),
             )
-            .children(self.render_watch_pill(active, tab_idx, half, cx))
+            .children(self.render_watch_pill(active, tab_idx, pane, cx))
             .children(ro_chip);
 
         div()

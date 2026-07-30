@@ -488,7 +488,7 @@ impl AppState {
         &self,
         active: &crate::app::ActiveConn,
         tab_idx: usize,
-        half: crate::app::SplitHalf,
+        pane: crate::app::PaneId,
         cx: &mut Context<Self>,
     ) -> Option<gpui::AnyElement> {
         use flint::Tooltip;
@@ -542,7 +542,7 @@ impl AppState {
                     .on_click(move |_, _, cx| {
                         toggle_view
                             .update(cx, |this, cx| {
-                                this.set_split_focus(half, cx);
+                                this.set_split_focus(pane, cx);
                                 let next = if on { None } else { Some(default_secs) };
                                 this.set_watch(next, cx);
                             })

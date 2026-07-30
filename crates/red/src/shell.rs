@@ -17,7 +17,10 @@ pub(crate) const TITLEBAR_LEFT_INSET: f32 = 12.;
 
 use std::rc::Rc;
 
-use crate::app::{ActiveConn, AppState, Phase, SplitHalf, TabWorkspace};
+use crate::app::{ActiveConn, AppState, Phase, TabWorkspace};
+use crate::editor::TabDrag;
+use crate::panes::{MIN_PANE_WEIGHT, drop_overlay, path_id};
+use crate::tabstrip::{StripTab, TabStrip};
 
 impl AppState {
     pub(crate) fn render_shell(
@@ -680,7 +683,10 @@ impl AppState {
             .child(topbar_right)
     }
 
-    /// The Redis work body: one pane, or two side-by-side halves when split.
+    /// The Redis work area: the pane tree, rendered as nested [`SplitStack`]s
+    /// whose leaves are panes (see [`Self::render_kv_pane`]). Rows and columns
+    /// come from the same shared tree the SQL and Mongo shells use — a key browse
+    /// stacked over a console is just a vertical split.
     fn render_kv_body(
         &self,
         active: &ActiveConn,
@@ -690,362 +696,176 @@ impl AppState {
         let Some(v) = active.kv_view.as_ref() else {
             return div().flex_1().into_any_element();
         };
-        let Some(s) = v.split.as_ref() else {
-            // Derive the body's tab from `pane_active` (the same source the strip
-            // highlight uses), not `active_tab` directly, so an `active_tab` that
-            // is momentarily out of range can't render an empty body under a
-            // highlighted strip tab.
-            let idx = v.pane_active(SplitHalf::Primary).unwrap_or(v.active_tab);
-            return self.render_kv_half(active, SplitHalf::Primary, idx, true, window, cx);
+        if let Some(zoomed) = v.layout.zoomed()
+            && let Some(tab_idx) = v.pane_active(zoomed)
+        {
+            return self.render_kv_pane(active, zoomed, tab_idx, true, window, cx);
+        }
+        self.render_kv_node(active, v.layout.tree().root(), &mut Vec::new(), window, cx)
+    }
+
+    /// One node of the Redis pane tree (mirrors [`Self::render_pane_node`]).
+    fn render_kv_node(
+        &self,
+        active: &ActiveConn,
+        node: &crate::panes::Node,
+        path: &mut crate::panes::SplitPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let session = active.session;
+        let (axis, children) = match node {
+            crate::panes::Node::Leaf(pane) => {
+                let tab_idx = active
+                    .kv_view
+                    .as_ref()
+                    .and_then(|v| v.pane_active(*pane))
+                    .unwrap_or(0);
+                let focused = active
+                    .kv_view
+                    .as_ref()
+                    .is_some_and(|v| v.layout.focus() == *pane);
+                return self.render_kv_pane(active, *pane, tab_idx, focused, window, cx);
+            }
+            crate::panes::Node::Split { axis, children } => (*axis, children),
         };
-        let (focus, width, drag) = (s.focus, s.width, s.drag);
-        let primary_focused = focus == SplitHalf::Primary;
-        let primary_tab = v.pane_active(SplitHalf::Primary).unwrap_or(v.active_tab);
-        let secondary_tab = v.pane_active(SplitHalf::Secondary).unwrap_or(s.secondary);
-        let first = self.render_kv_half(
-            active,
-            SplitHalf::Primary,
-            primary_tab,
-            primary_focused,
-            window,
-            cx,
-        );
-        let second = self.render_kv_half(
-            active,
-            SplitHalf::Secondary,
-            secondary_tab,
-            !primary_focused,
-            window,
-            cx,
-        );
+        let drag = active
+            .kv_view
+            .as_ref()
+            .and_then(|v| v.layout.divider_drag(path));
+        let mut stack = SplitStack::new(
+            format!("kv-panes-{}", path_id(path)),
+            match axis {
+                crate::panes::SplitAxis::Horizontal => Axis::Horizontal,
+                crate::panes::SplitAxis::Vertical => Axis::Vertical,
+            },
+        )
+        .gutter(px(1.))
+        .min(match axis {
+            crate::panes::SplitAxis::Horizontal => px(Self::MIN_KV_PANE_W),
+            crate::panes::SplitAxis::Vertical => px(Self::MIN_KV_PANE_H),
+        })
+        .drag(drag);
+        for (i, child) in children.iter().enumerate() {
+            path.push(i);
+            let element = self.render_kv_node(active, &child.node, path, window, cx);
+            path.pop();
+            stack = stack.child(child.weight, element);
+        }
+        let owned = path.clone();
+        let (start_path, resize_path) = (owned.clone(), owned);
         let start = cx.entity().downgrade();
         let resize = start.clone();
         let end = start.clone();
-        div()
-            .size_full()
-            .child(
-                SplitPane::new("kv-split-halves", Axis::Horizontal)
-                    .size(width)
-                    .gutter(px(1.))
-                    .drag(drag)
-                    .min_first(px(320.))
-                    .on_drag_start(move |anchor, _, cx| {
-                        start
-                            .update(cx, |this, cx| {
-                                if let Phase::Connected(a) = &mut this.phase
-                                    && let Some(v) = &mut a.kv_view
-                                    && let Some(s) = &mut v.split
-                                {
-                                    s.drag = Some(anchor);
-                                }
-                                cx.notify();
-                            })
-                            .ok();
+        stack
+            .on_drag_start(move |drag, _, cx| {
+                let path = start_path.clone();
+                start
+                    .update(cx, |this, cx| {
+                        if let Some(v) = this
+                            .conn_mut(Some(session))
+                            .and_then(|a| a.kv_view.as_mut())
+                        {
+                            v.layout.begin_divider_drag(path, drag);
+                        }
+                        cx.notify();
                     })
-                    .on_resize(move |size, _, cx| {
-                        resize
-                            .update(cx, |this, cx| {
-                                if let Phase::Connected(a) = &mut this.phase
-                                    && let Some(v) = &mut a.kv_view
-                                    && let Some(s) = &mut v.split
-                                {
-                                    s.width = size;
-                                }
-                                cx.notify();
-                            })
-                            .ok();
+                    .ok();
+            })
+            .on_resize(move |gutter, leading, _, cx| {
+                let path = resize_path.clone();
+                resize
+                    .update(cx, |this, cx| {
+                        if let Some(v) = this
+                            .conn_mut(Some(session))
+                            .and_then(|a| a.kv_view.as_mut())
+                        {
+                            v.layout.set_weight(&path, gutter, leading, MIN_PANE_WEIGHT);
+                        }
+                        cx.notify();
                     })
-                    .on_drag_end(move |_, cx| {
-                        end.update(cx, |this, cx| {
-                            if let Phase::Connected(a) = &mut this.phase
-                                && let Some(v) = &mut a.kv_view
-                                && let Some(s) = &mut v.split
-                            {
-                                s.drag = None;
-                            }
-                            cx.notify();
-                        })
-                        .ok();
-                    })
-                    .first(first)
-                    .second(second),
-            )
+                    .ok();
+            })
+            .on_drag_end(move |_, cx| {
+                end.update(cx, |this, cx| {
+                    if let Some(v) = this
+                        .conn_mut(Some(session))
+                        .and_then(|a| a.kv_view.as_mut())
+                    {
+                        v.layout.end_divider_drag();
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
             .into_any_element()
     }
 
-    /// One split half: its own tab strip (only this half's tabs, styled 1:1 with the
-    /// SQL editor's strip) over the active tab's panel body. A mouse-down anywhere in
-    /// the half focuses it, so buttons/inputs act on the half the user just touched.
-    fn render_kv_half(
+    /// One Redis pane: its own tab strip (only this pane's tabs) over the active
+    /// tab's panel body, plus the drop zones that turn a tab drag into a split. A
+    /// mouse-down anywhere in the pane focuses it, so buttons and inputs act on
+    /// the pane the user just touched.
+    fn render_kv_pane(
         &self,
         active: &ActiveConn,
-        half: SplitHalf,
+        pane: crate::app::PaneId,
         tab_idx: usize,
         focused: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        use crate::editor::{TabDrag, TabDragPreview};
         use crate::kvbrowse::KvPanel;
         let theme = cx.theme().clone();
-        // Snapshot the same tokens/sizes the SQL strip uses, so the two tab bars
-        // are pixel-identical (see `render_editor`).
-        let (bg_app, bg_panel, bg_elevated, bg_hover) = (
-            theme.bg_app,
-            theme.bg_panel,
-            theme.bg_elevated,
-            theme.bg_hover,
-        );
-        let border = theme.border;
-        let (text, muted, faint) = (theme.text, theme.text_muted, theme.text_faint);
-        let accent = theme.accent;
-        let icon_close = theme.scale(9.);
-        let ui_family = theme.font_family.clone();
-        let size_12 = theme.scale(12.);
-        let view = cx.entity().downgrade();
+        let (border, accent, muted) = (theme.border, theme.accent, theme.text_faint);
         let session = active.session;
         let Some(v) = active.kv_view.as_ref() else {
             return div().flex_1().into_any_element();
         };
-        let is_split = v.split.is_some();
+        let is_split = v.layout.is_split();
 
-        let active_idx = v.pane_active(half);
-        let pane_indices = v.pane_tab_indices(half);
-        let last_in_pane = pane_indices.last().copied();
-        let drop_target = v.tab_drop_target;
-        let dragging = cx.has_active_drag();
-        let (pinned_indices, unpinned_indices): (Vec<usize>, Vec<usize>) = pane_indices
-            .iter()
-            .copied()
-            .partition(|&i| v.tabs[i].pinned);
-
-        let render_tab = |i: usize| {
-            let t = &v.tabs[i];
-            let is_active = Some(i) == active_idx;
-            let pinned = t.pinned;
-            let id = t.id;
-            let (tab_bg, tab_text) = if is_active {
-                (bg_app, text)
-            } else {
-                (bg_panel, muted)
-            };
-            let drag_title: SharedString = t.title.clone().into();
-            let move_view = view.clone();
-            let drop_view = view.clone();
-            let group = SharedString::from(format!("kv-tab-{i}"));
-            let bar_before = dragging && drop_target == Some(i);
-            let bar_after = dragging && Some(i) == last_in_pane && drop_target == Some(i + 1);
-            div()
-                .id(("kv-tab", i))
-                .group(group.clone())
-                .relative()
-                .flex()
-                .flex_shrink_0()
-                .items_center()
-                .justify_center()
-                .min_w(px(96.))
-                .max_w(px(200.))
-                .px(px(23.))
-                .bg(tab_bg)
-                .border_r_1()
-                .border_color(border)
-                .cursor_pointer()
-                .when(!is_active, |d| d.hover(|s| s.bg(bg_elevated)))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.kv_set_split_focus(session, half, cx);
-                    this.kv_activate_tab(session, i, cx);
-                }))
-                .on_mouse_down(
-                    MouseButton::Middle,
-                    cx.listener(move |this, _, _, cx| {
-                        if !pinned {
-                            this.kv_close_tab(session, i, cx);
-                        }
-                    }),
-                )
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, event: &gpui::MouseDownEvent, _, cx| {
-                        let pos = event.position;
-                        this.kv_open_tab_menu(session, id, pos, cx);
-                    }),
-                )
-                .on_drag(TabDrag(i), move |_, offset, _window, cx| {
-                    let title = drag_title.clone();
-                    cx.new(move |_| TabDragPreview {
-                        title,
-                        offset,
-                        bg: bg_elevated,
-                        border,
-                        text,
-                    })
-                })
-                .on_drag_move::<TabDrag>(move |e, _window, cx| {
-                    let b = e.bounds;
-                    let p = e.event.position;
-                    if p.x < b.origin.x
-                        || p.x >= b.origin.x + b.size.width
-                        || p.y < b.origin.y
-                        || p.y >= b.origin.y + b.size.height
-                    {
-                        return;
-                    }
-                    let gap = if p.x < b.origin.x + b.size.width / 2. {
-                        i
-                    } else {
-                        i + 1
-                    };
-                    move_view
-                        .update(cx, |this, cx| this.kv_set_tab_drop_target(session, gap, cx))
-                        .ok();
-                })
-                .on_drop::<TabDrag>(move |drag, _window, cx| {
-                    let from = drag.0;
-                    cx.stop_propagation();
-                    drop_view
-                        .update(cx, |this, cx| this.kv_drop_tab(session, from, half, cx))
-                        .ok();
-                })
-                .when(bar_before, |d| {
-                    d.child(
-                        div()
-                            .absolute()
-                            .left_0()
-                            .top_0()
-                            .bottom_0()
-                            .w(px(2.))
-                            .bg(accent),
-                    )
-                })
-                .when(bar_after, |d| {
-                    d.child(
-                        div()
-                            .absolute()
-                            .right_0()
-                            .top_0()
-                            .bottom_0()
-                            .w(px(2.))
-                            .bg(accent),
-                    )
-                })
-                .child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .gap_1()
-                        .min_w_0()
-                        .when(pinned, |d| {
-                            d.child(crate::icons::icon("pin", icon_close, faint))
-                        })
-                        .child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .font_family(ui_family.clone())
-                                .text_size(size_12)
-                                .text_color(tab_text)
-                                .child(t.title.clone()),
-                        ),
-                )
-                .child(
-                    div()
-                        .absolute()
-                        .right(px(4.))
-                        .top_0()
-                        .bottom_0()
-                        .flex()
-                        .items_center()
-                        .invisible()
-                        .group_hover(group, |s| s.visible())
-                        .child(
-                            div()
-                                .id(("kv-tab-close", i))
-                                .flex()
-                                .items_center()
-                                .justify_center()
-                                .size(px(15.))
-                                .rounded(px(3.))
-                                .text_color(faint)
-                                .hover(|s| s.bg(bg_hover).text_color(text))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    cx.stop_propagation();
-                                    this.kv_close_tab(session, i, cx);
-                                }))
-                                .child(crate::icons::icon("close", icon_close, faint)),
-                        ),
-                )
+        let active_idx = v.pane_active(pane);
+        let Some(ui) = v.layout.ui(pane) else {
+            return div().flex_1().into_any_element();
         };
-        let pinned_tabs: Vec<_> = pinned_indices.iter().map(|&i| render_tab(i)).collect();
-        let unpinned_tabs: Vec<_> = unpinned_indices.iter().map(|&i| render_tab(i)).collect();
-        let strip_move_view = view.clone();
-        let strip_drop_view = view.clone();
-        let tab_viewport = div()
-            .id("kv-tabstrip")
-            .flex_1()
-            .min_w(px(0.))
-            .h_full()
-            .flex()
-            .items_stretch()
-            .overflow_x_scroll()
-            .track_scroll(&v.tab_scroll)
-            .on_drag_move::<TabDrag>(move |e, _window, cx| {
-                let b = e.bounds;
-                let p = e.event.position;
-                let outside = p.y < b.origin.y || p.y >= b.origin.y + b.size.height;
-                if outside {
-                    strip_move_view
-                        .update(cx, |this, cx| this.kv_clear_tab_drop_target(session, cx))
-                        .ok();
-                }
+        let tabs: Vec<StripTab> = v
+            .pane_tab_indices(pane)
+            .into_iter()
+            .map(|i| StripTab {
+                index: i,
+                title: v.tabs[i].title.clone().into(),
+                pinned: v.tabs[i].pinned,
+                active: Some(i) == active_idx,
             })
-            .on_drop::<TabDrag>(move |drag, _window, cx| {
-                let from = drag.0;
-                cx.stop_propagation();
-                strip_drop_view
-                    .update(cx, |this, cx| this.kv_drop_tab(session, from, half, cx))
-                    .ok();
-            })
-            .children(unpinned_tabs);
-        let pinned_strip = (!pinned_tabs.is_empty()).then(|| {
-            div()
-                .id("kv-tabstrip-pinned")
-                .flex_shrink_0()
-                .h_full()
-                .flex()
-                .items_stretch()
-                .children(pinned_tabs)
+            .collect();
+        let ids: Vec<u64> = v.tabs.iter().map(|t| t.id).collect();
+        let menu_ids = ids.clone();
+        let strip = TabStrip::new(
+            "kv",
+            pane,
+            ui.tab_scroll.clone(),
+            move |this, i, cx| {
+                this.kv_set_split_focus(session, pane, cx);
+                this.kv_activate_tab(session, i, cx);
+            },
+            move |this, i, cx| this.kv_close_tab(session, i, cx),
+            move |this, cx| {
+                this.kv_set_split_focus(session, pane, cx);
+                this.kv_new_empty_tab(session, cx);
+            },
+            move |this, from, cx| this.kv_drop_tab(session, from, pane, cx),
+            move |this, slot, cx| this.kv_set_tab_drop_target(session, pane, slot, cx),
+            move |this, cx| this.kv_clear_tab_drop_target(session, cx),
+        )
+        .tabs(tabs)
+        .gap(v.layout.gap_in(pane))
+        .new_tab_tooltip(crate::keymap::localize_hint("New tab  ⌘T"))
+        .on_menu(move |this, i, position, cx| {
+            // The menu addresses tabs by stable id, since positions shift.
+            if let Some(&id) = menu_ids.get(i) {
+                this.kv_open_tab_menu(session, id, position, cx);
+            }
         });
-        let strip = div()
-            .flex_shrink_0()
-            .h(px(35.))
-            .flex()
-            .items_stretch()
-            .bg(bg_panel)
-            .border_b_1()
-            .border_color(border)
-            .children(pinned_strip)
-            .child(tab_viewport)
-            .child(
-                div()
-                    .id("kv-new")
-                    .flex_shrink_0()
-                    .w(px(34.))
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .border_l_1()
-                    .border_color(border)
-                    .cursor_pointer()
-                    .tooltip(Tooltip::text(crate::keymap::localize_hint("New tab  ⌘T")))
-                    .text_color(faint)
-                    .hover(|s| s.bg(bg_elevated).text_color(text))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.kv_set_split_focus(session, half, cx);
-                        this.kv_new_empty_tab(session, cx);
-                    }))
-                    .child(crate::icons::icon("plus", theme.scale(13.), faint)),
-            );
+        let strip = self.render_tab_strip(strip, cx);
 
         let panel = match v.tabs.get(tab_idx).map(|t| t.state.kind()) {
             Some(Some(KvPanel::Browse)) => self
@@ -1073,8 +893,13 @@ impl AppState {
             None => div().flex_1().into_any_element(),
         };
 
-        let focus_view = view.clone();
+        let target = v
+            .layout
+            .drop_target()
+            .filter(|t| t.pane == pane && cx.has_active_drag());
         div()
+            .id(("kv-pane", pane.0 as usize))
+            .relative()
             .size_full()
             .flex()
             .flex_col()
@@ -1082,15 +907,26 @@ impl AppState {
                 d.border_1().border_color(accent.opacity(0.5))
             })
             .when(is_split && !focused, |d| d.border_1().border_color(border))
-            .when(is_split, |d| {
-                d.on_mouse_down(MouseButton::Left, move |_, _, cx| {
-                    focus_view
-                        .update(cx, |this, cx| this.kv_set_split_focus(session, half, cx))
-                        .ok();
-                })
-            })
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.kv_set_split_focus(session, pane, cx)),
+            )
+            .on_drag_move::<TabDrag>(cx.listener(
+                move |this, e: &gpui::DragMoveEvent<TabDrag>, _, cx| {
+                    let Some(&TabDrag(from)) = e.dragged_item().downcast_ref::<TabDrag>() else {
+                        return;
+                    };
+                    this.kv_aim_tab_drop(session, from, pane, e.bounds, e.event.position, cx);
+                },
+            ))
+            .on_drop::<TabDrag>(cx.listener(move |this, drag: &TabDrag, _, cx| {
+                if let Some(zone) = this.kv_resolved_drop_zone(session, pane, cx) {
+                    this.kv_drop_tab_on_pane(session, drag.0, pane, zone, cx);
+                }
+            }))
             .child(strip)
             .child(div().flex_1().min_h(px(0.)).flex().child(panel))
+            .children(target.map(|t| drop_overlay(t.zone, t.allowed, accent, muted)))
             .into_any_element()
     }
 
@@ -1386,7 +1222,7 @@ impl AppState {
                         (p > 0, p + 1 < siblings.len(), siblings.len() > 1)
                     })
                     .unwrap_or((false, false, false));
-                (pinned, v.split.is_some(), has_left, has_right, has_others)
+                (pinned, v.layout.is_split(), has_left, has_right, has_others)
             })
             .unwrap_or((false, false, false, false, false));
         let closable = active
@@ -1991,121 +1827,159 @@ impl AppState {
             .children(auto_menu)
     }
 
-    /// The work area right of the schema dock: a single editor/result pane, or,
-    /// when `active.split` is set, two halves in a resizable horizontal split. Each
-    /// half is a full editor-over-result pane for its own tab (see [`Self::render_half`]).
+    /// Smallest a query pane may be squeezed to, and the floor below which a
+    /// drop zone stops offering a split.
+    ///
+    /// This is a *legibility* floor, not a comfort one. It is tempting to reuse
+    /// the old two-pane divider minimum (320px), but that answered a different
+    /// question -- how far an existing pane may be dragged down -- and using it
+    /// here refuses every split past the first: two panes in a default window are
+    /// about 430px each, and half of that is under 320. The user asking for a
+    /// third column has already decided it is worth the room.
+    pub(crate) const MIN_PANE_W: f32 = 180.;
+    pub(crate) const MIN_PANE_H: f32 = 120.;
+    /// The Redis and MongoDB panels are denser than a query pane, so they stay
+    /// usable in less room.
+    pub(crate) const MIN_KV_PANE_W: f32 = 160.;
+    pub(crate) const MIN_KV_PANE_H: f32 = 110.;
+
+    /// What a query pane's drop zones measure against.
+    pub(crate) const PANE_LIMITS: crate::panes::PaneLimits = crate::panes::PaneLimits {
+        min_w: Self::MIN_PANE_W,
+        min_h: Self::MIN_PANE_H,
+        strip_h: crate::tabstrip::STRIP_H,
+    };
+
+    /// The same, for the Redis and MongoDB panes.
+    pub(crate) const KV_PANE_LIMITS: crate::panes::PaneLimits = crate::panes::PaneLimits {
+        min_w: Self::MIN_KV_PANE_W,
+        min_h: Self::MIN_KV_PANE_H,
+        strip_h: crate::tabstrip::STRIP_H,
+    };
+
+    /// The work area right of the schema dock: the pane tree, rendered as nested
+    /// [`SplitStack`]s whose leaves are panes (see [`Self::render_pane`]).
+    ///
+    /// A zoomed pane short-circuits the whole walk: it fills the area alone, and
+    /// the layout is restored untouched when the zoom is toggled off.
     fn render_work_body(
         &self,
         active: &ActiveConn,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let Some(s) = active.split.as_ref() else {
-            // Single pane: the ordinary layout, behaviourally unchanged.
-            return self.render_half(
-                active,
-                SplitHalf::Primary,
-                active.active_tab,
-                true,
-                window,
-                cx,
-            );
+        if let Some(zoomed) = active.layout.zoomed()
+            && let Some(tab_idx) = active.pane_active(zoomed)
+        {
+            return self.render_pane(active, zoomed, tab_idx, true, window, cx);
+        }
+        self.render_pane_node(
+            active,
+            active.layout.tree().root(),
+            &mut Vec::new(),
+            window,
+            cx,
+        )
+    }
+
+    /// One node of the pane tree: a pane, or a split whose children are laid out
+    /// along its axis with draggable dividers between them. `path` is the child
+    /// index chain from the root, which names the split a divider belongs to.
+    fn render_pane_node(
+        &self,
+        active: &ActiveConn,
+        node: &crate::panes::Node,
+        path: &mut crate::panes::SplitPath,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let (axis, children) = match node {
+            crate::panes::Node::Leaf(pane) => {
+                let tab_idx = active.pane_active(*pane).unwrap_or(0);
+                let focused = active.layout.focus() == *pane;
+                return self.render_pane(active, *pane, tab_idx, focused, window, cx);
+            }
+            crate::panes::Node::Split { axis, children } => (*axis, children),
         };
-
-        let (focus, width, drag) = (s.focus, s.width, s.drag);
-        let primary_focused = focus == SplitHalf::Primary;
-        // Each half renders its pane's active tab (its strip shows only its own tabs).
-        let primary_tab = active
-            .pane_active(SplitHalf::Primary)
-            .unwrap_or(active.active_tab);
-        let secondary_tab = active
-            .pane_active(SplitHalf::Secondary)
-            .unwrap_or(s.secondary);
-        let first = self.render_half(
-            active,
-            SplitHalf::Primary,
-            primary_tab,
-            primary_focused,
-            window,
-            cx,
-        );
-        let second = self.render_half(
-            active,
-            SplitHalf::Secondary,
-            secondary_tab,
-            !primary_focused,
-            window,
-            cx,
-        );
-
-        let view = cx.entity().downgrade();
-        let start = view.clone();
-        let resize = view.clone();
-        let end = view.clone();
-        div()
-            .size_full()
-            .child(
-                SplitPane::new("shell-split-halves", Axis::Horizontal)
-                    .size(width)
-                    .gutter(px(1.))
-                    .drag(drag)
-                    .min_first(px(320.))
-                    .on_drag_start(move |anchor, _, cx| {
-                        start
-                            .update(cx, |this, cx| {
-                                if let Phase::Connected(a) = &mut this.phase
-                                    && let Some(s) = &mut a.split
-                                {
-                                    s.drag = Some(anchor);
-                                }
-                                cx.notify();
-                            })
-                            .ok();
+        let mut stack = SplitStack::new(
+            format!("sql-panes-{}", path_id(path)),
+            match axis {
+                crate::panes::SplitAxis::Horizontal => Axis::Horizontal,
+                crate::panes::SplitAxis::Vertical => Axis::Vertical,
+            },
+        )
+        .gutter(px(1.))
+        .min(match axis {
+            crate::panes::SplitAxis::Horizontal => px(Self::MIN_PANE_W),
+            crate::panes::SplitAxis::Vertical => px(Self::MIN_PANE_H),
+        })
+        .drag(active.layout.divider_drag(path));
+        for (i, child) in children.iter().enumerate() {
+            path.push(i);
+            let element = self.render_pane_node(active, &child.node, path, window, cx);
+            path.pop();
+            stack = stack.child(child.weight, element);
+        }
+        // The handlers own a copy of the path: `path` itself is scratch, reused as
+        // the walk unwinds.
+        let owned = path.clone();
+        let (start_path, resize_path) = (owned.clone(), owned);
+        let start = cx.entity().downgrade();
+        let resize = start.clone();
+        let end = start.clone();
+        stack
+            .on_drag_start(move |drag, _, cx| {
+                let path = start_path.clone();
+                start
+                    .update(cx, |this, cx| {
+                        if let Phase::Connected(a) = &mut this.phase {
+                            a.layout.begin_divider_drag(path, drag);
+                        }
+                        cx.notify();
                     })
-                    .on_resize(move |size, _, cx| {
-                        resize
-                            .update(cx, |this, cx| {
-                                if let Phase::Connected(a) = &mut this.phase
-                                    && let Some(s) = &mut a.split
-                                {
-                                    s.width = size;
-                                }
-                                cx.notify();
-                            })
-                            .ok();
+                    .ok();
+            })
+            .on_resize(move |gutter, leading, _, cx| {
+                let path = resize_path.clone();
+                resize
+                    .update(cx, |this, cx| {
+                        if let Phase::Connected(a) = &mut this.phase {
+                            // The minimum is a *fraction* here; the stack has no
+                            // pixel context to convert it, so approximate against
+                            // the whole split rather than letting a pane vanish.
+                            a.layout.set_weight(&path, gutter, leading, MIN_PANE_WEIGHT);
+                        }
+                        cx.notify();
                     })
-                    .on_drag_end(move |_, cx| {
-                        end.update(cx, |this, cx| {
-                            if let Phase::Connected(a) = &mut this.phase
-                                && let Some(s) = &mut a.split
-                            {
-                                s.drag = None;
-                            }
-                            cx.notify();
-                        })
-                        .ok();
-                    })
-                    .first(first)
-                    .second(second),
-            )
+                    .ok();
+            })
+            .on_drag_end(move |_, cx| {
+                end.update(cx, |this, cx| {
+                    if let Phase::Connected(a) = &mut this.phase {
+                        a.layout.end_divider_drag();
+                    }
+                    cx.notify();
+                })
+                .ok();
+            })
             .into_any_element()
     }
 
-    /// One split half: the tab `tab_idx` rendered as the editor-over-result vertical
-    /// split, wrapped so a click anywhere in it focuses the half (`half`) and, while
-    /// split, an accent outline marks the focused one. The editor/result ratio is
-    /// shared between halves (both read `editor_h`).
-    fn render_half(
+    /// One pane: the tab `tab_idx` rendered as the editor-over-result vertical
+    /// split, wrapped so a click anywhere in it focuses the pane and, while the
+    /// work area is divided, an accent outline marks the focused one. Each pane
+    /// owns its editor/result ratio.
+    fn render_pane(
         &self,
         active: &ActiveConn,
-        half: SplitHalf,
+        pane: crate::app::PaneId,
         tab_idx: usize,
         is_focused: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let theme = cx.theme().clone();
-        let is_split = active.split.is_some();
+        let is_split = active.layout.is_split();
 
         // An ER diagram takes the half whole *below the tab strip*. Unlike a query
         // plan, which shares the result slot with the grid and keeps the editor above
@@ -2123,7 +1997,7 @@ impl AppState {
                 .flex()
                 .flex_col()
                 .bg(theme.bg_app)
-                .child(self.render_tab_strip(active, half, cx))
+                .child(self.render_sql_tab_strip(active, pane, cx))
                 .child(
                     div()
                         .flex_1()
@@ -2131,7 +2005,7 @@ impl AppState {
                         .child(self.render_schema_diff(active, tab_idx, cx)),
                 )
                 .into_any_element();
-            return self.wrap_half(body, half, is_focused, is_split, &theme, cx);
+            return self.wrap_pane(body, active, pane, is_focused, is_split, &theme, cx);
         }
 
         // The health report takes the half the same way: it is about the
@@ -2146,7 +2020,7 @@ impl AppState {
                 .flex()
                 .flex_col()
                 .bg(theme.bg_app)
-                .child(self.render_tab_strip(active, half, cx))
+                .child(self.render_sql_tab_strip(active, pane, cx))
                 .child(
                     div()
                         .flex_1()
@@ -2154,7 +2028,7 @@ impl AppState {
                         .child(self.render_health(active, tab_idx, cx)),
                 )
                 .into_any_element();
-            return self.wrap_half(body, half, is_focused, is_split, &theme, cx);
+            return self.wrap_pane(body, active, pane, is_focused, is_split, &theme, cx);
         }
 
         // A DDL view takes the half the same way, and for the same reason: there
@@ -2165,7 +2039,7 @@ impl AppState {
                 .flex()
                 .flex_col()
                 .bg(theme.bg_app)
-                .child(self.render_tab_strip(active, half, cx))
+                .child(self.render_sql_tab_strip(active, pane, cx))
                 .child(
                     div()
                         .flex_1()
@@ -2173,7 +2047,7 @@ impl AppState {
                         .child(self.render_ddl(active, tab_idx, cx)),
                 )
                 .into_any_element();
-            return self.wrap_half(body, half, is_focused, is_split, &theme, cx);
+            return self.wrap_pane(body, active, pane, is_focused, is_split, &theme, cx);
         }
 
         if active.tabs.get(tab_idx).is_some_and(|t| t.is_er()) {
@@ -2183,7 +2057,7 @@ impl AppState {
                 .flex()
                 .flex_col()
                 .bg(theme.bg_app)
-                .child(self.render_tab_strip(active, half, cx))
+                .child(self.render_sql_tab_strip(active, pane, cx))
                 .child(div().flex_1().min_h(px(0.)).child(canvas))
                 .into_any_element();
             // The visible-table describe wants `&mut self`, so it can't run inside the
@@ -2194,26 +2068,34 @@ impl AppState {
                 view.update(cx, |this, cx| this.er_fetch_visible_details(tab_idx, cx))
                     .ok();
             });
-            return self.wrap_half(body, half, is_focused, is_split, &theme, cx);
+            return self.wrap_pane(body, active, pane, is_focused, is_split, &theme, cx);
         }
 
-        let editor_pane = self.render_editor(active, tab_idx, half, is_focused, cx);
-        let results_pane = self.render_results_slot(active, tab_idx, half, is_focused, window, cx);
+        let editor_pane = self.render_editor(active, tab_idx, pane, is_focused, cx);
+        let results_pane = self.render_results_slot(active, tab_idx, pane, is_focused, window, cx);
 
         let view = cx.entity().downgrade();
         let start = view.clone();
         let resize = view.clone();
         let end = view.clone();
-        let vsplit = SplitPane::new(format!("shell-split-v-{}", half.index()), Axis::Vertical)
-            .size(active.editor_h)
+        // Each pane owns its editor/result ratio, so dragging one pane's divider
+        // leaves the others where the user put them.
+        let (editor_h, editor_drag) = active
+            .layout
+            .ui(pane)
+            .map_or((px(300.), None), |u| (u.editor_h, u.editor_drag));
+        let vsplit = SplitPane::new(format!("shell-split-v-{}", pane.0), Axis::Vertical)
+            .size(editor_h)
             .gutter(px(1.))
-            .drag(active.editor_drag)
+            .drag(editor_drag)
             .min_first(px(80.))
             .on_drag_start(move |anchor, _, cx| {
                 start
                     .update(cx, |this, cx| {
-                        if let Phase::Connected(a) = &mut this.phase {
-                            a.editor_drag = Some(anchor);
+                        if let Phase::Connected(a) = &mut this.phase
+                            && let Some(u) = a.layout.ui_mut(pane)
+                        {
+                            u.editor_drag = Some(anchor);
                         }
                         cx.notify();
                     })
@@ -2222,8 +2104,10 @@ impl AppState {
             .on_resize(move |size, _, cx| {
                 resize
                     .update(cx, |this, cx| {
-                        if let Phase::Connected(a) = &mut this.phase {
-                            a.editor_h = size;
+                        if let Phase::Connected(a) = &mut this.phase
+                            && let Some(u) = a.layout.ui_mut(pane)
+                        {
+                            u.editor_h = size;
                         }
                         cx.notify();
                     })
@@ -2231,8 +2115,10 @@ impl AppState {
             })
             .on_drag_end(move |_, cx| {
                 end.update(cx, |this, cx| {
-                    if let Phase::Connected(a) = &mut this.phase {
-                        a.editor_drag = None;
+                    if let Phase::Connected(a) = &mut this.phase
+                        && let Some(u) = a.layout.ui_mut(pane)
+                    {
+                        u.editor_drag = None;
                     }
                     cx.notify();
                 })
@@ -2241,9 +2127,10 @@ impl AppState {
             .first(editor_pane)
             .second(results_pane);
 
-        self.wrap_half(
+        self.wrap_pane(
             vsplit.into_any_element(),
-            half,
+            active,
+            pane,
             is_focused,
             is_split,
             &theme,
@@ -2251,14 +2138,22 @@ impl AppState {
         )
     }
 
-    /// Wrap a half's body in the chrome every half shares: the id that scopes the two
-    /// halves' child element ids apart, the focus outline and cross-divider tab drop
-    /// target shown while split, and the mouse-down that aims run/export/filter at
-    /// whichever half was clicked.
-    fn wrap_half(
+    /// Wrap a pane's body in the chrome every pane shares: the id that scopes its
+    /// child element ids apart from its siblings', the focus outline shown while
+    /// the work area is divided, the tab drop zones, and the mouse-down that aims
+    /// run/export/filter at whichever pane was clicked.
+    ///
+    /// The drop zones are what make splitting a gesture: a tab dragged over the
+    /// middle of a pane moves into it, and one dragged near an edge splits a new
+    /// pane off that side — including the first split of an undivided area. The
+    /// strips handle their own drops (a reorder) and stop propagation, so this
+    /// fires only for the body.
+    #[allow(clippy::too_many_arguments, reason = "render plumbing, not an API")]
+    fn wrap_pane(
         &self,
         body: gpui::AnyElement,
-        half: SplitHalf,
+        active: &ActiveConn,
+        pane: crate::app::PaneId,
         is_focused: bool,
         is_split: bool,
         theme: &flint::Theme,
@@ -2266,45 +2161,60 @@ impl AppState {
     ) -> gpui::AnyElement {
         let accent = theme.accent;
         let border = theme.border;
-        let drop_view = cx.entity().downgrade();
+        let muted = theme.text_faint;
+        // Only paint a zone for the pane the cursor is actually over.
+        let target = active
+            .layout
+            .drop_target()
+            .filter(|t| t.pane == pane && cx.has_active_drag());
         div()
-            .id(("split-half", half.index()))
+            .id(("sql-pane", pane.0 as usize))
+            .relative()
             .size_full()
             .flex()
             .flex_col()
-            .when(is_split, move |d| {
+            .when(is_split, |d| {
                 d.border_1()
                     .border_color(if is_focused { accent } else { border })
-                    // A tab dragged from either strip and dropped onto this half's
-                    // body moves (or swaps) it here. The strips handle their own
-                    // drops (reorder) and stop propagation, so this fires only for
-                    // the editor/result area. `drag_over` tints the hovered half.
-                    .drag_over::<crate::editor::TabDrag>(move |s, _, _, _| {
-                        s.border_color(accent).bg(accent.opacity(0.06))
-                    })
-                    .on_drop::<crate::editor::TabDrag>(move |drag, _window, cx| {
-                        let from = drag.0;
-                        drop_view
-                            .update(cx, |this, cx| this.move_tab_to_half(from, half, cx))
-                            .ok();
-                    })
             })
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, _, _, cx| this.set_split_focus(half, cx)),
+                cx.listener(move |this, _, _, cx| this.set_split_focus(pane, cx)),
             )
+            .on_drag_move::<crate::editor::TabDrag>(cx.listener(
+                move |this, e: &gpui::DragMoveEvent<crate::editor::TabDrag>, _, cx| {
+                    // The zones depend on *which* tab is in flight: a pane's only
+                    // tab has nowhere to go within its own pane.
+                    let Some(&crate::editor::TabDrag(from)) =
+                        e.dragged_item().downcast_ref::<crate::editor::TabDrag>()
+                    else {
+                        return;
+                    };
+                    this.aim_tab_drop(from, pane, e.bounds, e.event.position, cx);
+                },
+            ))
+            .on_drop::<crate::editor::TabDrag>(cx.listener(
+                move |this, drag: &crate::editor::TabDrag, _, cx| {
+                    // `None` means the zone was refused; the muted highlight
+                    // already said so, so the drop leaves the layout alone.
+                    if let Some(zone) = this.resolved_drop_zone(pane, cx) {
+                        this.drop_tab_on_pane(drag.0, pane, zone, cx);
+                    }
+                },
+            ))
             .child(body)
+            .children(target.map(|t| crate::panes::drop_overlay(t.zone, t.allowed, accent, muted)))
             .into_any_element()
     }
 
     /// The lower pane for tab `tab_idx`: its query plan when one is open,
     /// else the result grid; both share the slot. Picks per-tab (not per-focus) so
-    /// each half shows its own tab's view.
+    /// each pane shows its own tab's view.
     fn render_results_slot(
         &self,
         active: &ActiveConn,
         tab_idx: usize,
-        half: SplitHalf,
+        pane: crate::app::PaneId,
         is_focused: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -2313,7 +2223,7 @@ impl AppState {
         if tab.is_some_and(|t| t.plan.is_some()) {
             self.render_plan(active, tab_idx, cx)
         } else {
-            self.render_result(active, tab_idx, half, is_focused, window, cx)
+            self.render_result(active, tab_idx, pane, is_focused, window, cx)
                 .into_any_element()
         }
     }

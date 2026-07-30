@@ -6,6 +6,31 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- The work area can now hold any number of panes, arranged as columns, rows, or
+  any nesting of the two, in the SQL, Redis and MongoDB shells alike. Dragging a
+  tab shows where it would land — into the pane under the cursor, or into a new
+  pane on whichever edge you are nearest — and dropping it there creates that
+  pane, including the very first split of an undivided work area. Nothing
+  highlights where nothing would happen, and nothing happens where the highlight
+  said it would not, so a drop is never offered and then quietly ignored or
+  turned into something else.
+- Panes from the keyboard: ⌘\ splits the focused pane to the right and ⌘⇧\
+  splits it downward (both repeatable), ⌥⌘\ cycles focus, ⌥⌘W closes a pane and
+  folds its tabs into its neighbour, ⌘⇧↩ zooms a pane to fill the work area, and
+  ⌥⌘0 resets every divider to even shares.
+
+### Changed
+- ⌘\ now splits the focused pane rather than toggling a fixed two-pane split;
+  existing `keymap.toml` files that bind it keep working unchanged. Pane widths
+  are held as proportions, so resizing the window now widens every pane in step
+  instead of stretching only the last one.
+
+### Fixed
+- Each pane now keeps its own tab-strip scroll position and editor/result
+  divider; previously the two halves of a split shared both, so scrolling one
+  strip scrolled the other.
+
 ## [0.20.0] - 2026-07-30
 
 ### Added

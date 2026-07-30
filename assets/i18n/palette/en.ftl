@@ -36,11 +36,17 @@ palette-cmd_next_tab = query: next tab
 
 palette-cmd_prev_tab = query: previous tab
 
-palette-cmd_unsplit = view: unsplit
+palette-cmd_split_right = view: split pane right
 
-palette-cmd_focus_other_half = view: focus other split half
+palette-cmd_split_down = view: split pane down
 
-palette-cmd_split_right = view: split right
+palette-cmd_focus_other_half = view: focus next pane
+
+palette-cmd_maximize_pane = view: maximize / restore pane
+
+palette-cmd_equalize_panes = view: equalize pane sizes
+
+palette-cmd_unsplit = view: unsplit (fold panes back into one)
 
 palette-cmd_migrate_schema = schema: migrate to…
 

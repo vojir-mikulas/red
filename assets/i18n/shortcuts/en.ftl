@@ -36,9 +36,17 @@ shortcuts-panes-cycle_focus_forward_back = Cycle focus forward / back
 
 shortcuts-panes-toggle_schema_sidebar = Toggle schema sidebar
 
-shortcuts-panes-split_view_two_tabs_side_by_side = Split view (two tabs side by side)
+shortcuts-panes-split_pane_right = Split pane right
 
-shortcuts-panes-focus_other_split_half = Focus other split half
+shortcuts-panes-split_pane_down = Split pane down
+
+shortcuts-panes-focus_next_pane = Focus next pane
+
+shortcuts-panes-close_pane = Close pane
+
+shortcuts-panes-maximize_pane = Maximize / restore pane
+
+shortcuts-panes-equalize_panes = Equalize pane sizes
 
 shortcuts-query_tabs-title = Query tabs
 

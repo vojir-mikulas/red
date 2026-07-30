@@ -47,6 +47,7 @@ mod markdown;
 mod menu;
 mod mutations;
 mod palette;
+mod panes;
 mod plan;
 mod queries;
 mod recent_keys;
@@ -62,6 +63,7 @@ mod settings_ui;
 mod settings_watch;
 mod shell;
 mod sql;
+mod tabstrip;
 mod theme;
 mod window_chrome;
 

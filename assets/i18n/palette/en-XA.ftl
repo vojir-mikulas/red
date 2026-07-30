@@ -36,11 +36,17 @@ palette-cmd_next_tab = [qúéry: ñéxt táb]
 
 palette-cmd_prev_tab = [qúéry: prévíöús táb]
 
-palette-cmd_unsplit = [víéw: úñsplít]
+palette-cmd_split_right = [víéw: splít páñé ríght]
 
-palette-cmd_focus_other_half = [víéw: föçús öthér splít hálf]
+palette-cmd_split_down = [víéw: splít páñé döwñ]
 
-palette-cmd_split_right = [víéw: splít ríght]
+palette-cmd_focus_other_half = [víéw: föçús ñéxt páñé]
+
+palette-cmd_maximize_pane = [víéw: máxímízé / réstöré páñé]
+
+palette-cmd_equalize_panes = [víéw: éqúálízé páñé sízés]
+
+palette-cmd_unsplit = [víéw: úñsplít (föld páñés báçk íñtö öñé)]
 
 palette-cmd_migrate_schema = [sçhémá: mígráté tö…]
 

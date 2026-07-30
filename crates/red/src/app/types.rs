@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use flint::prelude::*;
 use flint::{CodeEditor, CodeEditorEvent};
-use gpui::{Context, Entity, FocusHandle, Pixels, ScrollHandle, SharedString, prelude::*, px};
+use gpui::{Context, Entity, FocusHandle, Pixels, SharedString, prelude::*, px};
 use red_core::kv::RecycledKey;
 use red_core::{
     Column, ColumnMap, ColumnMeta, ConnectionConfig, CopyMode, DbKind, EditOp, FkEdge,
@@ -17,6 +17,9 @@ use red_core::{
 };
 use red_service::{OpId, SessionId};
 
+// Re-exported so the rest of the app keeps reaching for pane types through
+// `crate::app::{…}`, the path every workspace already imports its tab traits from.
+pub(crate) use crate::panes::{DraggedTab, DropZone, PaneId, PaneLayout};
 use crate::result::ResultGrid;
 use crate::schema::SchemaState;
 
@@ -54,97 +57,123 @@ pub(crate) enum TabCloseScope {
     Right,
 }
 
-/// Which half of a side-by-side split (see [`SplitState`]) the run/export/filter
-/// actions target: the focused half. `Primary` is the left pane (`active_tab`);
-/// `Secondary` is the right pane (`SplitState::secondary`).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SplitHalf {
-    Primary,
-    Secondary,
-}
-
-impl SplitHalf {
-    /// The other half, used by "focus other half" and the strip's swap logic.
-    pub(crate) fn other(self) -> SplitHalf {
-        match self {
-            SplitHalf::Primary => SplitHalf::Secondary,
-            SplitHalf::Secondary => SplitHalf::Primary,
-        }
-    }
-
-    /// A 0/1 discriminant used to salt the two halves' element ids apart.
-    pub(crate) fn index(self) -> usize {
-        match self {
-            SplitHalf::Primary => 0,
-            SplitHalf::Secondary => 1,
-        }
-    }
-}
-
-/// The side-by-side split: the work area shows two query tabs at once. `active_tab`
-/// is the left (primary) half; `secondary` indexes the right half's tab. `focus`
-/// says which half receives run/export/filter (and draws the active outline);
-/// `width` drives the resizable divider (left-half width). `None` on [`ActiveConn`]
-/// is the ordinary single-pane layout. Always holds `secondary != active_tab` and
-/// `secondary < tabs.len()`; a tab close/reorder that breaks either collapses it.
-pub(crate) struct SplitState {
-    pub secondary: usize,
-    pub focus: SplitHalf,
-    pub width: Pixels,
-    pub drag: Option<DragAnchor>,
-}
-
-/// A tab that lives in a split workspace: the two structural facts the
-/// pane-routing and split invariants need, independent of what the tab renders.
-/// Implemented by both [`QueryTab`] (SQL) and `RedisTab` (Redis).
+/// A tab that lives in a pane workspace: the two structural facts the
+/// pane-routing and layout invariants need, independent of what the tab renders.
+/// Implemented by [`QueryTab`] (SQL), `RedisTab` and `MongoTab`.
 pub(crate) trait WorkspaceTab {
-    fn pane(&self) -> SplitHalf;
-    fn set_pane(&mut self, half: SplitHalf);
+    fn pane(&self) -> PaneId;
+    fn set_pane(&mut self, pane: PaneId);
     fn pinned(&self) -> bool;
     fn set_pinned(&mut self, pinned: bool);
 }
 
-/// A view hosting a set of tabs in an optional side-by-side split. The
-/// pane-routing and split-invariant logic lives here once, as provided methods,
-/// for both the SQL query workspace ([`ActiveConn`]) and the Redis workspace
-/// (`RedisView`) — which previously carried byte-for-byte copies that could
-/// drift. An implementor supplies only the field accessors; everything below is
-/// shared. The one deliberate difference (Redis orders pinned tabs first within
-/// a strip; SQL renders pinned in a separate section and keeps raw order) is a
-/// `pins_sort_first` hook rather than a forked method.
+/// A view hosting a set of tabs across one or more panes. The pane-routing and
+/// layout-invariant logic lives here once, as provided methods, for the SQL
+/// query workspace ([`ActiveConn`]), the Redis workspace (`RedisView`) and the
+/// MongoDB one (`MongoView`) — which previously carried byte-for-byte copies
+/// that could drift. An implementor supplies only the field accessors;
+/// everything below is shared. The one deliberate difference (Redis orders
+/// pinned tabs first within a strip; SQL renders pinned in a separate section
+/// and keeps raw order) is a `pins_sort_first` hook rather than a forked method.
+///
+/// Which pane a tab belongs to is a field on the *tab*; the layout owns only
+/// geometry and focus. Keeping membership on the tab is what lets a close or
+/// reorder stay a `Vec` splice plus an index remap, rather than a re-shuffle of
+/// per-pane tab lists that would have to be kept consistent with the tree.
 pub(crate) trait TabWorkspace {
     type Tab: WorkspaceTab;
 
     fn ws_tabs(&self) -> &[Self::Tab];
     fn ws_tabs_mut(&mut self) -> &mut Vec<Self::Tab>;
-    fn ws_active(&self) -> usize;
-    fn ws_set_active(&mut self, i: usize);
-    fn ws_split(&self) -> Option<&SplitState>;
-    fn ws_split_mut(&mut self) -> &mut Option<SplitState>;
-    /// The gap a dragged tab would land in (the drop indicator), or `None`.
-    fn ws_drop_target(&self) -> Option<usize>;
-    fn ws_drop_target_mut(&mut self) -> &mut Option<usize>;
+    fn ws_layout(&self) -> &PaneLayout;
+    fn ws_layout_mut(&mut self) -> &mut PaneLayout;
 
     /// Whether pinned tabs sort ahead of the rest within a pane's strip.
     fn pins_sort_first(&self) -> bool {
         false
     }
 
-    /// Record the gap a dragged tab would land in. Returns whether it changed, so
-    /// the caller only re-renders when the indicator actually moved (this fires on
-    /// every drag-move, so a no-op notify would spam the frame loop).
-    fn set_drop_target(&mut self, gap: usize) -> bool {
-        if self.ws_drop_target() != Some(gap) {
-            *self.ws_drop_target_mut() = Some(gap);
-            return true;
-        }
-        false
+    /// The pane run/export/filter and the keyboard target.
+    fn focused_pane(&self) -> PaneId {
+        self.ws_layout().focus()
     }
 
-    /// Drop the drop indicator (cursor left the strip mid-drag). Returns whether
-    /// anything was showing.
-    fn clear_drop_target(&mut self) -> bool {
-        self.ws_drop_target_mut().take().is_some()
+    /// The tab the focused pane shows, or `None` when it holds none.
+    fn focused_tab_index(&self) -> Option<usize> {
+        self.pane_active(self.focused_pane())
+    }
+
+    /// Point focus at `pane`. Returns whether it moved.
+    fn set_focused_pane(&mut self, pane: PaneId) -> bool {
+        self.ws_layout_mut().set_focus(pane)
+    }
+
+    /// First tab belonging to `pane`, if any.
+    fn first_tab_in(&self, pane: PaneId) -> Option<usize> {
+        self.ws_tabs().iter().position(|t| t.pane() == pane)
+    }
+
+    /// The active tab index of `pane`: its stored index when that still names a
+    /// tab in the pane, else the pane's first tab (`None` when it holds none).
+    /// Going through the fallback rather than trusting the stored index is what
+    /// keeps a close or reorder from rendering another pane's tab in this one.
+    fn pane_active(&self, pane: PaneId) -> Option<usize> {
+        match self.ws_layout().active_tab(pane) {
+            Some(i) if self.ws_tabs().get(i).is_some_and(|t| t.pane() == pane) => Some(i),
+            _ => self.first_tab_in(pane),
+        }
+    }
+
+    /// Record `i` as `pane`'s active tab.
+    fn set_pane_active(&mut self, pane: PaneId, i: usize) {
+        self.ws_layout_mut().set_active_tab(pane, i);
+    }
+
+    /// Global indices of the tabs in `pane`, in strip order (pinned first when
+    /// [`pins_sort_first`](Self::pins_sort_first)).
+    fn pane_tab_indices(&self, pane: PaneId) -> Vec<usize> {
+        let mut idx: Vec<usize> = self
+            .ws_tabs()
+            .iter()
+            .enumerate()
+            .filter(|(_, t)| t.pane() == pane)
+            .map(|(i, _)| i)
+            .collect();
+        if self.pins_sort_first() {
+            // Stable sort: pinned (`true`) first, relative order preserved.
+            idx.sort_by_key(|&i| !self.ws_tabs()[i].pinned());
+        }
+        idx
+    }
+
+    /// Scroll the strip of whichever pane owns tab `index` so it is fully
+    /// visible. The scroll handle counts children of that pane's own strip, so
+    /// the global tab index has to be translated into a position within the
+    /// pane — handing it the global one scrolls to the wrong tab the moment a
+    /// second pane exists.
+    fn scroll_tab_into_view(&self, index: usize) {
+        let Some(pane) = self.ws_tabs().get(index).map(|t| t.pane()) else {
+            return;
+        };
+        let Some(pos) = self.pane_tab_indices(pane).iter().position(|&i| i == index) else {
+            return;
+        };
+        if let Some(ui) = self.ws_layout().ui(pane) {
+            ui.tab_scroll.scroll_to_item(pos);
+        }
+    }
+
+    /// Record the gap in `pane`'s strip that a dragged tab would land in.
+    /// Returns whether it changed, so the caller only re-renders when the
+    /// indicator actually moved (this fires on every drag-move, and a no-op
+    /// notify would spam the frame loop).
+    fn set_drop_gap(&mut self, pane: PaneId, gap: usize) -> bool {
+        self.ws_layout_mut().set_gap(pane, gap)
+    }
+
+    /// Drop the strip drop indicator (the cursor left the strip mid-drag).
+    fn clear_drop_gap(&mut self) -> bool {
+        self.ws_layout_mut().clear_gap()
     }
 
     /// Toggle the pinned flag of the tab at `index`. Returns whether it hit a tab.
@@ -157,271 +186,214 @@ pub(crate) trait TabWorkspace {
         false
     }
 
-    /// Finish a tab-strip drag onto `half`'s strip: assign the dragged tab
-    /// (`from`) to that half and move it into the gap the indicator settled on,
-    /// then remap the *other* pane's active index across the remove+insert so it
-    /// keeps pointing at its own tab (previously only the SQL workspace did this;
-    /// Redis/Mongo relied on `normalize_panes`, which could jump the other pane to
-    /// its first tab). Clears the indicator. Lands the tab in `half` and focuses
-    /// it; `normalize_panes` collapses the split if the drag emptied the source.
-    fn reorder_tab(&mut self, from: usize, half: SplitHalf) {
-        let Some(gap) = self.ws_drop_target_mut().take() else {
-            return;
-        };
+    /// Finish a tab-strip drag onto `pane`'s strip: assign the dragged tab
+    /// (`from`) to that pane and move it into the gap the indicator settled on,
+    /// then remap every pane's stored active index across the remove+insert so
+    /// each keeps pointing at its own tab. A drop on the strip's empty tail (no
+    /// tab was hovered, so no gap settled) appends rather than doing nothing.
+    /// `normalize_panes` drops the source pane if the drag emptied it.
+    fn reorder_tab(&mut self, from: usize, pane: PaneId) {
         if from >= self.ws_tabs().len() {
+            self.ws_layout_mut().clear_drag();
             return;
         }
+        let gap = self
+            .ws_layout()
+            .gap_in(pane)
+            .or_else(|| self.pane_tab_indices(pane).last().map(|&i| i + 1))
+            .unwrap_or(from);
+        self.ws_layout_mut().clear_drag();
         // The dragged tab now belongs to the strip it was dropped on.
-        self.ws_tabs_mut()[from].set_pane(half);
-        // `gap` indexes the pre-removal strip; shift left when the dragged tab sat
-        // before the gap.
+        self.ws_tabs_mut()[from].set_pane(pane);
+        // `gap` indexes the pre-removal strip; shift left when the dragged tab
+        // sat before the gap.
         let dest = if from < gap { gap - 1 } else { gap };
         let dest = dest.min(self.ws_tabs().len() - 1);
         let tab = self.ws_tabs_mut().remove(from);
         self.ws_tabs_mut().insert(dest, tab);
-        // Remap an index across remove(from)+insert(dest): the moved tab lands at
-        // `dest`, everything else shifts to keep pointing at its own tab.
-        let remap = |idx: usize| -> usize {
+        // Remap an index across remove(from)+insert(dest): the moved tab lands
+        // at `dest`, everything else shifts to keep pointing at its own tab.
+        self.ws_layout_mut().remap_active_tabs(|idx| {
             if idx == from {
                 return dest;
             }
             let j = if idx > from { idx - 1 } else { idx };
             if j >= dest { j + 1 } else { j }
-        };
-        let active = self.ws_active();
-        self.ws_set_active(remap(active));
-        if let Some(s) = self.ws_split_mut() {
-            s.secondary = remap(s.secondary);
-            s.focus = half;
-        }
-        self.set_pane_active(half, dest);
+        });
+        self.ws_layout_mut().set_focus(pane);
+        self.set_pane_active(pane, dest);
         self.normalize_panes();
     }
 
-    /// Which half currently receives actions/focus (`Primary` when unsplit).
-    fn focused_half(&self) -> SplitHalf {
-        self.ws_split()
-            .map(|s| s.focus)
-            .unwrap_or(SplitHalf::Primary)
+    /// The tab at `from`, as the drop zones need to see it. `None` when the index
+    /// is stale (a close raced the drag).
+    fn dragged_tab(&self, from: usize) -> Option<DraggedTab> {
+        let pane = self.ws_tabs().get(from)?.pane();
+        Some(DraggedTab {
+            from: pane,
+            alone: self.pane_tab_indices(pane).len() == 1,
+        })
     }
 
-    /// The global tab index the focused half points at.
-    fn focused_tab_index(&self) -> usize {
-        match self.ws_split() {
-            Some(s) if s.focus == SplitHalf::Secondary => s.secondary,
-            _ => self.ws_active(),
-        }
-    }
-
-    /// Record `i` as `half`'s active tab.
-    fn set_pane_active(&mut self, half: SplitHalf, i: usize) {
-        match half {
-            SplitHalf::Primary => self.ws_set_active(i),
-            SplitHalf::Secondary => {
-                if let Some(s) = self.ws_split_mut() {
-                    s.secondary = i;
-                }
-            }
-        }
-    }
-
-    /// First tab belonging to `half`, if any.
-    fn first_tab_in(&self, half: SplitHalf) -> Option<usize> {
-        self.ws_tabs().iter().position(|t| t.pane() == half)
-    }
-
-    /// The active tab index of `half`: its stored index when that still names a
-    /// tab in the half, else the first tab in the half (`None` if empty).
-    fn pane_active(&self, half: SplitHalf) -> Option<usize> {
-        let stored = match half {
-            SplitHalf::Primary => Some(self.ws_active()),
-            SplitHalf::Secondary => self.ws_split().map(|s| s.secondary),
+    /// Finish a tab drag dropped on a pane's *body*: into that pane
+    /// ([`DropZone::Center`]), or into a new pane split off the side the cursor
+    /// was nearest. Returns whether the layout changed.
+    ///
+    /// The no-op cases are [`DraggedTab::would_move`]'s call, shared with the
+    /// highlight so the two can never disagree — a zone that lights up and then
+    /// does nothing is the worst of both.
+    fn drop_tab_into(&mut self, from: usize, target: PaneId, zone: DropZone) -> bool {
+        self.ws_layout_mut().clear_drag();
+        let Some(dragged) = self.dragged_tab(from) else {
+            return false;
         };
-        match stored {
-            Some(i) if self.ws_tabs().get(i).is_some_and(|t| t.pane() == half) => Some(i),
-            _ => self.first_tab_in(half),
+        if !dragged.would_move(target, zone) {
+            return false;
         }
+        let dest = match zone {
+            DropZone::Center => target,
+            _ => match self.ws_layout_mut().insert(target, zone) {
+                Some(new) => new,
+                None => return false,
+            },
+        };
+        self.ws_tabs_mut()[from].set_pane(dest);
+        self.ws_layout_mut().set_focus(dest);
+        self.set_pane_active(dest, from);
+        self.normalize_panes();
+        true
     }
 
-    /// Global indices of the tabs in `half`, in strip order (pinned first when
-    /// [`pins_sort_first`](Self::pins_sort_first)).
-    fn pane_tab_indices(&self, half: SplitHalf) -> Vec<usize> {
-        let mut idx: Vec<usize> = self
-            .ws_tabs()
-            .iter()
-            .enumerate()
-            .filter(|(_, t)| t.pane() == half)
-            .map(|(i, _)| i)
-            .collect();
-        if self.pins_sort_first() {
-            // Stable sort: pinned (`true`) first, relative order preserved.
-            idx.sort_by_key(|&i| !self.ws_tabs()[i].pinned());
-        }
-        idx
-    }
-
-    /// Restore the pane invariants after any tab add/close/move/reorder: collapse
-    /// the split when a half has emptied, and re-point each pane's active index at
-    /// a tab it actually owns. The safety net every mutation ends on.
+    /// Restore the pane invariants after any tab add/close/move/reorder: rehome
+    /// tabs whose pane is gone, drop panes that no longer hold a tab (letting the
+    /// tree collapse and re-flatten around them), and re-point every pane's
+    /// stored active index at a tab it actually owns. The safety net every
+    /// mutation ends on.
     fn normalize_panes(&mut self) {
-        if self.ws_tabs().is_empty() {
-            self.ws_set_active(0);
-            *self.ws_split_mut() = None;
-            return;
+        let live = self.ws_layout().panes();
+        let fallback = self.ws_layout().focus();
+        for t in self.ws_tabs_mut() {
+            if !live.contains(&t.pane()) {
+                t.set_pane(fallback);
+            }
         }
-        if self.ws_split().is_some() {
-            let has_primary = self
-                .ws_tabs()
-                .iter()
-                .any(|t| t.pane() == SplitHalf::Primary);
-            let has_secondary = self
-                .ws_tabs()
-                .iter()
-                .any(|t| t.pane() == SplitHalf::Secondary);
-            if !has_primary || !has_secondary {
-                // A half emptied: collapse, keeping the surviving half's tab on screen.
-                let survivor = if has_primary {
-                    SplitHalf::Primary
-                } else {
-                    SplitHalf::Secondary
-                };
-                let keep = self.pane_active(survivor).unwrap_or(0);
-                for t in self.ws_tabs_mut() {
-                    t.set_pane(SplitHalf::Primary);
-                }
-                *self.ws_split_mut() = None;
-                let clamped = keep.min(self.ws_tabs().len() - 1);
-                self.ws_set_active(clamped);
-                return;
+        // With no tabs left there is nothing to divide: fold back to a single
+        // pane so the shell shows one placeholder, not N empty strips.
+        let empty = self.ws_tabs().is_empty();
+        for pane in live {
+            if self.ws_layout().panes().len() <= 1 {
+                break;
             }
-            // Both halves populated: clamp each active index into its own pane.
-            if let Some(p) = self.pane_active(SplitHalf::Primary) {
-                self.ws_set_active(p);
+            if empty || self.first_tab_in(pane).is_none() {
+                self.ws_layout_mut().remove(pane);
             }
-            if let Some(sec) = self.pane_active(SplitHalf::Secondary)
-                && let Some(state) = self.ws_split_mut()
-            {
-                state.secondary = sec;
-            }
-        } else {
-            // Single pane: every tab lives in `Primary`; keep the index in range.
-            for t in self.ws_tabs_mut() {
-                t.set_pane(SplitHalf::Primary);
-            }
-            if self.ws_active() >= self.ws_tabs().len() {
-                let last = self.ws_tabs().len() - 1;
-                self.ws_set_active(last);
+        }
+        for pane in self.ws_layout().panes() {
+            if let Some(i) = self.pane_active(pane) {
+                self.ws_layout_mut().set_active_tab(pane, i);
             }
         }
     }
 }
 
-/// The split-pane operations (⌘\ open/close, ⌥⌘\ focus, move-tab-across) shared
-/// by the Redis and MongoDB workspaces, whose versions were byte-for-byte copies
-/// modulo the tab type and default width. Implemented by `RedisView`/`MongoView`
-/// only, not SQL: SQL's `split_right` mints its blank tab with `QueryTab::new`
-/// (which needs a `cx` to build the editor entity) and carries editor-focus and
-/// completion side effects, so it keeps its own `AppState`-level methods.
+/// The pane operations (split, close, focus, move-tab-across) shared by the
+/// Redis and MongoDB workspaces, whose versions were byte-for-byte copies modulo
+/// the tab type. Implemented by `RedisView`/`MongoView` only, not SQL: SQL mints
+/// its blank tab with `QueryTab::new` (which needs a `cx` to build the editor
+/// entity) and carries editor-focus and completion side effects, so it keeps its
+/// own `AppState`-level methods.
 ///
 /// Each method does the field work on the view and returns whether it changed
 /// anything, so the thin `AppState` wrappers `cx.notify()` exactly when the
 /// per-seam originals did (some notified only on a real change).
 pub(crate) trait SplitWorkspace: TabWorkspace {
-    /// Mint a fresh blank tab in `half`, push it, and return its index. The one
-    /// genuinely per-seam step of opening a split (a `RedisTab` vs a `MongoTab`).
-    fn push_blank_tab(&mut self, half: SplitHalf) -> usize;
-    /// The initial width of the secondary pane.
-    fn split_default_width(&self) -> Pixels;
-    /// Dismiss the tab context menu (a move-to-other-half closes it).
+    /// Mint a fresh blank tab in `pane`, push it, and return its index. The one
+    /// genuinely per-seam step of splitting (a `RedisTab` vs a `MongoTab`).
+    fn push_blank_tab(&mut self, pane: PaneId) -> usize;
+    /// Dismiss the tab context menu (a move-to-another-pane closes it).
     fn clear_tab_menu(&mut self);
     /// Index of the tab with stable id `id`, if present.
     fn tab_idx_of(&self, id: u64) -> Option<usize>;
 
-    /// Open the split: a fresh blank tab in a focused second pane on the right.
-    /// No-op (returns `false`) when already split.
-    fn split_open(&mut self) -> bool {
-        if self.ws_split().is_some() {
+    /// Split the focused pane along `zone` and put a fresh blank tab in the new
+    /// pane, which takes focus. `None` when the zone creates nothing.
+    fn split_focused(&mut self, zone: DropZone) -> Option<PaneId> {
+        let at = self.focused_pane();
+        let new = self.ws_layout_mut().insert(at, zone)?;
+        let idx = self.push_blank_tab(new);
+        self.ws_layout_mut().set_focus(new);
+        self.set_pane_active(new, idx);
+        self.normalize_panes();
+        Some(new)
+    }
+
+    /// Close `pane`, folding its tabs into the pane that absorbs its space so
+    /// nothing is silently thrown away. No-op (returns `false`) on the last pane.
+    fn close_pane(&mut self, pane: PaneId) -> bool {
+        let Some(heir) = self.ws_layout_mut().remove(pane) else {
             return false;
+        };
+        for t in self.ws_tabs_mut() {
+            if t.pane() == pane {
+                t.set_pane(heir);
+            }
         }
-        let secondary = self.push_blank_tab(SplitHalf::Secondary);
-        let width = self.split_default_width();
-        *self.ws_split_mut() = Some(SplitState {
-            secondary,
-            focus: SplitHalf::Secondary,
-            width,
-            drag: None,
-        });
+        self.ws_layout_mut().set_focus(heir);
         self.normalize_panes();
         true
     }
 
-    /// Collapse the split, folding every tab into the single strip and keeping the
-    /// focused half's tab on screen. No-op (returns `false`) when not split.
-    fn split_close(&mut self) -> bool {
-        let Some(s) = self.ws_split_mut().take() else {
+    /// Fold every pane back into one, keeping the focused pane's tabs on screen.
+    /// Returns whether anything collapsed.
+    fn unsplit(&mut self) -> bool {
+        let keep = self.focused_pane();
+        let others: Vec<PaneId> = self
+            .ws_layout()
+            .panes()
+            .into_iter()
+            .filter(|&p| p != keep)
+            .collect();
+        if others.is_empty() {
             return false;
-        };
-        let keep = if s.focus == SplitHalf::Secondary {
-            s.secondary
-        } else {
-            self.ws_active()
-        };
-        for t in self.ws_tabs_mut() {
-            t.set_pane(SplitHalf::Primary);
         }
-        let last = self.ws_tabs().len().saturating_sub(1);
-        self.ws_set_active(keep.min(last));
+        for t in self.ws_tabs_mut() {
+            t.set_pane(keep);
+        }
+        for pane in others {
+            self.ws_layout_mut().remove(pane);
+        }
+        self.ws_layout_mut().set_focus(keep);
+        self.normalize_panes();
         true
     }
 
-    /// Toggle the split (the ⌘\ action).
-    fn split_toggle(&mut self) {
-        if self.ws_split().is_some() {
-            self.split_close();
-        } else {
-            self.split_open();
+    /// Move focus to the next pane in visual order, wrapping. Returns whether it
+    /// moved (false with a single pane).
+    fn focus_pane_step(&mut self, forward: bool) -> bool {
+        let cur = self.focused_pane();
+        match self.ws_layout().cycle(cur, forward) {
+            Some(next) => self.ws_layout_mut().set_focus(next),
+            None => false,
         }
     }
 
-    /// Point the focused half at `half`. Returns whether it changed.
-    fn split_set_focus(&mut self, half: SplitHalf) -> bool {
-        if let Some(s) = self.ws_split_mut()
-            && s.focus != half
-        {
-            s.focus = half;
-            return true;
-        }
-        false
-    }
-
-    /// Move focus to the other half (the ⌥⌘\ action). Returns whether split.
-    fn split_focus_other(&mut self) -> bool {
-        if let Some(s) = self.ws_split_mut() {
-            s.focus = s.focus.other();
-            return true;
-        }
-        false
-    }
-
-    /// Move the tab with `id` to the other half (tab context menu), opening the
-    /// split first when there isn't one to move to.
+    /// Move the tab with `id` to the next pane (the tab context menu), splitting
+    /// off a new one to the right when it is the only pane.
     fn split_move_tab(&mut self, id: u64) {
-        if self.ws_split().is_none() {
-            self.split_open();
-        }
         let Some(idx) = self.tab_idx_of(id) else {
             return;
         };
-        let target = if self.ws_tabs()[idx].pane() == SplitHalf::Primary {
-            SplitHalf::Secondary
-        } else {
-            SplitHalf::Primary
+        let from = self.ws_tabs()[idx].pane();
+        let target = match self.ws_layout().cycle(from, true) {
+            Some(next) => next,
+            None => match self.ws_layout_mut().insert(from, DropZone::Right) {
+                Some(new) => new,
+                None => return,
+            },
         };
         self.ws_tabs_mut()[idx].set_pane(target);
         self.set_pane_active(target, idx);
-        if let Some(s) = self.ws_split_mut() {
-            s.focus = target;
-        }
+        self.ws_layout_mut().set_focus(target);
         self.clear_tab_menu();
         self.normalize_panes();
     }
@@ -430,17 +402,18 @@ pub(crate) trait SplitWorkspace: TabWorkspace {
 #[cfg(test)]
 mod workspace_tests {
     use super::*;
+    use crate::panes::DropZone;
 
     struct TestTab {
-        pane: SplitHalf,
+        pane: PaneId,
         pinned: bool,
     }
     impl WorkspaceTab for TestTab {
-        fn pane(&self) -> SplitHalf {
+        fn pane(&self) -> PaneId {
             self.pane
         }
-        fn set_pane(&mut self, half: SplitHalf) {
-            self.pane = half;
+        fn set_pane(&mut self, pane: PaneId) {
+            self.pane = pane;
         }
         fn pinned(&self) -> bool {
             self.pinned
@@ -452,10 +425,8 @@ mod workspace_tests {
 
     struct TestWs {
         tabs: Vec<TestTab>,
-        active: usize,
-        split: Option<SplitState>,
+        layout: PaneLayout,
         sort_pins: bool,
-        drop_target: Option<usize>,
     }
     impl TabWorkspace for TestWs {
         type Tab = TestTab;
@@ -465,141 +436,253 @@ mod workspace_tests {
         fn ws_tabs_mut(&mut self) -> &mut Vec<TestTab> {
             &mut self.tabs
         }
-        fn ws_active(&self) -> usize {
-            self.active
+        fn ws_layout(&self) -> &PaneLayout {
+            &self.layout
         }
-        fn ws_set_active(&mut self, i: usize) {
-            self.active = i;
-        }
-        fn ws_split(&self) -> Option<&SplitState> {
-            self.split.as_ref()
-        }
-        fn ws_split_mut(&mut self) -> &mut Option<SplitState> {
-            &mut self.split
-        }
-        fn ws_drop_target(&self) -> Option<usize> {
-            self.drop_target
-        }
-        fn ws_drop_target_mut(&mut self) -> &mut Option<usize> {
-            &mut self.drop_target
+        fn ws_layout_mut(&mut self) -> &mut PaneLayout {
+            &mut self.layout
         }
         fn pins_sort_first(&self) -> bool {
             self.sort_pins
         }
     }
-
-    fn tab(pane: SplitHalf, pinned: bool) -> TestTab {
-        TestTab { pane, pinned }
+    impl SplitWorkspace for TestWs {
+        fn push_blank_tab(&mut self, pane: PaneId) -> usize {
+            self.tabs.push(TestTab {
+                pane,
+                pinned: false,
+            });
+            self.tabs.len() - 1
+        }
+        fn clear_tab_menu(&mut self) {}
+        fn tab_idx_of(&self, id: u64) -> Option<usize> {
+            let i = id as usize;
+            (i < self.tabs.len()).then_some(i)
+        }
     }
-    fn split(secondary: usize, focus: SplitHalf) -> SplitState {
-        SplitState {
-            secondary,
-            focus,
-            width: px(500.),
-            drag: None,
+
+    impl TestWs {
+        /// A workspace with `n` tabs, all in the single starting pane.
+        fn with_tabs(n: usize) -> Self {
+            let layout = PaneLayout::new();
+            let first = layout.focus();
+            Self {
+                tabs: (0..n)
+                    .map(|_| TestTab {
+                        pane: first,
+                        pinned: false,
+                    })
+                    .collect(),
+                layout,
+                sort_pins: false,
+            }
+        }
+
+        /// Split the starting pane to the right and return both pane ids.
+        fn split(&mut self) -> (PaneId, PaneId) {
+            let left = self.focused_pane();
+            let right = self
+                .ws_layout_mut()
+                .insert(left, DropZone::Right)
+                .expect("split");
+            (left, right)
         }
     }
 
     #[test]
-    fn pane_active_falls_back_to_first_tab_in_half() {
-        let ws = TestWs {
-            tabs: vec![
-                tab(SplitHalf::Primary, false),
-                tab(SplitHalf::Secondary, false),
-                tab(SplitHalf::Secondary, false),
-            ],
-            active: 0,
-            // Secondary points at a Primary tab (index 0): should fall back to
-            // the first Secondary tab (index 1).
-            split: Some(split(0, SplitHalf::Secondary)),
-            sort_pins: false,
-            drop_target: None,
-        };
-        assert_eq!(ws.pane_active(SplitHalf::Primary), Some(0));
-        assert_eq!(ws.pane_active(SplitHalf::Secondary), Some(1));
-        assert_eq!(ws.focused_tab_index(), 0); // stored secondary is 0
+    fn pane_active_falls_back_to_the_panes_first_tab() {
+        let mut ws = TestWs::with_tabs(3);
+        let (left, right) = ws.split();
+        ws.tabs[1].pane = right;
+        ws.tabs[2].pane = right;
+        // The right pane's stored index still names a left-pane tab (0), so it
+        // must fall back to the first tab it actually owns rather than render
+        // the other pane's.
+        ws.ws_layout_mut().set_active_tab(right, 0);
+        assert_eq!(ws.pane_active(left), Some(0));
+        assert_eq!(ws.pane_active(right), Some(1));
     }
 
     #[test]
-    fn normalize_collapses_split_when_a_half_empties() {
-        let mut ws = TestWs {
-            // Both tabs in Primary; the split claims a Secondary that no tab owns.
-            tabs: vec![
-                tab(SplitHalf::Primary, false),
-                tab(SplitHalf::Primary, false),
-            ],
-            active: 5, // out of range on purpose
-            split: Some(split(1, SplitHalf::Secondary)),
-            sort_pins: false,
-            drop_target: None,
-        };
+    fn normalize_drops_a_pane_that_lost_its_last_tab() {
+        let mut ws = TestWs::with_tabs(2);
+        let (left, right) = ws.split();
+        ws.tabs[1].pane = right;
         ws.normalize_panes();
-        assert!(ws.split.is_none(), "an emptied half collapses the split");
-        assert!(ws.active < ws.tabs.len(), "active index clamped into range");
-        assert!(ws.tabs.iter().all(|t| t.pane == SplitHalf::Primary));
+        assert_eq!(ws.ws_layout().panes().len(), 2, "both panes hold a tab");
+        // Move the right pane's only tab back: the empty pane goes away.
+        ws.tabs[1].pane = left;
+        ws.normalize_panes();
+        assert_eq!(ws.ws_layout().panes(), vec![left]);
+        assert!(!ws.ws_layout().is_split());
+    }
+
+    #[test]
+    fn normalize_folds_back_to_one_pane_when_every_tab_closes() {
+        let mut ws = TestWs::with_tabs(2);
+        let (left, right) = ws.split();
+        ws.tabs[1].pane = right;
+        ws.tabs.clear();
+        ws.normalize_panes();
+        assert_eq!(ws.ws_layout().panes().len(), 1);
+        assert!(ws.ws_layout().panes() == vec![left] || ws.ws_layout().panes() == vec![right]);
+    }
+
+    #[test]
+    fn normalize_rehomes_tabs_whose_pane_is_gone() {
+        let mut ws = TestWs::with_tabs(2);
+        let (_left, right) = ws.split();
+        ws.tabs[1].pane = right;
+        // Drop the pane out from under the tab, as a close would.
+        ws.ws_layout_mut().remove(right);
+        ws.normalize_panes();
+        let live = ws.ws_layout().panes();
+        assert!(
+            ws.tabs.iter().all(|t| live.contains(&t.pane())),
+            "a tab was left pointing at a dead pane"
+        );
     }
 
     #[test]
     fn pane_tab_indices_orders_pinned_first_only_when_requested() {
-        let tabs = || {
-            vec![
-                tab(SplitHalf::Primary, false),
-                tab(SplitHalf::Primary, true),
-                tab(SplitHalf::Primary, false),
-            ]
-        };
-        let raw = TestWs {
-            tabs: tabs(),
-            active: 0,
-            split: None,
-            sort_pins: false,
-            drop_target: None,
-        };
-        assert_eq!(raw.pane_tab_indices(SplitHalf::Primary), vec![0, 1, 2]);
-        let pinned_first = TestWs {
-            tabs: tabs(),
-            active: 0,
-            split: None,
-            sort_pins: true,
-            drop_target: None,
-        };
+        let mut ws = TestWs::with_tabs(3);
+        ws.tabs[1].pinned = true;
+        let pane = ws.focused_pane();
+        assert_eq!(ws.pane_tab_indices(pane), vec![0, 1, 2]);
+        ws.sort_pins = true;
         // Pinned (index 1) moves ahead; relative order otherwise preserved.
+        assert_eq!(ws.pane_tab_indices(pane), vec![1, 0, 2]);
+    }
+
+    #[test]
+    fn reorder_lands_the_tab_in_its_new_pane_and_keeps_the_invariants() {
+        let mut ws = TestWs::with_tabs(3);
+        let (left, right) = ws.split();
+        ws.tabs[2].pane = right;
+        ws.ws_layout_mut().set_active_tab(left, 1);
+        ws.ws_layout_mut().set_active_tab(right, 2);
+        // Drag tab 0 to the end of the right pane's strip.
+        ws.set_drop_gap(right, 3);
+        ws.reorder_tab(0, right);
+        // The indicator is consumed and the target pane is focused.
+        assert_eq!(ws.ws_layout().gap_in(right), None);
+        assert_eq!(ws.focused_pane(), right);
         assert_eq!(
-            pinned_first.pane_tab_indices(SplitHalf::Primary),
-            vec![1, 0, 2]
+            ws.tabs.iter().filter(|t| t.pane() == right).count(),
+            2,
+            "the dragged tab did not join the right pane"
+        );
+        // The remap keeps each pane's stored active index on a tab it owns.
+        for pane in ws.ws_layout().panes() {
+            if let Some(i) = ws.pane_active(pane) {
+                assert_eq!(ws.tabs[i].pane(), pane);
+            }
+        }
+    }
+
+    #[test]
+    fn reorder_onto_an_empty_strip_tail_appends() {
+        let mut ws = TestWs::with_tabs(2);
+        let (_left, right) = ws.split();
+        // No gap settled (the cursor never crossed a tab): the tab still lands.
+        ws.reorder_tab(0, right);
+        assert_eq!(ws.tabs[0].pane(), right);
+    }
+
+    #[test]
+    fn dropping_on_an_edge_splits_and_moves_the_tab() {
+        let mut ws = TestWs::with_tabs(2);
+        let pane = ws.focused_pane();
+        assert!(ws.drop_tab_into(0, pane, DropZone::Right));
+        let panes = ws.ws_layout().panes();
+        assert_eq!(panes.len(), 2);
+        // The dragged tab is alone in the new pane, which took focus.
+        let new = ws.focused_pane();
+        assert_ne!(new, pane);
+        assert_eq!(ws.pane_tab_indices(new).len(), 1);
+    }
+
+    #[test]
+    fn dropping_a_lone_tab_on_its_own_pane_is_a_no_op() {
+        let mut ws = TestWs::with_tabs(1);
+        let pane = ws.focused_pane();
+        // Would mint a pane and normalize it straight back away.
+        assert!(!ws.drop_tab_into(0, pane, DropZone::Right));
+        assert!(!ws.ws_layout().is_split());
+        // As is dropping a tab into the middle of the pane it already lives in.
+        assert!(!ws.drop_tab_into(0, pane, DropZone::Center));
+    }
+
+    #[test]
+    fn dropping_in_the_centre_moves_the_tab_without_splitting() {
+        let mut ws = TestWs::with_tabs(2);
+        let (_left, right) = ws.split();
+        ws.tabs[1].pane = right;
+        assert!(ws.drop_tab_into(0, right, DropZone::Center));
+        assert_eq!(ws.ws_layout().panes().len(), 1, "the emptied pane stayed");
+        assert!(ws.tabs.iter().all(|t| t.pane() == ws.focused_pane()));
+    }
+
+    #[test]
+    fn closing_a_pane_folds_its_tabs_into_the_heir() {
+        let mut ws = TestWs::with_tabs(3);
+        let (left, right) = ws.split();
+        ws.tabs[1].pane = right;
+        ws.tabs[2].pane = right;
+        assert!(ws.close_pane(right));
+        assert_eq!(ws.ws_layout().panes(), vec![left]);
+        assert!(
+            ws.tabs.iter().all(|t| t.pane() == left),
+            "closing a pane dropped its tabs"
         );
     }
 
     #[test]
-    fn reorder_lands_the_tab_in_its_new_half_and_keeps_pane_invariants() {
-        let mut ws = TestWs {
-            tabs: vec![
-                tab(SplitHalf::Primary, false),   // 0
-                tab(SplitHalf::Primary, false),   // 1 (focused primary)
-                tab(SplitHalf::Secondary, false), // 2 (focused secondary)
-            ],
-            active: 1,
-            split: Some(split(2, SplitHalf::Primary)),
-            sort_pins: false,
-            drop_target: Some(3), // drag tab 0 to the end of the Secondary strip
-        };
-        ws.reorder_tab(0, SplitHalf::Secondary);
-        // The drop indicator is consumed and the target half is focused.
-        assert_eq!(ws.ws_drop_target(), None);
-        assert_eq!(ws.split.as_ref().unwrap().focus, SplitHalf::Secondary);
-        // The dragged tab now belongs to Secondary.
-        assert!(
-            ws.tabs
-                .iter()
-                .filter(|t| t.pane() == SplitHalf::Secondary)
-                .count()
-                >= 2
-        );
-        // The remap keeps each pane's stored active index pointing at a tab that
-        // pane actually owns (the invariant that previously only held for SQL).
-        let s = ws.split.as_ref().unwrap();
-        assert_eq!(ws.tabs[ws.active].pane(), SplitHalf::Primary);
-        assert_eq!(ws.tabs[s.secondary].pane(), SplitHalf::Secondary);
+    fn split_focused_opens_a_pane_with_a_blank_tab() {
+        let mut ws = TestWs::with_tabs(1);
+        let new = ws.split_focused(DropZone::Bottom).expect("split");
+        assert_eq!(ws.focused_pane(), new);
+        assert_eq!(ws.tabs.len(), 2);
+        assert_eq!(ws.pane_tab_indices(new), vec![1]);
+    }
+
+    #[test]
+    fn unsplit_folds_every_pane_back_into_the_focused_one() {
+        let mut ws = TestWs::with_tabs(2);
+        let (_left, right) = ws.split();
+        ws.tabs[1].pane = right;
+        ws.set_focused_pane(right);
+        assert!(ws.unsplit());
+        assert_eq!(ws.ws_layout().panes(), vec![right]);
+        assert!(ws.tabs.iter().all(|t| t.pane() == right));
+        assert!(!ws.unsplit(), "unsplitting a single pane changed something");
+    }
+
+    #[test]
+    fn a_lone_tab_dropped_on_another_panes_edge_lands_in_a_new_pane() {
+        let mut ws = TestWs::with_tabs(2);
+        let (left, right) = ws.split();
+        ws.tabs[1].pane = right;
+        // The left pane's only tab, onto the right pane's outer edge.
+        assert!(ws.drop_tab_into(0, right, DropZone::Right));
+        let panes = ws.ws_layout().panes();
+        assert_eq!(panes.len(), 2, "expected the source pane to be replaced");
+        assert!(!panes.contains(&left), "the emptied source pane stayed");
+        // Each pane holds exactly one tab, and the dragged one took focus.
+        assert_eq!(ws.pane_tab_indices(ws.focused_pane()).len(), 1);
+        assert_eq!(ws.tabs[0].pane(), ws.focused_pane());
+    }
+
+    #[test]
+    fn focus_step_cycles_the_panes() {
+        let mut ws = TestWs::with_tabs(2);
+        let (left, right) = ws.split();
+        ws.tabs[1].pane = right;
+        assert_eq!(ws.focused_pane(), left);
+        assert!(ws.focus_pane_step(true));
+        assert_eq!(ws.focused_pane(), right);
+        assert!(ws.focus_pane_step(true), "focus did not wrap");
+        assert_eq!(ws.focused_pane(), left);
     }
 }
 
@@ -1266,10 +1349,10 @@ pub(crate) struct QueryTab {
     /// have a query behind it" -- which is now [`QueryTab::is_view`] in one place
     /// rather than a widening list of `!is_er() && !is_ddl() && ...` conditions.
     pub view: Option<TabView>,
-    /// Which split half owns this tab (Zed-style): each pane's tab strip shows only
-    /// its own tabs, so the two halves never duplicate. Always `Primary` while the
-    /// work area is unsplit; a drag across the divider (or `split_right`) reassigns it.
-    pub pane: SplitHalf,
+    /// Which pane owns this tab (Zed-style): each pane's tab strip shows only its
+    /// own tabs, so panes never duplicate a tab. A drag onto another pane (or
+    /// onto a pane edge, which mints one) reassigns it.
+    pub pane: PaneId,
     /// Pinned tabs render in a fixed section at the start of the strip, always
     /// visible regardless of scroll, and are skipped by the bulk close actions
     /// (Close Others / Close All / Close Left / Close Right).
@@ -1346,7 +1429,9 @@ impl QueryTab {
             watch: None,
             view: None,
             // New tabs join the focused pane; `push_tab` reassigns this when split.
-            pane: SplitHalf::Primary,
+            // Reassigned by `push_tab` to whichever pane the tab lands in; a tab
+            // is built before its destination is known.
+            pane: PaneId::FIRST,
             pinned: false,
             namespace: None,
         }
@@ -1425,11 +1510,11 @@ impl QueryTab {
 }
 
 impl WorkspaceTab for QueryTab {
-    fn pane(&self) -> SplitHalf {
+    fn pane(&self) -> PaneId {
         self.pane
     }
-    fn set_pane(&mut self, half: SplitHalf) {
-        self.pane = half;
+    fn set_pane(&mut self, pane: PaneId) {
+        self.pane = pane;
     }
     fn pinned(&self) -> bool {
         self.pinned
@@ -1447,23 +1532,11 @@ impl TabWorkspace for ActiveConn {
     fn ws_tabs_mut(&mut self) -> &mut Vec<QueryTab> {
         &mut self.tabs
     }
-    fn ws_active(&self) -> usize {
-        self.active_tab
+    fn ws_layout(&self) -> &PaneLayout {
+        &self.layout
     }
-    fn ws_set_active(&mut self, i: usize) {
-        self.active_tab = i;
-    }
-    fn ws_split(&self) -> Option<&SplitState> {
-        self.split.as_ref()
-    }
-    fn ws_split_mut(&mut self) -> &mut Option<SplitState> {
-        &mut self.split
-    }
-    fn ws_drop_target(&self) -> Option<usize> {
-        self.tab_drop_target
-    }
-    fn ws_drop_target_mut(&mut self) -> &mut Option<usize> {
-        &mut self.tab_drop_target
+    fn ws_layout_mut(&mut self) -> &mut PaneLayout {
+        &mut self.layout
     }
     // SQL renders pinned tabs in a separate strip section, so `pane_tab_indices`
     // keeps raw order (`pins_sort_first` stays the default `false`).
@@ -1498,8 +1571,6 @@ pub(crate) struct ActiveConn {
     /// When set, the Schema panel is hidden; `sidebar_w` is retained so toggling it
     /// back restores the previous width.
     pub sidebar_collapsed: bool,
-    pub editor_h: Pixels,
-    pub editor_drag: Option<DragAnchor>,
     /// Width of the cell/row detail inspector when docked to the right of the
     /// grid; retained while the inspector is closed so reopening restores it.
     pub inspector_w: Pixels,
@@ -1533,32 +1604,23 @@ pub(crate) struct ActiveConn {
     /// Whether the run bar's namespace picker is showing its option list. Flint's
     /// `Select` is caller-controlled, so the open state lives here.
     pub namespace_menu_open: bool,
-    /// Open query tabs (never empty), and the index of the focused one.
+    /// Open query tabs. May be empty: closing every tab leaves the strip bare and
+    /// the shell shows a placeholder, with the connection still open.
     pub tabs: Vec<QueryTab>,
-    pub active_tab: usize,
     /// Monotonic counter for naming blank tabs ("query 1", "query 2", …).
     pub query_seq: usize,
-    /// While a tab is being dragged, the gap (insertion index `0..=tabs.len()`)
-    /// where it would land; drives the drop indicator. Only meaningful when a
-    /// drag is active; the strip gates rendering on `has_active_drag`.
-    pub tab_drop_target: Option<usize>,
-    /// Horizontal scroll position of the tab strip, so a crowded strip scrolls
-    /// instead of squashing tabs. Persists across renders.
-    pub tab_scroll: ScrollHandle,
-    /// Focus anchors for the schema sidebar and result grid panes, so keyboard
-    /// focus can move between panes and each can receive its own navigation keys.
-    /// The editor pane focuses its own `CodeEditor` directly.
+    /// How the work area is divided, which pane has focus, and the per-pane state
+    /// (active tab, strip scroll, editor/result ratio, grid focus). One pane in
+    /// the unsplit layout.
+    pub layout: PaneLayout,
+    /// Focus anchor for the schema sidebar, so keyboard focus can move between
+    /// docks and each can receive its own navigation keys. The editor focuses its
+    /// own `CodeEditor` and each pane's grid its own handle (see
+    /// [`crate::panes::PaneUi`]).
     pub schema_focus: FocusHandle,
-    pub grid_focus: FocusHandle,
-    /// Focus anchor for the *secondary* (right) half's result grid while the work
-    /// area is split. The primary half keeps `grid_focus`; giving the second grid
-    /// its own handle keeps keyboard focus unambiguous between the two grids.
-    pub secondary_grid_focus: FocusHandle,
-    /// Which pane currently holds focus; drives focus cycling and the pane ring.
+    /// Which of the shell's three areas holds focus; drives focus cycling and the
+    /// focus ring.
     pub active_pane: Pane,
-    /// When `Some`, the work area is split into two side-by-side query panes. See
-    /// [`SplitState`]; `None` is the single-pane layout.
-    pub split: Option<SplitState>,
     /// Whether the History panel is shown in the left dock. Entries live in the
     /// centralized [`AppState::query_history`]; this is per-connection UI state.
     pub history_open: bool,
@@ -1644,6 +1706,7 @@ impl ActiveConn {
         kv_mode: crate::kvbrowse::QueryMode,
         cx: &mut Context<AppState>,
     ) -> Self {
+        let layout = PaneLayout::new();
         let tab = QueryTab::new(
             "query 1".to_string(),
             crate::sql::Dialect::of(config.kind),
@@ -1680,8 +1743,6 @@ impl ActiveConn {
             sidebar_w: px(240.),
             sidebar_drag: None,
             sidebar_collapsed: false,
-            editor_h: px(300.),
-            editor_drag: None,
             inspector_w: px(360.),
             inspector_drag: None,
             schema: SchemaState::new(kind, cx),
@@ -1690,15 +1751,10 @@ impl ActiveConn {
             enum_cache: std::collections::HashMap::new(),
             enum_requested: std::collections::HashSet::new(),
             tabs: vec![tab],
-            active_tab: 0,
             query_seq: 1,
-            tab_drop_target: None,
-            tab_scroll: ScrollHandle::new(),
+            layout,
             schema_focus: cx.focus_handle(),
-            grid_focus: cx.focus_handle(),
-            secondary_grid_focus: cx.focus_handle(),
             active_pane: Pane::Editor,
-            split: None,
             history_open: false,
             history_focus: cx.focus_handle(),
             history_sel: 0,
@@ -1725,30 +1781,29 @@ impl ActiveConn {
         }
     }
 
-    /// Point the focused half at tab `i` (a global index that already belongs to that
-    /// half; each strip shows only its own tabs, so a strip click never crosses).
+    /// Point the focused pane at tab `i` (a global index that already belongs to
+    /// that pane; each strip shows only its own tabs, so a strip click never
+    /// crosses).
     pub(crate) fn set_focused_tab(&mut self, i: usize) {
-        let half = self.focused_half();
-        self.set_pane_active(half, i);
+        let pane = self.focused_pane();
+        self.set_pane_active(pane, i);
     }
 
-    /// The focus handle for the result grid in `half`; the second half has its own
-    /// so keyboard focus never lands on both grids at once.
-    pub(crate) fn grid_focus_for(&self, half: SplitHalf) -> &FocusHandle {
-        match half {
-            SplitHalf::Primary => &self.grid_focus,
-            SplitHalf::Secondary => &self.secondary_grid_focus,
-        }
+    /// The focus handle for `pane`'s result grid; each pane has its own so
+    /// keyboard focus never lands on two grids at once. `None` before the first
+    /// frame after the pane appeared (see [`crate::panes::PaneUi::grid_focus`]).
+    pub(crate) fn grid_focus_for(&self, pane: PaneId) -> Option<&FocusHandle> {
+        self.layout.grid_focus(pane)
     }
 
-    /// The focused tab, or `None` when the strip is empty (the user closed the
+    /// The focused tab, or `None` when the pane holds none (the user closed the
     /// last tab; the shell then shows an empty pane instead of a query editor).
     pub(crate) fn active(&self) -> Option<&QueryTab> {
-        self.tabs.get(self.focused_tab_index())
+        self.tabs.get(self.focused_tab_index()?)
     }
 
     pub(crate) fn active_mut(&mut self) -> Option<&mut QueryTab> {
-        let i = self.focused_tab_index();
+        let i = self.focused_tab_index()?;
         self.tabs.get_mut(i)
     }
 

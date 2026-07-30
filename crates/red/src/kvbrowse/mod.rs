@@ -15,7 +15,7 @@ use std::time::Duration;
 
 use flint::prelude::*;
 use gpui::{
-    App, AsyncApp, Context, Entity, FocusHandle, Focusable, Hsla, ScrollHandle, Subscription,
+    App, AsyncApp, Context, Entity, FocusHandle, Focusable, Hsla, Subscription,
     UniformListScrollHandle, WeakEntity, Window, div, prelude::*, px, relative,
 };
 use red_core::kv::{
@@ -24,9 +24,8 @@ use red_core::kv::{
 };
 use red_service::{Command, SessionId};
 
-use crate::app::{
-    AppState, Phase, SplitHalf, SplitState, SplitWorkspace, TabWorkspace, WorkspaceTab,
-};
+use crate::app::{AppState, Phase, SplitWorkspace, TabWorkspace, WorkspaceTab};
+use crate::panes::{PaneId, PaneLayout};
 mod analysis;
 mod inspector;
 mod render;
@@ -645,10 +644,9 @@ pub(crate) struct RedisTab {
     pub(crate) id: u64,
     pub(crate) title: String,
     pub(crate) state: RedisTabState,
-    /// Which split half this tab belongs to (mirrors the SQL side). Always
-    /// `Primary` in the single-pane layout.
-    pub(crate) pane: SplitHalf,
-    /// Pinned tabs sort ahead of the rest in their half's strip.
+    /// Which pane this tab belongs to (mirrors the SQL side).
+    pub(crate) pane: PaneId,
+    /// Pinned tabs sort ahead of the rest in their pane's strip.
     pub(crate) pinned: bool,
 }
 
@@ -657,8 +655,6 @@ pub(crate) struct RedisTab {
 /// `ActiveConn` for a Redis session only (`None` for a SQL one).
 pub(crate) struct RedisView {
     pub(crate) tabs: Vec<RedisTab>,
-    /// Index into `tabs` of the visible tab. Kept in range by every close.
-    pub(crate) active_tab: usize,
     /// Monotonic id source for `RedisTab::id`.
     pub(crate) tab_seq: u64,
     /// `DBSIZE`, fetched once at connect.
@@ -666,14 +662,9 @@ pub(crate) struct RedisView {
     /// Recently-viewed keys, newest-first (browser-history for the keyspace),
     /// shown in the History dock's Keys section.
     pub(crate) recent_keys: Vec<RecentKey>,
-    /// Horizontal scroll for the tab strip (mirrors the SQL `ActiveConn::tab_scroll`).
-    pub(crate) tab_scroll: ScrollHandle,
-    /// The gap a dragged tab would land in during a reorder, or `None`.
-    pub(crate) tab_drop_target: Option<usize>,
-    /// The side-by-side split (reuses the SQL side's [`SplitState`]); `None` is the
-    /// ordinary single-pane layout. `active_tab` is the Primary half's active tab;
-    /// `split.secondary` the Secondary half's.
-    pub(crate) split: Option<SplitState>,
+    /// How the work area is divided, which pane has focus, and the per-pane
+    /// state (active tab, strip scroll). Shared with the SQL and MongoDB sides.
+    pub(crate) layout: PaneLayout,
     /// The tab whose right-click context menu is open, as `(id, position)`.
     pub(crate) tab_menu: Option<(u64, gpui::Point<gpui::Pixels>)>,
     /// The key whose right-click context menu is open (from either the live
@@ -1352,11 +1343,11 @@ impl RedisTabState {
 }
 
 impl WorkspaceTab for RedisTab {
-    fn pane(&self) -> SplitHalf {
+    fn pane(&self) -> PaneId {
         self.pane
     }
-    fn set_pane(&mut self, half: SplitHalf) {
-        self.pane = half;
+    fn set_pane(&mut self, pane: PaneId) {
+        self.pane = pane;
     }
     fn pinned(&self) -> bool {
         self.pinned
@@ -1374,23 +1365,11 @@ impl TabWorkspace for RedisView {
     fn ws_tabs_mut(&mut self) -> &mut Vec<RedisTab> {
         &mut self.tabs
     }
-    fn ws_active(&self) -> usize {
-        self.active_tab
+    fn ws_layout(&self) -> &PaneLayout {
+        &self.layout
     }
-    fn ws_set_active(&mut self, i: usize) {
-        self.active_tab = i;
-    }
-    fn ws_split(&self) -> Option<&SplitState> {
-        self.split.as_ref()
-    }
-    fn ws_split_mut(&mut self) -> &mut Option<SplitState> {
-        &mut self.split
-    }
-    fn ws_drop_target(&self) -> Option<usize> {
-        self.tab_drop_target
-    }
-    fn ws_drop_target_mut(&mut self) -> &mut Option<usize> {
-        &mut self.tab_drop_target
+    fn ws_layout_mut(&mut self) -> &mut PaneLayout {
+        &mut self.layout
     }
     /// Redis has no separate pinned strip section, so pinned tabs sort ahead
     /// within their pane's strip.
@@ -1400,20 +1379,17 @@ impl TabWorkspace for RedisView {
 }
 
 impl SplitWorkspace for RedisView {
-    fn push_blank_tab(&mut self, half: SplitHalf) -> usize {
+    fn push_blank_tab(&mut self, pane: PaneId) -> usize {
         let id = self.tab_seq;
         self.tab_seq += 1;
         self.tabs.push(RedisTab {
             id,
             title: "New tab".to_string(),
             state: RedisTabState::Empty,
-            pane: half,
+            pane,
             pinned: false,
         });
         self.tabs.len() - 1
-    }
-    fn split_default_width(&self) -> gpui::Pixels {
-        px(520.)
     }
     fn clear_tab_menu(&mut self) {
         self.tab_menu = None;
@@ -1432,16 +1408,13 @@ impl RedisView {
                 id: 0,
                 title: KvPanel::Browse.label().to_string(),
                 state: browse,
-                pane: SplitHalf::Primary,
+                pane: PaneId::FIRST,
                 pinned: false,
             }],
-            active_tab: 0,
             tab_seq: 1,
             db_size: None,
             recent_keys: Vec::new(),
-            tab_scroll: ScrollHandle::new(),
-            tab_drop_target: None,
-            split: None,
+            layout: PaneLayout::new(),
             tab_menu: None,
             key_menu: None,
             annotate: None,
@@ -1516,10 +1489,10 @@ impl RedisView {
     // --- active-tab accessors (UI actions target the visible tab) ---
 
     pub(crate) fn active_state(&self) -> Option<&RedisTabState> {
-        self.tabs.get(self.focused_tab_index()).map(|t| &t.state)
+        self.tabs.get(self.focused_tab_index()?).map(|t| &t.state)
     }
     pub(crate) fn active_state_mut(&mut self) -> Option<&mut RedisTabState> {
-        let i = self.focused_tab_index();
+        let i = self.focused_tab_index()?;
         self.tabs.get_mut(i).map(|t| &mut t.state)
     }
     pub(crate) fn active_browse(&self) -> Option<&BrowseState> {
@@ -1895,7 +1868,11 @@ impl AppState {
         let id = self
             .conn_mut(Some(session))
             .and_then(|a| a.kv_view.as_ref())
-            .and_then(|v| v.tabs.get(v.focused_tab_index()).map(|t| t.id));
+            .and_then(|v| {
+                v.focused_tab_index()
+                    .and_then(|i| v.tabs.get(i))
+                    .map(|t| t.id)
+            });
         let Some(id) = id else {
             return;
         };
@@ -2381,7 +2358,11 @@ impl AppState {
         let tab_id = self
             .conn_mut(Some(session))
             .and_then(|a| a.kv_view.as_ref())
-            .and_then(|v| v.tabs.get(v.focused_tab_index()).map(|t| t.id));
+            .and_then(|v| {
+                v.focused_tab_index()
+                    .and_then(|i| v.tabs.get(i))
+                    .map(|t| t.id)
+            });
         if let Some(browse) = self
             .conn_mut(Some(session))
             .and_then(|a| a.kv_view.as_mut())
