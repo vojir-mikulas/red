@@ -2,6 +2,7 @@
 //! Parallel to the SQL-shaped `ResultPage`/`RowWindow`/`KeySpec` in `lib.rs`,
 //! but nothing here assumes a table/column model or an orderable key.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use crate::Value;
@@ -1036,9 +1037,224 @@ fn namespace_of(key: &str) -> &str {
     }
 }
 
+/// One inferred key *template* and the sampled keys that match it, from
+/// [`infer_key_templates`]. A Redis keyspace has no schema, but it almost always
+/// has a shape (`user:{id}:sessions`, `cache:v2:product:{sku}`); this is that
+/// shape, made explicit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyTemplate {
+    /// Segments joined by `:`, with each variable segment written `*`.
+    pub pattern: String,
+    pub count: u64,
+    pub bytes: u64,
+    /// Types seen under this template, most common first. More than one entry
+    /// means the template covers keys of mixed type, which is usually a bug in
+    /// the naming rather than an intent.
+    pub types: Vec<(String, u64)>,
+    /// How many matched keys carry an expiry.
+    pub with_ttl: u64,
+    /// The median remaining expiry of the keys that carry one. Median rather
+    /// than mean because a countdown sample is dominated by where in their life
+    /// the keys happen to be, and one just-refreshed key would drag a mean.
+    pub median_ttl: Option<Duration>,
+}
+
+/// How many distinct values a segment position may take before it is read as a
+/// variable rather than a literal. Above this, enumerating the branch would
+/// produce one template per key, which is the noise the rollup exists to remove.
+const TEMPLATE_MAX_FANOUT: usize = 12;
+
+/// How deep the segmentation walks before treating the rest of a key as one
+/// variable tail. A key with more colons than this is pathological, and the
+/// extra levels add no structure a reader would act on.
+const TEMPLATE_MAX_DEPTH: usize = 8;
+
+/// Infer the key templates of a sampled keyspace: segment each key on `:`,
+/// classify each segment position as literal or variable by how many distinct
+/// values it takes, and roll the keys up under the resulting patterns.
+///
+/// This is the structural grounding the SQL seam gets free from
+/// `information_schema` and Redis has to derive, so it is deliberately
+/// conservative: a position is only collapsed to `*` when enumerating it would
+/// produce roughly one branch per key ([`TEMPLATE_MAX_FANOUT`], or a distinct
+/// count that is most of the rows). A keyspace of flat, delimiter-less keys
+/// therefore rolls into a single `*` bucket rather than one template per key.
+///
+/// Pure and UI-free like [`analyze_keyspace`], and bounded by `max_templates`
+/// (largest first); the caller reports the truncation.
+pub fn infer_key_templates(keys: &[KeyMeta], max_templates: usize) -> Vec<KeyTemplate> {
+    let segmented: Vec<KeySegments<'_>> = keys
+        .iter()
+        .map(|meta| KeySegments {
+            segments: meta.key.split(':').collect(),
+            meta,
+        })
+        .collect();
+    let rows: Vec<&KeySegments<'_>> = segmented.iter().collect();
+    let mut out = Vec::new();
+    walk_templates(&rows, 0, &mut Vec::new(), &mut out);
+    // Biggest first, pattern as a stable tiebreak so two runs of the same sample
+    // list the same way.
+    out.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| a.pattern.cmp(&b.pattern))
+    });
+    out.truncate(max_templates);
+    out
+}
+
+/// One sampled key pre-split on `:`, so the recursive walk segments each key
+/// once rather than per level.
+struct KeySegments<'a> {
+    segments: Vec<&'a str>,
+    meta: &'a KeyMeta,
+}
+
+/// Recursive half of [`infer_key_templates`]: classify segment position `depth`
+/// across `rows`, then recurse per literal branch (or once, for a variable).
+fn walk_templates(
+    rows: &[&KeySegments<'_>],
+    depth: usize,
+    prefix: &mut Vec<String>,
+    out: &mut Vec<KeyTemplate>,
+) {
+    // Keys that end exactly here form a template of their own: `user:1` and
+    // `user:1:sessions` are different shapes even though one prefixes the other.
+    let (terminal, deeper): (Vec<_>, Vec<_>) = rows
+        .iter()
+        .copied()
+        .partition(|row| row.segments.len() <= depth);
+    if !terminal.is_empty() {
+        out.push(summarize_template(prefix.join(":"), &terminal));
+    }
+    if deeper.is_empty() {
+        return;
+    }
+    if depth >= TEMPLATE_MAX_DEPTH {
+        prefix.push("*".into());
+        out.push(summarize_template(prefix.join(":"), &deeper));
+        prefix.pop();
+        return;
+    }
+    let mut groups: BTreeMap<&str, Vec<&KeySegments<'_>>> = BTreeMap::new();
+    for row in &deeper {
+        groups.entry(row.segments[depth]).or_default().push(row);
+    }
+    if is_variable_position(groups.len(), deeper.len()) {
+        prefix.push("*".into());
+        walk_templates(&deeper, depth + 1, prefix, out);
+        prefix.pop();
+    } else {
+        for (segment, group) in groups {
+            prefix.push(segment.to_string());
+            walk_templates(&group, depth + 1, prefix, out);
+            prefix.pop();
+        }
+    }
+}
+
+/// Whether a segment position holding `distinct` values across `total` keys is a
+/// variable. Either it fans out past what a reader would scan, or its distinct
+/// count is most of the rows — the signature of an id rather than a name.
+fn is_variable_position(distinct: usize, total: usize) -> bool {
+    distinct > TEMPLATE_MAX_FANOUT || (distinct >= 2 && distinct * 3 >= total * 2)
+}
+
+fn summarize_template(pattern: String, rows: &[&KeySegments<'_>]) -> KeyTemplate {
+    let mut bytes = 0u64;
+    let mut by_type: BTreeMap<&str, u64> = BTreeMap::new();
+    let mut ttls: Vec<Duration> = Vec::new();
+    for meta in rows.iter().map(|row| row.meta) {
+        bytes = bytes.saturating_add(meta.approx_bytes);
+        *by_type.entry(meta.kv_type.label()).or_default() += 1;
+        if let Some(d) = meta.ttl {
+            ttls.push(d);
+        }
+    }
+    let mut types: Vec<(String, u64)> = by_type
+        .into_iter()
+        .map(|(t, n)| (t.to_string(), n))
+        .collect();
+    types.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ttls.sort();
+    KeyTemplate {
+        pattern: if pattern.is_empty() {
+            NO_PREFIX_LABEL.to_string()
+        } else {
+            pattern
+        },
+        count: rows.len() as u64,
+        bytes,
+        types,
+        with_ttl: ttls.len() as u64,
+        median_ttl: ttls.get(ttls.len() / 2).copied(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn key_templates_collapse_ids_and_keep_literals() {
+        let mut keys = Vec::new();
+        for id in 0..40 {
+            keys.push(meta(
+                &format!("user:{id}:sessions"),
+                KvType::Set,
+                Some(Duration::from_secs(86_400)),
+                100,
+            ));
+            keys.push(meta(
+                &format!("cache:v2:product:{id}"),
+                KvType::String,
+                None,
+                200,
+            ));
+        }
+        let templates = infer_key_templates(&keys, 10);
+        let patterns: Vec<&str> = templates.iter().map(|t| t.pattern.as_str()).collect();
+        assert_eq!(patterns, ["cache:v2:product:*", "user:*:sessions"]);
+
+        let sessions = &templates[1];
+        assert_eq!(sessions.count, 40);
+        // A high-cardinality position collapses; the literal `sessions` tail does not.
+        assert_eq!(sessions.types, [("set".to_string(), 40)]);
+        assert_eq!(sessions.with_ttl, 40);
+        assert_eq!(sessions.median_ttl, Some(Duration::from_secs(86_400)));
+        // `cache:v2:product:*` keeps both literal segments and reports no expiry.
+        assert_eq!(templates[0].with_ttl, 0);
+        assert_eq!(templates[0].median_ttl, None);
+    }
+
+    /// A keyspace with no `:` structure must roll into ONE bucket. Emitting a
+    /// template per key would be noise dressed as structure.
+    #[test]
+    fn key_templates_flatten_a_delimiterless_keyspace() {
+        let keys: Vec<KeyMeta> = (0..25)
+            .map(|i| meta(&format!("flat{i}"), KvType::String, None, 8))
+            .collect();
+        let templates = infer_key_templates(&keys, 10);
+        assert_eq!(templates.len(), 1);
+        assert_eq!(templates[0].pattern, "*");
+        assert_eq!(templates[0].count, 25);
+    }
+
+    /// Keys that end at different depths are different shapes, even when one
+    /// prefixes the other.
+    #[test]
+    fn key_templates_split_by_arity() {
+        let mut keys: Vec<KeyMeta> = (0..20)
+            .map(|i| meta(&format!("job:{i}"), KvType::Hash, None, 10))
+            .collect();
+        keys.extend((0..20).map(|i| meta(&format!("job:{i}:log"), KvType::List, None, 10)));
+        let patterns: Vec<String> = infer_key_templates(&keys, 10)
+            .into_iter()
+            .map(|t| t.pattern)
+            .collect();
+        assert_eq!(patterns, ["job:*", "job:*:log"]);
+    }
 
     #[test]
     fn tokenize_splits_on_whitespace() {

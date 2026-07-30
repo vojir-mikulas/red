@@ -19,18 +19,19 @@ use red_ai::{
     AiProvider, CancelToken, ContentBlock, Message, Role, StopReason, ToolDef, TurnRequest,
 };
 use red_core::doc::{
-    CollKind, DocPlan, DocSchema, DocUpdate, DocValue, DocWrite, Document, FindQuery, IndexInfo,
-    IndexSpec, OpClass, classify_doc_op, pipeline_write_stage, server_js_operator,
+    CollKind, DocPlan, DocSchema, DocType, DocUpdate, DocValue, DocWrite, Document, FindQuery,
+    IndexInfo, IndexSpec, OpClass, classify_doc_op, pipeline_write_stage, server_js_operator,
 };
 use red_core::kv::{
-    KeyMeta, KvCollection, KvValue, RespValue, ScanBudget, ScanCursor, analyze_keyspace,
+    KeyMeta, KeyTemplate, KvCollection, KvValue, RespValue, ScanBudget, ScanCursor, StringTtl,
+    analyze_keyspace, infer_key_templates,
 };
 // The read gate below and the write gate in `write_shape` share their stripping,
 // their whole-word test, and their token lists with the UI's own gates, so a fix to
 // one can't leave the others behind.
 use red_core::sql::{DANGEROUS_FNS, Dialect, WRITE_TOKENS, has_word, strip_noise};
 use red_core::{
-    ActivityKind, ActivityStatus, AiLimits, AiPolicy, AiTier, RedError, TableRef, Value,
+    ActivityKind, ActivityStatus, AiLimits, AiPolicy, AiTier, FkEdge, RedError, TableRef, Value,
 };
 use red_driver::{AbortSignal, DatabaseDriver, DocDriver, KvDriver, PageCap};
 use serde_json::{Value as Json, json};
@@ -987,6 +988,50 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "object_ddl".into(),
+            description: "The object's REAL definition, as SQL. describe_table gives columns, keys \
+                and indexes but silently drops check constraints, defaults, generated-column \
+                expressions, view bodies and trigger source. Call this when the question is \"why \
+                does this insert fail\", \"what does this view actually do\", or \"what does this \
+                trigger/function contain\" — the DDL is the answer. Nothing is executed."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "schema": { "type": "string", "description": "Schema/namespace name, as reported by list_schema." },
+                    "name": { "type": "string", "description": "The object's name." },
+                    "kind": {
+                        "type": "string",
+                        "enum": ["table", "view", "matview", "function", "procedure", "trigger", "sequence", "type"],
+                        "description": "The object kind (default \"table\").",
+                    },
+                },
+                "required": ["schema", "name"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "relationship_map".into(),
+            description: "The database's foreign-key graph in ONE call: every declared FK edge as \
+                `child.column -> parent.column`, plus the tables nothing references and that \
+                reference nothing. CALL THIS BEFORE WRITING ANY QUERY THAT JOINS MORE THAN ONE \
+                TABLE — it is the verified join graph, so you never have to guess a join key from \
+                a column name. Omit both arguments for the whole database."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "schema": { "type": "string", "description": "Restrict to one schema/namespace; omit for all." },
+                    "tables": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Restrict to edges touching these tables (either side); omit for all.",
+                    },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
             name: "profile_table".into(),
             description: "Profile one table's data: per-column null counts and ratios, distinct \
                 counts (with unique-key and constant-column hints), and min/max (plus sum/avg for \
@@ -1027,19 +1072,160 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "search_data".into(),
+            description: format!(
+                "Find rows anywhere in a table containing `term`, without writing a WHERE clause: \
+                it builds a case-insensitive contains-match across every searchable column and \
+                returns up to {max_rows} matching rows. Use it for \"where is this value\", \
+                \"which row mentions X\", or when you know a value but not which column holds it. \
+                Binary/blob columns are skipped."
+            ),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "schema": { "type": "string", "description": "Schema/namespace name, as reported by list_schema." },
+                    "table": { "type": "string", "description": "The table to search." },
+                    "term": { "type": "string", "description": "The text to look for (matched case-insensitively as a substring)." },
+                    "limit": {
+                        "type": "integer",
+                        "description": format!("Max rows to return (1..{max_rows})."),
+                    },
+                },
+                "required": ["schema", "table", "term"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
             name: "explain".into(),
-            description: "Return the query planner's EXPLAIN output for a SQL statement (it does \
-                not execute the statement). Use this to reason about performance."
+            description: "Return the query planner's EXPLAIN output for a SQL statement. By \
+                default it only PLANS (nothing executes). Pass `analyze: true` to run the \
+                statement and get actual row counts and timings beside the estimates — that \
+                comparison is what makes plan reasoning real, and it is the way to prove a bad \
+                cardinality estimate. Because EXPLAIN ANALYZE executes, it is allowed for \
+                read-only statements ONLY; anything that could write is refused outright."
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "sql": { "type": "string", "description": "The SQL to explain." },
+                    "analyze": {
+                        "type": "boolean",
+                        "description": "Run the statement to collect actuals (read-only statements only). Default false.",
+                    },
                 },
                 "required": ["sql"],
                 "additionalProperties": false,
             }),
         },
+        ToolDef {
+            name: "health_report".into(),
+            description: "A bounded health snapshot of the connection: total and per-table sizes \
+                (largest first), plus the findings the engine's catalog supports — unused and \
+                redundant indexes, foreign keys with no index on the child side, tables with no \
+                primary key, dead tuples/bloat, sequential-scan-heavy tables. It also lists the \
+                checks that could NOT run here, so \"no findings\" is never mistaken for a clean \
+                bill of health. Every query inside is a bounded catalog read, not a scan. Pair \
+                with server_sessions for \"why is this database slow\": this one answers the \
+                structural half."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "schema": { "type": "string", "description": "Restrict the report to one schema/namespace; omit for the whole connection." },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "server_sessions".into(),
+            description: "What the server is doing RIGHT NOW: the live sessions longest-running \
+                first, with their user, database, state, wait, elapsed time, running statement, \
+                and which sessions block which. This is the \"why is it slow right now\" half \
+                that health_report cannot answer — a blocked-on-lock wait tree looks nothing \
+                like a missing index."
+                .into(),
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "diff_schema".into(),
+            description: "Compare the STRUCTURE of two schemas in this connection: which objects \
+                exist on one side only, and per shared table which columns/indexes/foreign keys \
+                were added, removed, or changed. Use it for \"what is different between staging \
+                and production\" when both live here. Nothing is executed; the differences come \
+                back as text."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "left": { "type": "string", "description": "The baseline schema/namespace." },
+                    "right": { "type": "string", "description": "The schema/namespace to compare against it." },
+                    "tables": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Restrict the comparison to these tables; omit for all.",
+                    },
+                },
+                "required": ["left", "right"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "diff_data".into(),
+            description: "Compare the ROWS of two tables in this connection, aligned on a key \
+                column: which keys are only on one side, and which shared keys have differing \
+                values (and in which columns). Both tables are read key-ordered and merge-walked, \
+                so nothing is materialized. Use it for \"did the copy land\", \"what drifted\", \
+                \"which rows differ\"."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "left_schema": { "type": "string", "description": "Schema of the baseline table." },
+                    "left_table": { "type": "string", "description": "The baseline table." },
+                    "right_schema": { "type": "string", "description": "Schema of the table to compare against it." },
+                    "right_table": { "type": "string", "description": "The table to compare against it." },
+                    "key": { "type": "string", "description": "The column to align on; omit to use the baseline's single-column primary key." },
+                },
+                "required": ["left_table", "right_table"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "suggest_index".into(),
+            description: "Given a query, decide whether an index would help and emit the CREATE \
+                INDEX statement to consider — as TEXT, for the user to read. It explains the \
+                query, and if the plan scans, reads the table's existing indexes and columns so \
+                the suggestion does not duplicate one that already exists. It does NOT create \
+                anything; create_index does that, behind approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "sql": { "type": "string", "description": "The slow SELECT to advise on." },
+                    "schema": { "type": "string", "description": "Schema of the table the query filters (for the existing-index check)." },
+                    "table": { "type": "string", "description": "The table the query filters." },
+                },
+                "required": ["sql", "table"],
+                "additionalProperties": false,
+            }),
+        },
+        export_tool_def(
+            "Stream a read-only query's WHOLE result to a file for the user (CSV, JSON, SQL \
+             INSERTs, or a standalone HTML table) and hand it over as a card in the chat they can \
+             open. Unlike run_select this is not row-capped — the rows go to a file, not to you — \
+             so use it when the user asks for an export/download/dump rather than an answer. Only \
+             SELECT/WITH queries are accepted.",
+            json!({
+                "sql": { "type": "string", "description": "A single SELECT/WITH query whose full result is written." },
+                "format": {
+                    "type": "string",
+                    "enum": ["csv", "json", "sql", "html"],
+                    "description": "Output format (default \"csv\").",
+                },
+                "name": { "type": "string", "description": "A short name for the file, e.g. \"monthly-revenue\"." },
+            }),
+            &["sql"],
+        ),
         report_tool_def(),
         ToolDef {
             name: "open_query".into(),
@@ -1078,6 +1264,58 @@ pub(crate) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             }),
         },
         spawn_subagent_tool_def(),
+        ToolDef {
+            name: "create_index".into(),
+            description: "Create an index, behind the user's explicit approval. This is the one \
+                DDL the agent may run: an index is ADDITIVE and reversible, unlike \
+                DROP/TRUNCATE/ALTER, which stay blocked. Read suggest_index and describe_table \
+                first — building an index on a large table locks and loads the server, so say how \
+                big the table is when you propose it."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "schema": { "type": "string", "description": "Schema/namespace of the table." },
+                    "table": { "type": "string", "description": "The table to index." },
+                    "name": { "type": "string", "description": "The index name." },
+                    "columns": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "The columns to index, in order.",
+                        "minItems": 1,
+                    },
+                    "unique": { "type": "boolean", "description": "Create a UNIQUE index. Default false." },
+                },
+                "required": ["table", "name", "columns"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kill_session".into(),
+            description: "Stop a running server session: `cancel` stops its current statement and \
+                keeps the session, `terminate` drops the whole session and ROLLS BACK its open \
+                transaction. Call server_sessions first to get the `key`, and copy that session's \
+                `user` and `statement` into this call so the user can see what they are stopping — \
+                the target is re-checked against the live server before anything happens, and the \
+                kill is refused if the session has been recycled meanwhile. Requires the user's \
+                explicit approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "The session key from server_sessions." },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["cancel", "terminate"],
+                        "description": "\"cancel\" stops the statement; \"terminate\" drops the session (rolls back its transaction). Default \"cancel\".",
+                    },
+                    "user": { "type": "string", "description": "The session's user, copied from server_sessions; verified before the kill." },
+                    "statement": { "type": "string", "description": "The session's running statement, copied from server_sessions, so the approval shows what is being stopped." },
+                },
+                "required": ["key"],
+                "additionalProperties": false,
+            }),
+        },
         ToolDef {
             name: "propose_write".into(),
             description: "Execute a SINGLE data-modifying statement: INSERT, UPDATE, or DELETE. \
@@ -1146,6 +1384,7 @@ fn summarize_tool_args(name: &str, input: &Json) -> Option<String> {
         "run_select" | "explain" | "propose_write" => input.get("sql")?.as_str()?,
         "describe_table" | "profile_table" => input.get("table").and_then(Json::as_str)?,
         "save_query" => input.get("name").and_then(Json::as_str)?,
+        "kv_set" | "kv_key_info" | "kv_get_value" => input.get("key").and_then(Json::as_str)?,
         _ => return None,
     };
     let line = salient.split('\n').find(|l| !l.trim().is_empty())?.trim();
@@ -1220,6 +1459,24 @@ fn spawn_subagent_tool_def() -> ToolDef {
                 "task": { "type": "string", "description": "A single, self-contained read-only task for the subagent, with all needed context." },
             },
             "required": ["task"],
+            "additionalProperties": false,
+        }),
+    }
+}
+
+/// The `export_result` tool definition. One name across all three seams, since
+/// "write this out to a file for me" is the same request everywhere, but each
+/// passes its own `description` and arguments: SQL exports a query, Redis a set
+/// of keys, MongoDB a collection, and pretending those take the same parameters
+/// would produce a schema nobody could call.
+fn export_tool_def(description: &str, properties: Json, required: &[&str]) -> ToolDef {
+    ToolDef {
+        name: "export_result".into(),
+        description: description.into(),
+        input_schema: json!({
+            "type": "object",
+            "properties": properties,
+            "required": required,
             "additionalProperties": false,
         }),
     }
@@ -1360,6 +1617,107 @@ fn run_generate_report(input: &Json, report: &ReportSink) -> (String, bool) {
     }
 }
 
+/// Resolve a model-supplied export name to a path inside the assistant's own
+/// output folder.
+///
+/// Only the *stem* is taken, sanitized to `[A-Za-z0-9._-]` and length-capped,
+/// then suffixed with a fresh UUID. A tool argument therefore cannot escape the
+/// folder (no `..`, no absolute path, no separator survives), cannot clobber an
+/// existing file, and cannot choose the extension — the format decides that.
+fn export_path(sink: &ReportSink, name: Option<&str>, ext: &str) -> PathBuf {
+    let stem: String = name
+        .unwrap_or("")
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-') {
+                c
+            } else {
+                '-'
+            }
+        })
+        .take(48)
+        .collect();
+    let stem = stem.trim_matches(['-', '.']).to_string();
+    let label = if stem.is_empty() {
+        String::new()
+    } else {
+        format!("{stem}-")
+    };
+    sink.output_dir().join(format!(
+        "red-export-{label}{}.{ext}",
+        uuid::Uuid::new_v4().simple()
+    ))
+}
+
+/// Parse the `format` argument of a SQL `export_result`.
+fn export_format(input: &Json) -> Result<(red_core::ExportFormat, &'static str), String> {
+    match input.get("format").and_then(Json::as_str).unwrap_or("csv") {
+        "csv" => Ok((red_core::ExportFormat::Csv, "csv")),
+        "json" => Ok((red_core::ExportFormat::Json, "json")),
+        "sql" => Ok((red_core::ExportFormat::Sql, "sql")),
+        "html" => Ok((red_core::ExportFormat::Html, "html")),
+        other => Err(format!(
+            "export format must be csv/json/sql/html, not `{other}`"
+        )),
+    }
+}
+
+/// Stream a read-only query's whole result to a file for the user.
+///
+/// Unlike `run_select` this is **not** row-capped: the rows go to disk, not into
+/// the model's context, and the driver's export streams row by row without ever
+/// materializing the result. The read gate still applies — an export is a read,
+/// and `is_read_only_select` is what makes that true.
+async fn export_result(
+    driver: &Arc<dyn DatabaseDriver>,
+    dialect: Dialect,
+    input: &Json,
+    sink: &ReportSink,
+) -> (String, bool) {
+    use std::sync::atomic::AtomicBool;
+
+    let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
+    if !is_read_only_select(sql, dialect) {
+        return (
+            "error: export_result runs a single SELECT or WITH...SELECT query; anything else is \
+             rejected"
+                .into(),
+            false,
+        );
+    }
+    let (format, ext) = match export_format(input) {
+        Ok(f) => f,
+        Err(why) => return (format!("error: {why}"), false),
+    };
+    let path = export_path(sink, input.get("name").and_then(Json::as_str), ext);
+    // The driver's export reports progress on a channel and honours a cancel flag;
+    // neither has a job here (there is no toast to update and no Cancel button),
+    // so the flag stays clear and the receiver is dropped immediately.
+    let (progress, _rx) = tokio::sync::mpsc::unbounded_channel();
+    match driver
+        .export(
+            sql,
+            &path,
+            format,
+            Arc::new(AtomicBool::new(false)),
+            progress,
+        )
+        .await
+    {
+        Ok(rows) => {
+            sink.announce(&path, Some(&format!("Export ({rows} rows)")));
+            (
+                format!(
+                    "Wrote {rows} row(s) to {}. It is now a card in the chat the user can open.",
+                    path.display()
+                ),
+                true,
+            )
+        }
+        Err(e) => (format!("error: the export failed: {e}"), false),
+    }
+}
+
 // --- Redis (KV) agent backend ---
 
 /// Round-trip cap on a bounded keyspace walk, so a `kv_scan_keys`/sample never
@@ -1375,6 +1733,12 @@ const KV_VALUE_ELEMS: usize = 50;
 /// Max keys a single bulk write (kv_delete/kv_expire by pattern) touches per call;
 /// past this it reports the bound was hit so the agent can run again.
 const KV_BULK_MAX: usize = 50_000;
+/// Ceiling on the pending entries `kv_stream_groups` lists for one group. The
+/// PEL of a stuck consumer can be enormous; the oldest few show the pattern.
+const KV_PENDING_MAX: usize = 100;
+/// How many key templates `kv_key_schema` reports. A real keyspace has a handful
+/// of shapes; past this the rollup has stopped rolling anything up.
+const KV_TEMPLATE_TOP: usize = 40;
 
 /// The Redis agent's read-only tool catalog, gated by tier via
 /// [`AiTier::allows_tool`] exactly like the SQL [`tool_catalog`]. Redis writes
@@ -1383,9 +1747,11 @@ pub(crate) fn kv_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
     let all = [
         ToolDef {
             name: "kv_server_info".into(),
-            description: "Summarize the server's INFO: version, memory (used/max/fragmentation), \
-                connected clients, ops/sec, keyspace hit rate, evictions/expirations, uptime, and \
-                per-database key counts. Call this first to understand the server's health and size."
+            description: "Summarize the server: TOPOLOGY (standalone/sentinel/cluster), total key \
+                count, version, memory (used/max/fragmentation), connected clients, ops/sec, \
+                keyspace hit rate, evictions/expirations, uptime, and per-database key counts. \
+                CALL THIS FIRST — a SCAN means something different on a cluster (it fans out \
+                across slots), so the topology frames every other answer."
                 .into(),
             input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
@@ -1400,6 +1766,22 @@ pub(crate) fn kv_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                 "properties": {
                     "pattern": { "type": "string", "description": "Glob MATCH pattern (default `*`, all keys)." },
                     "limit": { "type": "integer", "description": "Max keys to return." },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_key_schema".into(),
+            description: "Infer the keyspace's STRUCTURE: sample keys, segment each on `:`, and \
+                report the key templates behind them (`user:*:sessions`, `cache:v2:product:*`) \
+                with each one's key count, type, average size, and TTL coverage. Redis has no \
+                schema, so the key template IS the schema — CALL THIS BEFORE REASONING ABOUT WHAT \
+                THE KEYSPACE HOLDS, rather than guessing patterns and scanning for them."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "pattern": { "type": "string", "description": "Optional glob to restrict the sample (e.g. `cache:*`)." },
                 },
                 "additionalProperties": false,
             }),
@@ -1428,6 +1810,85 @@ pub(crate) fn kv_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                 "required": ["key"],
                 "additionalProperties": false,
             }),
+        },
+        ToolDef {
+            name: "kv_read_collection".into(),
+            description: "Page DEEP into one big key's contents, past the preview kv_get_value \
+                stops at: hash fields, set/zset members (cursor-paged), list elements (a head or \
+                tail window), or stream entries (newest-first by ID range). Use this when the \
+                preview says the collection is larger than what it showed. Echo the `next_cursor` \
+                / `next_before` from the previous page to continue."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "The exact key name." },
+                    "cursor": { "type": "string", "description": "Hash/set/zset: the previous page's next_cursor (omit to start)." },
+                    "before": { "type": "string", "description": "Stream: the previous page's next_before, to walk older (omit to start at the newest)." },
+                    "from_tail": { "type": "boolean", "description": "List: read the tail rather than the head. Default false." },
+                    "limit": { "type": "integer", "description": "Max elements to return." },
+                },
+                "required": ["key"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_stream_groups".into(),
+            description: "A stream's CONSUMER GROUPS: per group, its consumer count, pending \
+                (delivered-but-unacked) entries, lag behind the tip, and last-delivered id. Pass \
+                `group` to drill into that group's consumers (each with its pending count and \
+                idle time) and its oldest pending entries. This is the answer to \"why is my \
+                consumer lagging\", \"who owns these pending messages\", and \"is anything \
+                stuck\" — a high delivery count with a large idle time is a stuck entry."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "The stream key." },
+                    "group": { "type": "string", "description": "Drill into this group's consumers and pending entries." },
+                },
+                "required": ["key"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_keyspace_notifications".into(),
+            description: "Read the server's `notify-keyspace-events` setting. An empty value means \
+                keyspace notifications are OFF and no watcher will ever see anything — the first \
+                thing to check when a subscriber reports silence."
+                .into(),
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
+            name: "kv_command".into(),
+            description: "Run one INTROSPECTION command verbatim. Deliberately restricted to a \
+                hard allowlist of read-only verbs — INFO, MEMORY, OBJECT, TYPE, TTL, PTTL, \
+                EXISTS, STRLEN, LATENCY, COMMAND, DBSIZE, LASTSAVE, TIME, ROLE — because a \
+                general command tool would route around every other gate in this catalog. \
+                Anything else is refused; use the dedicated tool instead. Requires the user's \
+                approval, and the approval shows the exact command."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "argv": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "The command and its arguments, e.g. [\"MEMORY\", \"DOCTOR\"].",
+                        "minItems": 1,
+                    },
+                },
+                "required": ["argv"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_client_list".into(),
+            description: "The clients connected to the server (CLIENT LIST): id, address, name, \
+                selected database, age, idle time, flags, and last command. The Redis analogue of \
+                a SQL session list. Under a cluster this reports the seed node only."
+                .into(),
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
         },
         ToolDef {
             name: "kv_biggest_keys".into(),
@@ -1482,9 +1943,59 @@ pub(crate) fn kv_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                 "additionalProperties": false,
             }),
         },
+        export_tool_def(
+            "Write the keys matching a glob, with their values, to a file for the user (CSV or \
+             JSON) and hand it over as a card in the chat they can open. Bounded: it walks a large \
+             but finite number of keys and says so if it stopped early. Use it when the user asks \
+             for an export/dump rather than an answer.",
+            json!({
+                "pattern": { "type": "string", "description": "Glob MATCH pattern (default `*`, every key)." },
+                "format": {
+                    "type": "string",
+                    "enum": ["csv", "json"],
+                    "description": "Output format (default \"json\"; CSV writes key,type,ttl,value).",
+                },
+                "name": { "type": "string", "description": "A short name for the file, e.g. \"session-keys\"." },
+            }),
+            &[],
+        ),
         report_tool_def(),
         spawn_subagent_tool_def(),
         // --- gated writes (Write tier, writable connection only) ---
+        ToolDef {
+            name: "kv_set".into(),
+            description: "Write a key's value. This is how you CREATE or UPDATE data: pick the \
+                Redis `type` and pass `value` in that type's shape — a string/number for \
+                `string`, a { field: value } object for `hash` and `stream`, an array for `set` \
+                and `list`, a { member: score } object for `zset`. For one hash field, pass \
+                `field` plus a scalar `value`. `ttl_seconds` sets an expiry. `mode` is \"set\" \
+                (default: the key ends up holding exactly this, so a hash/set/zset/list is \
+                cleared first) or \"append\" (add to what is already there); a stream always \
+                appends. Requires the user's explicit approval, which shows the exact commands \
+                that will run."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "The exact key to write (not a glob)." },
+                    "type": {
+                        "type": "string",
+                        "enum": ["string", "hash", "set", "zset", "list", "stream"],
+                        "description": "The Redis type to write. Check kv_key_info first if the key may already exist as another type.",
+                    },
+                    "value": { "description": "The value, in the shape this `type` takes (see the tool description)." },
+                    "field": { "type": "string", "description": "Hash only: write this single field, leaving the rest of the hash alone." },
+                    "ttl_seconds": { "type": "integer", "description": "Expiry in seconds; omit for no expiry." },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["set", "append"],
+                        "description": "\"set\" (default) replaces the key's contents; \"append\" adds to them.",
+                    },
+                },
+                "required": ["key", "type", "value"],
+                "additionalProperties": false,
+            }),
+        },
         ToolDef {
             name: "kv_expire".into(),
             description: "Set or remove a key's expiry (EXPIRE / PERSIST). Targets one `key`, or \
@@ -1531,6 +2042,45 @@ pub(crate) fn kv_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                     "to": { "type": "string", "description": "New key name." },
                 },
                 "required": ["from", "to"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_copy_key".into(),
+            description: "Copy a key with its value and remaining expiry to a new name (DUMP then \
+                RESTORE), leaving the original alone. The serialized value never passes through \
+                this conversation — the server copies it — so this works for a key of any size or \
+                type. Requires explicit approval; it refuses to overwrite an existing key unless \
+                `replace` is set."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string", "description": "The key to copy." },
+                    "to": { "type": "string", "description": "The new key name." },
+                    "replace": { "type": "boolean", "description": "Overwrite `to` if it already exists. Default false." },
+                    "keep_ttl": { "type": "boolean", "description": "Carry the source's remaining expiry over. Default true." },
+                },
+                "required": ["from", "to"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_client_kill".into(),
+            description: "Disconnect a client by its connection id (CLIENT KILL ID). Call \
+                kv_client_list first for the `id`, and copy that client's `addr` and `cmd` into \
+                this call so the user can see what they are disconnecting — the target is \
+                re-checked against the live server first and refused if the id has been reused. \
+                Requires explicit approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "integer", "description": "The client's connection id, from kv_client_list." },
+                    "addr": { "type": "string", "description": "The client's address, copied from kv_client_list; verified before the kill." },
+                    "cmd": { "type": "string", "description": "The client's last command, copied from kv_client_list, so the approval shows what is being cut off." },
+                },
+                "required": ["id"],
                 "additionalProperties": false,
             }),
         },
@@ -1586,6 +2136,451 @@ async fn kv_collect_keys(
     Ok((out, exhausted))
 }
 
+/// Ceiling on the keys / documents one non-SQL `export_result` writes. The SQL
+/// seam streams through the driver's own exporter and needs no bound; these two
+/// walk the keyspace/collection from here, so they stop at a stated number
+/// rather than running for an unbounded time.
+const EXPORT_ITEM_MAX: usize = 50_000;
+/// Documents fetched per keyset window while exporting a collection.
+const EXPORT_DOC_WINDOW: usize = 1_000;
+
+/// Write matching keys and their values to a file for the user.
+///
+/// Values are read and written key by key, so the file grows incrementally and
+/// no whole-keyspace snapshot is ever held. The key *list* is the one bounded
+/// materialization, and its bound is reported.
+async fn kv_export(driver: &Arc<dyn KvDriver>, input: &Json, sink: &ReportSink) -> (String, bool) {
+    use std::io::Write;
+
+    let pattern = input
+        .get("pattern")
+        .and_then(Json::as_str)
+        .filter(|p| !p.is_empty());
+    let as_csv = match input.get("format").and_then(Json::as_str).unwrap_or("json") {
+        "json" => false,
+        "csv" => true,
+        other => {
+            return (
+                format!("error: export format must be csv or json, not `{other}`"),
+                false,
+            );
+        }
+    };
+    let (keys, exhausted) = match kv_collect_keys(driver, pattern, EXPORT_ITEM_MAX).await {
+        Ok(k) => k,
+        Err(e) => return (format!("error: {e}"), false),
+    };
+    if keys.is_empty() {
+        return (
+            "No keys matched, so nothing was exported.".to_string(),
+            true,
+        );
+    }
+    let path = export_path(
+        sink,
+        input.get("name").and_then(Json::as_str),
+        if as_csv { "csv" } else { "json" },
+    );
+    let mut file = match std::fs::File::create(&path) {
+        Ok(f) => std::io::BufWriter::new(f),
+        Err(e) => {
+            return (
+                format!("error: could not create the export file: {e}"),
+                false,
+            );
+        }
+    };
+    let mut write = |line: &str| file.write_all(line.as_bytes());
+    let result = (|| -> std::io::Result<()> {
+        if as_csv {
+            write("key,type,ttl,value\n")?;
+        } else {
+            write("[\n")?;
+        }
+        Ok(())
+    })();
+    if let Err(e) = result {
+        return (format!("error: writing the export failed: {e}"), false);
+    }
+    let mut written = 0usize;
+    for (i, meta) in keys.iter().enumerate() {
+        let value = driver
+            .read_value(&meta.key)
+            .await
+            .ok()
+            .flatten()
+            .map(|v| fmt_kv_value(&v))
+            .unwrap_or_default();
+        let ttl = kv_ttl(meta.ttl);
+        let line = if as_csv {
+            format!(
+                "{},{},{},{}\n",
+                csv_field(&meta.key),
+                meta.kv_type.label(),
+                ttl,
+                csv_field(&value),
+            )
+        } else {
+            format!(
+                "  {{\"key\":{},\"type\":{},\"ttl\":{},\"value\":{}}}{}\n",
+                json_str(&meta.key),
+                json_str(meta.kv_type.label()),
+                json_str(&ttl),
+                json_str(&value),
+                if i + 1 == keys.len() { "" } else { "," },
+            )
+        };
+        if let Err(e) = file.write_all(line.as_bytes()) {
+            return (
+                format!("error: writing the export failed after {written} key(s): {e}"),
+                false,
+            );
+        }
+        written += 1;
+    }
+    if !as_csv && let Err(e) = file.write_all(b"]\n") {
+        return (format!("error: writing the export failed: {e}"), false);
+    }
+    if let Err(e) = file.flush() {
+        return (format!("error: flushing the export failed: {e}"), false);
+    }
+    let note = if exhausted {
+        String::new()
+    } else {
+        format!(" (stopped at the {EXPORT_ITEM_MAX}-key bound; narrow the pattern for the rest)")
+    };
+    sink.announce(&path, Some(&format!("Export ({written} keys)")));
+    (
+        format!(
+            "Wrote {written} key(s) to {}{note}. It is now a card in the chat the user can open.",
+            path.display()
+        ),
+        true,
+    )
+}
+
+/// Write matching documents to a JSON array file for the user.
+///
+/// Paged by `_id` keyset (`find_seek`), one window at a time and appended as it
+/// goes, so an export of a large collection never holds more than a window.
+async fn doc_export(
+    driver: &Arc<dyn DocDriver>,
+    input: &Json,
+    sink: &ReportSink,
+) -> (String, bool) {
+    use std::io::Write;
+
+    let db = input.get("db").and_then(Json::as_str).unwrap_or("");
+    let coll = input.get("coll").and_then(Json::as_str).unwrap_or("");
+    if db.is_empty() || coll.is_empty() {
+        return ("error: export_result needs `db` and `coll`".into(), false);
+    }
+    let filter = match doc_arg_value(driver, input, "filter") {
+        Ok(f) => f,
+        Err(e) => return (format!("error: {e}"), false),
+    };
+    let path = export_path(sink, input.get("name").and_then(Json::as_str), "json");
+    let mut file = match std::fs::File::create(&path) {
+        Ok(f) => std::io::BufWriter::new(f),
+        Err(e) => {
+            return (
+                format!("error: could not create the export file: {e}"),
+                false,
+            );
+        }
+    };
+    let abort = AbortSignal::new();
+    let mut after: Option<DocValue> = None;
+    let mut written = 0usize;
+    let mut truncated = false;
+    if let Err(e) = file.write_all(b"[\n") {
+        return (format!("error: writing the export failed: {e}"), false);
+    }
+    loop {
+        let window = match driver
+            .find_seek(
+                db,
+                coll,
+                filter.as_ref(),
+                red_core::doc::DocSeek::Forward {
+                    after: after.clone(),
+                },
+                EXPORT_DOC_WINDOW.min(EXPORT_ITEM_MAX - written),
+                &abort,
+            )
+            .await
+        {
+            Ok(w) => w,
+            Err(e) => {
+                return (
+                    format!("error: the export failed after {written} document(s): {e}"),
+                    false,
+                );
+            }
+        };
+        if window.is_empty() {
+            break;
+        }
+        for doc in &window {
+            let sep = if written == 0 { "  " } else { ",\n  " };
+            let line = format!("{sep}{}", doc.to_doc_value().to_extended_json());
+            if let Err(e) = file.write_all(line.as_bytes()) {
+                return (
+                    format!("error: writing the export failed after {written} document(s): {e}"),
+                    false,
+                );
+            }
+            written += 1;
+        }
+        after = window.last().map(|d| d.id.clone());
+        if written >= EXPORT_ITEM_MAX {
+            truncated = true;
+            break;
+        }
+    }
+    if let Err(e) = file.write_all(b"\n]\n").and_then(|()| file.flush()) {
+        return (format!("error: writing the export failed: {e}"), false);
+    }
+    let note = if truncated {
+        format!(
+            " (stopped at the {EXPORT_ITEM_MAX}-document bound; narrow the filter for the rest)"
+        )
+    } else {
+        String::new()
+    };
+    sink.announce(&path, Some(&format!("Export ({written} documents)")));
+    (
+        format!(
+            "Wrote {written} document(s) to {}{note}. It is now a card in the chat the user can \
+             open.",
+            path.display()
+        ),
+        true,
+    )
+}
+
+/// One CSV field: quoted and doubled-up when it carries a comma, quote, or
+/// newline, per RFC 4180.
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// One JSON string literal, escaped by `serde_json` so the export is parseable
+/// whatever a Redis value happens to contain.
+fn json_str(s: &str) -> String {
+    Json::String(s.to_string()).to_string()
+}
+
+/// Page deep into one key's contents, dispatching on the key's actual type to
+/// the windowed reader for it. Never loads a whole collection: the reply carries
+/// the continuation token so the model pages rather than asking for everything.
+async fn kv_read_collection(
+    driver: &Arc<dyn KvDriver>,
+    input: &Json,
+    limits: &AiLimits,
+) -> (String, bool) {
+    use red_core::kv::{CollectionKind, KvElement, KvType};
+
+    let key = input.get("key").and_then(Json::as_str).unwrap_or("");
+    if key.is_empty() {
+        return ("error: `key` is required".into(), false);
+    }
+    let limit = input
+        .get("limit")
+        .and_then(Json::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(limits.max_rows.max(1))
+        .clamp(1, limits.max_rows.max(1));
+    let meta = match driver.probe_key(key).await {
+        Ok(Some(m)) => m,
+        Ok(None) => return (format!("key `{key}` does not exist"), true),
+        Err(e) => return (format!("error: {e}"), false),
+    };
+    let budget = ScanBudget {
+        count_hint: limit.min(1000) as u32,
+        wall_clock: Duration::from_millis(500),
+        want: limit,
+    };
+    let abort = AbortSignal::new();
+    let kind = match meta.kv_type {
+        KvType::Hash => Some(CollectionKind::Hash),
+        KvType::Set => Some(CollectionKind::Set),
+        KvType::ZSet => Some(CollectionKind::ZSet),
+        _ => None,
+    };
+    let out = if let Some(kind) = kind {
+        let cursor = input
+            .get("cursor")
+            .and_then(Json::as_str)
+            .and_then(|c| c.parse::<u64>().ok())
+            .unwrap_or(0);
+        match driver
+            .read_collection_page(key, kind, cursor, budget, &abort)
+            .await
+        {
+            Ok(page) => {
+                let mut s = format!(
+                    "{key} ({}) — {} element(s):\n",
+                    meta.kv_type.label(),
+                    page.elements.len()
+                );
+                for e in &page.elements {
+                    s.push_str(&match e {
+                        KvElement::Member(m) => format!("  {m}\n"),
+                        KvElement::Field(f, v) => format!("  {f} = {v}\n"),
+                        KvElement::Scored(m, score) => format!("  {score}  {m}\n"),
+                    });
+                }
+                s.push_str(&if page.exhausted {
+                    "(end of collection)\n".to_string()
+                } else {
+                    format!("(more: pass cursor \"{}\" to continue)\n", page.next_cursor)
+                });
+                s
+            }
+            Err(e) => return (format!("error: {e}"), false),
+        }
+    } else if meta.kv_type == KvType::List {
+        let from_tail = input
+            .get("from_tail")
+            .and_then(Json::as_bool)
+            .unwrap_or(false);
+        // `LRANGE`'s cost grows with the offset, so the seam offers a head or a
+        // tail window and no arbitrary deep-middle access; say so rather than
+        // letting the model ask for page 900.
+        match driver.read_list_window(key, !from_tail, limit).await {
+            Ok(values) => {
+                let mut s = format!(
+                    "{key} (list) — {} element(s) from the {}:\n",
+                    values.len(),
+                    if from_tail { "tail" } else { "head" },
+                );
+                for v in &values {
+                    s.push_str(&format!("  {v}\n"));
+                }
+                s.push_str("(lists window from either end only; there is no deep-middle page)\n");
+                s
+            }
+            Err(e) => return (format!("error: {e}"), false),
+        }
+    } else if meta.kv_type == KvType::Stream {
+        let before = input
+            .get("before")
+            .and_then(Json::as_str)
+            .filter(|b| !b.is_empty());
+        match driver.read_stream_range(key, before, limit).await {
+            Ok(page) => {
+                let mut s = format!(
+                    "{key} (stream) — {} entr(ies), newest first:\n",
+                    page.entries.len()
+                );
+                for e in &page.entries {
+                    let fields: Vec<String> =
+                        e.fields.iter().map(|(f, v)| format!("{f}={v}")).collect();
+                    s.push_str(&format!("  {}  {}\n", e.id, fields.join(" ")));
+                }
+                s.push_str(&match (page.exhausted, &page.next_before) {
+                    (false, Some(b)) => format!("(more: pass before \"{b}\" to walk older)\n"),
+                    _ => "(end of stream)\n".to_string(),
+                });
+                s
+            }
+            Err(e) => return (format!("error: {e}"), false),
+        }
+    } else {
+        return (
+            format!(
+                "`{key}` is a {}, which has no pages: read it with kv_get_value.",
+                meta.kv_type.label()
+            ),
+            false,
+        );
+    };
+    (cap_result_bytes(out, limits.max_result_bytes), true)
+}
+
+/// A stream's consumer-group diagnostics: every group, and optionally one
+/// group's consumers and oldest pending entries.
+async fn kv_stream_groups(
+    driver: &Arc<dyn KvDriver>,
+    input: &Json,
+    limits: &AiLimits,
+) -> (String, bool) {
+    let key = input.get("key").and_then(Json::as_str).unwrap_or("");
+    if key.is_empty() {
+        return ("error: `key` is required".into(), false);
+    }
+    let groups = match driver.stream_groups(key).await {
+        Ok(g) => g,
+        Err(e) => return (format!("error: {e}"), false),
+    };
+    if groups.is_empty() {
+        return (
+            format!("`{key}` has no consumer groups (entries are read directly, not via a group)."),
+            true,
+        );
+    }
+    let mut out = format!("{} consumer group(s) on `{key}`:\n", groups.len());
+    for g in &groups {
+        out.push_str(&format!(
+            "  {}: {} consumer(s), {} pending, lag {}, last-delivered {}\n",
+            g.name,
+            g.consumers,
+            g.pending,
+            g.lag
+                .map(|l| l.to_string())
+                // Redis reports nil lag after certain trims; "unknown" is the
+                // honest reading, and it is not the same as zero.
+                .unwrap_or_else(|| "unknown".into()),
+            g.last_delivered_id,
+        ));
+    }
+    if let Some(group) = input
+        .get("group")
+        .and_then(Json::as_str)
+        .filter(|g| !g.is_empty())
+    {
+        let count = limits.max_rows.clamp(1, KV_PENDING_MAX);
+        match driver.stream_consumers(key, group).await {
+            Ok(consumers) => {
+                out.push_str(&format!("\nConsumers in `{group}`:\n"));
+                for c in &consumers {
+                    out.push_str(&format!(
+                        "  {}: {} pending, idle {}\n",
+                        c.name,
+                        c.pending,
+                        kv_ttl(Some(c.idle)),
+                    ));
+                }
+            }
+            Err(e) => out.push_str(&format!("\nConsumers in `{group}`: error: {e}\n")),
+        }
+        match driver.stream_pending(key, group, count).await {
+            Ok(pending) if pending.is_empty() => {
+                out.push_str("\nNothing pending: every delivered entry has been acked.\n");
+            }
+            Ok(pending) => {
+                out.push_str(&format!("\n{} pending entr(ies):\n", pending.len()));
+                for p in &pending {
+                    out.push_str(&format!(
+                        "  {} held by {}, idle {}, delivered {}x\n",
+                        p.id,
+                        p.consumer,
+                        kv_ttl(Some(p.idle)),
+                        p.delivery_count,
+                    ));
+                }
+            }
+            Err(e) => out.push_str(&format!("\nPending entries: error: {e}\n")),
+        }
+    }
+    (cap_result_bytes(out, limits.max_result_bytes), true)
+}
+
 /// Execute one Redis agent tool (the KV analogue of [`run_tool`]). Read-only:
 /// every arm reads through the `KvDriver` seam. Shares the tier gate, the byte
 /// cap, and the `generate_report` pipeline with the SQL path.
@@ -1613,13 +2608,23 @@ pub(crate) async fn kv_run_tool(
     }
     let limits = &policy.limits;
     let (content, ok) = match name {
-        "kv_server_info" => match driver.command(&["INFO".to_string()]).await {
-            Ok(RespValue::Bulk(info)) | Ok(RespValue::Simple(info)) => {
-                (kv_info_summary(&info), true)
+        "kv_server_info" => {
+            // Topology and DBSIZE lead: this is the "call this first" tool, and
+            // both change how every later answer should be read (a SCAN fans out
+            // on a cluster; a sample is only meaningful against a total).
+            let header = format!(
+                "Topology: {:?} · DBSIZE {} key(s) in the selected database\n",
+                driver.topology(),
+                driver.db_size().await.unwrap_or(0),
+            );
+            match driver.command(&["INFO".to_string()]).await {
+                Ok(RespValue::Bulk(info)) | Ok(RespValue::Simple(info)) => {
+                    (format!("{header}{}", kv_info_summary(&info)), true)
+                }
+                Ok(other) => (format!("{header}unexpected INFO reply: {other:?}"), true),
+                Err(e) => (format!("error: {e}"), false),
             }
-            Ok(other) => (format!("unexpected INFO reply: {other:?}"), true),
-            Err(e) => (format!("error: {e}"), false),
-        },
+        }
         "kv_scan_keys" => {
             let pattern = input
                 .get("pattern")
@@ -1643,7 +2648,7 @@ pub(crate) async fn kv_run_tool(
                                 k.key,
                                 k.kv_type.label(),
                                 kv_ttl(k.ttl),
-                                kv_bytes(k.approx_bytes),
+                                fmt_bytes(k.approx_bytes),
                             ));
                         }
                         if !exhausted && keys.len() >= limit {
@@ -1653,6 +2658,26 @@ pub(crate) async fn kv_run_tool(
                         }
                         (out, true)
                     }
+                }
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "kv_key_schema" => {
+            let pattern = input
+                .get("pattern")
+                .and_then(Json::as_str)
+                .filter(|p| !p.is_empty());
+            let total = driver.db_size().await.unwrap_or(0);
+            match kv_collect_keys(driver, pattern, KV_SAMPLE_MAX).await {
+                Ok((keys, exhausted)) => {
+                    let templates = infer_key_templates(&keys, KV_TEMPLATE_TOP);
+                    (
+                        cap_result_bytes(
+                            kv_format_templates(&templates, keys.len(), total, exhausted),
+                            limits.max_result_bytes,
+                        ),
+                        true,
+                    )
                 }
                 Err(e) => (format!("error: {e}"), false),
             }
@@ -1670,7 +2695,7 @@ pub(crate) async fn kv_run_tool(
                         m.kv_type.label(),
                         kv_ttl(m.ttl),
                         m.encoding,
-                        kv_bytes(m.approx_bytes),
+                        fmt_bytes(m.approx_bytes),
                     ),
                     true,
                 ),
@@ -1695,6 +2720,64 @@ pub(crate) async fn kv_run_tool(
                 Err(e) => (format!("error: {e}"), false),
             }
         }
+        "kv_read_collection" => kv_read_collection(driver, input, limits).await,
+        "kv_stream_groups" => kv_stream_groups(driver, input, limits).await,
+        "kv_keyspace_notifications" => match driver.notify_config().await {
+            Ok(flags) if flags.trim().is_empty() => (
+                "notify-keyspace-events is EMPTY: keyspace notifications are off, so nothing will \
+                 be delivered to any subscriber until they are enabled."
+                    .to_string(),
+                true,
+            ),
+            Ok(flags) => (
+                format!(
+                    "notify-keyspace-events = {flags} (notifications are on for these classes)"
+                ),
+                true,
+            ),
+            Err(e) => (format!("error: {e}"), false),
+        },
+        "kv_command" => {
+            let argv = kv_command_argv(input);
+            match kv_allowed_command(&argv) {
+                // Re-checked here as well as in the gate: this is the one tool
+                // whose whole safety story is the allowlist, so it is enforced at
+                // the point of execution, not only where the prompt was built.
+                Err(why) => (format!("error: {why}"), false),
+                Ok(()) => match driver.command(&argv).await {
+                    Ok(v) => (
+                        cap_result_bytes(format!("{v:?}"), limits.max_result_bytes),
+                        true,
+                    ),
+                    Err(e) => (format!("error: {e}"), false),
+                },
+            }
+        }
+        "kv_client_list" => match driver.client_list().await {
+            Ok(clients) if clients.is_empty() => ("No clients are connected.".to_string(), true),
+            Ok(clients) => {
+                let mut out = format!("{} connected client(s):\n", clients.len());
+                for c in &clients {
+                    out.push_str(&format!(
+                        "  id={} {} db={} age={}s idle={}s flags={} last={}{}\n",
+                        c.id,
+                        c.addr,
+                        c.db,
+                        c.age,
+                        c.idle,
+                        c.flags,
+                        c.cmd,
+                        if c.name.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" name={}", c.name)
+                        },
+                    ));
+                }
+                (cap_result_bytes(out, limits.max_result_bytes), true)
+            }
+            Err(e) => (format!("error: {e}"), false),
+        },
         "kv_biggest_keys" => {
             let pattern = input
                 .get("pattern")
@@ -1720,7 +2803,7 @@ pub(crate) async fn kv_run_tool(
                     for k in &keys {
                         out.push_str(&format!(
                             "  ~{}  {}  [{}, {}]\n",
-                            kv_bytes(k.approx_bytes),
+                            fmt_bytes(k.approx_bytes),
                             k.key,
                             k.kv_type.label(),
                             kv_ttl(k.ttl),
@@ -1802,6 +2885,10 @@ pub(crate) async fn kv_run_tool(
         }
         // --- gated writes: run_turn already surfaced the Allow/Deny prompt and
         // ran these only on approval; execute directly here.
+        "kv_set" => match kv_set_plan(input) {
+            Ok(plan) => kv_apply_set(driver, &plan).await,
+            Err(why) => (format!("error: {why}"), false),
+        },
         "kv_expire" => {
             let seconds = input.get("seconds").and_then(Json::as_i64);
             let ttl = match seconds {
@@ -1891,6 +2978,84 @@ pub(crate) async fn kv_run_tool(
                 Err(e) => (format!("error: {e}"), false),
             }
         }
+        "kv_copy_key" => {
+            let from = input.get("from").and_then(Json::as_str).unwrap_or("");
+            let to = input.get("to").and_then(Json::as_str).unwrap_or("");
+            if from.is_empty() || to.is_empty() {
+                return ("error: kv_copy_key needs `from` and `to`".into(), false);
+            }
+            let keep_ttl = input
+                .get("keep_ttl")
+                .and_then(Json::as_bool)
+                .unwrap_or(true);
+            let replace = input
+                .get("replace")
+                .and_then(Json::as_bool)
+                .unwrap_or(false);
+            match driver.dump_key(from).await {
+                Ok(None) => (
+                    format!("key `{from}` does not exist; nothing copied."),
+                    true,
+                ),
+                Ok(Some((payload, ttl))) => {
+                    match driver
+                        .restore_key(to, keep_ttl.then_some(ttl).flatten(), &payload, replace)
+                        .await
+                    {
+                        Ok(()) => (format!("Copied `{from}` to `{to}`."), true),
+                        // BUSYKEY is the guard doing its job, not a transport
+                        // failure; say which so the model offers `replace` rather
+                        // than retrying blindly.
+                        Err(e) => (
+                            format!(
+                                "error: copying to `{to}` failed: {e}. If the key already exists, \
+                                 set `replace` to overwrite it deliberately."
+                            ),
+                            false,
+                        ),
+                    }
+                }
+                Err(e) => (format!("error: reading `{from}` failed: {e}"), false),
+            }
+        }
+        "kv_client_kill" => {
+            let Some(id) = input.get("id").and_then(Json::as_i64) else {
+                return ("error: kv_client_kill needs an `id`".into(), false);
+            };
+            // Re-resolve before cutting: a connection id the user approved may
+            // have closed and been handed to somebody else since the prompt.
+            match driver.client_list().await {
+                Ok(clients) => match clients.iter().find(|c| c.id == id) {
+                    None => (
+                        format!("client {id} is no longer connected; nothing to disconnect."),
+                        true,
+                    ),
+                    Some(live) => {
+                        if let Some(claimed) = input
+                            .get("addr")
+                            .and_then(Json::as_str)
+                            .filter(|a| !a.is_empty())
+                            && live.addr != claimed
+                        {
+                            return (
+                                format!(
+                                    "error: client {id} is now {}, not {claimed}: the id was \
+                                     reused since you read it. Re-read kv_client_list and propose \
+                                     again.",
+                                    live.addr
+                                ),
+                                false,
+                            );
+                        }
+                        match driver.client_kill(id).await {
+                            Ok(()) => (format!("Disconnected client {id} ({}).", live.addr), true),
+                            Err(e) => (format!("error: {e}"), false),
+                        }
+                    }
+                },
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
         "kv_config_set" => {
             let param = input.get("parameter").and_then(Json::as_str).unwrap_or("");
             let value = input.get("value").and_then(Json::as_str).unwrap_or("");
@@ -1908,6 +3073,7 @@ pub(crate) async fn kv_run_tool(
                 Err(e) => (format!("error: {e}"), false),
             }
         }
+        "export_result" => kv_export(driver, input, report).await,
         "generate_report" => run_generate_report(input, report),
         other => (format!("error: unknown tool `{other}`"), false),
     };
@@ -1942,29 +3108,35 @@ pub(crate) fn kv_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
              user you cannot read the live server."
         }
         AiTier::Schema => {
-            "You have metadata-only Redis tools: kv_server_info, kv_scan_keys, and kv_key_info. \
-             You can see the server's stats and keys' types/TTLs/sizes but you CANNOT read a \
-             key's value."
+            "You have metadata-only Redis tools: kv_server_info, kv_scan_keys, kv_key_schema, and \
+             kv_key_info. You can see the server's stats, the keyspace's key templates, and keys' \
+             types/TTLs/sizes, but you CANNOT read a key's value."
         }
         AiTier::Read => {
-            "You have read-only Redis tools: kv_server_info (INFO summary), kv_scan_keys (find \
-             keys by glob pattern), kv_key_info (a key's type/TTL/encoding/size), kv_get_value (a \
-             key's value or a collection preview), kv_biggest_keys (sample for the largest keys by \
-             memory), kv_analyze (a keyspace rollup: memory by type and namespace, TTL coverage), \
-             kv_slowlog (recent slow commands), kv_config_get (read a CONFIG parameter), and \
-             generate_report (author an HTML report from what you've read, with optional Chart.js \
-             charts; it appears as a card the user can open — use it when the user asks for a \
-             report). Ground every answer in the live server with these tools rather than guessing."
+            "You have read-only Redis tools: kv_server_info (INFO summary, topology and size), \
+             kv_key_schema (the keyspace's inferred key templates), kv_scan_keys (find keys by \
+             glob pattern), kv_key_info (a key's type/TTL/encoding/size), kv_get_value (a key's \
+             value or a collection preview), kv_read_collection (page deep into a big \
+             collection/list/stream), kv_stream_groups (consumer groups, pending and lag), \
+             kv_biggest_keys (sample for the largest keys by memory), kv_analyze (a keyspace \
+             rollup: memory by type and namespace, TTL coverage), kv_slowlog (recent slow \
+             commands), kv_client_list (connected clients), kv_config_get (read a CONFIG \
+             parameter), export_result (write keys to a file for the user), and generate_report \
+             (author an HTML report from what you've read, with optional Chart.js charts; it \
+             appears as a card the user can open — use it when the user asks for a report). Ground \
+             every answer in the live server with these tools rather than guessing."
         }
         AiTier::Write => {
             "You have the read-only Redis tools (kv_server_info, kv_scan_keys, kv_key_info, \
              kv_get_value, kv_biggest_keys, kv_analyze, kv_slowlog, kv_config_get, generate_report) \
-             AND gated write tools: kv_expire (set/remove a key's TTL), kv_delete (delete keys), \
-             kv_rename, and kv_config_set. Every write requires the user's explicit Allow on the \
-             exact operation; assume it may be denied. Before a bulk kv_delete/kv_expire by \
-             pattern, scan first (kv_scan_keys) and tell the user how many keys will be affected — \
-             a keyspace-wide delete or expire (pattern `*`) is refused outright. Only write when \
-             the user has asked you to change data."
+             AND gated tools: kv_set (write a key of any type — this is how you create or update \
+             data), kv_expire (set/remove a key's TTL), kv_delete (delete keys), kv_rename, \
+             kv_copy_key, kv_client_kill, kv_config_set, and kv_command (introspection verbs only). \
+             Every one requires the user's explicit Allow on the exact operation; assume it may be \
+             denied. Before a bulk kv_delete/kv_expire by pattern, scan first (kv_scan_keys) and \
+             tell the user how many keys will be affected — a keyspace-wide delete or expire \
+             (pattern `*`) is refused outright. Only write when the user has asked you to change \
+             data."
         }
     };
     finish_system_prompt(
@@ -1972,6 +3144,9 @@ pub(crate) fn kv_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
             "You are RED's Redis agent, embedded in a native database explorer. You help the user \
              explore and understand the Redis server they are connected to.\n\n\
              {tools_line}\n\n\
+             Call kv_server_info first — it tells you the topology, and a SCAN means something \
+             different on a cluster. Call kv_key_schema before reasoning about what the keyspace \
+             holds; the key template is the schema.\n\n\
              Redis keys are addressed by glob patterns (e.g. `user:*`), not SQL — there are no \
              tables or joins. Be concise: lead with the answer, then the supporting detail. When \
              you show a command, put it in a fenced ```sh block (e.g. `redis-cli GET foo`).\n",
@@ -2038,6 +3213,63 @@ fn kv_info_summary(info: &str) -> String {
     s
 }
 
+/// Format inferred key templates as the keyspace's schema. The sample size and
+/// whether it was exhaustive lead, because every number below is only as good as
+/// the walk that produced it and a truncated sample reads as fact otherwise.
+fn kv_format_templates(
+    templates: &[KeyTemplate],
+    sampled: usize,
+    total_keys: u64,
+    exhausted: bool,
+) -> String {
+    if templates.is_empty() {
+        return "No keys matched, so there is no key structure to report.".to_string();
+    }
+    let scope = if exhausted {
+        format!("all {sampled} key(s)")
+    } else {
+        format!("a truncated sample of {sampled} key(s) of ~{total_keys} in the database")
+    };
+    let mut s = format!("Key templates inferred from {scope}:\n");
+    for t in templates {
+        let types = t
+            .types
+            .iter()
+            .map(|(label, n)| {
+                if t.types.len() == 1 {
+                    label.clone()
+                } else {
+                    format!("{label} x{n}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/");
+        let avg = t.bytes / t.count.max(1);
+        let ttl = if t.with_ttl == 0 {
+            "no TTL".to_string()
+        } else {
+            format!(
+                "TTL on {:.0}% (~{})",
+                t.with_ttl as f64 / t.count as f64 * 100.0,
+                kv_ttl(t.median_ttl),
+            )
+        };
+        s.push_str(&format!(
+            "  {}  {} keys  {types}  avg ~{}  {ttl}\n",
+            t.pattern,
+            t.count,
+            fmt_bytes(avg),
+        ));
+    }
+    if !exhausted {
+        s.push_str(
+            "(the sample stopped at a bound, so counts are proportions of the sample, not the \
+             whole keyspace)\n",
+        );
+    }
+    s
+}
+
 /// Format a [`RedisAnalysis`] as compact text for the agent.
 fn kv_format_analysis(r: &red_core::kv::RedisAnalysis) -> String {
     let mut s = String::new();
@@ -2050,7 +3282,7 @@ fn kv_format_analysis(r: &red_core::kv::RedisAnalysis) -> String {
         } else {
             "full walk"
         },
-        kv_bytes(r.total_bytes),
+        fmt_bytes(r.total_bytes),
     ));
     s.push_str("By type (memory):\n");
     for t in &r.types {
@@ -2058,7 +3290,7 @@ fn kv_format_analysis(r: &red_core::kv::RedisAnalysis) -> String {
             "  {}: {} keys, ~{}\n",
             t.kv_type,
             t.count,
-            kv_bytes(t.bytes),
+            fmt_bytes(t.bytes),
         ));
     }
     s.push_str("Top namespaces (memory):\n");
@@ -2067,7 +3299,7 @@ fn kv_format_analysis(r: &red_core::kv::RedisAnalysis) -> String {
             "  {}: {} keys, ~{}\n",
             n.prefix,
             n.count,
-            kv_bytes(n.bytes),
+            fmt_bytes(n.bytes),
         ));
     }
     let t = &r.ttl;
@@ -2147,8 +3379,9 @@ fn kv_ttl(ttl: Option<Duration>) -> String {
     }
 }
 
-/// Coarse human byte count for the agent's text output.
-fn kv_bytes(n: u64) -> String {
+/// Coarse human byte count for the agent's text output, shared by every seam's
+/// formatter.
+fn fmt_bytes(n: u64) -> String {
     const KB: u64 = 1024;
     const MB: u64 = KB * 1024;
     if n >= MB {
@@ -2202,6 +3435,7 @@ pub(crate) async fn run_tool(
             }
             profile_table(driver, schema, table, limits).await
         }
+        "relationship_map" => relationship_map(driver, input).await,
         "run_select" => {
             let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
             if !is_read_only_select(sql, dialect) {
@@ -2252,12 +3486,33 @@ pub(crate) async fn run_tool(
             if sql.is_empty() {
                 return ("error: `sql` is required".into(), false);
             }
-            // Bound the wait like run_select. `explain(analyze=false)` only *plans*
-            // (it never executes the statement), and the trait gives it no abort
+            let analyze = input
+                .get("analyze")
+                .and_then(Json::as_bool)
+                .unwrap_or(false);
+            // `EXPLAIN ANALYZE` *executes* on Postgres and MySQL 8.0.18+, so an
+            // analyze request is a run request and is graded as one. Anything above
+            // `Safe` is refused outright rather than prompted: the model asked to
+            // read a plan, and a user asked to approve a write here would be
+            // approving something they did not request. `risk::assess` handles both
+            // a bare statement and one the model already wrapped in EXPLAIN.
+            if analyze {
+                let verdict = red_core::sql::risk::assess(sql, dialect);
+                if verdict.level != red_core::sql::risk::RiskLevel::Safe {
+                    return (
+                        "error: EXPLAIN ANALYZE executes the statement, and this one is not a \
+                         read. Explain it without `analyze` to see the plan, or run the change \
+                         yourself in a query tab."
+                            .into(),
+                        false,
+                    );
+                }
+            }
+            // Bound the wait like run_select. The trait gives `explain` no abort
             // seam, so on timeout we hand the model a clean error while the engine's
-            // plan call winds down on its own; it's plan-only, so it can't run away
-            // with data, only take a moment on a pathological statement.
-            let explain = driver.explain(sql, false);
+            // call winds down on its own; the read-only gate above is what keeps an
+            // `analyze` from running away with anything but time.
+            let explain = driver.explain(sql, analyze);
             let result = match limits.statement_timeout_ms {
                 0 => explain.await,
                 ms => tokio::time::timeout(Duration::from_millis(ms), explain)
@@ -2275,6 +3530,53 @@ pub(crate) async fn run_tool(
                 Err(e) => (format!("error: {e}"), false),
             }
         }
+        "object_ddl" => {
+            let schema = input.get("schema").and_then(Json::as_str).unwrap_or("");
+            let name = input.get("name").and_then(Json::as_str).unwrap_or("");
+            if name.is_empty() {
+                return ("error: `name` is required".into(), false);
+            }
+            let token = input.get("kind").and_then(Json::as_str).unwrap_or("table");
+            let Some(kind) = red_core::ObjectKind::from_token(token) else {
+                return (
+                    format!(
+                        "error: unknown object kind `{token}`; use one of table/view/matview/\
+                         function/procedure/trigger/sequence/type"
+                    ),
+                    false,
+                );
+            };
+            match driver.object_ddl(schema, name, kind).await {
+                Ok(ddl) => (ddl, true),
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "search_data" => search_data(driver, input, limits).await,
+        "health_report" => {
+            let namespace = input
+                .get("schema")
+                .and_then(Json::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty());
+            match driver.health(namespace).await {
+                Ok(report) => (
+                    cap_result_bytes(format_health(&report), limits.max_result_bytes),
+                    true,
+                ),
+                Err(e) => (format!("error: {e}"), false),
+            }
+        }
+        "server_sessions" => match driver.server_sessions().await {
+            Ok((sessions, restricted)) => (
+                cap_result_bytes(
+                    format_sessions(&sessions, restricted),
+                    limits.max_result_bytes,
+                ),
+                true,
+            ),
+            Err(e) => (format!("error: {e}"), false),
+        },
+        "export_result" => export_result(driver, dialect, input, report).await,
         "generate_report" => run_generate_report(input, report),
         "open_query" => {
             let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
@@ -2314,6 +3616,20 @@ pub(crate) async fn run_tool(
                 format!("Saved the query as “{name}” to the user's saved-queries library."),
                 true,
             )
+        }
+        "diff_schema" => diff_schema(driver, input, limits).await,
+        "diff_data" => diff_data(driver, input, limits).await,
+        "suggest_index" => suggest_index(driver, input, limits).await,
+        "kill_session" => kill_session(driver, input).await,
+        "create_index" => {
+            let (table, name, columns, unique) = match index_args(input) {
+                Ok(a) => a,
+                Err(why) => return (format!("error: {why}"), false),
+            };
+            match driver.create_index(&table, &name, unique, &columns).await {
+                Ok(_) => (format!("Created index {name} on {}.", table.name), true),
+                Err(e) => (format!("error: creating the index failed: {e}"), false),
+            }
         }
         "propose_write" => {
             // Re-vet at execution (defense in depth): tier, read-only, and the
@@ -2492,9 +3808,20 @@ fn is_read_only_select(sql: &str, dialect: Dialect) -> bool {
 pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "list_schema",
     "describe_table",
+    "relationship_map",
+    "object_ddl",
     "profile_table",
     "run_select",
+    "search_data",
+    // Plans; with `analyze` it also *runs* the statement, which is why that
+    // branch refuses anything `risk::assess` grades above Safe.
     "explain",
+    "health_report",
+    "server_sessions",
+    "diff_schema",
+    "diff_data",
+    "suggest_index",
+    "export_result",
     "generate_report",
     // Hands the user a SQL query to open in a tab; no DB mutation of its own.
     "open_query",
@@ -2504,19 +3831,26 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "kv_server_info",
     "kv_scan_keys",
     "kv_key_info",
+    "kv_key_schema",
     "kv_get_value",
+    "kv_read_collection",
+    "kv_stream_groups",
     "kv_biggest_keys",
     "kv_analyze",
     "kv_slowlog",
+    "kv_client_list",
     "kv_config_get",
+    "kv_keyspace_notifications",
     // MongoDB (doc) read tools: pure reads through the `DocDriver` seam. The
     // signature tools (`profile_collection`/`audit_collection`/`index_advice`)
     // are host-side compositions over the read methods, so they're reads too.
     "doc_server_info",
     "list_collections",
     "describe_collection",
+    "doc_reference_map",
     "profile_collection",
     "sample_documents",
+    "get_document",
     "find",
     "aggregate",
     "count",
@@ -2524,6 +3858,7 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
     "explain_query",
     "index_advice",
     "audit_collection",
+    "doc_current_op",
 ];
 
 /// Whether `name` is a mutating tool: it never auto-runs and never auto-allows;
@@ -2538,7 +3873,15 @@ pub(crate) fn is_write_tool(name: &str) -> bool {
 /// (`save_query`, `generate_report`) for the app to surface. They're meaningless
 /// over the headless `red mcp` stdio transport, so that path drops them from the
 /// advertised catalog and refuses a call to them.
-pub(crate) const UI_ONLY_TOOLS: &[&str] = &["open_query", "save_query", "generate_report"];
+pub(crate) const UI_ONLY_TOOLS: &[&str] = &[
+    "open_query",
+    "save_query",
+    "generate_report",
+    // Writes a file into the app's output folder and announces it as a card for
+    // the user to open. Over a headless transport there is nobody to hand it to,
+    // and the folder is the app's, not the caller's.
+    "export_result",
+];
 
 /// Whether `name` may run over the headless `red mcp` transport: a read-only tool
 /// that isn't one of the GUI-only [`UI_ONLY_TOOLS`]. Writes are already excluded
@@ -2594,6 +3937,29 @@ pub(crate) fn assess_write(
     if name == "propose_changeset" {
         return assess_changeset(input, dialect);
     }
+    // Not SQL, so `write_shape` has nothing to lex: a kill is graded by what it
+    // stops, and the prompt has to say what that is.
+    if name == "kill_session" {
+        return assess_kill_session(input);
+    }
+    // The one DDL the agent may run. It is deliberately carved out of
+    // `write_shape`'s blanket DDL block rather than loosening it: an index is
+    // additive and reversible, a DROP/TRUNCATE/ALTER is not, and widening the
+    // block would let all three through.
+    if name == "create_index" {
+        return match index_args(input) {
+            Ok((table, index, columns, unique)) => WriteAssessment::NeedsApproval {
+                sql: format!(
+                    "CREATE{} INDEX {index} ON {} ({})\nBuilding an index locks and loads the \
+                     server for the duration; it is reversible with a DROP INDEX afterwards.",
+                    if unique { " UNIQUE" } else { "" },
+                    qualified(table.schema.as_deref(), &table.name),
+                    columns.join(", "),
+                ),
+            },
+            Err(why) => WriteAssessment::Reject(why),
+        };
+    }
     let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
     match write_shape(sql, dialect) {
         WriteShape::Ok => WriteAssessment::NeedsApproval {
@@ -2606,9 +3972,110 @@ pub(crate) fn assess_write(
     }
 }
 
+/// Vet a `kill_session` for the approval gate. Not a statement, so there is no
+/// shape to lex; what matters is that the prompt names the *target* — the
+/// session, whose it is, and what it is running — because "terminate session
+/// 4711" alone is not something anyone can meaningfully approve.
+fn assess_kill_session(input: &Json) -> WriteAssessment {
+    let Some(key) = input
+        .get("key")
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+    else {
+        return WriteAssessment::Reject(
+            "kill_session needs the `key` of a session from server_sessions".into(),
+        );
+    };
+    let mode = match kill_mode(input) {
+        Ok(m) => m,
+        Err(why) => return WriteAssessment::Reject(why),
+    };
+    let who = input
+        .get("user")
+        .and_then(Json::as_str)
+        .filter(|u| !u.is_empty())
+        .map(|u| format!(" (user {u})"))
+        .unwrap_or_default();
+    let mut op = format!("{} `{key}`{who}", mode.verb());
+    if mode == red_core::KillMode::Terminate {
+        op.push_str("\n\u{26a0} Terminating rolls back this session's open transaction.");
+    }
+    match input
+        .get("statement")
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        Some(sql) => op.push_str(&format!("\nRunning: {}", truncate_summary(sql, 300))),
+        None => op.push_str(
+            "\nThe agent did not say what this session is running; read server_sessions before \
+             allowing.",
+        ),
+    }
+    WriteAssessment::NeedsApproval { sql: op }
+}
+
 /// The Redis mutating tools (KV backend): each rides the same per-call
 /// approval gate as a SQL write.
-const KV_WRITE_TOOLS: &[&str] = &["kv_expire", "kv_delete", "kv_rename", "kv_config_set"];
+const KV_WRITE_TOOLS: &[&str] = &[
+    "kv_set",
+    "kv_expire",
+    "kv_delete",
+    "kv_rename",
+    "kv_copy_key",
+    "kv_config_set",
+    // Not a keyspace write, but a server-state one that rides the same gate.
+    "kv_client_kill",
+    // Read-only by allowlist, but classified as a write on purpose: this is the
+    // one tool whose safety rests entirely on that allowlist, so the fail-closed
+    // default (approval required, never advertised headlessly) protects it too.
+    "kv_command",
+];
+
+/// The command verbs `kv_command` may run. Introspection only: nothing here
+/// reads a key's value, writes anything, or reconfigures the server, so the tool
+/// cannot be used to route around `kv_get_value`'s tier gate or any write gate.
+const KV_COMMAND_ALLOWLIST: &[&str] = &[
+    "INFO", "MEMORY", "OBJECT", "TYPE", "TTL", "PTTL", "EXISTS", "STRLEN", "LATENCY", "COMMAND",
+    "DBSIZE", "LASTSAVE", "TIME", "ROLE",
+];
+
+/// The `argv` of a `kv_command` call: the non-empty string entries, in order.
+fn kv_command_argv(input: &Json) -> Vec<String> {
+    input
+        .get("argv")
+        .and_then(Json::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(Json::as_str)
+                .map(str::trim)
+                .filter(|a| !a.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether `argv` names a command `kv_command` may run. The verb must be on
+/// [`KV_COMMAND_ALLOWLIST`], and there must be exactly one of them: Redis has no
+/// in-command chaining, but refusing anything unexpected is the posture this
+/// tool only exists under.
+fn kv_allowed_command(argv: &[String]) -> Result<(), String> {
+    let Some(verb) = argv.first() else {
+        return Err("kv_command needs a non-empty `argv`".into());
+    };
+    let upper = verb.to_ascii_uppercase();
+    if !KV_COMMAND_ALLOWLIST.contains(&upper.as_str()) {
+        return Err(format!(
+            "`{verb}` is not on kv_command's allowlist ({}). Use the dedicated tool for what you \
+             need; this one is introspection only.",
+            KV_COMMAND_ALLOWLIST.join(", ")
+        ));
+    }
+    Ok(())
+}
 
 fn is_kv_write_tool(name: &str) -> bool {
     KV_WRITE_TOOLS.contains(&name)
@@ -2660,6 +4127,413 @@ fn kv_delete_targets(input: &Json) -> Vec<String> {
         targets.extend(arr.iter().filter_map(|v| v.as_str()).map(str::to_string));
     }
     targets
+}
+
+/// Ceiling on one `kv_set` value (a string body, a hash/stream field value, a
+/// set/list member). A multi-megabyte value in a tool call is a context problem
+/// before it is a Redis one — it has already crossed the wire to the provider and
+/// back — so refuse it here and tell the model to write it by hand.
+const KV_SET_VALUE_MAX: usize = 64 * 1024;
+/// Ceiling on all of one `kv_set` call's values combined.
+const KV_SET_PAYLOAD_MAX: usize = 256 * 1024;
+/// Ceiling on the elements (hash fields, set/zset members, list values, stream
+/// fields) one `kv_set` call may write. The per-element writers are one round
+/// trip each, so this bounds the call's cost as well as the prompt's length.
+const KV_SET_ELEMS_MAX: usize = 1_000;
+/// How much of a `kv_set` command list the approval prompt shows before it is
+/// truncated. Long enough for a realistic collection write, short enough that a
+/// thousand-member payload cannot push the key name off the top of the dialog.
+const KV_SET_PROMPT_CHARS: usize = 800;
+
+/// The value shape a [`KvSetPlan`] writes, one variant per Redis type. Each maps
+/// to the `KvDriver` writer for that type, so an unwritable combination (a score
+/// on a plain set, a field on a list) cannot be represented.
+enum KvSetBody {
+    /// `SET`, whose own expiry option replaces a separate `PEXPIRE`.
+    Str { value: String, ttl: StringTtl },
+    /// `HSET` per field.
+    Hash(Vec<(String, String)>),
+    /// One `SADD` with every member.
+    Set(Vec<String>),
+    /// `ZADD` per `(member, score)`.
+    ZSet(Vec<(String, f64)>),
+    /// `RPUSH` per value.
+    List(Vec<String>),
+    /// One `XADD … *` with the entry's fields.
+    Stream(Vec<(String, String)>),
+}
+
+/// One parsed, validated `kv_set` call: the typed `KvDriver` writes it will
+/// perform, in order.
+///
+/// Built once by [`kv_set_plan`] and used by *both* the approval prompt (which
+/// renders [`KvSetPlan::commands`]) and the executor, so what the user allows is
+/// exactly what runs — the contract the SQL path gets for free by showing the
+/// statement itself, and the one `kv_delete`'s shared target list restored here.
+struct KvSetPlan {
+    key: String,
+    /// `DEL` the key before writing. Redis has no "replace this whole
+    /// collection" primitive, so `mode: "set"` over a hash/set/zset/list is a
+    /// delete and a rebuild; it is rendered in the prompt rather than implied.
+    clear_first: bool,
+    body: KvSetBody,
+    /// Applied after the body as a `PEXPIRE`. The string form carries its expiry
+    /// inside `SET` instead, so this stays `None` there.
+    expire: Option<Duration>,
+}
+
+impl KvSetPlan {
+    /// The commands this plan runs, in order, as `redis-cli` would echo them.
+    /// The approval prompt's body and the executor's script are the same list.
+    fn commands(&self) -> Vec<String> {
+        let key = resp_arg(&self.key);
+        let mut out = Vec::new();
+        if self.clear_first {
+            out.push(format!("DEL {key}"));
+        }
+        match &self.body {
+            KvSetBody::Str { value, ttl } => {
+                let mut cmd = format!("SET {key} {}", resp_arg(value));
+                if let StringTtl::Set(d) = ttl {
+                    cmd.push_str(&format!(" PX {}", kv_millis(*d)));
+                }
+                out.push(cmd);
+            }
+            KvSetBody::Hash(fields) => out.extend(
+                fields
+                    .iter()
+                    .map(|(f, v)| format!("HSET {key} {} {}", resp_arg(f), resp_arg(v))),
+            ),
+            KvSetBody::Set(members) => {
+                let args: Vec<String> = members.iter().map(|m| resp_arg(m)).collect();
+                out.push(format!("SADD {key} {}", args.join(" ")));
+            }
+            KvSetBody::ZSet(members) => out.extend(
+                members
+                    .iter()
+                    .map(|(m, score)| format!("ZADD {key} {score} {}", resp_arg(m))),
+            ),
+            KvSetBody::List(values) => out.extend(
+                values
+                    .iter()
+                    .map(|v| format!("RPUSH {key} {}", resp_arg(v))),
+            ),
+            KvSetBody::Stream(fields) => {
+                let args: Vec<String> = fields
+                    .iter()
+                    .flat_map(|(f, v)| [resp_arg(f), resp_arg(v)])
+                    .collect();
+                out.push(format!("XADD {key} * {}", args.join(" ")));
+            }
+        }
+        if let Some(d) = self.expire {
+            out.push(format!("PEXPIRE {key} {}", kv_millis(d)));
+        }
+        out
+    }
+}
+
+/// A `Duration` as the whole milliseconds the `PX`/`PEXPIRE` writers send. Both
+/// clamp to at least 1, since a zero-millisecond expiry deletes the key on
+/// arrival, which is never what a `ttl_seconds` of a fraction meant.
+fn kv_millis(d: Duration) -> u64 {
+    (d.as_millis() as u64).max(1)
+}
+
+/// Render one command argument the way `redis-cli` echoes it: bare when it is a
+/// simple token, double-quoted with escapes otherwise. The approval prompt is a
+/// reading aid, so this only has to be unambiguous — an empty, spaced, or
+/// newline-bearing value must not silently blend into the command around it.
+fn resp_arg(s: &str) -> String {
+    let simple = !s.is_empty()
+        && s.chars().all(|c| {
+            c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '-' | '.' | '/' | '@' | '+' | '#')
+        });
+    if simple {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            _ => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+/// Coerce one JSON scalar to the string Redis stores. Numbers and booleans are
+/// accepted (a model writing `{"value": 42}` means the string `"42"`); a nested
+/// object or array is not, because silently serializing one to JSON would write
+/// a shape the user never approved reading back as a document.
+fn kv_scalar(v: &Json, what: &str) -> Result<String, String> {
+    match v {
+        Json::String(s) => Ok(s.clone()),
+        Json::Number(n) => Ok(n.to_string()),
+        Json::Bool(b) => Ok(b.to_string()),
+        _ => Err(format!(
+            "{what} must be a string, number, or boolean; Redis stores bytes, so encode a \
+             document yourself if that is what you mean"
+        )),
+    }
+}
+
+/// Parse and validate a `kv_set` call into the plan both the prompt and the
+/// executor use. Every refusal here is a `Reject` the model can act on, never a
+/// prompt: an oversized payload or an unwritable shape is not something a user
+/// should be asked to rubber-stamp.
+fn kv_set_plan(input: &Json) -> Result<KvSetPlan, String> {
+    let key = input
+        .get("key")
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .ok_or("kv_set needs a non-empty `key`")?
+        .to_string();
+    // A key with no literal character is a glob the model mistook for a key name.
+    // Writing it would create a key literally called `*`, which is worse than the
+    // error: it collides with every pattern the user later types.
+    if matches_whole_keyspace(&key) {
+        return Err(format!(
+            "`{key}` is a glob pattern, not a key: kv_set writes one exact key. Scan first if you \
+             meant to find keys."
+        ));
+    }
+    let kind = input
+        .get("type")
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    let value = input.get("value");
+    let mode_replace = match input.get("mode").and_then(Json::as_str).unwrap_or("set") {
+        "set" => true,
+        "append" => false,
+        other => {
+            return Err(format!(
+                "kv_set `mode` must be \"set\" or \"append\", not `{other}`"
+            ));
+        }
+    };
+    let ttl = match input.get("ttl_seconds").and_then(Json::as_i64) {
+        Some(s) if s > 0 => Some(Duration::from_secs(s as u64)),
+        _ => None,
+    };
+
+    // `{ field: value }` pairs from a JSON object, in the order the model wrote
+    // them (serde_json preserves insertion order), so the prompt reads the way
+    // the call did.
+    let pairs = |what: &str| -> Result<Vec<(String, String)>, String> {
+        let obj = value.and_then(Json::as_object).ok_or_else(|| {
+            format!("kv_set on a {kind} needs `value` as a JSON object of {what}")
+        })?;
+        obj.iter()
+            .map(|(k, v)| Ok((k.clone(), kv_scalar(v, "each value")?)))
+            .collect()
+    };
+    // A list of scalars from a JSON array, or a lone scalar treated as a
+    // one-element list (the shape a model reaches for when adding one member).
+    let members = || -> Result<Vec<String>, String> {
+        match value {
+            Some(Json::Array(items)) => items
+                .iter()
+                .map(|v| kv_scalar(v, "each member"))
+                .collect::<Result<Vec<_>, _>>(),
+            Some(v) => Ok(vec![kv_scalar(v, "`value`")?]),
+            None => Err(format!("kv_set on a {kind} needs `value`")),
+        }
+    };
+
+    let (body, clear_first) = match kind {
+        "string" => {
+            let v = value.ok_or("kv_set on a string needs `value`")?;
+            let body = KvSetBody::Str {
+                value: kv_scalar(v, "`value`")?,
+                // `SET` carries its own expiry; a plain `SET` clears any existing
+                // one, which is Redis's own semantics and is what the rendered
+                // command says.
+                ttl: ttl.map_or(StringTtl::Clear, StringTtl::Set),
+            };
+            (body, false)
+        }
+        "hash" => match input
+            .get("field")
+            .and_then(Json::as_str)
+            .filter(|f| !f.is_empty())
+        {
+            // The single-field form is an upsert of that one field, so it never
+            // clears the rest of the hash regardless of `mode`.
+            Some(field) => {
+                let v = value.ok_or("kv_set with a `field` needs `value`")?;
+                (
+                    KvSetBody::Hash(vec![(field.to_string(), kv_scalar(v, "`value`")?)]),
+                    false,
+                )
+            }
+            None => (KvSetBody::Hash(pairs("field/value")?), mode_replace),
+        },
+        "set" => (KvSetBody::Set(members()?), mode_replace),
+        "zset" => {
+            let obj = value.and_then(Json::as_object).ok_or(
+                "kv_set on a zset needs `value` as a JSON object of member/score, e.g. \
+                 { \"ada\": 1.5 }",
+            )?;
+            let scored = obj
+                .iter()
+                .map(|(m, s)| {
+                    s.as_f64()
+                        .filter(|f| f.is_finite())
+                        .map(|score| (m.clone(), score))
+                        .ok_or_else(|| format!("zset score for `{m}` must be a finite number"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (KvSetBody::ZSet(scored), mode_replace)
+        }
+        "list" => (KvSetBody::List(members()?), mode_replace),
+        // A stream is an append-only log and `value` describes ONE entry, so
+        // there is no "the stream is these entries" shape to replace with;
+        // `mode` is deliberately inert here rather than silently wiping a log.
+        "stream" => (KvSetBody::Stream(pairs("field/value")?), false),
+        "" => return Err("kv_set needs `type` (string/hash/set/zset/list/stream)".into()),
+        other => {
+            return Err(format!(
+                "kv_set `type` must be string/hash/set/zset/list/stream, not `{other}`"
+            ));
+        }
+    };
+
+    let size = kv_set_size(&body);
+    if size.elems == 0 {
+        return Err(format!("kv_set on a {kind} needs at least one value"));
+    }
+    if size.elems > KV_SET_ELEMS_MAX {
+        return Err(format!(
+            "kv_set is capped at {KV_SET_ELEMS_MAX} elements per call ({} given); split it",
+            size.elems
+        ));
+    }
+    if size.largest > KV_SET_VALUE_MAX {
+        return Err(format!(
+            "a single kv_set value is {} bytes, over the {KV_SET_VALUE_MAX}-byte cap; write a \
+             value this large by hand",
+            size.largest
+        ));
+    }
+    if size.bytes > KV_SET_PAYLOAD_MAX {
+        return Err(format!(
+            "kv_set payload is {} bytes, over the {KV_SET_PAYLOAD_MAX}-byte cap; split it",
+            size.bytes
+        ));
+    }
+    Ok(KvSetPlan {
+        key,
+        clear_first,
+        // The string form folds its expiry into `SET`; every other type needs the
+        // separate `PEXPIRE`.
+        expire: match body {
+            KvSetBody::Str { .. } => None,
+            _ => ttl,
+        },
+        body,
+    })
+}
+
+/// What the payload guards measure: the values a `kv_set` call writes, not the
+/// rendered command text. `largest` is kept alongside `bytes` because one 10 MB
+/// string and ten thousand small members are different problems with different
+/// advice.
+struct KvSetSize {
+    elems: usize,
+    bytes: usize,
+    largest: usize,
+}
+
+fn kv_set_size(body: &KvSetBody) -> KvSetSize {
+    let measure = |lengths: &[usize]| KvSetSize {
+        elems: lengths.len(),
+        bytes: lengths.iter().sum(),
+        largest: lengths.iter().copied().max().unwrap_or(0),
+    };
+    let pairs = |v: &[(String, String)]| {
+        measure(&v.iter().map(|(f, s)| f.len() + s.len()).collect::<Vec<_>>())
+    };
+    match body {
+        KvSetBody::Str { value, .. } => measure(&[value.len()]),
+        KvSetBody::Hash(f) | KvSetBody::Stream(f) => pairs(f),
+        KvSetBody::Set(m) | KvSetBody::List(m) => {
+            measure(&m.iter().map(String::len).collect::<Vec<_>>())
+        }
+        KvSetBody::ZSet(m) => measure(&m.iter().map(|(s, _)| s.len()).collect::<Vec<_>>()),
+    }
+}
+
+/// Run an approved [`KvSetPlan`] against the driver, one typed write per element.
+/// A mid-plan failure reports how far it got: Redis has no transaction here, so
+/// claiming nothing happened would be a lie.
+async fn kv_apply_set(driver: &Arc<dyn KvDriver>, plan: &KvSetPlan) -> (String, bool) {
+    let key = plan.key.as_str();
+    if plan.clear_first
+        && let Err(e) = driver.delete_keys(std::slice::from_ref(&plan.key)).await
+    {
+        return (format!("error: clearing `{key}` failed: {e}"), false);
+    }
+    let mut done = 0usize;
+    let failed =
+        |n: usize, e: RedError| (format!("error: after {n} write(s) to `{key}`: {e}"), false);
+    match &plan.body {
+        KvSetBody::Str { value, ttl } => {
+            if let Err(e) = driver.set_string(key, value.clone(), *ttl).await {
+                return failed(0, e);
+            }
+            done = 1;
+        }
+        KvSetBody::Hash(fields) => {
+            for (field, value) in fields {
+                if let Err(e) = driver.set_field(key, field, value.clone()).await {
+                    return failed(done, e);
+                }
+                done += 1;
+            }
+        }
+        KvSetBody::Set(members) => match driver.set_add(key, members).await {
+            Ok(_) => done = members.len(),
+            Err(e) => return failed(0, e),
+        },
+        KvSetBody::ZSet(members) => {
+            for (member, score) in members {
+                if let Err(e) = driver.zset_add(key, member, *score).await {
+                    return failed(done, e);
+                }
+                done += 1;
+            }
+        }
+        KvSetBody::List(values) => {
+            for value in values {
+                if let Err(e) = driver.list_push(key, value.clone(), false).await {
+                    return failed(done, e);
+                }
+                done += 1;
+            }
+        }
+        KvSetBody::Stream(fields) => match driver.stream_add(key, fields).await {
+            Ok(_) => done = fields.len(),
+            Err(e) => return failed(0, e),
+        },
+    }
+    if let Some(d) = plan.expire
+        && let Err(e) = driver.set_ttl(key, Some(d)).await
+    {
+        return (
+            format!("error: wrote `{key}` but setting its expiry failed: {e}"),
+            false,
+        );
+    }
+    (format!("Wrote `{key}` ({done} element(s))."), true)
 }
 
 fn assess_kv_write(name: &str, input: &Json) -> WriteAssessment {
@@ -2724,6 +4598,63 @@ fn assess_kv_write(name: &str, input: &Json) -> WriteAssessment {
                 WriteAssessment::Reject("kv_delete needs `key`, `keys`, or `pattern`".into())
             }
         }
+        "kv_set" => match kv_set_plan(input) {
+            // The prompt IS the command list: the user reads what will run, not a
+            // paraphrase of it.
+            Ok(plan) => WriteAssessment::NeedsApproval {
+                sql: truncate_summary(&plan.commands().join("\n"), KV_SET_PROMPT_CHARS),
+            },
+            Err(why) => WriteAssessment::Reject(why),
+        },
+        "kv_copy_key" => match (s("from"), s("to")) {
+            (Some(f), Some(t)) => {
+                let replace = input
+                    .get("replace")
+                    .and_then(Json::as_bool)
+                    .unwrap_or(false);
+                let clobber = if replace {
+                    format!(", OVERWRITING `{t}` if it already exists")
+                } else {
+                    format!(", refusing if `{t}` already exists")
+                };
+                WriteAssessment::NeedsApproval {
+                    sql: format!("COPY key `{f}` to `{t}` (DUMP + RESTORE){clobber}"),
+                }
+            }
+            _ => WriteAssessment::Reject("kv_copy_key needs `from` and `to`".into()),
+        },
+        "kv_command" => {
+            let argv = kv_command_argv(input);
+            match kv_allowed_command(&argv) {
+                Ok(()) => WriteAssessment::NeedsApproval {
+                    sql: argv
+                        .iter()
+                        .map(|a| resp_arg(a))
+                        .collect::<Vec<_>>()
+                        .join(" "),
+                },
+                Err(why) => WriteAssessment::Reject(why),
+            }
+        }
+        "kv_client_kill" => match input.get("id").and_then(Json::as_i64) {
+            Some(id) => {
+                let mut op = format!("CLIENT KILL ID {id}");
+                if let Some(addr) = s("addr") {
+                    op.push_str(&format!(" ({addr})"));
+                }
+                match s("cmd") {
+                    Some(cmd) => op.push_str(&format!("\nLast command: {cmd}")),
+                    None => op.push_str(
+                        "\nThe agent did not say what this client is doing; read kv_client_list \
+                         before allowing.",
+                    ),
+                }
+                WriteAssessment::NeedsApproval { sql: op }
+            }
+            None => WriteAssessment::Reject(
+                "kv_client_kill needs the numeric `id` of a client from kv_client_list".into(),
+            ),
+        },
         "kv_rename" => match (s("from"), s("to")) {
             (Some(f), Some(t)) => WriteAssessment::NeedsApproval {
                 sql: format!("RENAME `{f}` -> `{t}`"),
@@ -3123,30 +5054,36 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
              conversation alone, and tell the user you cannot read the live database."
         }
         AiTier::Schema => {
-            "You have schema-only tools: list_schema and describe_table. You can inspect \
-             structure (tables, columns, types, keys) but you CANNOT read row data; there is no \
-             query tool, so do not promise to run one."
+            "You have schema-only tools: list_schema, describe_table, relationship_map, and \
+             object_ddl. You can inspect structure (tables, columns, types, keys, definitions) but \
+             you CANNOT read row data; there is no query tool, so do not promise to run one."
         }
         AiTier::Read => {
-            "You have read-only tools: list_schema, describe_table, run_select (capped SELECTs), \
-             explain, open_query (open a SQL query in a new editor tab in the user's workspace; a \
-             read-only SELECT runs automatically), and generate_report (you author an HTML report \
-             from data you've read, with optional interactive Chart.js charts; it appears as a \
-             card in the chat the user can open; use it when the user asks for a report). Use them \
-             to ground every \
-             answer in the live database rather than \
-             guessing: discover objects with list_schema, inspect structure with describe_table, \
-             and read data with run_select. Use open_query to hand the user a query to explore in \
-             the grid. Prefer small, targeted queries with explicit columns and LIMIT."
+            "You have read-only tools: list_schema, describe_table, relationship_map (the \
+             foreign-key graph), object_ddl (an object's real definition), run_select (capped \
+             SELECTs), search_data (find a term across a table's columns), explain (optionally \
+             with actuals), health_report and server_sessions (what is wrong / what is running \
+             now), export_result (write a result to a file for the user), open_query (open a SQL \
+             query in a new editor tab in the user's workspace; a read-only SELECT runs \
+             automatically), and generate_report (you author an HTML report from data you've read, \
+             with optional interactive Chart.js charts; it appears as a card in the chat the user \
+             can open; use it when the user asks for a report). Use them to ground every answer in \
+             the live database rather than guessing: discover objects with list_schema, inspect \
+             structure with describe_table, and read data with run_select. Use open_query to hand \
+             the user a query to explore in the grid. Prefer small, targeted queries with explicit \
+             columns and LIMIT."
         }
         AiTier::Write => {
-            "You have the read tools (list_schema, describe_table, run_select, explain, open_query, \
-             generate_report) AND a gated write tool, propose_write, for a SINGLE \
-             INSERT/UPDATE/DELETE. Every propose_write call requires the user's explicit Allow on \
-             the exact SQL; assume it may be denied, and never batch or chain statements. \
-             UPDATE/DELETE must have a WHERE clause; DDL (DROP/TRUNCATE/ALTER/CREATE) is not \
-             available; tell the user to run those by hand. Only write when the user has asked you \
-             to change data; read first to get it right, and verify after."
+            "You have the read tools (list_schema, describe_table, relationship_map, object_ddl, \
+             run_select, search_data, explain, health_report, server_sessions, diff_schema, \
+             diff_data, suggest_index, export_result, open_query, generate_report) AND gated write \
+             tools: propose_write for a SINGLE INSERT/UPDATE/DELETE, propose_changeset for several \
+             as one unit, create_index, and kill_session. Every one requires the user's explicit \
+             Allow on the exact operation; assume it may be denied, and never batch or chain \
+             statements inside one propose_write. UPDATE/DELETE must have a WHERE clause; \
+             destructive DDL (DROP/TRUNCATE/ALTER) is not available; tell the user to run those by \
+             hand. Only write when the user has asked you to change data; read first to get it \
+             right, and verify after."
         }
     };
     let mut s = finish_system_prompt(
@@ -3154,6 +5091,9 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
             "You are RED's database agent, embedded in a native SQL explorer. You help the user \
              explore and understand the database they are connected to.\n\n\
              {tools_line}\n\n\
+             Before any query that joins more than one table, call relationship_map; do not infer \
+             join keys from column names. Before explaining a constraint failure or what a view \
+             actually does, call object_ddl.\n\n\
              When you write SQL for the user, put it in a fenced ```sql block so they can run it. \
              Be concise: lead with the answer, then the supporting query or detail.\n",
         ),
@@ -3377,6 +5317,808 @@ async fn profile_table(
     (out, true)
 }
 
+/// Find rows containing `term` anywhere in a table, without the model having to
+/// guess which column holds it. Composes the driver's own
+/// [`contains_predicate`](DatabaseDriver::contains_predicate) (the same
+/// escaped, blob-skipping OR-of-LIKE the grid's find-in-result builds) with the
+/// windowed `fetch_page`, so it inherits both the escaping and the row cap
+/// rather than interpolating a model-supplied string into SQL.
+async fn search_data(
+    driver: &Arc<dyn DatabaseDriver>,
+    input: &Json,
+    limits: &AiLimits,
+) -> (String, bool) {
+    let schema = input.get("schema").and_then(Json::as_str).unwrap_or("");
+    let table = input.get("table").and_then(Json::as_str).unwrap_or("");
+    let term = input.get("term").and_then(Json::as_str).unwrap_or("");
+    if table.is_empty() || term.is_empty() {
+        return (
+            "error: search_data needs a non-empty `table` and `term`".into(),
+            false,
+        );
+    }
+    let detail = match driver.describe_table(schema, table).await {
+        Ok(d) => d,
+        Err(e) => return (format!("error: {e}"), false),
+    };
+    let table_ref = TableRef {
+        schema: (!schema.is_empty()).then(|| schema.to_string()),
+        name: table.to_string(),
+    };
+    let Some(predicate) = driver.contains_predicate(&detail.columns, term) else {
+        return (
+            format!(
+                "`{table}` has no searchable columns (they are all binary/blob), so there is \
+                 nothing to match `{term}` against."
+            ),
+            true,
+        );
+    };
+    let max_rows = limits.max_rows.max(1);
+    let limit = input
+        .get("limit")
+        .and_then(Json::as_u64)
+        .map(|n| n as usize)
+        .unwrap_or(max_rows)
+        .clamp(1, max_rows);
+    let sql = format!(
+        "SELECT * FROM {} WHERE {predicate}",
+        driver.quote_table(&table_ref)
+    );
+    let abort = AbortSignal::new();
+    // One probe row past the cap, so "exactly `limit` matches" is told apart from
+    // "there are more", exactly as run_select does.
+    let fetch = driver.fetch_page(
+        &sql,
+        0,
+        limit.saturating_add(1),
+        PageCap::Display { key: None },
+        &abort,
+    );
+    match guard_timeout(limits.statement_timeout_ms, &abort, fetch).await {
+        Ok(mut page) => {
+            let truncated = page.rows.len() > limit;
+            page.rows.truncate(limit);
+            let mut out = format_page(&page);
+            if truncated {
+                out.push_str(&format!(
+                    "\n(truncated to {limit} rows: more rows contain `{term}`)"
+                ));
+            }
+            (out, true)
+        }
+        Err(RedError::Timeout) => (
+            "error: the search exceeded the agent's statement timeout. A contains-match cannot \
+             use an index, so it scans; narrow it to a table you know is small, or write a \
+             targeted run_select instead."
+                .into(),
+            false,
+        ),
+        Err(e) => (format!("error: {e}"), false),
+    }
+}
+
+/// Cap on the tables one `diff_schema` describes per side. Each is a catalog
+/// round trip, so a schema with a thousand tables is compared by existence past
+/// this bound rather than in detail, and the report says so.
+const DIFF_SCHEMA_MAX_TABLES: usize = 200;
+/// Cap on the differing rows one `diff_data` reports back. The merge-walk itself
+/// streams the whole table; this bounds what reaches the model's context.
+const DIFF_ROW_REPORT: usize = 200;
+
+/// Compare two schemas' structure inside one connection.
+///
+/// Deliberately same-connection: `AiBackend` holds one driver, so a cross-server
+/// comparison would need a second session and is a different feature. Both sides
+/// are graded as the same engine, which is the truth here and makes a spelling
+/// difference (`varchar(50)` vs `varchar(100)`) a real finding rather than noise.
+async fn diff_schema(
+    driver: &Arc<dyn DatabaseDriver>,
+    input: &Json,
+    limits: &AiLimits,
+) -> (String, bool) {
+    use red_core::schema_diff::{SchemaSnapshot, compare};
+
+    let name = |k: &str| {
+        input
+            .get(k)
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    };
+    let (Some(left), Some(right)) = (name("left"), name("right")) else {
+        return (
+            "error: diff_schema needs `left` and `right` schema names".into(),
+            false,
+        );
+    };
+    let wanted: Vec<String> = input
+        .get("tables")
+        .and_then(Json::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Json::as_str)
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .unwrap_or_default();
+    let schemas = match driver.list_objects().await {
+        Ok(s) => s,
+        Err(e) => return (format!("error: {e}"), false),
+    };
+    let mut truncated = false;
+    let mut snapshot = async |want: &str| -> Result<SchemaSnapshot, String> {
+        let meta = schemas
+            .iter()
+            .find(|s| s.name.eq_ignore_ascii_case(want))
+            .ok_or_else(|| format!("no schema named `{want}` in this connection"))?;
+        // Same engine on both sides by construction, so `DbKind` only has to be
+        // consistent, not accurate: `compare` reads it to decide cross-engine.
+        let mut snap = SchemaSnapshot::from_meta(red_core::DbKind::default(), meta);
+        let relations: Vec<&red_core::ObjectMeta> = meta
+            .objects
+            .iter()
+            .filter(|o| o.kind.is_relation())
+            .filter(|o| wanted.is_empty() || wanted.contains(&o.name.to_ascii_lowercase()))
+            .collect();
+        truncated |= relations.len() > DIFF_SCHEMA_MAX_TABLES;
+        for obj in relations.into_iter().take(DIFF_SCHEMA_MAX_TABLES) {
+            if let Ok(detail) = driver.describe_table(&meta.name, &obj.name).await {
+                snap.details.insert(obj.name.clone(), detail);
+            }
+        }
+        Ok(snap)
+    };
+    let left_snap = match snapshot(left).await {
+        Ok(s) => s,
+        Err(why) => return (format!("error: {why}"), false),
+    };
+    let right_snap = match snapshot(right).await {
+        Ok(s) => s,
+        Err(why) => return (format!("error: {why}"), false),
+    };
+
+    let delta = compare(&left_snap, &right_snap);
+    let mut out = if delta.is_empty() {
+        format!("`{left}` and `{right}` are structurally identical.\n")
+    } else {
+        format!(
+            "{} difference(s) between `{left}` (baseline) and `{right}`:\n",
+            delta.count()
+        )
+    };
+    let list = |label: &str, items: &[red_core::ObjectMeta]| {
+        if items.is_empty() {
+            return String::new();
+        }
+        let names: Vec<&str> = items.iter().map(|o| o.name.as_str()).collect();
+        format!("{label}: {}\n", names.join(", "))
+    };
+    out.push_str(&list(&format!("Only in `{right}`"), &delta.objects_added));
+    out.push_str(&list(&format!("Only in `{left}`"), &delta.objects_removed));
+    for t in &delta.tables_changed {
+        out.push_str(&format!("\n{}:\n", t.name));
+        for c in &t.columns_added {
+            out.push_str(&format!("  + column {}\n", c.name));
+        }
+        for c in &t.columns_removed {
+            out.push_str(&format!("  - column {}\n", c.name));
+        }
+        for c in &t.columns_changed {
+            // The uncertain flag is load-bearing: outside the type lattice this is
+            // a raw string comparison, and calling it a change without saying so
+            // would send the model chasing a spelling difference.
+            let note = match c.confidence {
+                red_core::schema_diff::Confidence::Certain => "",
+                red_core::schema_diff::Confidence::Uncertain => " (may be a spelling difference)",
+            };
+            out.push_str(&format!(
+                "  ~ column {}: {}{note}\n",
+                c.left.name, c.summary
+            ));
+        }
+        for i in &t.indexes_added {
+            out.push_str(&format!("  + index {}\n", i.name));
+        }
+        for i in &t.indexes_removed {
+            out.push_str(&format!("  - index {}\n", i.name));
+        }
+        for f in &t.fks_added {
+            out.push_str(&format!(
+                "  + foreign key {} -> {}.{}\n",
+                f.column, f.ref_table, f.ref_column
+            ));
+        }
+        for f in &t.fks_removed {
+            out.push_str(&format!(
+                "  - foreign key {} -> {}.{}\n",
+                f.column, f.ref_table, f.ref_column
+            ));
+        }
+    }
+    if truncated {
+        out.push_str(&format!(
+            "\n(only the first {DIFF_SCHEMA_MAX_TABLES} tables per side were compared in detail; \
+             narrow with `tables`)\n"
+        ));
+    }
+    (cap_result_bytes(out, limits.max_result_bytes), true)
+}
+
+/// Compare two tables' rows inside one connection, key-ordered and merge-walked.
+///
+/// Runs the same streaming job the UI's data diff uses, so both tables are read
+/// through cursors and never materialized; only the reported differences are
+/// bounded, because those are what enter the model's context.
+async fn diff_data(
+    driver: &Arc<dyn DatabaseDriver>,
+    input: &Json,
+    limits: &AiLimits,
+) -> (String, bool) {
+    use std::sync::atomic::AtomicBool;
+
+    let table = |schema_key: &str, table_key: &str| -> Option<TableRef> {
+        let name = input
+            .get(table_key)
+            .and_then(Json::as_str)
+            .map(str::trim)
+            .filter(|t| !t.is_empty())?;
+        Some(TableRef {
+            schema: input
+                .get(schema_key)
+                .and_then(Json::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            name: name.to_string(),
+        })
+    };
+    let (Some(left), Some(right)) = (
+        table("left_schema", "left_table"),
+        table("right_schema", "right_table"),
+    ) else {
+        return (
+            "error: diff_data needs `left_table` and `right_table`".into(),
+            false,
+        );
+    };
+    let key = input
+        .get("key")
+        .and_then(Json::as_str)
+        .unwrap_or("")
+        .to_string();
+    // The job reports progress to the UI; there is no toast behind an agent call,
+    // so the receiver is dropped and the sends fall on the floor.
+    let (events, _rx) = futures::channel::mpsc::unbounded();
+    let cancel = Arc::new(AtomicBool::new(false));
+    let job = crate::dispatch::jobs::diff_job(
+        driver.clone(),
+        left.clone(),
+        driver.clone(),
+        right.clone(),
+        key,
+        cancel,
+        events,
+        crate::protocol::OpId::new(0),
+    );
+    let result = match limits.statement_timeout_ms {
+        0 => job.await,
+        ms => match tokio::time::timeout(Duration::from_millis(ms), job).await {
+            Ok(r) => r,
+            Err(_) => {
+                return (
+                    "error: the diff exceeded the agent's statement timeout. It reads both tables \
+                     whole, so compare smaller tables or do it from the UI's data diff, which can \
+                     run long."
+                        .into(),
+                    false,
+                );
+            }
+        },
+    };
+    let (plan, acc) = match result {
+        Ok(pair) => pair,
+        Err(e) => return (format!("error: {e}"), false),
+    };
+    let summary = &acc.summary;
+    let l = qualified(left.schema.as_deref(), &left.name);
+    let r = qualified(right.schema.as_deref(), &right.name);
+    let mut out = format!(
+        "Compared {l} (baseline) against {r} on `{}`:\n  {} identical, {} changed, {} only in {l}, \
+         {} only in {r}\n",
+        plan.key, summary.unchanged, summary.changed, summary.removed, summary.added,
+    );
+    if !plan.left_only.is_empty() || !plan.right_only.is_empty() {
+        out.push_str(&format!(
+            "  columns compared: {}; only in {l}: {}; only in {r}: {}\n",
+            plan.columns.join(", "),
+            if plan.left_only.is_empty() {
+                "none".into()
+            } else {
+                plan.left_only.join(", ")
+            },
+            if plan.right_only.is_empty() {
+                "none".into()
+            } else {
+                plan.right_only.join(", ")
+            },
+        ));
+    }
+    if !acc.rows.is_empty() {
+        out.push_str("\nDifferences:\n");
+        for row in acc.rows.iter().take(DIFF_ROW_REPORT) {
+            let what = match row.kind {
+                red_core::diff::DiffKind::Added => format!("only in {r}"),
+                red_core::diff::DiffKind::Removed => format!("only in {l}"),
+                red_core::diff::DiffKind::Changed => {
+                    let cols: Vec<&str> = row
+                        .changed
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, differs)| **differs)
+                        .filter_map(|(i, _)| plan.columns.get(i).map(String::as_str))
+                        .collect();
+                    format!("differs in {}", cols.join(", "))
+                }
+            };
+            out.push_str(&format!("  {} — {what}\n", row.key));
+        }
+        if acc.rows.len() > DIFF_ROW_REPORT || acc.truncated {
+            out.push_str(
+                "  …(more differing rows than are shown; the counts above are complete)\n",
+            );
+        }
+    }
+    (cap_result_bytes(out, limits.max_result_bytes), true)
+}
+
+/// Decide whether an index would help a query and emit the candidate DDL as
+/// text. A composition of `explain` and `describe_table`, not a new seam: the
+/// plan says whether it scans, and the table's existing indexes say whether the
+/// suggestion is already there.
+async fn suggest_index(
+    driver: &Arc<dyn DatabaseDriver>,
+    input: &Json,
+    limits: &AiLimits,
+) -> (String, bool) {
+    let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
+    let schema = input.get("schema").and_then(Json::as_str).unwrap_or("");
+    let table = input.get("table").and_then(Json::as_str).unwrap_or("");
+    if sql.is_empty() || table.is_empty() {
+        return (
+            "error: suggest_index needs `sql` and the `table` it filters".into(),
+            false,
+        );
+    }
+    let explain = driver.explain(sql, false);
+    let plan = match limits.statement_timeout_ms {
+        0 => explain.await,
+        ms => tokio::time::timeout(Duration::from_millis(ms), explain)
+            .await
+            .unwrap_or(Err(RedError::Timeout)),
+    };
+    let plan = match plan {
+        Ok(p) => p,
+        Err(e) => return (format!("error: {e}"), false),
+    };
+    let detail = match driver.describe_table(schema, table).await {
+        Ok(d) => d,
+        Err(e) => return (format!("error: {e}"), false),
+    };
+    let mut out = format!("Plan for the query:\n{}\n\n", format_plan(&plan));
+    out.push_str("Existing indexes:\n");
+    if detail.indexes.is_empty() {
+        out.push_str("  (none)\n");
+    }
+    for ix in &detail.indexes {
+        out.push_str(&format!(
+            "  {} on ({}){}\n",
+            ix.name,
+            ix.columns.join(", "),
+            if ix.unique { " UNIQUE" } else { "" },
+        ));
+    }
+    let table_ref = TableRef {
+        schema: (!schema.is_empty()).then(|| schema.to_string()),
+        name: table.to_string(),
+    };
+    out.push_str(&format!(
+        "\nColumns available to index: {}\n\nIf the plan above scans rather than seeks, the index \
+         to consider has the query's equality-filtered columns first, then its range-filtered \
+         one, then anything it sorts by. Check it is not already listed above, then propose it as \
+         TEXT for the user:\n\n  CREATE INDEX idx_{}_<columns> ON {} (<columns>);\n\nNothing here \
+         was created. Use create_index (which needs the user's approval) only if they ask for it, \
+         and tell them how large the table is first.\n",
+        detail
+            .columns
+            .iter()
+            .map(|c| c.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", "),
+        table,
+        driver.quote_table(&table_ref),
+    ));
+    (cap_result_bytes(out, limits.max_result_bytes), true)
+}
+
+/// The validated arguments of a `create_index` call, shared by the approval
+/// prompt and the executor so the index the user allows is the index that runs.
+fn index_args(input: &Json) -> Result<(TableRef, String, Vec<String>, bool), String> {
+    let table = input
+        .get("table")
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .ok_or("create_index needs a `table`")?;
+    let name = input
+        .get("name")
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .ok_or("create_index needs a `name` for the index")?;
+    let columns: Vec<String> = input
+        .get("columns")
+        .and_then(Json::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Json::as_str)
+                .map(str::trim)
+                .filter(|c| !c.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if columns.is_empty() {
+        return Err("create_index needs a non-empty `columns` array".into());
+    }
+    Ok((
+        TableRef {
+            schema: input
+                .get("schema")
+                .and_then(Json::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+            name: table.to_string(),
+        },
+        name.to_string(),
+        columns,
+        input.get("unique").and_then(Json::as_bool).unwrap_or(false),
+    ))
+}
+
+/// The [`KillMode`](red_core::KillMode) a `kill_session`/`doc_kill_op` input
+/// names, defaulting to the reversible one. An unrecognized spelling is an error
+/// rather than a guess: guessing wrong here means terminating a session the user
+/// only meant to interrupt.
+fn kill_mode(input: &Json) -> Result<red_core::KillMode, String> {
+    match input.get("mode").and_then(Json::as_str).unwrap_or("cancel") {
+        "cancel" => Ok(red_core::KillMode::Cancel),
+        "terminate" => Ok(red_core::KillMode::Terminate),
+        other => Err(format!(
+            "kill mode must be \"cancel\" or \"terminate\", not `{other}`"
+        )),
+    }
+}
+
+/// Stop a server session, re-resolving the target against the live server first.
+///
+/// The approval the user gave names a specific session doing a specific thing.
+/// Between that prompt and this call the server may have finished that statement
+/// and handed the same pid/thread id to something else, so the facts the model
+/// echoed are *verified* rather than trusted: a mismatch refuses the kill instead
+/// of stopping whatever now holds the key.
+async fn kill_session(driver: &Arc<dyn DatabaseDriver>, input: &Json) -> (String, bool) {
+    let key = input
+        .get("key")
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if key.is_empty() {
+        return ("error: `key` is required".into(), false);
+    }
+    let mode = match kill_mode(input) {
+        Ok(m) => m,
+        Err(why) => return (format!("error: {why}"), false),
+    };
+    let sessions = match driver.server_sessions().await {
+        Ok((s, _)) => s,
+        Err(e) => return (format!("error: {e}"), false),
+    };
+    let Some(target) = sessions
+        .iter()
+        .find(|s| s.key == red_core::SessionKey(key.to_string()))
+    else {
+        return (
+            format!("session `{key}` is no longer running; nothing to stop."),
+            true,
+        );
+    };
+    if target.is_self {
+        return (
+            "error: that is RED's own connection. Stopping it would just force a reconnect; \
+             refusing."
+                .into(),
+            false,
+        );
+    }
+    if let Some(claimed) = input
+        .get("user")
+        .and_then(Json::as_str)
+        .filter(|u| !u.is_empty())
+        && target.user.as_deref() != Some(claimed)
+    {
+        return (
+            format!(
+                "error: session `{key}` now belongs to {}, not {claimed}: it was recycled since \
+                 you read it. Re-read server_sessions and propose again.",
+                target.user.as_deref().unwrap_or("an unknown user"),
+            ),
+            false,
+        );
+    }
+    match driver.kill_session(&target.key, mode).await {
+        Ok(()) => (
+            format!(
+                "{} on session `{key}`. Confirm with server_sessions.",
+                mode.verb()
+            ),
+            true,
+        ),
+        Err(e) => (format!("error: {e}"), false),
+    }
+}
+
+/// How many of the largest tables `health_report` lists. Enough to answer "where
+/// did the disk go" without turning the report into a catalog dump.
+const HEALTH_TOP_TABLES: usize = 20;
+
+/// A [`HealthReport`](red_core::health::HealthReport) as text for the agent.
+///
+/// The `unavailable` list is not decoration: a report that silently drops the
+/// unused-index check reads as a clean bill of health, so what could *not* be
+/// checked is stated as plainly as what was.
+fn format_health(r: &red_core::health::HealthReport) -> String {
+    use std::fmt::Write;
+
+    let scope = match &r.namespace {
+        Some(ns) => format!(" (schema {ns})"),
+        None => String::new(),
+    };
+    let mut s = format!(
+        "Health of this {:?} connection{scope}\n{} across {} table(s), of which {} is index.\n",
+        r.engine,
+        fmt_bytes(r.totals.bytes),
+        r.totals.table_count,
+        fmt_bytes(r.totals.index_bytes),
+    );
+    if !r.tables.is_empty() {
+        s.push_str("\nLargest tables:\n");
+        for t in r.tables.iter().take(HEALTH_TOP_TABLES) {
+            let _ = writeln!(
+                s,
+                "  {}  {} ({} index, ~{} rows est)",
+                qualified(t.table.schema.as_deref(), &t.table.name),
+                fmt_bytes(t.bytes),
+                fmt_bytes(t.index_bytes),
+                t.estimated_rows,
+            );
+        }
+        if r.tables.len() > HEALTH_TOP_TABLES {
+            let _ = writeln!(s, "  …({} more)", r.tables.len() - HEALTH_TOP_TABLES);
+        }
+    }
+    let findings = r.sorted_findings();
+    if findings.is_empty() {
+        s.push_str("\nNo findings from the checks that ran.\n");
+    } else {
+        let _ = write!(s, "\n{} finding(s), worst first:\n", findings.len());
+        for f in findings {
+            let object = f
+                .object
+                .as_ref()
+                .map(|t| format!(" {}", qualified(t.schema.as_deref(), &t.name)))
+                .unwrap_or_default();
+            let _ = writeln!(s, "  [{:?}] {:?}{object}: {}", f.severity, f.kind, f.title);
+            let _ = writeln!(s, "    {}", f.detail);
+            if let Some(sql) = &f.suggested_sql {
+                // Text to read and paste. RED never runs a remediation itself, and
+                // saying so keeps the model from treating it as something to apply.
+                let _ = writeln!(s, "    suggested (NOT run; hand this to the user): {sql}");
+            }
+        }
+    }
+    if !r.unavailable.is_empty() {
+        s.push_str("\nChecks that could NOT run here (so their absence proves nothing):\n");
+        for u in &r.unavailable {
+            let _ = writeln!(s, "  {:?}: {}", u.kind, u.reason);
+        }
+    }
+    s
+}
+
+/// Live server sessions as text, longest-running first (the driver's own order).
+fn format_sessions(sessions: &[red_core::ServerSession], restricted: bool) -> String {
+    use std::fmt::Write;
+
+    if sessions.is_empty() {
+        return "No client sessions are running.".to_string();
+    }
+    let mut s = format!("{} session(s), longest-running first:\n", sessions.len());
+    for x in sessions {
+        let field = |label: &str, v: &Option<String>| match v {
+            Some(v) if !v.is_empty() => format!(" {label}={v}"),
+            _ => String::new(),
+        };
+        let _ = write!(
+            s,
+            "  [{}]{}{}{}{} {} for {:.1}s",
+            x.key,
+            field("user", &x.user),
+            field("db", &x.database),
+            field("app", &x.application),
+            field("from", &x.client_addr),
+            x.state,
+            x.elapsed_secs,
+        );
+        if x.is_self {
+            s.push_str(" (RED's own connection)");
+        }
+        s.push('\n');
+        if let Some(w) = &x.wait {
+            let _ = writeln!(s, "    waiting on {w}");
+        }
+        if !x.blocked_by.is_empty() {
+            let by: Vec<String> = x.blocked_by.iter().map(ToString::to_string).collect();
+            let _ = writeln!(s, "    blocked by {}", by.join(", "));
+        }
+        match &x.query {
+            Some(q) => {
+                let _ = writeln!(s, "    {}", truncate_summary(q.trim(), 300));
+            }
+            None => s.push_str("    (statement not visible to this role)\n"),
+        }
+    }
+    if restricted {
+        s.push_str(
+            "(the connected role may not read other sessions' statements, so some are hidden \
+             rather than absent)\n",
+        );
+    }
+    s
+}
+
+/// Cap on the edges one `relationship_map` reports. Large enough for any schema a
+/// person reasons about in one sitting; past it the map is a data dump rather than
+/// a map, and the truncation is reported so the model narrows with `tables`.
+const FK_EDGE_CAP: usize = 400;
+
+/// The connection's foreign-key graph as text: every edge, then the tables no
+/// edge touches. One `foreign_keys()` pass (the same graph the ER canvas draws)
+/// plus the object list for the islands, because a table nobody references is a
+/// fact the model cannot infer from the edges it *did* get.
+async fn relationship_map(driver: &Arc<dyn DatabaseDriver>, input: &Json) -> (String, bool) {
+    let schema = input
+        .get("schema")
+        .and_then(Json::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let wanted: Vec<String> = input
+        .get("tables")
+        .and_then(Json::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Json::as_str)
+                .map(str::to_ascii_lowercase)
+                .collect()
+        })
+        .unwrap_or_default();
+    let edges = match driver.foreign_keys().await {
+        Ok(e) => e,
+        Err(e) => return (format!("error: {e}"), false),
+    };
+
+    let in_schema = |ns: Option<&str>| match schema {
+        None => true,
+        Some(want) => ns.is_some_and(|got| got.eq_ignore_ascii_case(want)),
+    };
+    let named = |t: &str| {
+        wanted.is_empty()
+            || wanted
+                .iter()
+                .any(|w| w.eq_ignore_ascii_case(t.trim_matches('"')))
+    };
+    // Either side matching keeps the edge: a filter on `orders` should still show
+    // what points *at* orders, which is the half a column-name guess gets wrong.
+    let kept: Vec<&FkEdge> = edges
+        .iter()
+        .filter(|e| {
+            (in_schema(e.from_schema.as_deref()) || in_schema(e.to_schema.as_deref()))
+                && (named(&e.from_table) || named(&e.to_table))
+        })
+        .collect();
+
+    let mut out = if kept.is_empty() {
+        "No declared foreign keys. This engine or schema has none, so join keys cannot be \
+         verified here: confirm any join against describe_table and the data itself.\n"
+            .to_string()
+    } else {
+        format!("{} foreign-key edge(s):\n", kept.len())
+    };
+    for e in kept.iter().take(FK_EDGE_CAP) {
+        out.push_str(&format!(
+            "  {} -> {}\n",
+            fk_side(e.from_schema.as_deref(), &e.from_table, 0, &e.columns),
+            fk_side(e.to_schema.as_deref(), &e.to_table, 1, &e.columns),
+        ));
+    }
+    if kept.len() > FK_EDGE_CAP {
+        out.push_str(&format!(
+            "  …({} more edges; narrow with `schema` or `tables`)\n",
+            kept.len() - FK_EDGE_CAP
+        ));
+    }
+
+    // Islands are a property of the *whole* graph, so they're computed against
+    // every edge and only then narrowed to the requested schema for display.
+    let mut touched: Vec<String> = Vec::with_capacity(edges.len() * 2);
+    for e in &edges {
+        touched.push(qualified(e.from_schema.as_deref(), &e.from_table).to_ascii_lowercase());
+        touched.push(qualified(e.to_schema.as_deref(), &e.to_table).to_ascii_lowercase());
+    }
+    if let Ok(schemas) = driver.list_objects().await {
+        let islands: Vec<String> = schemas
+            .iter()
+            .filter(|s| in_schema(Some(&s.name)))
+            .flat_map(|s| {
+                s.objects
+                    .iter()
+                    // Views hold no constraints, so listing them here would report
+                    // every view as an island and drown the real ones.
+                    .filter(|o| o.kind == red_core::ObjectKind::Table)
+                    .map(move |o| qualified(Some(&s.name), &o.name))
+            })
+            .filter(|t| !touched.contains(&t.to_ascii_lowercase()) && named(t))
+            .collect();
+        if !islands.is_empty() {
+            out.push_str(&format!(
+                "\n{} table(s) with no foreign key in either direction:\n  {}\n",
+                islands.len(),
+                islands.join(", ")
+            ));
+        }
+    }
+    (out, true)
+}
+
+/// One end of an FK edge as `schema.table.column`, or `schema.table.(a, b)` for a
+/// composite key. `side` picks the column of each `(from, to)` pair.
+fn fk_side(schema: Option<&str>, table: &str, side: usize, columns: &[(String, String)]) -> String {
+    let cols: Vec<&str> = columns
+        .iter()
+        .map(|(from, to)| {
+            if side == 0 {
+                from.as_str()
+            } else {
+                to.as_str()
+            }
+        })
+        .collect();
+    let table = qualified(schema, table);
+    match cols.as_slice() {
+        [one] => format!("{table}.{one}"),
+        many => format!("{table}.({})", many.join(", ")),
+    }
+}
+
+/// `schema.table`, or the bare table on an engine with no schemas.
+fn qualified(schema: Option<&str>, table: &str) -> String {
+    match schema.filter(|s| !s.is_empty()) {
+        Some(s) => format!("{s}.{table}"),
+        None => table.to_string(),
+    }
+}
+
 fn format_schema(schemas: &[red_core::SchemaMeta]) -> String {
     use std::fmt::Write;
     let mut out = String::new();
@@ -3495,6 +6237,8 @@ const DOC_WRITE_TOOLS: &[&str] = &[
     "propose_doc_write",
     "propose_index",
     "propose_collection_op",
+    // Not a document write, but a server-state one that rides the same gate.
+    "doc_kill_op",
 ];
 
 fn is_doc_write_tool(name: &str) -> bool {
@@ -3554,6 +6298,29 @@ pub(crate) fn doc_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             input_schema: coll_args(json!({})),
         },
         ToolDef {
+            name: "doc_reference_map".into(),
+            description: "Discover which fields REFERENCE other collections, and how well they \
+                resolve. MongoDB has no foreign keys, so a field named `user_id` may point at \
+                `users._id`, at something else, or at nothing: this samples each candidate \
+                field's values, probes the target collection's `_id`, and reports the HIT RATE \
+                (\"198/200 resolve\" is a usable join; \"0/200\" is a name collision). CALL THIS \
+                BEFORE WRITING AN AGGREGATION THAT $lookups ACROSS COLLECTIONS. Bounded: a few \
+                collections, a couple of hundred sampled values per field."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "db": { "type": "string", "description": "Database to map; omit for every non-system database." },
+                    "collections": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Restrict to these collections; omit for all in the database.",
+                    },
+                },
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
             name: "profile_collection".into(),
             description: "The signature data-quality tool: sample the collection and report, per \
                 field path, its type distribution and how often it is present — surfacing schema \
@@ -3563,6 +6330,16 @@ pub(crate) fn doc_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             input_schema: coll_args(
                 json!({ "sample": { "type": "integer", "description": "Documents to sample (default 200)." } }),
             ),
+        },
+        ToolDef {
+            name: "get_document".into(),
+            description: "Fetch ONE document by its `_id`. Cheaper and less error-prone than a \
+                find with an _id filter. Pass an ObjectId as { \"$oid\": \"…\" } and a plain id \
+                as itself."
+                .into(),
+            input_schema: coll_args(json!({
+                "id": { "description": "The _id to fetch, in extended JSON ({ \"$oid\": \"…\" }) or as a plain scalar." },
+            })),
         },
         ToolDef {
             name: "sample_documents".into(),
@@ -3614,9 +6391,10 @@ pub(crate) fn doc_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
         },
         ToolDef {
             name: "explain_query".into(),
-            description: "Explain a find: the winning plan, the index used, docs-examined vs \
-                returned, and an explicit COLLSCAN flag. The flag turns 'slow query' into 'here's \
-                the missing index'."
+            description: "Explain a find: the winning plan, the index used, ACTUAL docs-examined \
+                vs returned (it runs with executionStats, so these are measurements rather than \
+                estimates), and an explicit COLLSCAN flag. Examined far exceeding returned is the \
+                missing-index signature."
                 .into(),
             input_schema: coll_args(json!({ "filter": { "type": "object", "description": "The find filter to explain." } })),
         },
@@ -3628,12 +6406,35 @@ pub(crate) fn doc_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             input_schema: coll_args(json!({ "filter": { "type": "object", "description": "The find filter to advise on." } })),
         },
         ToolDef {
+            name: "doc_current_op".into(),
+            description: "What the deployment is running RIGHT NOW ($currentOp), longest-running \
+                first: opid, operation kind, namespace, elapsed time, client, the command itself, \
+                and whether it is blocked waiting for a lock. The \"why is it slow right now\" \
+                answer, as opposed to audit_collection's structural one. Idle connections are \
+                excluded."
+                .into(),
+            input_schema: json!({ "type": "object", "properties": {}, "additionalProperties": false }),
+        },
+        ToolDef {
             name: "audit_collection".into(),
             description: "Roll a sample into a health report: schema drift (mixed-type fields), \
                 optional/sparse fields, and index coverage. The 'what's wrong in here' answer."
                 .into(),
             input_schema: coll_args(json!({})),
         },
+        export_tool_def(
+            "Write the documents matching a filter to a JSON file for the user (an array of \
+             extended-JSON documents) and hand it over as a card in the chat they can open. \
+             Bounded: it pages through a large but finite number of documents and says so if it \
+             stopped early. Use it when the user asks for an export/dump rather than an answer.",
+            json!({
+                "db": { "type": "string", "description": "Database name." },
+                "coll": { "type": "string", "description": "Collection name." },
+                "filter": { "type": "object", "description": "Match document (empty = the whole collection)." },
+                "name": { "type": "string", "description": "A short name for the file, e.g. \"active-users\"." },
+            }),
+            &["db", "coll"],
+        ),
         report_tool_def(),
         spawn_subagent_tool_def(),
         // --- gated writes (Write tier, writable connection only) ---
@@ -3675,6 +6476,26 @@ pub(crate) fn doc_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                     "unique": { "type": "boolean" },
                 },
                 "required": ["db", "coll", "keys"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "doc_kill_op".into(),
+            description: "Stop one running operation by its opid (killOp). Call doc_current_op \
+                first for the `opid`, and copy that operation's `namespace` and `command` into \
+                this call so the user can see what they are stopping — the target is re-checked \
+                against the live server first and refused if the opid now belongs to something \
+                else. Note that Mongo does NOT roll back an interrupted multi-document write: a \
+                killed updateMany leaves what it already changed. Requires explicit approval."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "opid": { "type": "integer", "description": "The operation id from doc_current_op." },
+                    "namespace": { "type": "string", "description": "The operation's db.collection, copied from doc_current_op; verified before the kill." },
+                    "command": { "type": "string", "description": "The operation's command, copied from doc_current_op, so the approval shows what is being stopped." },
+                },
+                "required": ["opid"],
                 "additionalProperties": false,
             }),
         },
@@ -3723,23 +6544,28 @@ pub(crate) fn doc_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
             "You have NO MongoDB tools available; the assistant is limited to general conversation."
         }
         AiTier::Schema => {
-            "You have metadata-only MongoDB tools: doc_server_info, list_collections, and \
-             describe_collection. You can see the catalog and each collection's inferred schema and \
-             indexes, but cannot read documents."
+            "You have metadata-only MongoDB tools: doc_server_info (which lists the databases), \
+             list_collections, and describe_collection. You can see the catalog and each \
+             collection's inferred schema, indexes and validator, but cannot read documents."
         }
         AiTier::Read => {
-            "You have read-only MongoDB tools: doc_server_info, list_collections, \
-             describe_collection, profile_collection (per-field type/drift stats), sample_documents, \
-             find, aggregate ($out/$merge rejected), count, distinct, explain_query, index_advice, \
-             audit_collection, and generate_report. Ground every answer in the live deployment."
+            "You have read-only MongoDB tools: doc_server_info (deployment, topology and the \
+             database list), list_collections, describe_collection (inferred schema, indexes and \
+             any declared validator), doc_reference_map (which fields reference which collections, and \
+             how well they resolve), profile_collection (per-field type/drift stats), \
+             sample_documents, get_document (one document by _id), find, aggregate ($out/$merge \
+             rejected), count, distinct, explain_query (optionally with execution stats), \
+             index_advice, audit_collection, doc_current_op (what is running now), export_result, \
+             and generate_report. Ground every answer in the live deployment."
         }
         AiTier::Write => {
             "You have the read-only MongoDB tools (doc_server_info, list_collections, \
              describe_collection, profile_collection, sample_documents, find, aggregate, count, \
-             distinct, explain_query, index_advice, audit_collection) AND gated write tools: \
-             propose_doc_write, propose_index, and propose_collection_op. Every write requires the \
-             user's explicit Allow; update/delete require a non-empty filter, and dropping a \
-             collection always confirms."
+             distinct, explain_query, index_advice, audit_collection, doc_current_op, \
+             export_result) AND gated write tools: propose_doc_write, propose_index, \
+             propose_collection_op, and doc_kill_op. Every write requires the user's explicit \
+             Allow; update/delete require a non-empty filter, and dropping a collection always \
+             confirms."
         }
     };
     finish_system_prompt(
@@ -3752,8 +6578,11 @@ pub(crate) fn doc_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
              deployment, list_collections for the catalog, describe_collection/profile_collection \
              to learn the discovered schema, sample_documents to see real shape — THEN \
              find/aggregate to read, and explain_query/index_advice/audit_collection to reason \
-             about performance and health. Queries are filter documents and aggregation pipelines \
-             (extended JSON), never SQL. Be concise: lead with the answer, then the detail.\n",
+             about performance and health. Before writing an aggregation that joins collections \
+             with $lookup, call doc_reference_map: Mongo has no foreign keys, so a field named \
+             `user_id` may not resolve, and the map tells you the hit rate.\n\n\
+             Queries are filter documents and aggregation pipelines (extended JSON), never SQL. Be \
+             concise: lead with the answer, then the detail.\n",
         ),
         ctx,
         "This connection is READ-ONLY.",
@@ -3862,6 +6691,32 @@ fn assess_doc_write(name: &str, input: &Json) -> WriteAssessment {
                 sql: format!("CREATE{unique_note} INDEX on {ns} keys {keys}"),
             }
         }
+        "doc_kill_op" => match input.get("opid").and_then(Json::as_i64) {
+            Some(opid) => {
+                let mut op = format!("KILL operation {opid}");
+                if let Some(ns) = s("namespace") {
+                    op.push_str(&format!(" on {ns}"));
+                }
+                op.push_str(
+                    "\n\u{26a0} An interrupted multi-document write is NOT rolled back: what it \
+                     already changed stays changed.",
+                );
+                match s("command") {
+                    Some(cmd) => op.push_str(&format!(
+                        "\nRunning: {}",
+                        truncate_summary(cmd, DOC_PAYLOAD_CHARS)
+                    )),
+                    None => op.push_str(
+                        "\nThe agent did not say what this operation is; read doc_current_op \
+                         before allowing.",
+                    ),
+                }
+                WriteAssessment::NeedsApproval { sql: op }
+            }
+            None => WriteAssessment::Reject(
+                "doc_kill_op needs the numeric `opid` of an operation from doc_current_op".into(),
+            ),
+        },
         "propose_collection_op" => match s("op").unwrap_or("") {
             "create" => WriteAssessment::NeedsApproval {
                 sql: format!("CREATE collection {ns}"),
@@ -3944,8 +6799,18 @@ pub(crate) async fn doc_run_tool(
                                 CollKind::Timeseries => " (timeseries)",
                             };
                             let capped = if c.capped { " capped" } else { "" };
+                            let size = if c.size > 0 {
+                                format!(", {}", fmt_bytes(c.size))
+                            } else {
+                                String::new()
+                            };
+                            let validator = if c.validator.is_some() {
+                                " [has a validator]"
+                            } else {
+                                ""
+                            };
                             out.push_str(&format!(
-                                "  {} — ~{} docs{kind}{capped}\n",
+                                "  {} — ~{} docs{size}{kind}{capped}{validator}\n",
                                 c.name, c.est_count
                             ));
                         }
@@ -3962,12 +6827,52 @@ pub(crate) async fn doc_run_tool(
                 Err(e) => return (format!("error: {e}"), false),
             };
             let indexes = driver.indexes(db(), coll()).await.unwrap_or_default();
-            let out = format!(
+            let mut out = format!(
                 "{}\nIndexes:\n{}",
                 fmt_doc_schema(&schema),
                 fmt_doc_indexes(&indexes)
             );
+            // A declared validator is the only *enforced* rule in a schemaless
+            // store: a write that violates it bounces, so the model has to see it
+            // here rather than discover it from a rejected insert.
+            let validator = driver.list_collections(db()).await.ok().and_then(|list| {
+                list.into_iter()
+                    .find(|c| c.name == coll())
+                    .and_then(|c| c.validator)
+            });
+            out.push_str(&match validator {
+                Some(v) => format!(
+                    "\nValidator (writes that violate this are rejected by the server):\n  {v}\n"
+                ),
+                None => "\nValidator: none declared.\n".to_string(),
+            });
             (cap_result_bytes(out, limits.max_result_bytes), true)
+        }
+        "get_document" => {
+            let id = match doc_arg_value(driver, input, "id") {
+                Ok(Some(v)) => v,
+                Ok(None) => return ("error: `id` is required".into(), false),
+                Err(e) => return (format!("error: {e}"), false),
+            };
+            match driver.get_document(db(), coll(), &id).await {
+                Ok(Some(doc)) => (
+                    cap_result_bytes(
+                        doc.to_doc_value().to_extended_json(),
+                        limits.max_result_bytes,
+                    ),
+                    true,
+                ),
+                Ok(None) => (
+                    format!(
+                        "no document with that _id in {}.{}. If the _id is an ObjectId, pass it \
+                         as {{\"$oid\": \"…\"}} rather than a bare string.",
+                        db(),
+                        coll()
+                    ),
+                    true,
+                ),
+                Err(e) => (format!("error: {e}"), false),
+            }
         }
         "profile_collection" => {
             let sample = input
@@ -4123,13 +7028,65 @@ pub(crate) async fn doc_run_tool(
                 limit: None,
                 batch: 1,
             };
-            match driver.explain(&query).await {
+            // `DocDriver::explain` always asks for `executionStats`, so the plan
+            // already carries actuals beside the estimates and needs no `analyze`
+            // flag. It does run the plan to gather them, though, so bound it like
+            // any other read: a find can't be destructive, only slow.
+            let explain = driver.explain(&query);
+            let result = match limits.statement_timeout_ms {
+                0 => explain.await,
+                ms => tokio::time::timeout(Duration::from_millis(ms), explain)
+                    .await
+                    .unwrap_or(Err(RedError::Timeout)),
+            };
+            match result {
                 Ok(plan) => (fmt_doc_plan(&plan), true),
+                Err(RedError::Timeout) => (
+                    "error: the explain exceeded the agent's statement timeout; narrow the filter."
+                        .into(),
+                    false,
+                ),
                 Err(e) => (format!("error: {e}"), false),
             }
         }
+        "doc_reference_map" => doc_reference_map(driver, input, limits).await,
+        "doc_current_op" => match driver.current_ops().await {
+            Ok(ops) if ops.is_empty() => ("Nothing is running right now.".to_string(), true),
+            Ok(ops) => {
+                let mut out = format!("{} running operation(s), longest first:\n", ops.len());
+                for o in &ops {
+                    out.push_str(&format!(
+                        "  opid {} {} on {} for {:.1}s{}{}\n",
+                        o.opid,
+                        o.op,
+                        if o.namespace.is_empty() {
+                            "(no namespace)"
+                        } else {
+                            &o.namespace
+                        },
+                        o.secs_running,
+                        o.client
+                            .as_deref()
+                            .map(|c| format!(" from {c}"))
+                            .unwrap_or_default(),
+                        if o.waiting_for_lock {
+                            " — WAITING FOR LOCK"
+                        } else {
+                            ""
+                        },
+                    ));
+                    if let Some(cmd) = &o.command {
+                        out.push_str(&format!("    {}\n", truncate_summary(cmd, 300)));
+                    }
+                }
+                (cap_result_bytes(out, limits.max_result_bytes), true)
+            }
+            Err(e) => (format!("error: {e}"), false),
+        },
+        "doc_kill_op" => doc_kill_op(driver, input).await,
         "index_advice" => doc_index_advice(driver, input).await,
         "audit_collection" => doc_audit_collection(driver, input, limits).await,
+        "export_result" => doc_export(driver, input, report).await,
         "generate_report" => run_generate_report(input, report),
         // Gated writes — the approval already happened in the turn loop.
         "propose_doc_write" => doc_apply_write(driver, input).await,
@@ -4345,6 +7302,293 @@ async fn doc_execute_write(
 }
 
 /// `index_advice`: explain the filter, then report coverage / suggest a key.
+/// Stop a running Mongo operation, re-resolving the opid against the live
+/// deployment first. Same contract as [`kill_session`]: what the user approved
+/// was a specific operation, and an opid can be reused, so the echoed facts are
+/// verified rather than trusted.
+async fn doc_kill_op(driver: &Arc<dyn DocDriver>, input: &Json) -> (String, bool) {
+    let Some(opid) = input.get("opid").and_then(Json::as_i64) else {
+        return ("error: doc_kill_op needs an `opid`".into(), false);
+    };
+    let ops = match driver.current_ops().await {
+        Ok(o) => o,
+        Err(e) => return (format!("error: {e}"), false),
+    };
+    let Some(live) = ops.iter().find(|o| o.opid == opid) else {
+        return (
+            format!("operation {opid} is no longer running; nothing to stop."),
+            true,
+        );
+    };
+    if let Some(claimed) = input
+        .get("namespace")
+        .and_then(Json::as_str)
+        .filter(|n| !n.is_empty())
+        && live.namespace != claimed
+    {
+        return (
+            format!(
+                "error: opid {opid} now runs on {}, not {claimed}: it was reused since you read \
+                 it. Re-read doc_current_op and propose again.",
+                live.namespace
+            ),
+            false,
+        );
+    }
+    match driver.kill_op(opid).await {
+        Ok(()) => (
+            format!(
+                "Stopped opid {opid} on {}. Mongo does not roll back a partially-applied \
+                 multi-document write, so verify the data if it was one.",
+                live.namespace
+            ),
+            true,
+        ),
+        Err(e) => (format!("error: {e}"), false),
+    }
+}
+
+/// Documents sampled per collection when hunting reference candidates, and per
+/// candidate field when collecting values to probe with. 200 is the plan's
+/// number: enough that a hit rate means something, small enough that the whole
+/// map is a handful of bounded reads.
+const DOC_REF_SAMPLE: usize = 200;
+/// Cap on candidate fields probed in one `doc_reference_map` call. Each is one
+/// `find` plus one `count`, so this is what keeps the tool a map rather than a
+/// crawl.
+const DOC_REF_MAX_FIELDS: usize = 20;
+/// Cap on collections whose schema is inferred in one call.
+const DOC_REF_MAX_COLLECTIONS: usize = 25;
+/// Databases that are the server's own bookkeeping, never a user's data model.
+const DOC_SYSTEM_DBS: &[&str] = &["admin", "local", "config"];
+
+/// One field that *looks* like a reference, with the target it would resolve
+/// against. Built before any probing so the candidate list can be capped and
+/// reported whole — including the ones that turn out to resolve nothing.
+struct RefCandidate {
+    coll: String,
+    path: String,
+    /// The collection the field name points at, already spelled as the catalog
+    /// spells it.
+    target: String,
+    /// The dominant BSON type of the field, for the report (a `string` field
+    /// pointing at an `objectId` `_id` explains a 0/200 on its own).
+    doc_type: String,
+}
+
+/// The Mongo analogue of `relationship_map`: guess which fields reference other
+/// collections from their names, then *test each guess* against the target's
+/// `_id` and report the hit rate.
+///
+/// The hit rate is the entire point. A name-based guess alone is exactly the
+/// failure mode this tool exists to prevent, so an unresolved candidate is
+/// reported as unresolved and never silently dropped: an omission would read as
+/// "no reference exists", which is the opposite of what was found.
+async fn doc_reference_map(
+    driver: &Arc<dyn DocDriver>,
+    input: &Json,
+    limits: &AiLimits,
+) -> (String, bool) {
+    let abort = AbortSignal::new();
+    let dbs: Vec<String> = match input
+        .get("db")
+        .and_then(Json::as_str)
+        .filter(|d| !d.is_empty())
+    {
+        Some(d) => vec![d.to_string()],
+        None => match driver.list_databases().await {
+            Ok(list) => list
+                .into_iter()
+                .map(|d| d.name)
+                .filter(|n| !DOC_SYSTEM_DBS.contains(&n.as_str()))
+                .collect(),
+            Err(e) => return (format!("error: {e}"), false),
+        },
+    };
+    let wanted: Vec<String> = input
+        .get("collections")
+        .and_then(Json::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Json::as_str)
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut out = String::new();
+    for db in &dbs {
+        let catalog: Vec<String> = match driver.list_collections(db).await {
+            Ok(list) => list.into_iter().map(|c| c.name).collect(),
+            Err(e) => {
+                out.push_str(&format!("{db}: error: {e}\n"));
+                continue;
+            }
+        };
+        let scanned: Vec<&String> = catalog
+            .iter()
+            .filter(|c| wanted.is_empty() || wanted.iter().any(|w| w == *c))
+            .take(DOC_REF_MAX_COLLECTIONS)
+            .collect();
+        let mut candidates: Vec<RefCandidate> = Vec::new();
+        let mut truncated = scanned.len() < catalog.len();
+        for coll in &scanned {
+            let Ok(schema) = driver.infer_schema(db, coll, DOC_REF_SAMPLE, &abort).await else {
+                continue;
+            };
+            candidates.extend(reference_candidates(coll, &schema, &catalog));
+            // Stopping here leaves later collections unexamined whether or not the
+            // count lands exactly on the cap, so the truncation is recorded from
+            // the break rather than inferred from the length afterwards.
+            if candidates.len() >= DOC_REF_MAX_FIELDS {
+                truncated = true;
+                break;
+            }
+        }
+        candidates.truncate(DOC_REF_MAX_FIELDS);
+
+        out.push_str(&format!(
+            "{db} ({} of {} collection(s) sampled, {} candidate field(s)):\n",
+            scanned.len(),
+            catalog.len(),
+            candidates.len(),
+        ));
+        if candidates.is_empty() {
+            out.push_str(
+                "  No field names suggest a reference. Mongo declares none, so if these \
+                 collections are related the link is by a name this heuristic does not \
+                 recognize.\n",
+            );
+        }
+        for c in &candidates {
+            out.push_str(&probe_reference(driver, db, c, &abort).await);
+        }
+        if truncated {
+            out.push_str(&format!(
+                "  …(stopped early, at {DOC_REF_MAX_FIELDS} candidate fields or \
+                 {DOC_REF_MAX_COLLECTIONS} collections; narrow with `collections` for the rest)\n"
+            ));
+        }
+    }
+    (cap_result_bytes(out, limits.max_result_bytes), true)
+}
+
+/// The reference candidates in one collection's inferred schema: scalar fields
+/// whose name points at a collection in `catalog`.
+fn reference_candidates(coll: &str, schema: &DocSchema, catalog: &[String]) -> Vec<RefCandidate> {
+    schema
+        .fields
+        .iter()
+        .filter_map(|f| {
+            let name = f.path.rsplit('.').next().unwrap_or(&f.path);
+            // A reference is a scalar handle. A document or array field may
+            // *contain* one, but the field itself is not it, and probing an
+            // array against `_id` would report a meaningless 0.
+            let (doc_type, _) = f.types.first()?;
+            if matches!(doc_type, DocType::Object | DocType::Array | DocType::Null) {
+                return None;
+            }
+            // `order_id` -> `order`, else the bare name (`customer` -> `customers`).
+            let base = red_core::doc::reference_base(&f.path).unwrap_or(name);
+            let target = red_core::doc::match_collection(base, catalog)?;
+            Some(RefCandidate {
+                coll: coll.to_string(),
+                path: f.path.clone(),
+                target: target.to_string(),
+                doc_type: doc_type.label().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Sample one candidate field's values and count how many resolve to a document
+/// in the target collection. One `find` and one `count`, both bounded.
+async fn probe_reference(
+    driver: &Arc<dyn DocDriver>,
+    db: &str,
+    c: &RefCandidate,
+    abort: &AbortSignal,
+) -> String {
+    let query = FindQuery {
+        db: db.to_string(),
+        coll: c.coll.clone(),
+        // Ask only for the candidate path, so a wide document costs one field.
+        projection: Some(DocValue::Document(vec![(
+            c.path.clone(),
+            DocValue::Int32(1),
+        )])),
+        filter: None,
+        sort: None,
+        skip: 0,
+        limit: Some(DOC_REF_SAMPLE as u64),
+        batch: DOC_REF_SAMPLE,
+    };
+    let page = match driver.find(&query, abort).await {
+        Ok(p) => p,
+        Err(e) => return format!("  {}.{} -> ? probe failed: {e}\n", c.coll, c.path),
+    };
+    let mut values: Vec<DocValue> = Vec::new();
+    for doc in &page.docs {
+        if let Some(v) = doc_path_value(doc, &c.path)
+            && !matches!(v, DocValue::Null)
+            && !values.contains(v)
+        {
+            values.push(v.clone());
+        }
+    }
+    if values.is_empty() {
+        return format!(
+            "  {}.{} -> ? no values sampled ({}, {} doc(s) had no value here)\n",
+            c.coll,
+            c.path,
+            c.doc_type,
+            page.docs.len(),
+        );
+    }
+    let sampled = values.len();
+    let filter = DocValue::Document(vec![(
+        "_id".into(),
+        DocValue::Document(vec![("$in".into(), DocValue::Array(values))]),
+    )]);
+    match driver.count(db, &c.target, Some(&filter)).await {
+        Ok(0) => format!(
+            "  {}.{} -> ? UNRESOLVED ({}, 0/{sampled} sampled values match any {}._id)\n",
+            c.coll, c.path, c.doc_type, c.target,
+        ),
+        Ok(hits) => format!(
+            "  {}.{} -> {}._id ({}, {hits}/{sampled} sampled values resolve)\n",
+            c.coll, c.path, c.target, c.doc_type,
+        ),
+        Err(e) => format!(
+            "  {}.{} -> {}._id probe failed: {e}\n",
+            c.coll, c.path, c.target
+        ),
+    }
+}
+
+/// The value at a dotted `path` in a document, descending sub-documents. `_id`
+/// is held beside the fields, so it is resolved explicitly rather than searched
+/// for. `None` when any segment is missing or the path runs into a scalar.
+fn doc_path_value<'a>(doc: &'a Document, path: &str) -> Option<&'a DocValue> {
+    let mut segments = path.split('.');
+    let first = segments.next()?;
+    let mut current = if first == "_id" {
+        &doc.id
+    } else {
+        doc.fields
+            .iter()
+            .find(|(k, _)| k == first)
+            .map(|(_, v)| v)?
+    };
+    for segment in segments {
+        let DocValue::Document(fields) = current else {
+            return None;
+        };
+        current = fields.iter().find(|(k, _)| k == segment).map(|(_, v)| v)?;
+    }
+    Some(current)
+}
+
 async fn doc_index_advice(driver: &Arc<dyn DocDriver>, input: &Json) -> (String, bool) {
     let db = input.get("db").and_then(Json::as_str).unwrap_or("");
     let coll = input.get("coll").and_then(Json::as_str).unwrap_or("");
@@ -4577,6 +7821,7 @@ fn fmt_doc_plan(plan: &DocPlan) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use red_core::doc::DocPage;
 
     /// The gate tests probe statement shapes, not dialect lexing, so they run
     /// under [`Dialect::Generic`]; the dialect-sensitive cases have their own
@@ -4635,6 +7880,135 @@ mod tests {
             assess_kv_write("kv_delete", &json!({ "pattern": "user:*" })),
             WriteAssessment::NeedsApproval { .. }
         ));
+    }
+
+    /// The approval prompt must be the command list itself, not a paraphrase:
+    /// the user allows `HSET user:1 name "Ada"`, so that is what runs.
+    #[test]
+    fn kv_set_prompt_shows_the_literal_commands() {
+        let detail = |input: Json| match assess_kv_write("kv_set", &input) {
+            WriteAssessment::NeedsApproval { sql } => sql,
+            other => panic!(
+                "expected NeedsApproval, got {}",
+                match other {
+                    WriteAssessment::Reject(w) => format!("Reject({w})"),
+                    _ => "NotWrite".into(),
+                }
+            ),
+        };
+        assert_eq!(
+            detail(json!({ "key": "user:1:name", "type": "string", "value": "Ada" })),
+            "SET user:1:name Ada"
+        );
+        // A value needing quoting gets it, and an explicit TTL rides inside SET as
+        // the `PX` the driver actually sends.
+        assert_eq!(
+            detail(json!({
+                "key": "greeting", "type": "string", "value": "hello world", "ttl_seconds": 60
+            })),
+            "SET greeting \"hello world\" PX 60000"
+        );
+        assert_eq!(
+            detail(json!({ "key": "user:1", "type": "hash", "field": "name", "value": "Ada" })),
+            "HSET user:1 name Ada"
+        );
+        // A collection replace is a DEL and a rebuild; the DEL is shown, never implied.
+        let zset = detail(json!({
+            "key": "board", "type": "zset", "value": { "ada": 1.5 }, "ttl_seconds": 30
+        }));
+        assert_eq!(zset, "DEL board\nZADD board 1.5 ada\nPEXPIRE board 30000");
+        // `append` leaves what is there alone.
+        assert_eq!(
+            detail(json!({ "key": "q", "type": "list", "value": ["a"], "mode": "append" })),
+            "RPUSH q a"
+        );
+        // A stream always appends: no DEL, whatever `mode` says.
+        assert_eq!(
+            detail(json!({
+                "key": "events", "type": "stream", "value": { "kind": "signup" }, "mode": "set"
+            })),
+            "XADD events * kind signup"
+        );
+    }
+
+    #[test]
+    fn kv_set_refuses_bad_keys_and_oversized_payloads() {
+        let rejected = |input: Json| {
+            matches!(
+                assess_kv_write("kv_set", &input),
+                WriteAssessment::Reject(_)
+            )
+        };
+        // An empty key, and a glob the model mistook for one.
+        assert!(rejected(
+            json!({ "key": "", "type": "string", "value": "x" })
+        ));
+        assert!(rejected(
+            json!({ "key": "  ", "type": "string", "value": "x" })
+        ));
+        for pattern in ["*", "?*", "[a-z]*"] {
+            assert!(
+                rejected(json!({ "key": pattern, "type": "string", "value": "x" })),
+                "key `{pattern}` must be refused"
+            );
+        }
+        // Oversized: one huge value, and too many small ones. Both refused at the
+        // gate, so neither reaches the driver.
+        let huge = "x".repeat(KV_SET_VALUE_MAX + 1);
+        assert!(rejected(
+            json!({ "key": "k", "type": "string", "value": huge })
+        ));
+        let many: Vec<String> = (0..KV_SET_ELEMS_MAX + 1).map(|i| i.to_string()).collect();
+        assert!(rejected(
+            json!({ "key": "k", "type": "set", "value": many })
+        ));
+        // Shape errors are rejections too, never a prompt.
+        assert!(rejected(
+            json!({ "key": "k", "type": "trie", "value": "x" })
+        ));
+        assert!(rejected(
+            json!({ "key": "k", "type": "zset", "value": { "a": "not-a-score" } })
+        ));
+        assert!(rejected(
+            json!({ "key": "k", "type": "string", "value": { "nested": 1 } })
+        ));
+        assert!(rejected(json!({ "key": "k", "type": "set", "value": [] })));
+    }
+
+    #[test]
+    fn kv_set_is_a_gated_write_at_write_tier_only() {
+        assert!(is_write_tool("kv_set"));
+        assert!(!AiTier::Read.allows_tool("kv_set"));
+        assert!(AiTier::Write.allows_tool("kv_set"));
+        let names = |p: AiPolicy| {
+            kv_tool_catalog(&p)
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+        };
+        assert!(names(AiPolicy::default()).iter().all(|n| n != "kv_set"));
+        let write = AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        };
+        assert!(names(write).iter().any(|n| n == "kv_set"));
+        // A read-only connection withholds it, and a subagent never gets it.
+        let write_ro = AiPolicy {
+            tier: AiTier::Write,
+            read_only: true,
+            ..AiPolicy::default()
+        };
+        assert!(names(write_ro).iter().all(|n| n != "kv_set"));
+        assert!(
+            kv_subagent_catalog(&AiPolicy {
+                tier: AiTier::Write,
+                ..AiPolicy::default()
+            })
+            .iter()
+            .all(|t| t.name != "kv_set")
+        );
+        // Never advertised over the headless transport either (it is a write).
+        assert!(!is_headless_tool("kv_set"));
     }
 
     #[test]
@@ -4788,15 +8162,35 @@ mod tests {
             .collect()
         };
         assert!(names(AiTier::Off).is_empty());
-        assert_eq!(names(AiTier::Schema), ["list_schema", "describe_table"]);
+        // Schema tier: structure only. `object_ddl` and `relationship_map` belong
+        // here because a definition and a declared constraint are catalog facts,
+        // not rows.
+        assert_eq!(
+            names(AiTier::Schema),
+            [
+                "list_schema",
+                "describe_table",
+                "object_ddl",
+                "relationship_map"
+            ]
+        );
         assert_eq!(
             names(AiTier::Read),
             [
                 "list_schema",
                 "describe_table",
+                "object_ddl",
+                "relationship_map",
                 "profile_table",
                 "run_select",
+                "search_data",
                 "explain",
+                "health_report",
+                "server_sessions",
+                "diff_schema",
+                "diff_data",
+                "suggest_index",
+                "export_result",
                 "generate_report",
                 "open_query",
                 "save_query",
@@ -4874,9 +8268,18 @@ mod tests {
             [
                 "list_schema",
                 "describe_table",
+                "object_ddl",
+                "relationship_map",
                 "profile_table",
                 "run_select",
+                "search_data",
                 "explain",
+                "health_report",
+                "server_sessions",
+                "diff_schema",
+                "diff_data",
+                "suggest_index",
+                "export_result",
                 "generate_report",
                 "open_query",
                 "save_query",
@@ -5901,6 +9304,992 @@ mod tests {
         turn.await.unwrap();
 
         assert!(name_now(driver).await.contains("after"));
+    }
+
+    /// A minimal in-memory `DocDriver` for the doc-seam tools. Purpose-built for
+    /// what they actually exercise — the catalog, an inferred schema, a windowed
+    /// `find`, and a **filtered** `count` — because a `count` that ignores its
+    /// filter would report every reference as fully resolving, which is exactly
+    /// the failure `doc_reference_map` exists to catch.
+    struct DocStub {
+        colls: Vec<(String, Vec<Document>)>,
+    }
+
+    impl DocStub {
+        fn docs(&self, coll: &str) -> &[Document] {
+            self.colls
+                .iter()
+                .find(|(name, _)| name == coll)
+                .map(|(_, docs)| docs.as_slice())
+                .unwrap_or(&[])
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DocDriver for DocStub {
+        async fn ping(&self) -> red_core::Result<()> {
+            Ok(())
+        }
+        fn server_version(&self) -> String {
+            "7.0.0".into()
+        }
+        fn topology(&self) -> red_core::doc::DocTopology {
+            red_core::doc::DocTopology::Standalone
+        }
+        async fn list_databases(&self) -> red_core::Result<Vec<red_core::doc::DbInfo>> {
+            Ok(vec![red_core::doc::DbInfo {
+                name: "app".into(),
+                size_on_disk: 0,
+                empty: false,
+            }])
+        }
+        async fn list_collections(
+            &self,
+            _db: &str,
+        ) -> red_core::Result<Vec<red_core::doc::CollectionInfo>> {
+            Ok(self
+                .colls
+                .iter()
+                .map(|(name, docs)| red_core::doc::CollectionInfo {
+                    name: name.clone(),
+                    kind: CollKind::Collection,
+                    est_count: docs.len() as u64,
+                    size: 0,
+                    capped: false,
+                    validator: None,
+                })
+                .collect())
+        }
+        async fn find(&self, q: &FindQuery, _abort: &AbortSignal) -> red_core::Result<DocPage> {
+            let all = self.docs(&q.coll);
+            let take = q.limit.map(|l| l as usize).unwrap_or(q.batch);
+            Ok(DocPage {
+                docs: all.iter().take(take).cloned().collect(),
+                cursor: None,
+                exhausted: true,
+            })
+        }
+        async fn find_seek(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _filter: Option<&red_core::doc::Filter>,
+            _seek: red_core::doc::DocSeek,
+            _limit: usize,
+            _abort: &AbortSignal,
+        ) -> red_core::Result<Vec<Document>> {
+            Ok(Vec::new())
+        }
+        async fn get_document(
+            &self,
+            _db: &str,
+            coll: &str,
+            id: &DocValue,
+        ) -> red_core::Result<Option<Document>> {
+            Ok(self.docs(coll).iter().find(|d| &d.id == id).cloned())
+        }
+        /// Understands exactly one filter shape: `{_id: {$in: [...]}}`, the probe
+        /// `doc_reference_map` issues. Anything else counts everything.
+        async fn count(
+            &self,
+            _db: &str,
+            coll: &str,
+            filter: Option<&red_core::doc::Filter>,
+        ) -> red_core::Result<u64> {
+            let docs = self.docs(coll);
+            let Some(DocValue::Document(fields)) = filter else {
+                return Ok(docs.len() as u64);
+            };
+            let wanted = fields.iter().find(|(k, _)| k == "_id").and_then(|(_, v)| {
+                let DocValue::Document(ops) = v else {
+                    return None;
+                };
+                ops.iter().find(|(k, _)| k == "$in").map(|(_, v)| v)
+            });
+            let Some(DocValue::Array(ids)) = wanted else {
+                return Ok(docs.len() as u64);
+            };
+            Ok(docs.iter().filter(|d| ids.contains(&d.id)).count() as u64)
+        }
+        async fn infer_schema(
+            &self,
+            _db: &str,
+            coll: &str,
+            sample: usize,
+            _abort: &AbortSignal,
+        ) -> red_core::Result<DocSchema> {
+            let docs = self.docs(coll);
+            Ok(DocSchema::from_documents(&docs[..docs.len().min(sample)]))
+        }
+        async fn aggregate(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _pipeline: &[DocValue],
+            _batch: usize,
+            _abort: &AbortSignal,
+        ) -> red_core::Result<DocPage> {
+            Ok(DocPage {
+                docs: Vec::new(),
+                cursor: None,
+                exhausted: true,
+            })
+        }
+        async fn indexes(&self, _db: &str, _coll: &str) -> red_core::Result<Vec<IndexInfo>> {
+            Ok(Vec::new())
+        }
+        async fn explain(&self, _q: &FindQuery) -> red_core::Result<DocPlan> {
+            Ok(DocPlan {
+                stages: Vec::new(),
+                index_used: None,
+                docs_examined: None,
+                n_returned: None,
+                collscan: true,
+            })
+        }
+        async fn distinct(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _field: &str,
+            _filter: Option<&red_core::doc::Filter>,
+        ) -> red_core::Result<Vec<DocValue>> {
+            Ok(Vec::new())
+        }
+        async fn next_batch(
+            &self,
+            _cursor: &red_core::doc::DocCursor,
+            _batch: usize,
+        ) -> red_core::Result<DocPage> {
+            Ok(DocPage {
+                docs: Vec::new(),
+                cursor: None,
+                exhausted: true,
+            })
+        }
+        async fn close_cursor(&self, _cursor: &red_core::doc::DocCursor) {}
+        /// Enough extended JSON for the tool arguments under test: plain JSON
+        /// plus `{"$oid": …}`. The real dialect is the engine's; this only has
+        /// to round-trip what the tests pass in.
+        fn parse_ext_json(&self, text: &str) -> red_core::Result<DocValue> {
+            fn convert(v: &Json) -> DocValue {
+                match v {
+                    Json::Null => DocValue::Null,
+                    Json::Bool(b) => DocValue::Bool(*b),
+                    Json::Number(n) => match n.as_i64() {
+                        Some(i) if i32::try_from(i).is_ok() => DocValue::Int32(i as i32),
+                        Some(i) => DocValue::Int64(i),
+                        None => DocValue::Double(n.as_f64().unwrap_or(0.0)),
+                    },
+                    Json::String(s) => DocValue::Str(s.clone()),
+                    Json::Array(items) => DocValue::Array(items.iter().map(convert).collect()),
+                    Json::Object(map) => {
+                        if let Some(Json::String(hex)) = map.get("$oid")
+                            && let Ok(bytes) = <[u8; 12]>::try_from(
+                                (0..hex.len().min(24))
+                                    .step_by(2)
+                                    .filter_map(|i| u8::from_str_radix(&hex[i..i + 2], 16).ok())
+                                    .collect::<Vec<u8>>(),
+                            )
+                        {
+                            return DocValue::ObjectId(bytes);
+                        }
+                        DocValue::Document(
+                            map.iter().map(|(k, v)| (k.clone(), convert(v))).collect(),
+                        )
+                    }
+                }
+            }
+            serde_json::from_str::<Json>(text)
+                .map(|v| convert(&v))
+                .map_err(|e| RedError::Query(e.to_string()))
+        }
+        async fn insert(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _docs: &[Document],
+        ) -> red_core::Result<u64> {
+            Err(RedError::Driver("read-only stub".into()))
+        }
+        async fn update(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _filter: &red_core::doc::Filter,
+            _change: &DocUpdate,
+            _many: bool,
+        ) -> red_core::Result<u64> {
+            Err(RedError::Driver("read-only stub".into()))
+        }
+        async fn replace(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _id: &DocValue,
+            _doc: &Document,
+        ) -> red_core::Result<()> {
+            Err(RedError::Driver("read-only stub".into()))
+        }
+        async fn delete(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _filter: &red_core::doc::Filter,
+            _many: bool,
+        ) -> red_core::Result<u64> {
+            Err(RedError::Driver("read-only stub".into()))
+        }
+        async fn create_collection(&self, _db: &str, _coll: &str) -> red_core::Result<()> {
+            Err(RedError::Driver("read-only stub".into()))
+        }
+        async fn drop_collection(&self, _db: &str, _coll: &str) -> red_core::Result<()> {
+            Err(RedError::Driver("read-only stub".into()))
+        }
+        async fn create_index(
+            &self,
+            _db: &str,
+            _coll: &str,
+            _spec: &IndexSpec,
+        ) -> red_core::Result<()> {
+            Err(RedError::Driver("read-only stub".into()))
+        }
+    }
+
+    /// `customers` holds ids 1..=3. `orders.customer_id` points at two of them
+    /// and one stranger; `orders.customerRef` points at nothing.
+    fn doc_stub() -> Arc<dyn DocDriver> {
+        let customers = (1..=3)
+            .map(|id| Document {
+                id: DocValue::Int32(id),
+                fields: vec![("name".into(), DocValue::Str(format!("c{id}")))],
+            })
+            .collect();
+        let orders = (1..=3)
+            .map(|i| Document {
+                id: DocValue::Int32(100 + i),
+                fields: vec![
+                    ("customer_id".into(), DocValue::Int32(i)),
+                    ("customerRef".into(), DocValue::Int32(900 + i)),
+                ],
+            })
+            .collect();
+        Arc::new(DocStub {
+            colls: vec![
+                ("customers".to_string(), customers),
+                ("orders".to_string(), orders),
+            ],
+        })
+    }
+
+    async fn doc_tool(driver: &Arc<dyn DocDriver>, name: &str, input: Json) -> (String, bool) {
+        doc_run_tool(
+            driver,
+            name,
+            &input,
+            &AiPolicy::default(),
+            &CancelToken::new(),
+            &ReportSink::disabled(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn doc_reference_map_reports_hit_rates_and_names_the_unresolved() {
+        let driver = doc_stub();
+        let (content, ok) = doc_tool(&driver, "doc_reference_map", json!({ "db": "app" })).await;
+        assert!(ok, "{content}");
+        // A resolving reference reports its hit rate, not just its existence.
+        assert!(
+            content.contains("orders.customer_id -> customers._id"),
+            "{content}"
+        );
+        assert!(content.contains("3/3 sampled values resolve"), "{content}");
+        // A field whose values match nothing is reported as UNRESOLVED. Omitting
+        // it would read as "no reference exists", the opposite of what was found.
+        assert!(
+            content.contains("orders.customerRef -> ? UNRESOLVED"),
+            "{content}"
+        );
+        assert!(
+            content.contains("0/3 sampled values match any customers._id"),
+            "{content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn structure_maps_are_reads_at_their_stated_tiers() {
+        // Two are structure-only (Schema tier and up); the Mongo one samples
+        // values, so it starts at Read.
+        for t in ["relationship_map", "kv_key_schema"] {
+            assert!(!is_write_tool(t), "{t} must be read-only");
+            assert!(AiTier::Schema.allows_tool(t), "{t} must exist at Schema");
+            assert!(is_headless_tool(t), "{t} must be offered over MCP");
+        }
+        assert!(!is_write_tool("doc_reference_map"));
+        assert!(!AiTier::Schema.allows_tool("doc_reference_map"));
+        assert!(AiTier::Read.allows_tool("doc_reference_map"));
+        // Each seam's catalog actually offers its own map at Read tier.
+        let read = AiPolicy::default();
+        assert!(
+            tool_catalog(&read)
+                .iter()
+                .any(|t| t.name == "relationship_map")
+        );
+        assert!(
+            kv_tool_catalog(&read)
+                .iter()
+                .any(|t| t.name == "kv_key_schema")
+        );
+        assert!(
+            doc_tool_catalog(&read)
+                .iter()
+                .any(|t| t.name == "doc_reference_map")
+        );
+    }
+
+    /// `EXPLAIN ANALYZE` executes on Postgres and MySQL 8.0.18+, so an `analyze`
+    /// over a write must be refused. Asserted **per dialect**: the lexing differs,
+    /// and grading against the wrong one is the exact drift `risk.rs` exists to
+    /// prevent.
+    #[tokio::test]
+    async fn explain_analyze_refuses_anything_that_is_not_a_read() {
+        let db = std::env::temp_dir().join(format!("red-xa-{}.db", uuid::Uuid::new_v4().simple()));
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);")
+                .unwrap();
+        }
+        let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
+        let explain = async |sql: &str, analyze: bool, dialect: Dialect| {
+            run_tool(
+                &driver,
+                dialect,
+                "explain",
+                &json!({ "sql": sql, "analyze": analyze }),
+                &AiPolicy::default(),
+                &CancelToken::new(),
+                &ReportSink::disabled(),
+            )
+            .await
+        };
+        for dialect in [
+            Dialect::Generic,
+            Dialect::Postgres,
+            Dialect::MySql,
+            Dialect::Sqlite,
+            Dialect::ClickHouse,
+        ] {
+            for sql in [
+                "UPDATE t SET x = 1",
+                "DELETE FROM t WHERE id = 1",
+                "DROP TABLE t",
+                // Already wrapped by the model: `risk::assess` grades the inner
+                // statement, so this must be refused too.
+                "EXPLAIN ANALYZE DELETE FROM t WHERE id = 1",
+            ] {
+                let (content, ok) = explain(sql, true, dialect).await;
+                assert!(!ok, "{dialect:?} / {sql} must be refused, got: {content}");
+                assert!(content.contains("executes the statement"), "{content}");
+            }
+            // Without `analyze` the same statement only plans, so it is allowed.
+            let (_, ok) = explain("UPDATE t SET x = 1", false, dialect).await;
+            assert!(ok, "{dialect:?}: plain explain of a write must still plan");
+        }
+        // A read with actuals is the point of the flag, and is allowed.
+        let (content, ok) = explain("SELECT * FROM t", true, Dialect::Sqlite).await;
+        assert!(ok, "{content}");
+    }
+
+    #[tokio::test]
+    async fn search_data_finds_a_value_without_naming_its_column() {
+        let db =
+            std::env::temp_dir().join(format!("red-search-{}.db", uuid::Uuid::new_v4().simple()));
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT, note TEXT);
+                 INSERT INTO people VALUES (1, 'Ada', 'analytical engine'),
+                                           (2, 'Grace', 'compiler');",
+            )
+            .unwrap();
+        }
+        let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
+        let search = async |term: &str| {
+            run_tool(
+                &driver,
+                Dialect::Sqlite,
+                "search_data",
+                &json!({ "schema": "main", "table": "people", "term": term }),
+                &AiPolicy::default(),
+                &CancelToken::new(),
+                &ReportSink::disabled(),
+            )
+            .await
+        };
+        // The term is in `note`, not `name`; the model never had to know that.
+        let (content, ok) = search("engine").await;
+        assert!(ok, "{content}");
+        assert!(content.contains("Ada"), "{content}");
+        assert!(!content.contains("Grace"), "{content}");
+        // A quote in the term is escaped, not interpolated: no SQL error, no rows.
+        let (content, ok) = search("' OR 1=1 --").await;
+        assert!(ok, "{content}");
+        assert!(
+            !content.contains("Ada"),
+            "injection matched rows: {content}"
+        );
+    }
+
+    #[tokio::test]
+    async fn object_ddl_returns_a_view_body_describe_table_cannot() {
+        let db = std::env::temp_dir().join(format!("red-ddl-{}.db", uuid::Uuid::new_v4().simple()));
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+                 CREATE VIEW big AS SELECT id FROM t WHERE x > 100;",
+            )
+            .unwrap();
+        }
+        let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
+        let ddl = async |name: &str, kind: Json| {
+            run_tool(
+                &driver,
+                Dialect::Sqlite,
+                "object_ddl",
+                &json!({ "schema": "main", "name": name, "kind": kind }),
+                &AiPolicy::default(),
+                &CancelToken::new(),
+                &ReportSink::disabled(),
+            )
+            .await
+        };
+        let (content, ok) = ddl("big", json!("view")).await;
+        assert!(ok, "{content}");
+        assert!(content.contains("x > 100"), "view body missing: {content}");
+        // An unknown kind is a clean error the model can correct, not a panic.
+        let (content, ok) = ddl("big", json!("widget")).await;
+        assert!(!ok);
+        assert!(content.contains("unknown object kind"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn get_document_fetches_by_id_and_reports_a_miss() {
+        let driver = doc_stub();
+        let (content, ok) = doc_tool(
+            &driver,
+            "get_document",
+            json!({ "db": "app", "coll": "customers", "id": 2 }),
+        )
+        .await;
+        assert!(ok, "{content}");
+        assert!(content.contains("\"c2\""), "{content}");
+        // A miss is a normal answer, not an error, and it says how to spell an
+        // ObjectId in case that was the mistake.
+        let (content, ok) = doc_tool(
+            &driver,
+            "get_document",
+            json!({ "db": "app", "coll": "customers", "id": 99 }),
+        )
+        .await;
+        assert!(ok, "{content}");
+        assert!(content.contains("$oid"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn describe_collection_reports_whether_a_validator_exists() {
+        let driver = doc_stub();
+        let (content, ok) = doc_tool(
+            &driver,
+            "describe_collection",
+            json!({ "db": "app", "coll": "customers" }),
+        )
+        .await;
+        assert!(ok, "{content}");
+        // Absence is stated rather than left to inference: "no validator line"
+        // and "no validator" must not look the same.
+        assert!(content.contains("Validator: none declared."), "{content}");
+    }
+
+    #[tokio::test]
+    async fn relationship_map_lists_edges_and_islands() {
+        let db =
+            std::env::temp_dir().join(format!("red-relmap-{}.db", uuid::Uuid::new_v4().simple()));
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE orders (id INTEGER PRIMARY KEY);
+                 CREATE TABLE order_items (
+                    id INTEGER PRIMARY KEY,
+                    order_id INTEGER REFERENCES orders(id)
+                 );
+                 CREATE TABLE audit_log (id INTEGER PRIMARY KEY, note TEXT);",
+            )
+            .unwrap();
+        }
+        let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
+        let (content, ok) = run_tool(
+            &driver,
+            Dialect::Sqlite,
+            "relationship_map",
+            &json!({}),
+            &AiPolicy::default(),
+            &CancelToken::new(),
+            &ReportSink::disabled(),
+        )
+        .await;
+        assert!(ok, "{content}");
+        assert!(
+            content.contains("main.order_items.order_id -> main.orders.id"),
+            "{content}"
+        );
+        // The island is named, so the model can see the graph has disconnected
+        // pieces rather than inferring one from silence.
+        assert!(content.contains("main.audit_log"), "{content}");
+    }
+
+    /// Every tool a catalog advertises must also be reachable in its executor.
+    /// A `ToolDef` with no `run_tool` arm is a tool that exists right up until
+    /// the model calls it, which is worse than one that was never offered — so
+    /// this asserts the *structural* wiring by checking nothing falls through to
+    /// the unknown-tool arm. (`spawn_subagent` is intercepted in `run_turn`
+    /// before `run_tool` and is excluded by design.)
+    #[tokio::test]
+    async fn every_advertised_tool_has_an_executor_arm() {
+        let write = AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        };
+        let db = std::env::temp_dir().join(format!("red-arm-{}.db", uuid::Uuid::new_v4().simple()));
+        {
+            rusqlite::Connection::open(&db)
+                .unwrap()
+                .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY);")
+                .unwrap();
+        }
+        let sql: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
+        for tool in tool_catalog(&write) {
+            if tool.name == "spawn_subagent" {
+                continue;
+            }
+            let (content, _) = run_tool(
+                &sql,
+                Dialect::Sqlite,
+                &tool.name,
+                &json!({}),
+                &write,
+                &CancelToken::new(),
+                &ReportSink::disabled(),
+            )
+            .await;
+            assert!(
+                !content.contains("unknown tool"),
+                "SQL tool `{}` is advertised but has no executor arm",
+                tool.name
+            );
+        }
+        let doc = doc_stub();
+        for tool in doc_tool_catalog(&write) {
+            if tool.name == "spawn_subagent" {
+                continue;
+            }
+            let (content, _) = doc_tool(&doc, &tool.name, json!({})).await;
+            assert!(
+                !content.contains("unknown tool"),
+                "doc tool `{}` is advertised but has no executor arm",
+                tool.name
+            );
+        }
+    }
+
+    /// `is_write_tool` is the complement of an allowlist, so a read nobody
+    /// remembered to list is silently gated as a write (and withheld from MCP).
+    /// Assert the membership *and* the fail-closed property it rests on.
+    #[test]
+    fn new_reads_are_listed_and_an_unlisted_name_fails_closed() {
+        for t in [
+            "relationship_map",
+            "object_ddl",
+            "search_data",
+            "health_report",
+            "server_sessions",
+            "diff_schema",
+            "diff_data",
+            "suggest_index",
+            "export_result",
+            "kv_key_schema",
+            "kv_read_collection",
+            "kv_stream_groups",
+            "kv_client_list",
+            "kv_keyspace_notifications",
+            "doc_reference_map",
+            "get_document",
+            "doc_current_op",
+        ] {
+            assert!(!is_write_tool(t), "{t} must be in READ_ONLY_TOOLS");
+        }
+        // The property itself: an unlisted name is a write, so a future tool is
+        // gated until someone vets it rather than slipping through.
+        assert!(is_write_tool("some_tool_nobody_listed"));
+        // And the new writes are writes, so none is auto-allowed over ACP/MCP.
+        for t in [
+            "kill_session",
+            "create_index",
+            "kv_set",
+            "kv_copy_key",
+            "kv_client_kill",
+            "kv_command",
+            "doc_kill_op",
+        ] {
+            assert!(is_write_tool(t), "{t} must be gated as a write");
+            assert!(!is_headless_tool(t), "{t} must not be offered headlessly");
+            assert!(!AiTier::Read.allows_tool(t), "{t} must not exist at Read");
+            assert!(AiTier::Write.allows_tool(t), "{t} must exist at Write");
+        }
+        // The UI-bound reads are reads, but still withheld from the headless
+        // transport: there is no app there to hand a tab or a file to.
+        for t in [
+            "export_result",
+            "open_query",
+            "save_query",
+            "generate_report",
+        ] {
+            assert!(!is_write_tool(t));
+            assert!(!is_headless_tool(t), "{t} is GUI-bound");
+        }
+    }
+
+    /// A kill prompt has to say *what* is being stopped. "Terminate session 4711"
+    /// is not something anyone can meaningfully approve.
+    #[test]
+    fn kill_prompts_name_their_target() {
+        let write = AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        };
+        let detail = |name: &str, input: Json| match assess_write(name, &input, &write) {
+            WriteAssessment::NeedsApproval { sql } => sql,
+            _ => panic!("{name} must prompt"),
+        };
+        let sql = detail(
+            "kill_session",
+            json!({
+                "key": "4711", "mode": "terminate",
+                "user": "reporting", "statement": "SELECT * FROM huge",
+            }),
+        );
+        assert!(sql.contains("Terminate session"), "{sql}");
+        assert!(sql.contains("4711") && sql.contains("reporting"), "{sql}");
+        assert!(sql.contains("SELECT * FROM huge"), "{sql}");
+        // Terminate says what it costs; cancel does not claim to.
+        assert!(sql.contains("rolls back"), "{sql}");
+        assert!(
+            !detail("kill_session", json!({ "key": "4711" })).contains("rolls back"),
+            "a cancel must not claim to roll anything back"
+        );
+        // Missing context is stated rather than papered over.
+        assert!(
+            detail("kill_session", json!({ "key": "4711" })).contains("did not say"),
+            "an unexplained kill must say so"
+        );
+
+        let kv = detail(
+            "kv_client_kill",
+            json!({ "id": 12, "addr": "10.0.0.2:6379", "cmd": "keys" }),
+        );
+        assert!(kv.contains("CLIENT KILL ID 12"), "{kv}");
+        assert!(kv.contains("10.0.0.2:6379") && kv.contains("keys"), "{kv}");
+
+        let doc = detail(
+            "doc_kill_op",
+            json!({ "opid": 88, "namespace": "app.orders", "command": "{\"find\":\"orders\"}" }),
+        );
+        assert!(doc.contains("KILL operation 88"), "{doc}");
+        assert!(doc.contains("app.orders"), "{doc}");
+        assert!(doc.contains("NOT rolled back"), "{doc}");
+
+        // A kill with no target is refused outright, never prompted.
+        for (name, input) in [
+            ("kill_session", json!({})),
+            ("kv_client_kill", json!({})),
+            ("doc_kill_op", json!({})),
+            ("kill_session", json!({ "key": "1", "mode": "obliterate" })),
+        ] {
+            assert!(
+                matches!(
+                    assess_write(name, &input, &write),
+                    WriteAssessment::Reject(_)
+                ),
+                "{name} with {input} must be refused"
+            );
+        }
+    }
+
+    /// A denied write must come back as a recoverable error, not a dead turn.
+    /// `run_tool` is the executor half of that: a rejected assessment is an
+    /// `is_error` result carrying the reason.
+    #[tokio::test]
+    async fn a_refused_kill_is_a_recoverable_tool_error() {
+        let driver = doc_stub();
+        let write = AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        };
+        let (content, ok) = doc_run_tool(
+            &driver,
+            "doc_kill_op",
+            &json!({}),
+            &write,
+            &CancelToken::new(),
+            &ReportSink::disabled(),
+        )
+        .await;
+        assert!(!ok, "a refusal must be an is_error result");
+        assert!(content.starts_with("error:"), "{content}");
+        assert!(content.contains("doc_current_op"), "{content}");
+    }
+
+    #[test]
+    fn kv_command_runs_only_allowlisted_verbs() {
+        let write = AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        };
+        // An allowlisted verb prompts with the exact command.
+        match assess_write(
+            "kv_command",
+            &json!({ "argv": ["MEMORY", "DOCTOR"] }),
+            &write,
+        ) {
+            WriteAssessment::NeedsApproval { sql } => assert_eq!(sql, "MEMORY DOCTOR"),
+            _ => panic!("an allowlisted verb must prompt"),
+        }
+        // Everything else is refused, including the reads it could otherwise use
+        // to route around kv_get_value's tier gate and any write gate.
+        for argv in [
+            json!(["GET", "user:1"]),
+            json!(["SET", "user:1", "x"]),
+            json!(["FLUSHALL"]),
+            json!(["CONFIG", "SET", "dir", "/tmp"]),
+            json!(["EVAL", "return 1", "0"]),
+            json!([]),
+        ] {
+            assert!(
+                matches!(
+                    assess_write("kv_command", &json!({ "argv": argv }), &write),
+                    WriteAssessment::Reject(_)
+                ),
+                "kv_command {argv} must be refused"
+            );
+        }
+    }
+
+    /// `create_index` deliberately widens the blanket DDL block. Assert the
+    /// widening is exactly one statement kind wide: the DDL that destroys is
+    /// still refused through `propose_write`.
+    #[test]
+    fn create_index_is_the_only_ddl_the_agent_may_run() {
+        let write = AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        };
+        match assess_write(
+            "create_index",
+            &json!({ "schema": "public", "table": "orders", "name": "idx_orders_created",
+                     "columns": ["created_at"], "unique": true }),
+            &write,
+        ) {
+            WriteAssessment::NeedsApproval { sql } => {
+                assert!(
+                    sql.contains("CREATE UNIQUE INDEX idx_orders_created"),
+                    "{sql}"
+                );
+                assert!(sql.contains("public.orders"), "{sql}");
+                assert!(sql.contains("created_at"), "{sql}");
+                // The cost is named: an index build is not free on a live server.
+                assert!(sql.contains("locks and loads"), "{sql}");
+            }
+            _ => panic!("create_index must prompt"),
+        }
+        // Destructive DDL is still blocked at the shape gate.
+        for sql in [
+            "DROP TABLE orders",
+            "TRUNCATE orders",
+            "ALTER TABLE orders DROP COLUMN x",
+            "DROP INDEX idx_orders_created",
+        ] {
+            assert!(
+                matches!(
+                    assess_write("propose_write", &json!({ "sql": sql }), &write),
+                    WriteAssessment::Reject(_)
+                ),
+                "`{sql}` must stay blocked"
+            );
+        }
+        // And a create_index with no columns is refused rather than prompted.
+        assert!(matches!(
+            assess_write(
+                "create_index",
+                &json!({ "table": "orders", "name": "idx", "columns": [] }),
+                &write
+            ),
+            WriteAssessment::Reject(_)
+        ));
+    }
+
+    /// The export path is model-supplied, so it is the one place a tool argument
+    /// could reach outside the app's own folder. Assert it cannot.
+    #[test]
+    fn export_paths_stay_inside_the_output_folder() {
+        let sink = ReportSink::disabled();
+        let dir = sink.output_dir();
+        for name in [
+            "../../etc/passwd",
+            "/etc/passwd",
+            "..\\..\\windows\\system32",
+            "a/b/c",
+            "orders",
+            "",
+        ] {
+            let path = export_path(&sink, Some(name), "csv");
+            assert_eq!(path.parent(), Some(dir.as_path()), "escaped for `{name}`");
+            let file = path.file_name().unwrap().to_string_lossy().to_string();
+            assert!(file.starts_with("red-export-"), "{file}");
+            assert!(file.ends_with(".csv"), "{file}");
+            assert!(!file.contains(".."), "{file}");
+        }
+        // Two calls never collide, so an export cannot clobber an earlier one.
+        assert_ne!(
+            export_path(&sink, Some("x"), "csv"),
+            export_path(&sink, Some("x"), "csv")
+        );
+    }
+
+    /// A report that drops a check it could not run reads as a clean bill of
+    /// health, so the unavailable list is part of the output contract.
+    #[test]
+    fn health_report_states_what_it_could_not_check() {
+        use red_core::health::{
+            Finding, FindingKind, HealthReport, Severity, SizeTotals, TableSize, UnavailableCheck,
+        };
+
+        let mut report = HealthReport::new(red_core::DbKind::Postgres, Some("public".into()), 0);
+        report.totals = SizeTotals {
+            bytes: 2 * 1024 * 1024,
+            index_bytes: 1024 * 1024,
+            table_count: 3,
+        };
+        report.tables = vec![TableSize {
+            table: TableRef {
+                schema: Some("public".into()),
+                name: "events".into(),
+            },
+            bytes: 1024 * 1024,
+            index_bytes: 512 * 1024,
+            estimated_rows: 90_000,
+        }];
+        report.findings = vec![Finding {
+            severity: Severity::Bad,
+            kind: FindingKind::MissingFkIndex,
+            object: Some(TableRef {
+                schema: Some("public".into()),
+                name: "order_items".into(),
+            }),
+            title: "foreign key with no index".into(),
+            detail: "every parent delete scans".into(),
+            suggested_sql: Some("CREATE INDEX ...".into()),
+        }];
+        report.unavailable = vec![UnavailableCheck {
+            kind: FindingKind::UnusedIndex,
+            reason: "needs pg_stat_user_indexes".into(),
+        }];
+
+        let out = format_health(&report);
+        assert!(out.contains("public.events"), "{out}");
+        assert!(out.contains("public.order_items"), "{out}");
+        assert!(out.contains("Bad"), "{out}");
+        // The remediation is text, and says so, so nothing reads it as applied.
+        assert!(out.contains("NOT run"), "{out}");
+        assert!(out.contains("needs pg_stat_user_indexes"), "{out}");
+        assert!(out.contains("absence proves nothing"), "{out}");
+    }
+
+    #[test]
+    fn session_list_reports_hidden_statements_as_hidden() {
+        use red_core::{ServerSession, SessionKey};
+
+        let sessions = vec![
+            ServerSession {
+                key: SessionKey("101".into()),
+                user: Some("reporting".into()),
+                application: Some("psql".into()),
+                client_addr: Some("10.0.0.9".into()),
+                database: Some("shop".into()),
+                state: "active".into(),
+                wait: None,
+                blocked_by: vec![SessionKey("77".into())],
+                query: Some("SELECT * FROM orders".into()),
+                elapsed_secs: 12.5,
+                is_self: false,
+            },
+            ServerSession {
+                key: SessionKey("102".into()),
+                user: None,
+                application: None,
+                client_addr: None,
+                database: None,
+                state: "idle".into(),
+                wait: Some("Lock:transactionid".into()),
+                blocked_by: Vec::new(),
+                query: None,
+                elapsed_secs: 0.2,
+                is_self: true,
+            },
+        ];
+        let out = format_sessions(&sessions, true);
+        assert!(
+            out.contains("[101]") && out.contains("user=reporting"),
+            "{out}"
+        );
+        assert!(out.contains("blocked by 77"), "{out}");
+        assert!(out.contains("waiting on Lock:transactionid"), "{out}");
+        assert!(out.contains("RED's own connection"), "{out}");
+        // A statement the role may not read is reported as hidden, not as absent.
+        assert!(out.contains("not visible to this role"), "{out}");
+        assert!(out.contains("hidden rather than absent"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn suggest_index_reads_the_plan_and_the_existing_indexes() {
+        let db = std::env::temp_dir().join(format!("red-idx-{}.db", uuid::Uuid::new_v4().simple()));
+        {
+            rusqlite::Connection::open(&db)
+                .unwrap()
+                .execute_batch(
+                    "CREATE TABLE t (id INTEGER PRIMARY KEY, email TEXT, city TEXT);
+                     CREATE INDEX idx_t_email ON t (email);",
+                )
+                .unwrap();
+        }
+        let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
+        let (content, ok) = run_tool(
+            &driver,
+            Dialect::Sqlite,
+            "suggest_index",
+            &json!({ "sql": "SELECT * FROM t WHERE city = 'x'", "schema": "main", "table": "t" }),
+            &AiPolicy::default(),
+            &CancelToken::new(),
+            &ReportSink::disabled(),
+        )
+        .await;
+        assert!(ok, "{content}");
+        // It reports what already exists, so the suggestion cannot duplicate it…
+        assert!(content.contains("idx_t_email"), "{content}");
+        // …and it is explicit that nothing was created, so the suggestion is not
+        // mistaken for an action already taken.
+        assert!(content.contains("Nothing here was created."), "{content}");
+        assert!(content.contains("create_index"), "{content}");
     }
 
     #[test]

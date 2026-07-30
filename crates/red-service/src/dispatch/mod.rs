@@ -4913,7 +4913,7 @@ impl StreamRate {
     }
 }
 
-mod jobs;
+pub(crate) mod jobs;
 use jobs::*;
 
 #[cfg(test)]

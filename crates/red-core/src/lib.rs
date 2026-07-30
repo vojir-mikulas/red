@@ -686,9 +686,15 @@ impl AiTier {
                 tool,
                 "list_schema"
                     | "describe_table"
+                    // Structure, not data: the declared FK graph and an object's
+                    // own definition are catalog reads, never a row.
+                    | "relationship_map"
+                    | "object_ddl"
                     | "kv_server_info"
                     | "kv_scan_keys"
                     | "kv_key_info"
+                    // Key *names* segmented into templates: no value is read.
+                    | "kv_key_schema"
                     // MongoDB (doc) metadata tools: catalog + inferred schema, no
                     // document reads.
                     | "doc_server_info"
@@ -699,9 +705,22 @@ impl AiTier {
                 tool,
                 "list_schema"
                     | "describe_table"
+                    | "relationship_map"
+                    | "object_ddl"
                     | "run_select"
+                    | "search_data"
                     | "explain"
                     | "profile_table"
+                    | "health_report"
+                    | "server_sessions"
+                    | "diff_schema"
+                    | "diff_data"
+                    // Composes explain + describe_table and emits candidate DDL
+                    // as text; creating it is `create_index`'s job, at Write.
+                    | "suggest_index"
+                    // Streams a read to a file for the user. A read, and offered
+                    // by all three seams with per-seam arguments.
+                    | "export_result"
                     | "generate_report"
                     | "open_query"
                     | "save_query"
@@ -713,18 +732,27 @@ impl AiTier {
                     | "kv_server_info"
                     | "kv_scan_keys"
                     | "kv_key_info"
+                    | "kv_key_schema"
                     | "kv_get_value"
+                    | "kv_read_collection"
+                    | "kv_stream_groups"
                     | "kv_biggest_keys"
                     | "kv_analyze"
                     | "kv_slowlog"
+                    | "kv_client_list"
                     | "kv_config_get"
+                    | "kv_keyspace_notifications"
                     // MongoDB (doc) read tools: the metadata tools from Schema plus
                     // document/sample/analytical reads. All read-only.
                     | "doc_server_info"
                     | "list_collections"
                     | "describe_collection"
+                    // Samples field *values* to test each reference, so it is a
+                    // read tool rather than a Schema one despite mapping structure.
+                    | "doc_reference_map"
                     | "profile_collection"
                     | "sample_documents"
+                    | "get_document"
                     | "find"
                     | "aggregate"
                     | "count"
@@ -732,6 +760,7 @@ impl AiTier {
                     | "explain_query"
                     | "index_advice"
                     | "audit_collection"
+                    | "doc_current_op"
             ),
             // Write inherits the full read catalog and adds the gated write tools:
             // SQL (a single statement or a transactional changeset) and Redis
@@ -741,14 +770,27 @@ impl AiTier {
                     tool,
                     "propose_write"
                         | "propose_changeset"
+                        // Not a data write, but a server-state one: stopping a
+                        // session rolls back its transaction, so it rides the
+                        // same tier and the same per-call approval.
+                        | "kill_session"
+                        // The one DDL the agent may run: additive and reversible,
+                        // unlike the DROP/TRUNCATE/ALTER that stay blocked.
+                        | "create_index"
+                        | "kv_set"
                         | "kv_expire"
                         | "kv_delete"
                         | "kv_rename"
+                        | "kv_copy_key"
                         | "kv_config_set"
+                        | "kv_client_kill"
+                        // Read-only by allowlist, gated as a write on purpose.
+                        | "kv_command"
                         // MongoDB (doc) gated writes.
                         | "propose_doc_write"
                         | "propose_index"
                         | "propose_collection_op"
+                        | "doc_kill_op"
                 ) || AiTier::Read.allows_tool(tool)
             }
         }

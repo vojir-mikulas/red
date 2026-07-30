@@ -157,12 +157,34 @@ impl DocDriver for MongoDriver {
             } else {
                 0
             };
+            // `collStats` alongside the count, on the same terms: real collections
+            // only, and best-effort. A view has no storage of its own, and a
+            // permission error on one namespace must not sink the catalog.
+            let size = if kind == CollKind::Collection {
+                database
+                    .run_command(doc! { "collStats": &spec.name, "scale": 1 })
+                    .await
+                    .ok()
+                    .and_then(|stats| get_num(&stats, "size"))
+                    .unwrap_or(0)
+            } else {
+                0
+            };
+            // Rendered through the same value tree as any other document, so the
+            // validator reads the way the rest of the app spells BSON rather than
+            // in the driver's Debug format.
+            let validator = spec
+                .options
+                .validator
+                .as_ref()
+                .map(|v| bson_to_doc(Bson::Document(v.clone())).to_extended_json());
             out.push(CollectionInfo {
                 name: spec.name,
                 kind,
                 est_count,
-                size: 0,
+                size,
                 capped,
+                validator,
             });
         }
         Ok(out)
@@ -454,6 +476,65 @@ impl DocDriver for MongoDriver {
             .database(&cursor.db)
             .run_command(doc! { "killCursors": &cursor.coll, "cursors": [cursor.id] })
             .await;
+    }
+
+    async fn current_ops(&self) -> Result<Vec<red_core::doc::DocOp>> {
+        // `$currentOp` on `admin`, not the deprecated `currentOp` command: the
+        // aggregation stage is the supported path on 5.0+ and the only one that
+        // works uniformly through a mongos. Sorted and capped here so callers
+        // never need a guard of their own.
+        let mut cursor = self
+            .client
+            .database("admin")
+            .aggregate(vec![
+                doc! { "$currentOp": { "allUsers": true, "idleConnections": false } },
+                doc! { "$sort": { "secs_running": -1 } },
+                doc! { "$limit": 200 },
+            ])
+            .await
+            .map_err(query_err)?;
+
+        let mut out = Vec::new();
+        while let Some(op) = cursor.next().await {
+            let op = op.map_err(query_err)?;
+            // An entry with no opid cannot be killed and cannot be identified, so
+            // reporting it would be noise the caller can do nothing with.
+            let Some(opid) = op
+                .get_i64("opid")
+                .ok()
+                .or_else(|| op.get_i32("opid").ok().map(i64::from))
+            else {
+                continue;
+            };
+            out.push(red_core::doc::DocOp {
+                opid,
+                op: op.get_str("op").unwrap_or("unknown").to_string(),
+                namespace: op.get_str("ns").unwrap_or("").to_string(),
+                secs_running: op
+                    .get_i64("secs_running")
+                    .map(|s| s as f64)
+                    .or_else(|_| op.get_i32("secs_running").map(f64::from))
+                    .or_else(|_| op.get_f64("secs_running"))
+                    .unwrap_or(0.0),
+                client: op.get_str("client").ok().map(str::to_string),
+                command: op
+                    .get_document("command")
+                    .ok()
+                    .map(|c| bson_to_doc(Bson::Document(c.clone())).to_extended_json()),
+                waiting_for_lock: op.get_bool("waitingForLock").unwrap_or(false),
+            });
+        }
+        Ok(out)
+    }
+
+    async fn kill_op(&self, opid: i64) -> Result<()> {
+        self.ensure_writable()?;
+        self.client
+            .database("admin")
+            .run_command(doc! { "killOp": 1, "op": opid })
+            .await
+            .map(|_| ())
+            .map_err(query_err)
     }
 
     fn parse_ext_json(&self, text: &str) -> Result<DocValue> {

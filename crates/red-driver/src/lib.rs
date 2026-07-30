@@ -1663,8 +1663,11 @@ pub trait DatabaseDriver: Send + Sync {
     ///
     /// The most destructive-by-consequence call in this trait that is not itself a
     /// write: terminating a session rolls back its transaction. A read-only driver
-    /// refuses it, the UI grades the confirmation by `ConnEnv`, and it is never
-    /// exposed as an AI or MCP tool at any tier.
+    /// refuses it, the UI grades the confirmation by `ConnEnv`, and the agent
+    /// reaches it only through the `Write`-tier `kill_session` tool, which
+    /// re-resolves the target and rides a per-call approval naming the session and
+    /// its statement. It is a write for `is_write_tool`, so the headless MCP
+    /// transport never advertises it.
     async fn kill_session(
         &self,
         key: &red_core::SessionKey,

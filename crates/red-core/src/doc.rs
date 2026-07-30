@@ -293,6 +293,11 @@ pub struct CollectionInfo {
     pub size: u64,
     /// Whether the collection is capped (fixed-size ring).
     pub capped: bool,
+    /// The collection's JSON-schema validator (`options.validator`) as extended
+    /// JSON, when one is declared. The closest thing MongoDB has to a
+    /// constraint, so anything proposing a write wants to know it exists before
+    /// the write bounces off it.
+    pub validator: Option<String>,
 }
 
 /// A `find` filter / projection / sort, passed through as an extended-JSON
@@ -354,6 +359,30 @@ pub struct DocCursor {
     pub id: i64,
     pub db: String,
     pub coll: String,
+}
+
+/// One operation the deployment is running right now (`$currentOp`). The
+/// document-store analogue of [`ServerSession`](crate::ServerSession): same
+/// question ("what is it doing, and what is stuck"), different shape, because
+/// Mongo addresses an operation by an opid rather than a connection and reports
+/// a namespace rather than a database plus a statement.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocOp {
+    /// What `killOp` addresses this operation by.
+    pub opid: i64,
+    /// The operation kind as the server words it (`query`, `insert`, `getmore`,
+    /// `command`), verbatim.
+    pub op: String,
+    /// `db.collection` the operation runs against.
+    pub namespace: String,
+    /// Seconds the operation has been running, computed server-side.
+    pub secs_running: f64,
+    pub client: Option<String>,
+    /// The command document as text, when the connected role may see it.
+    pub command: Option<String>,
+    /// Whether the operation is blocked waiting for a lock, the signature of a
+    /// stall that is somebody else's fault.
+    pub waiting_for_lock: bool,
 }
 
 /// A document store's deployment topology, detected at connect. Mirrors
@@ -649,6 +678,66 @@ pub fn pipeline_write_stage(stages: &[DocValue]) -> Option<&'static str> {
         }),
         _ => None,
     })
+}
+
+/// The name a field is probably a reference *to*, or `None` when the field name
+/// suggests nothing. Mongo has no foreign keys, so a reference can only ever be
+/// guessed from the name and then *tested*; this is the guessing half, kept pure
+/// and next to the types it reads.
+///
+/// Recognizes the four conventions that actually appear in the wild — `order_id`,
+/// `orderId`, `order_ref`, `orderRef` — and returns the base (`order`). A field
+/// whose name carries no such suffix returns `None` here; the caller still gets a
+/// second chance by matching the bare name against the collection catalog
+/// (`customer` -> `customers`), which is [`match_collection`]'s job.
+///
+/// `_id` itself is excluded: it is the target of references, never one.
+pub fn reference_base(field: &str) -> Option<&str> {
+    let name = field.rsplit('.').next().unwrap_or(field);
+    if name == "_id" || name.is_empty() {
+        return None;
+    }
+    for suffix in ["_id", "_ref"] {
+        if let Some(base) = name.strip_suffix(suffix)
+            && !base.is_empty()
+        {
+            return Some(base);
+        }
+    }
+    // camelCase: only when the char before the suffix is lowercase, so `ID` and
+    // `UUID` don't read as `U` + `Id`.
+    for suffix in ["Id", "Ref"] {
+        if let Some(base) = name.strip_suffix(suffix)
+            && base.chars().next_back().is_some_and(char::is_lowercase)
+        {
+            return Some(base);
+        }
+    }
+    None
+}
+
+/// Resolve a reference base against a collection catalog, case-insensitively and
+/// tolerating the singular/plural mismatch that is the norm (`order` ->
+/// `orders`). Returns the catalog's own spelling so the caller can query it.
+///
+/// Deliberately narrow: only exact, `+s`, and `-s` are tried. An irregular plural
+/// (`person`/`people`) simply doesn't resolve, and reporting "unresolved" is the
+/// honest answer — inventing a match the probe would then have to disprove is
+/// worse than admitting the name told us nothing.
+pub fn match_collection<'a>(base: &str, collections: &'a [String]) -> Option<&'a str> {
+    let base = base.to_ascii_lowercase();
+    let candidates = [
+        base.clone(),
+        format!("{base}s"),
+        base.strip_suffix('s').unwrap_or(&base).to_string(),
+    ];
+    collections
+        .iter()
+        .find(|c| {
+            let lower = c.to_ascii_lowercase();
+            candidates.contains(&lower)
+        })
+        .map(String::as_str)
 }
 
 /// The first operator anywhere in `value` that executes server-side JavaScript
@@ -1013,6 +1102,34 @@ mod tests {
             }),
             OpClass::Destructive
         );
+    }
+
+    #[test]
+    fn reference_base_reads_the_four_conventions() {
+        assert_eq!(reference_base("order_id"), Some("order"));
+        assert_eq!(reference_base("orderId"), Some("order"));
+        assert_eq!(reference_base("order_ref"), Some("order"));
+        assert_eq!(reference_base("orderRef"), Some("order"));
+        // Nested paths are judged by their last segment.
+        assert_eq!(reference_base("meta.customer_id"), Some("customer"));
+        // `_id` is the target of references, never one; and an all-caps tail is
+        // not a camelCase suffix (`UUID` is not `UU` + `ID`).
+        assert_eq!(reference_base("_id"), None);
+        assert_eq!(reference_base("UUID"), None);
+        assert_eq!(reference_base("status"), None);
+        assert_eq!(reference_base("_ref"), None);
+    }
+
+    #[test]
+    fn match_collection_tolerates_case_and_plurality() {
+        let catalog = vec!["orders".to_string(), "Customer".to_string()];
+        assert_eq!(match_collection("order", &catalog), Some("orders"));
+        assert_eq!(match_collection("orders", &catalog), Some("orders"));
+        assert_eq!(match_collection("customers", &catalog), Some("Customer"));
+        // An irregular plural does not resolve, and saying so beats inventing a
+        // match the probe would then have to disprove.
+        assert_eq!(match_collection("person", &catalog), None);
+        assert_eq!(match_collection("invoice", &catalog), None);
     }
 
     #[test]

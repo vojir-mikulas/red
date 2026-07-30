@@ -7,6 +7,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- The AI assistant can now reach the parts of RED it was previously blind to.
+  Against a SQL database it can read the foreign-key graph in one call, pull an
+  object's real definition, search a table for a value without knowing which
+  column holds it, run EXPLAIN with actual row counts, produce a health report,
+  see what the server is running right now, compare two schemas or two tables'
+  rows, and suggest an index. Against Redis it can infer the keyspace's key
+  templates, page deep into a large collection or stream, read consumer-group
+  lag and pending entries, list connected clients, and see the topology up
+  front. Against MongoDB it can discover which fields reference which
+  collections and how reliably they resolve, fetch a document by `_id`, and see
+  what is running now.
+- The Redis agent can finally write a value. Previously it could delete a
+  thousand keys after one approval but could not set a single one; it now has a
+  `kv_set` that writes a string, hash, set, sorted set, list, or stream entry,
+  with an optional expiry, behind the same approval every other write rides.
+  The approval shows the exact commands that will run.
+- The assistant can hand you a file: a query's whole result, a set of Redis
+  keys, or a collection's documents, written out as CSV or JSON and offered as
+  a card in the chat you can open. Unlike what it reads into the conversation,
+  an exported query result is not row-capped.
+- The assistant can stop a runaway session, Redis client, or MongoDB operation,
+  and create an index, each behind an explicit approval that names the target
+  and what stopping it costs. Destructive DDL stays unavailable.
+- MongoDB collections now show their JSON-schema validator, where one is
+  declared, alongside the inferred schema and indexes, and the collection list
+  reports each collection's storage size.
 - The work area can now hold any number of panes, arranged as columns, rows, or
   any nesting of the two, in the SQL, Redis and MongoDB shells alike. Dragging a
   tab shows where it would land — into the pane under the cursor, or into a new

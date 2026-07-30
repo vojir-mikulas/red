@@ -390,19 +390,31 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        // Read-only tools only: the write tools (propose_write / propose_changeset)
-        // and the direct-path-only spawn_subagent are withheld over MCP.
+        // Read-only tools only: the write tools (propose_write / propose_changeset /
+        // create_index / kill_session) and the direct-path-only spawn_subagent are
+        // withheld. The GUI-bound reads stay: this server backs the in-app ACP
+        // agent, which has a UI to hand a tab or a file to (unlike the headless
+        // `red mcp` transport, which drops them via `is_headless_tool`).
         assert_eq!(
             names,
             [
                 "list_schema",
                 "describe_table",
+                "object_ddl",
+                "relationship_map",
                 "profile_table",
                 "run_select",
+                "search_data",
                 "explain",
+                "health_report",
+                "server_sessions",
+                "diff_schema",
+                "diff_data",
+                "suggest_index",
+                "export_result",
                 "generate_report",
                 "open_query",
-                "save_query"
+                "save_query",
             ]
         );
     }
@@ -474,7 +486,15 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, ["list_schema", "describe_table"]);
+        assert_eq!(
+            names,
+            [
+                "list_schema",
+                "describe_table",
+                "object_ddl",
+                "relationship_map"
+            ]
+        );
         // And a run_select call is refused by the server-side tier check (defense in
         // depth), as an in-band tool error rather than a transport failure.
         let reply = call(
@@ -849,7 +869,13 @@ mod tests {
         assert!(names.contains(&"kv_server_info"), "got: {names:?}");
         assert!(names.contains(&"kv_scan_keys"), "got: {names:?}");
         // …and every mutating tool is withheld.
-        for w in ["kv_delete", "kv_expire", "kv_rename", "kv_config_set"] {
+        for w in [
+            "kv_set",
+            "kv_delete",
+            "kv_expire",
+            "kv_rename",
+            "kv_config_set",
+        ] {
             assert!(!names.contains(&w), "{w} must not be offered over MCP");
         }
         // The SQL catalog must not bleed into a KV backend.

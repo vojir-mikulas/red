@@ -136,6 +136,33 @@ pub trait DocDriver: Send + Sync {
     /// a failed close is not worth surfacing (the cursor times out server-side).
     async fn close_cursor(&self, cursor: &DocCursor);
 
+    /// What the deployment is running right now (`$currentOp`), longest-running
+    /// first. The document-store analogue of
+    /// [`DatabaseDriver::server_sessions`](crate::DatabaseDriver::server_sessions),
+    /// and read-only like it.
+    ///
+    /// Bounded by contract: the driver caps and orders the pipeline itself, so a
+    /// caller can poll it without a size guard of its own. Idle connections are
+    /// excluded — the question is what is *running*. The default is empty for an
+    /// engine with no such notion.
+    async fn current_ops(&self) -> Result<Vec<red_core::doc::DocOp>> {
+        Ok(Vec::new())
+    }
+
+    /// Stop one running operation by its opid (`killOp`).
+    ///
+    /// The document-store analogue of
+    /// [`DatabaseDriver::kill_session`](crate::DatabaseDriver::kill_session), and
+    /// carries the same weight: an interrupted multi-document write is not rolled
+    /// back, so a killed `updateMany` leaves the documents it already touched
+    /// changed. The host gate confirms it; the default reports it unsupported.
+    async fn kill_op(&self, opid: i64) -> Result<()> {
+        let _ = opid;
+        Err(red_core::RedError::Driver(
+            "this engine has no running operations to stop".to_string(),
+        ))
+    }
+
     /// Parse an extended-JSON string (a filter document, or an aggregation
     /// pipeline array) into a [`DocValue`]. Engine-specific because the
     /// extended-JSON dialect is the engine's, kept off the pure `red-core` types.
@@ -253,6 +280,7 @@ mod tests {
                     est_count: docs.len() as u64,
                     size: 0,
                     capped: false,
+                    validator: None,
                 })
                 .collect())
         }

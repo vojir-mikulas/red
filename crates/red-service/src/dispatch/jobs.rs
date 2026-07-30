@@ -587,7 +587,7 @@ fn is_text_decl(ty: Option<&str>) -> bool {
 /// One window per side is resident, so memory is bounded by the window + the diff-row
 /// cap, never by table size. `cancel` is checked between windows.
 #[allow(clippy::too_many_arguments)]
-pub(super) async fn diff_job(
+pub(crate) async fn diff_job(
     left_driver: Arc<dyn DatabaseDriver>,
     left: TableRef,
     right_driver: Arc<dyn DatabaseDriver>,
