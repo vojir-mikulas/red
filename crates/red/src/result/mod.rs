@@ -53,7 +53,7 @@ use buffer::{BufferMode, GridBuffer, KeyedRun, next_epoch};
 /// decl_type, foreign)`, returned by [`ResultGrid::edit_identity`]. `key_values` are
 /// the row's identity-column values in `RowEditCaps::identity` order; `foreign` is
 /// `Some` for an inline-expanded FK column that writes back to its referenced table
-/// (Track B7).
+///.
 type EditIdentity = (
     usize,
     usize,
@@ -64,7 +64,7 @@ type EditIdentity = (
 pub(crate) use render::group_digits;
 
 /// Mint a fresh, process-unique epoch for a non-grid consumer (the plan view,
-/// Track B4) so its echoed replies are dropped once superseded; it shares the
+/// ) so its echoed replies are dropped once superseded; it shares the
 /// grid's monotonic source so the two never collide.
 pub(crate) fn new_epoch() -> red_service::Epoch {
     next_epoch()
@@ -95,7 +95,7 @@ pub(in crate::result) fn gutter_width(total: usize) -> f32 {
     (glyphs as f32 * 8.0 + 20.0).max(GUTTER_WIDTH)
 }
 
-/// One inline-expanded reference column (Track B7): a dotted path from the base
+/// One inline-expanded reference column: a dotted path from the base
 /// table down through single-column FKs to a leaf column, e.g.
 /// `["tier_id", "cascade_id", "name"]`, shown and aliased as
 /// `tier_id.cascade_id.name`. The leading segments are FK columns (each resolved
@@ -114,7 +114,7 @@ impl ExpandedCol {
 }
 
 /// The cell-menu data for expanding the focused FK cell's reference table inline
-/// (Track B7): the referenced table's name (the section header) and each of its
+///: the referenced table's name (the section header) and each of its
 /// columns with whether it's already shown and the dotted path that toggles it.
 /// Built only when the focused column is a single-column FK whose target table is
 /// already described (the eager prefetch usually has it).
@@ -234,7 +234,7 @@ pub(crate) struct ResultGrid {
     pub(in crate::result) error: Option<String>,
     /// `(data column, ascending)`; `None` is unsorted.
     pub(in crate::result) sort: Option<(usize, bool)>,
-    /// The active result filter (Track B2), pushed into the query on (re)open.
+    /// The active result filter, pushed into the query on (re)open.
     /// `None` is unfiltered. Survives a re-sort (both ride the same `OpenResult`).
     pub(in crate::result) filter: Option<ResultFilter>,
     /// The row count this result last reported *unfiltered*, so a filtered grid
@@ -252,10 +252,10 @@ pub(crate) struct ResultGrid {
     /// `None` for editor SQL and for sorted re-opens (which wrap the SQL).
     table: Option<(String, String)>,
     /// Data-column indices that are single-column forward foreign keys of `table`
-    /// (Track B7), recomputed from the connection's FK graph on open / graph-load.
+    ///, recomputed from the connection's FK graph on open / graph-load.
     /// Drives the in-grid FK accent; always empty for non-table results.
     fk_cols: HashSet<usize>,
-    /// Inline FK expansion (Track B7): the reference columns the user pulled into
+    /// Inline FK expansion: the reference columns the user pulled into
     /// this browse, each a dotted path from the base table (`["tier_id","name"]` →
     /// shown as `tier_id.name`). The source of truth the cell menu / Columns panel
     /// toggle; [`joins`](Self::joins) is derived from it against the FK graph. Empty
@@ -271,12 +271,12 @@ pub(crate) struct ResultGrid {
     /// Drives the joined-column tint; editing a single-hop one writes back to the
     /// referenced table (see [`foreign_edit_for`](Self::foreign_edit_for)).
     joined_cols: HashSet<usize>,
-    /// Which FK nodes are expanded open in the Columns panel's tree (Track B7),
+    /// Which FK nodes are expanded open in the Columns panel's tree,
     /// keyed by their dotted FK path (`["tier_id","cascade_id"]`). Purely panel UI
     /// state, distinct from [`expansion`](Self::expansion) (the *checked* columns);
     /// expanding a node only reveals its children, it doesn't add a column.
     pub(in crate::result) tree_expanded: HashSet<Vec<String>>,
-    /// The seek key the backend resolved (`ResultReady`). Track B5 reads its PK to
+    /// The seek key the backend resolved (`ResultReady`). reads its PK to
     /// key a guarded edit; `None` (editor SQL / no usable PK) means not editable.
     key: Option<KeySpec>,
     /// What this result's existing rows may be changed to, resolved by the backend
@@ -285,7 +285,7 @@ pub(crate) struct ResultGrid {
     /// grid shows instead of the affordances.
     pub(in crate::result) edit: RowEditCaps,
     pub(in crate::result) buffer: Rc<RefCell<GridBuffer>>,
-    /// Staged, not-yet-submitted edits for this result (Track B6), keyed by PK so
+    /// Staged, not-yet-submitted edits for this result, keyed by PK so
     /// they survive the windowed buffer's eviction. Cleared on every (re)open.
     pub(in crate::result) pending: edit::PendingChanges,
     pub(in crate::result) sender: CommandSender,
@@ -439,7 +439,7 @@ impl ResultGrid {
     }
 
     /// The `(schema, table)` this result browses; `Some` only for a single-table
-    /// preview (the FK click-through / relation-tree entry conditions, Track B7).
+    /// preview (the FK click-through / relation-tree entry conditions).
     pub(crate) fn base_table(&self) -> Option<&(String, String)> {
         self.table.as_ref()
     }
@@ -450,7 +450,7 @@ impl ResultGrid {
     }
 
     /// Recompute which data columns are single-column forward foreign keys of this
-    /// grid's base table, from the connection's FK graph (Track B7). An empty set
+    /// grid's base table, from the connection's FK graph. An empty set
     /// for non-table results or before the graph loads. Drives the in-grid accent.
     pub(crate) fn set_fk_cols(&mut self, graph: &[FkEdge]) {
         self.fk_cols.clear();
@@ -717,7 +717,7 @@ impl ResultGrid {
         }
     }
 
-    /// Assemble the guarded-edit target (Track B5) for the cell under the cursor:
+    /// Assemble the guarded-edit target for the cell under the cursor:
     /// the base table, its PK column + value (the row's identity), and the focused
     /// column's name / declared type / current value. `None` when the result isn't
     /// an editable single-table keyed browse, the cursor is on the PK column itself
@@ -783,7 +783,7 @@ impl ResultGrid {
         if !self.updatable_column(col) {
             return None;
         }
-        // An inline-expanded reference column (Track B7) writes back to the *joined*
+        // An inline-expanded reference column writes back to the *joined*
         // table, not this browse's base table; resolve its foreign target. A
         // multi-hop / composite / orphaned-FK expansion can't be resolved and stays
         // read-only (`foreign_edit_for` returns `None`).
@@ -797,7 +797,7 @@ impl ResultGrid {
     }
 
     /// Resolve the referenced-table write target for the inline-expanded FK column at
-    /// result column `col` in absolute `row` (Track B7 editable joined columns). The
+    /// result column `col` in absolute `row` (editable joined columns). The
     /// referenced row is identified by the FK value resident in the base row, so only
     /// a **single-hop** join (parent = the base subquery) with a **single-column** key
     /// is editable; a deeper chain would need an intermediate join's value that may
@@ -845,7 +845,7 @@ impl ResultGrid {
     }
 
     /// Patch the resident cell at `(row, data_col)` to `value` in place, after a
-    /// committed edit (Track B5); avoids a refetch round-trip for the common case.
+    /// committed edit; avoids a refetch round-trip for the common case.
     pub(crate) fn patch_cell(&mut self, row: usize, data_col: usize, value: Value) {
         self.buffer.borrow_mut().patch_cell(row, data_col, value);
     }
@@ -1110,7 +1110,7 @@ impl ResultGrid {
         }
     }
 
-    /// Find-in-result (Track B2, Tier 1): resident cells whose display text
+    /// Find-in-result : resident cells whose display text
     /// contains `term_lower` (already lower-cased), as `(ordinal, data column)`.
     /// Scans only loaded rows; see [`buffer::GridBuffer::find_matches`].
     pub(crate) fn find_matches(&self, term_lower: &str) -> Vec<(usize, usize)> {
@@ -1294,7 +1294,7 @@ pub(crate) struct PendingCopy {
     pub(crate) dcol_hi: usize,
 }
 
-/// An in-flight FK click-through (Track B7) awaiting its single-row `CopyRows`
+/// An in-flight FK click-through awaiting its single-row `CopyRows`
 /// re-fetch: once the row's typed value(s) arrive, the target browse is opened
 /// filtered to them. See [`AppState::on_fk_rows`].
 pub(crate) struct PendingFkFollow {
@@ -1414,9 +1414,9 @@ impl AppState {
     }
 
     /// Like [`open_result`](Self::open_result) but seeds an initial result filter:
-    /// the FK click-through (Track B7) opens the target browse pre-filtered to the
+    /// the FK click-through opens the target browse pre-filtered to the
     /// followed key. The filter rides the grid (so a re-sort preserves it) and the
-    /// first `OpenResult`, exactly like an applied Track B2 filter.
+    /// first `OpenResult`, exactly like an applied filter.
     pub(crate) fn open_result_filtered(
         &mut self,
         label: impl Into<String>,
@@ -1444,7 +1444,7 @@ impl AppState {
                     grid.filter.clone(),
                 );
                 // Safe: the guard above ensured a focused tab exists. A fresh run
-                // replaces any open plan (Track B4) with its grid.
+                // replaces any open plan with its grid.
                 #[allow(
                     clippy::unwrap_used,
                     reason = "guard above ensured a focused tab exists"
@@ -1458,7 +1458,7 @@ impl AppState {
         };
         let (sql, epoch, table, filter) = opened;
         // Ensure the base table's column detail is loaded so the reference-column tree
-        // (Track B7) can render; a schema-tree browse prefetches this, but a hand-typed
+        // can render; a schema-tree browse prefetches this, but a hand-typed
         // `SELECT * FROM t` resolved to a base table may not have it yet. Idempotent: it
         // only fires when the detail is missing (the accent path needs only the FK graph,
         // not this, but the columns panel reads the base table's columns from here).
@@ -1473,7 +1473,7 @@ impl AppState {
             }
         }
         // A fresh open is never sorted (the backend keys it from `table`); the filter
-        // (FK follow) is pushed into the query like a Track B2 filter.
+        // (FK follow) is pushed into the query like filter.
         self.send_active(Command::OpenResult {
             sql,
             epoch,
@@ -1671,7 +1671,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Apply (or clear) the result filter (Track B2): re-open the active grid with
+    /// Apply (or clear) the result filter: re-open the active grid with
     /// `filter` pushed into the query, preserving the current header-click sort. A
     /// new epoch drops pages still in flight for the prior (un)filtered ordering.
     /// `None` clears the filter. A no-op when the filter is unchanged.
@@ -1730,7 +1730,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Toggle one inline-expanded reference column (Track B7) into / out of the
+    /// Toggle one inline-expanded reference column into / out of the
     /// active browse, then re-open it (new epoch) so the backend re-runs with the
     /// updated `LEFT JOIN` set, preserving the current sort + filter. `path` is the
     /// dotted FK path (`["tier_id","name"]`). No-op unless the active result is a
@@ -1770,7 +1770,7 @@ impl AppState {
         self.apply_reopen(reopen, cx);
     }
 
-    /// Build the inline-FK-expansion menu for the focused cell (Track B7): when the
+    /// Build the inline-FK-expansion menu for the focused cell: when the
     /// focused column is a single-column forward FK and its target table has been
     /// described, list the target's columns with their current shown state. `None`
     /// for a non-FK cell, an undescribed target, editor SQL, or before the graph
@@ -1831,19 +1831,50 @@ impl AppState {
     /// Close the superseded epoch and re-open the active grid from a
     /// [`ResultGrid::reopen_spec`] bundle (shared by the expansion toggles).
     fn apply_reopen(&mut self, reopen: Option<ReopenSpec>, cx: &mut Context<Self>) {
-        if let Some((sql, epoch, table, sort, filter, joins, old_epoch)) = reopen {
-            self.send_active(Command::CloseResult { epoch: old_epoch });
-            self.send_active(Command::OpenResult {
+        let session = self.foreground_session;
+        self.apply_reopen_in(session, reopen, cx);
+    }
+
+    /// [`apply_reopen`](Self::apply_reopen) against a named connection and its own
+    /// tab's namespace.
+    ///
+    /// The namespace has to come from the tab being reopened, not the focused one:
+    /// on MySQL/ClickHouse a batch on tab A (namespace `sales`) whose reply lands
+    /// while tab B (`staging`) is focused would otherwise reopen A bound to
+    /// `staging`. The watch path fixed exactly this; the batch path had not.
+    fn apply_reopen_in(
+        &mut self,
+        session: Option<red_service::SessionId>,
+        reopen: Option<ReopenSpec>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((sql, epoch, table, sort, filter, joins, old_epoch)) = reopen else {
+            cx.notify();
+            return;
+        };
+        let Some(id) = session else {
+            cx.notify();
+            return;
+        };
+        let namespace = self.conn_for(Some(id)).and_then(|c| {
+            c.namespace_for_epoch(epoch)
+                .or_else(|| c.namespace_for_send())
+        });
+        self.service
+            .send_to(id, Command::CloseResult { epoch: old_epoch });
+        self.service.send_to(
+            id,
+            Command::OpenResult {
                 sql,
                 epoch,
                 table,
                 sort,
                 filter,
                 joins,
-                namespace: self.send_namespace(),
-            });
-            self.start_query_ticker(cx);
-        }
+                namespace,
+            },
+        );
+        self.start_query_ticker(cx);
         cx.notify();
     }
 
@@ -1882,12 +1913,21 @@ impl AppState {
 
     /// The foreground connection's open result carrying `epoch`, for epoch-scoped
     /// replies on the visible workspace (e.g. a committed in-place cell edit,
-    /// Track B5). Delegates to `ActiveConn::result_by_epoch`.
-    pub(crate) fn result_by_epoch(&mut self, epoch: red_service::Epoch) -> Option<&mut ResultGrid> {
-        match &mut self.phase {
-            Phase::Connected(active) => active.result_by_epoch(epoch),
-            _ => None,
-        }
+    /// ). Delegates to `ActiveConn::result_by_epoch`.
+    /// The grid carrying `epoch` on the connection that *owns* it, foreground or
+    /// parked.
+    ///
+    /// Resolving the foreground connection instead — as this did — meant a reply
+    /// arriving after the user switched connections found nothing: the staged set
+    /// was never cleared, the struck rows stayed, Submit stayed armed, and
+    /// re-submitting re-ran ops whose "touches exactly one row" assertion then
+    /// failed — while a "Changes submitted" toast said it had worked.
+    pub(crate) fn result_by_epoch_in(
+        &mut self,
+        session: Option<red_service::SessionId>,
+        epoch: red_service::Epoch,
+    ) -> Option<&mut ResultGrid> {
+        self.conn_mut(session)?.result_by_epoch(epoch)
     }
 
     /// Cell click: set the selection anchor, or extend it on shift-click. A click
@@ -2534,7 +2574,7 @@ impl AppState {
                 ignored_source.join(", ")
             ));
         }
-        self.confirm_exec = Some(PendingWrite::Import {
+        self.confirm_exec = self.pending_confirm(PendingWrite::Import {
             path: peek.path,
             format: peek.format,
             target: peek.target,
@@ -2663,7 +2703,7 @@ impl AppState {
             cx.notify();
             return;
         }
-        // An FK click-through (Track B7) also re-fetches one row in full to read the
+        // An FK click-through also re-fetches one row in full to read the
         // typed key; if this reply is its, it opens the target browse.
         if self.on_fk_rows(id, &rows, cx) {
             cx.notify();
@@ -2676,7 +2716,7 @@ impl AppState {
         cx.write_to_clipboard(ClipboardItem::new_string(tsv));
     }
 
-    /// FK click-through affordances for the focused cell's grid (Track B7): the
+    /// FK click-through affordances for the focused cell's grid: the
     /// forward target table name when the focused column is a single-column FK, and
     /// the reverse edges (tables referencing this grid's table) as
     /// `(child_schema, child_table, from_column, to_column)`. Empty without a base
@@ -2918,7 +2958,7 @@ mod join_tests {
     }
 }
 
-/// Editing an inline-expanded FK column (Track B7): a joined cell resolves to an
+/// Editing an inline-expanded FK column: a joined cell resolves to an
 /// `UPDATE` against its *referenced* table, keyed by the FK value from the base row.
 #[cfg(test)]
 mod foreign_edit_tests {

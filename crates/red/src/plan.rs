@@ -1,4 +1,4 @@
-//! The query-plan view (Track B4, EXPLAIN). An Explain action runs the engine's
+//! The query-plan view (EXPLAIN). An Explain action runs the engine's
 //! `EXPLAIN` for the editor's current query and shows the normalized plan tree in
 //! the result pane, in place of the grid. The driver does the engine-specific
 //! formatting (`DatabaseDriver::explain` → `red_core::QueryPlan`); this module is

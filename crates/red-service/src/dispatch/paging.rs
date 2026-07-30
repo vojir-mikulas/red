@@ -390,7 +390,7 @@ pub(crate) fn wrap_sorted(
     )
 }
 
-/// Wrap a base query in a filter `WHERE` (Track B2): `SELECT * FROM (base) WHERE
+/// Wrap a base query in a filter `WHERE`: `SELECT * FROM (base) WHERE
 /// (pred)`. `pred` is either a driver-rendered `Contains` predicate (already an
 /// OR-chain in parens) or a raw `Where` expression; the wrapping parens contain
 /// its precedence. `SELECT *` is preserved, so the keyset key column survives the

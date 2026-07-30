@@ -1495,9 +1495,8 @@ impl AppState {
     }
 
     /// The keyspace-analysis panel: a persisted, point-in-time report (type
-    /// distribution, top namespaces by memory, expiry summary) with a
-    /// Run/Re-run control (see docs/plans/redis.md's "persistent database
-    /// analysis report" gap).
+    /// distribution, top namespaces by memory, expiry summary) with a Run/Re-run
+    /// control.
     pub(crate) fn render_kv_analysis(
         &self,
         active: &ActiveConn,
@@ -2112,7 +2111,7 @@ impl AppState {
     /// The string inspector's lens toolbar (Auto/Raw/JSON/Hex + the binary
     /// decoders), reusing the SQL inspector's `ValueFormat`. Lets a Redis
     /// string holding msgpack/protobuf/pickle be decoded in place, the same way
-    /// a SQL blob cell can (see docs/plans/redis.md's "binary value decoders").
+    /// a SQL blob cell can.
     fn render_kv_str_lens(
         &self,
         session: SessionId,
@@ -2843,10 +2842,9 @@ impl AppState {
             .into_any_element()
     }
 
-    /// The stream inspector body: a segmented `Entries | Groups` toggle over
-    /// either the entries view (loaded list or paged sub-grid) or the
-    /// consumer-group management panel (see docs/plans/redis.md's "stream
-    /// consumer-group management" gap).
+    /// The stream inspector body: a segmented `Entries | Groups` toggle over either the
+    /// entries view (loaded list or paged sub-grid) or the consumer-group management
+    /// panel.
     fn render_kv_stream(
         &self,
         session: SessionId,

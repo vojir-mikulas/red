@@ -45,7 +45,7 @@ pub(crate) struct McpServer {
 impl McpServer {
     /// Bind a fresh loopback server backed by `backend` (the SQL or KV driver seam),
     /// gated by `policy`, and start accepting. The policy (access tier + resource
-    /// guards, M-S7) is captured here and enforced on every `tools/list`/
+    /// guards) is captured here and enforced on every `tools/list`/
     /// `tools/call`, so the subscription agent sees exactly the catalog the tier
     /// allows and can't exceed the limits, the same gate the API-key path runs under.
     pub(crate) async fn start(
@@ -179,7 +179,7 @@ async fn dispatch(
         }
         "ping" => Ok(json!({})),
         "tools/list" => {
-            // The tier filters the catalog (M-S7): the agent never even sees a
+            // The tier filters the catalog: the agent never even sees a
             // tool above its access tier. The subscription/MCP path additionally
             // withholds *write* tools: a write executes only on the API-key path,
             // where per-statement approval is enforced in-process *before* the tool
@@ -217,7 +217,7 @@ async fn dispatch(
                 }));
             }
             // Charge the agent's cumulative tool-call budget before running anything
-            // (M-S7). Over budget → a tool error the model can recover from, not a
+            //. Over budget → a tool error the model can recover from, not a
             // transport failure. Reserve a slot with a compare-update (not a plain
             // `fetch_add`) so a rejected over-budget call doesn't keep inflating the
             // counter, matching the API path's check-then-increment in

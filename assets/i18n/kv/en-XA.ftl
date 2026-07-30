@@ -32,6 +32,8 @@ kv-imported_commands = [Ímpörtéd { $ok } çömmáñd(s)]
 
 kv-imported_with_failures = [Ímpörtéd { $ok }, { $failed } fáíléd{ $detail }]
 
+kv-import_stopped = [Ímpört stöppéd áftér { $ok } çömmáñd(s); { $failed } fáíléd]
+
 kv-actions = [Áçtíöñs]
 
 kv-toggle_namespace_tree = [Tögglé ñáméspáçé tréé]

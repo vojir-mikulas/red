@@ -101,31 +101,30 @@ actions!(
         CloseInspector,
         /// Open or close the AI assistant chat panel (⌘L).
         ToggleAssistant,
-        /// Open or close the result filter bar (⌘⇧F). Track B2.
+        /// Open or close the result filter bar (⌘⇧F).
         ToggleFilter,
         /// Open or close the find-in-result bar (⌘F when the grid is focused).
-        /// Track B2, Tier 1.
         FindInResult,
-        /// Save the active tab's query as a named snippet (⇧⌘S). Track B3.
+        /// Save the active tab's query as a named snippet (⇧⌘S).
         SaveQuery,
-        /// Open the saved-query picker (⇧⌘O); Track B3.
+        /// Open the saved-query picker (⇧⌘O).
         OpenSavedQueries,
-        /// Explain the active tab's query: open the plan view (⇧⌘E). Track B4.
+        /// Explain the active tab's query: open the plan view (⇧⌘E).
         Explain,
         /// Beautify the active editor's SQL in place (⌥⌘F).
         FormatSql,
-        /// Begin editing the focused result cell in place (Enter / F2). Track B6.
+        /// Begin editing the focused result cell in place (Enter / F2).
         BeginEdit,
-        /// Submit the staged grid edits as one batch (⌘↵ in the grid); Track B6.
+        /// Submit the staged grid edits as one batch (⌘↵ in the grid).
         /// Falls back to running the query when nothing is staged.
         SubmitChanges,
-        /// Discard the staged grid edits (⌘⌥Z). Track B6.
+        /// Discard the staged grid edits (⌘⌥Z).
         RevertChanges,
-        /// Toggle deletion of the selected result row(s) (⌘⌫); Track B6.
+        /// Toggle deletion of the selected result row(s) (⌘⌫).
         DeleteRow,
-        /// Append a new draft (insert) row to the result (⌘⌥N). Track B6.
+        /// Append a new draft (insert) row to the result (⌘⌥N).
         AddRow,
-        /// Set the focused result cell to NULL (⌘⌥0); Track B6.
+        /// Set the focused result cell to NULL (⌘⌥0).
         SetNull,
         /// Select the whole result: every row and data column (⌘A in the grid).
         SelectAll,
@@ -634,7 +633,7 @@ const DEFAULTS: &[ActionDef] = &[
         "Focus other split half",
         Some("RedRoot"),
     ),
-    // --- staged grid editing (Track B6) ---
+    // --- staged grid editing ---
     // Scoped to the `Table` context (the result grid's focus context, set by
     // Flint's `Table`) so they fire only with the grid focused and never touch the
     // editor / schema tree. The `Table` context sits below `RedRoot`, so its

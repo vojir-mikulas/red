@@ -1,12 +1,10 @@
-//! The Redis keyspace-notification watcher (see docs/plans/redis.md's
-//! "keyspace-notification live tooling" gap). A live view of key-level events
+//! The Redis keyspace-notification watcher. A live view of key-level events
 //! (`set`/`del`/`expired`/`lpush`/…) as they happen, built on the same
 //! `PSUBSCRIBE`→`Event::KvMessage` path as the Pub/Sub monitor — just a canned
-//! `__keyevent@*__`/`__keyspace@*__` channel pattern and a decode.
-//!
-//! Keyspace notifications are off by default (`notify-keyspace-events` empty),
-//! so the panel surfaces the current setting and, on a writable connection,
-//! offers to enable them before nothing would otherwise arrive.
+//! `__keyevent@*__`/`__keyspace@*__` channel pattern and a decode. Keyspace
+//! notifications are off by default (`notify-keyspace-events` empty), so the panel
+//! surfaces the current setting and, on a writable connection, offers to enable them
+//! before nothing would otherwise arrive.
 
 use flint::prelude::*;
 use gpui::{Context, Window, div, prelude::*, px};

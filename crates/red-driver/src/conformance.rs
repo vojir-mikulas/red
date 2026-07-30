@@ -250,7 +250,7 @@ pub(crate) async fn introspects_tables_columns_fks_and_indexes(
     );
 }
 
-/// `foreign_keys` reports the connection-wide FK graph (Track B7). Reuses the
+/// `foreign_keys` reports the connection-wide FK graph. Reuses the
 /// introspection fixture (`books.author_id → authors.id`): the edge is present as a
 /// single-column edge with both endpoints' namespace = `schema`, and is discoverable
 /// by its referenced table (the reverse "show referencing rows" lookup).
@@ -287,7 +287,7 @@ pub(crate) async fn lists_foreign_key_graph(
 }
 
 /// `eq_predicate` renders an escaped equality predicate that narrows a result to the
-/// matching rows (Track B7 FK follow). `base_sql` selects a table where
+/// matching rows (FK follow). `base_sql` selects a table where
 /// `column = value` holds in exactly `expected` rows; wrapping the predicate must
 /// reproduce that count, proving the literal is rendered and compared correctly.
 pub(crate) async fn filters_eq(
@@ -961,7 +961,7 @@ pub(crate) async fn caps_display_keeps_key_and_export(
 }
 
 /// `explain` returns a readable plan for a row-returning query *without running
-/// it* (Track B4): the plan has at least one node, its `raw` text is non-empty and
+/// it*: the plan has at least one node, its `raw` text is non-empty and
 /// names the scanned `table`, and it isn't flagged analyzed. `sql` must be a
 /// `SELECT` over `table`.
 pub(crate) async fn explains_query(driver: &dyn DatabaseDriver, sql: &str, table: &str) {
@@ -990,7 +990,7 @@ pub(crate) async fn read_only_rejects_write(driver: &dyn DatabaseDriver, write_s
     );
 }
 
-/// Guarded data editing (Track B5): `apply_edit` renders a PK-keyed UPDATE / INSERT
+/// Guarded data editing: `apply_edit` renders a PK-keyed UPDATE / INSERT
 /// / DELETE, **binds** every value, and asserts exactly one affected row. The caller
 /// seeds a writable table `(id INTEGER PRIMARY KEY, name TEXT)` holding the single
 /// row `(1, 'one')`; `schema`/`table` name it. Verifies that an update rebinds one
@@ -1249,7 +1249,7 @@ pub(crate) async fn read_only_rejects_insert_rows(
     );
 }
 
-/// Atomic batch editing (Track B6): `apply_edits` commits a heterogeneous batch
+/// Atomic batch editing: `apply_edits` commits a heterogeneous batch
 /// (insert + update + delete) as one transaction, and rolls the *whole* batch back
 /// if any op fails. The caller seeds the same writable `(id PK, name)` table holding
 /// `(1, 'one')`. Verifies a 3-op batch commits together and lands every change, then

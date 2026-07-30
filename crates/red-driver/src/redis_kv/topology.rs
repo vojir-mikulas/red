@@ -180,7 +180,7 @@ pub(super) fn crc16(bytes: &[u8]) -> u16 {
 }
 
 /// One master a Sentinel monitors (`SENTINEL MASTERS`), for a connection
-/// form's master picker (see docs/plans/redis.md's Sentinel gap).
+/// form's master picker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SentinelMaster {
     /// The monitored name (the "service name" a Sentinel connection asks for).

@@ -1,5 +1,5 @@
 //! Dependency-free parsers from each engine's native `EXPLAIN` output into the
-//! normalized [`red_core::QueryPlan`] tree (Track B4). No JSON: SQLite returns
+//! normalized [`red_core::QueryPlan`] tree. No JSON: SQLite returns
 //! tabular `(id, parent, detail)` rows, Postgres an indented text plan, MySQL a
 //! `FORMAT=TREE` text tree, and older MySQL / MariaDB a tabular `EXPLAIN`. Every
 //! parser also keeps the engine's verbatim text in [`QueryPlan::raw`], the UI's

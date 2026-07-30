@@ -1,5 +1,5 @@
 //! The Server panel: what the database server is doing right now, and how to
-//! stop it (see `docs/plans/todo/server-sessions-monitor.md`).
+//! stop it.
 //!
 //! Redis has had this since `kvmonitor.rs` (SLOWLOG / MONITOR / CLIENT LIST with
 //! `CLIENT KILL`); ClickHouse had half of it in the Mutations panel; the SQL
@@ -149,7 +149,7 @@ impl AppState {
             .query
             .clone()
             .unwrap_or_else(|| "(this role cannot see the statement)".to_string());
-        self.confirm_exec = Some(PendingWrite::KillSession {
+        self.confirm_exec = self.pending_confirm(PendingWrite::KillSession {
             key,
             mode,
             who,
@@ -158,9 +158,18 @@ impl AppState {
         cx.notify();
     }
 
-    /// Fire the confirmed kill.
-    pub(crate) fn run_kill_session(&mut self, key: SessionKey, mode: KillMode) {
-        self.send_active(Command::KillServerSession { key, mode });
+    /// Fire the confirmed kill against the connection it was raised on. A server
+    /// session key means nothing on another server, so routing this to whichever
+    /// connection is foreground at click time could kill an unrelated session — or,
+    /// where keys are small integers, an arbitrary one.
+    pub(crate) fn run_kill_session(
+        &mut self,
+        session: red_service::SessionId,
+        key: SessionKey,
+        mode: KillMode,
+    ) {
+        self.service
+            .send_to(session, Command::KillServerSession { key, mode });
     }
 
     /// The Server dock.

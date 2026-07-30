@@ -1,4 +1,4 @@
-//! The Columns panel: inline foreign-key expansion (Track B7).
+//! The Columns panel: inline foreign-key expansion.
 //!
 //! A recursive, lazy tree that lets a single-table browse pull columns from
 //! *referenced* tables inline. The base table's columns are listed; an FK column

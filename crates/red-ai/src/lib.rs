@@ -29,11 +29,18 @@ pub const MODEL_OPUS: &str = "claude-opus-4-8";
 /// Cheap / fast lane.
 pub const MODEL_HAIKU: &str = "claude-haiku-4-5";
 
-/// A cloneable cancel flag the service flips when the user stops a turn. Cheap to
-/// poll; the provider checks it between streamed chunks and bails with
-/// [`AiError::Cancelled`].
+/// A cloneable cancel flag the service flips when the user stops a turn.
+///
+/// Both pollable and *awaitable*. The flag alone was not enough: a provider parked
+/// in `stream.next()` on a stalled connection never woke to read it, so Stop did
+/// nothing and the chat stayed streaming forever. [`cancelled`](Self::cancelled)
+/// gives a future to `select!` the read against, which makes cancellation abortive
+/// rather than cooperative.
 #[derive(Clone, Default)]
-pub struct CancelToken(Arc<AtomicBool>);
+pub struct CancelToken {
+    flag: Arc<AtomicBool>,
+    notify: Arc<tokio::sync::Notify>,
+}
 
 impl CancelToken {
     pub fn new() -> Self {
@@ -41,11 +48,32 @@ impl CancelToken {
     }
 
     pub fn cancel(&self) {
-        self.0.store(true, Ordering::SeqCst);
+        self.flag.store(true, Ordering::SeqCst);
+        // `notify_waiters` would miss a task that has not parked yet;
+        // `notify_one`+the flag check in `cancelled` covers both orderings.
+        self.notify.notify_waiters();
+        self.notify.notify_one();
     }
 
     pub fn is_cancelled(&self) -> bool {
-        self.0.load(Ordering::SeqCst)
+        self.flag.load(Ordering::SeqCst)
+    }
+
+    /// Resolves once [`cancel`](Self::cancel) has been called — immediately if it
+    /// already has. Never resolves spuriously, so it is safe as a `select!` arm.
+    pub async fn cancelled(&self) {
+        loop {
+            if self.is_cancelled() {
+                return;
+            }
+            // Register interest *before* re-checking the flag, so a `cancel` racing
+            // this loop cannot slip between the check and the wait.
+            let waiter = self.notify.notified();
+            if self.is_cancelled() {
+                return;
+            }
+            waiter.await;
+        }
     }
 }
 
@@ -58,7 +86,7 @@ impl CancelToken {
 pub trait AiProvider: Send + Sync {
     async fn stream_turn(
         &self,
-        req: &TurnRequest,
+        req: &TurnRequest<'_>,
         tx: &UnboundedSender<Delta>,
         cancel: &CancelToken,
     ) -> Result<TurnOutcome>;

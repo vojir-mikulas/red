@@ -145,11 +145,11 @@ pub struct AppState {
     /// The index into [`compare_tables`](Self::compare_tables) of the chosen left
     /// table, set after the first pick while the right table is chosen.
     pub(crate) compare_left: Option<usize>,
-    /// An in-flight FK click-through (Track B7), waiting on its single-row
+    /// An in-flight FK click-through, waiting on its single-row
     /// `CopyRows` re-fetch to read the typed key value before opening the target
     /// browse. The latest follow wins; an earlier reply is then stale and dropped.
     pub(crate) pending_fk: Option<crate::result::PendingFkFollow>,
-    /// The cell detail inspector, when open (Track B1). Owns its scroll position
+    /// The cell detail inspector, when open. Owns its scroll position
     /// and any on-demand full value fetched for a capped/evicted cell.
     pub(crate) inspector: Option<crate::inspector::InspectorState>,
     /// The AI assistant chat panel, when open (right-docked). Owns its input,
@@ -199,7 +199,7 @@ pub struct AppState {
     /// filter bar's visibility). When on, selecting a column requests its
     /// pushed-down aggregate summary; the per-column result lives on the grid.
     pub(crate) stats_bar: bool,
-    /// The result filter bar, when open (Track B2). The transient editing UI; the
+    /// The result filter bar, when open. The transient editing UI; the
     /// *applied* filter lives on the grid (`ResultGrid::filter`).
     pub(crate) filter_bar: Option<crate::filter::FilterBarState>,
     /// The mode the filter bar last opened / switched to, so a `WHERE` user isn't
@@ -210,7 +210,7 @@ pub struct AppState {
     /// loaded once at startup: what the filter bar's recall dropdown lists and
     /// what ↑/↓ in its box walk.
     pub(crate) filter_history: crate::filters::FilterHistory,
-    /// The find-in-result bar, when open (Track B2, Tier 1). Transient UI; it
+    /// The find-in-result bar, when open. Transient UI; it
     /// scans loaded rows and holds the matches + focused index in its own state.
     pub(crate) find_bar: Option<crate::find::FindBarState>,
     /// Where the watch-interval popover is anchored, or `None` when closed.
@@ -236,9 +236,9 @@ pub struct AppState {
     /// a scroll the user already cancelled/restarted elsewhere.
     pub(crate) autoscroll_epoch: u64,
     /// A pending write awaiting the user's confirmation before it runs: an editor
-    /// destructive statement, or a staged grid edit batch (Track B6). See
+    /// destructive statement, or a staged grid edit batch. See
     /// [`PendingWrite`].
-    pub(crate) confirm_exec: Option<PendingWrite>,
+    pub(crate) confirm_exec: Option<PendingConfirm>,
     /// A submit waiting on its backend preflight, held between `PreflightBatch` and
     /// the `BatchPreflight` that opens its confirm dialog. Only the best-effort
     /// contract uses it; the atomic one confirms without a round trip.
@@ -266,11 +266,11 @@ pub struct AppState {
     /// A data-import header peek in flight (file chosen, awaiting the source columns
     /// from the backend so the import confirm can be built). At most one at a time.
     pub(crate) pending_import: Option<PendingImportPeek>,
-    /// The open inline cell editor (Track B6), when the user is editing a grid cell
+    /// The open inline cell editor, when the user is editing a grid cell
     /// in place. `None` when no editor is open. The staged change-set itself lives
     /// on the result; this is just the live `TextInput`.
     pub(crate) grid_edit: Option<crate::result::GridEdit>,
-    /// The in-cell foreign-key suggestion picker (Track B8), when the open editor
+    /// The in-cell foreign-key suggestion picker, when the open editor
     /// targets an FK column: the fetched id/label list plus the live query and
     /// highlighted row. `None` for a plain cell. See [`crate::result::CellSuggest`].
     pub(crate) cell_suggest: Option<crate::result::CellSuggest>,
@@ -419,7 +419,7 @@ pub struct AppState {
     /// The saved queries shown by the open picker, held only while it's open so an
     /// activation can resolve its index. Loaded on demand, never at startup.
     pub(crate) saved_queries: Vec<crate::queries::SavedQuery>,
-    /// The saved conversations shown by the open history picker (M-S5), held only
+    /// The saved conversations shown by the open history picker, held only
     /// while it's open so an activation can resolve its index. Loaded on demand.
     pub(crate) loaded_conversations: Vec<crate::conversations::Conversation>,
     /// The persistent query-history log, centralized across all connections and
@@ -523,14 +523,14 @@ pub struct AppState {
     /// Set when the find bar just opened: the next render focuses its input so the
     /// user can type immediately.
     pub(crate) focus_find: bool,
-    /// Set when an inline cell edit just opened in the inspector (Track B5): the
+    /// Set when an inline cell edit just opened in the inspector: the
     /// next render focuses its field so the user types into it at once.
     pub(crate) focus_inspector_edit: bool,
     /// Set by the palette's "switch connection" command: the next render opens
     /// the switcher popover (its `toggle` needs a `Window` the palette lacks).
     pub(crate) open_switcher: bool,
     /// The self-updater's latest state, driving the titlebar pill + About-tab
-    /// status line (Phases 3–4 of docs/plans/self-update.md). Updated only by
+    /// status line. Updated only by
     /// `Event::UpdateState`; `Unknown` until the first check completes.
     pub(crate) update: UpdateState,
     /// Dev-only perf HUD collector; brackets `render` to read build time and
@@ -539,7 +539,7 @@ pub struct AppState {
     pub(crate) dev_stats: crate::dev_stats::DevStats,
 }
 
-/// The GitHub `owner/repo` the self-updater polls (see docs/plans/self-update.md).
+/// The GitHub `owner/repo` the self-updater polls.
 pub(crate) const UPDATE_REPO: &str = "vojir-mikulas/red";
 
 /// Where the "report a bug" links point: the project's GitHub issue tracker.
@@ -598,7 +598,7 @@ pub(crate) fn ai_config(settings: &Settings) -> red_service::AiConfig {
         agents,
         default_agent: settings.ai.resolved_default_agent(),
         show_thinking: settings.ai.show_thinking,
-        // The global AI access policy (M-S7); a connection's overrides layer over
+        // The global AI access policy; a connection's overrides layer over
         // it on the backend. The tier string parses leniently (a typo → `read`).
         enabled: settings.ai.enabled,
         tier: red_service::AiTier::parse(&settings.ai.tier),
@@ -1640,6 +1640,9 @@ impl AppState {
                 // as a selectable, expandable detail body, so a long backend error
                 // can be read in full, highlighted and copied straight from it.
                 tracing::error!(?session, "{message}");
+                if let Some(conn) = self.conn_mut(session) {
+                    conn.write_in_flight = false;
+                }
                 self.on_result_error(session, &message);
                 self.notify_detail(ToastVariant::Error, "Error", message, cx);
                 // A DDL Apply that the engine rejected: stay in edit mode with the
@@ -1741,7 +1744,7 @@ impl AppState {
                 cx.notify();
             }
 
-            // --- Redis keyspace browser (R1, see docs/plans/redis.md) ---
+            // --- Redis keyspace browser (R1) ---
             Event::KvScanPage { epoch, page } => {
                 self.on_kv_scan_page(session, epoch, page, cx);
             }
@@ -1819,9 +1822,10 @@ impl AppState {
                 ok,
                 failed,
                 first_error,
+                aborted,
                 ..
             } => {
-                self.on_kv_import_done(session, ok, failed, first_error, cx);
+                self.on_kv_import_done(session, ok, failed, first_error, aborted, cx);
             }
             Event::KvBatchLine {
                 epoch,
@@ -1859,7 +1863,7 @@ impl AppState {
                 self.on_kv_notify_config_ready(session, epoch, value, cx);
             }
 
-            // --- MongoDB document browser (see docs/plans/todo/doc-driver.md) ---
+            // --- MongoDB document browser ---
             Event::DocDatabases { epoch, databases } => {
                 self.on_doc_databases(session, epoch, databases, cx);
             }
@@ -1930,6 +1934,13 @@ impl AppState {
                 prompt,
             } => {
                 self.on_doc_write_confirm(session, epoch, write, prompt, cx);
+            }
+            Event::DocPipelineConfirm {
+                epoch,
+                pipeline,
+                prompt,
+            } => {
+                self.on_doc_pipeline_confirm(session, epoch, pipeline, prompt, cx);
             }
             Event::DocError { epoch, message } => {
                 self.on_doc_error(session, epoch, message, cx);
@@ -2014,6 +2025,9 @@ impl AppState {
                 statements,
                 affected,
             } => {
+                if let Some(conn) = self.conn_mut(session) {
+                    conn.write_in_flight = false;
+                }
                 // A script committed as one transaction: say how many statements ran,
                 // since "0 row(s) affected" alone reads like nothing happened after a
                 // batch of DDL.
@@ -2085,14 +2099,23 @@ impl AppState {
             Event::DiffFailed { id, message } => self.on_diff_failed(id, message, cx),
             Event::DiffCancelled { id } => self.on_diff_cancelled(id, cx),
 
-            // --- query plan (Track B4) ---
+            // --- query plan ---
             Event::PlanReady { epoch, plan } => self.on_plan_ready(session, epoch, plan),
             Event::PlanFailed { epoch, message } => self.on_plan_failed(session, epoch, message),
 
-            // --- staged grid edits (Track B6) ---
-            Event::BatchApplied { epoch, applied } => self.on_batch_applied(epoch, applied, cx),
-            Event::BatchFailed { epoch, message, .. } => self.on_batch_failed(epoch, message, cx),
-            Event::BatchPartial { epoch, outcomes } => self.on_batch_partial(epoch, outcomes, cx),
+            // --- staged grid edits ---
+            // These carry `session` rather than dropping it: a batch reply must find
+            // the grid on the connection that *submitted* it, not on whichever one is
+            // foreground when the reply lands.
+            Event::BatchApplied { epoch, applied } => {
+                self.on_batch_applied(session, epoch, applied, cx)
+            }
+            Event::BatchFailed { epoch, message, .. } => {
+                self.on_batch_failed(session, epoch, message, cx)
+            }
+            Event::BatchPartial { epoch, outcomes } => {
+                self.on_batch_partial(session, epoch, outcomes, cx)
+            }
             Event::MutationsLoaded { mutations } => {
                 self.on_mutations_loaded(session, mutations, cx)
             }
@@ -2159,14 +2182,43 @@ impl AppState {
                 self.on_ai_agent_auth_status(agent_id, status, cx)
             }
 
+            // A cancelled *write* lands here (the read path drives results through
+            // `OpenResult`), so it has to release the Stop affordance.
+            Event::QueryCancelled => {
+                if let Some(conn) = self.conn_mut(session) {
+                    conn.write_in_flight = false;
+                }
+            }
             // The streaming `Query`/`FetchMore` path stays in the protocol for
             // headless use + tests; the UI now drives results via `OpenResult`.
-            Event::QueryStarted { .. }
-            | Event::QueryRows(_)
-            | Event::QueryFinished { .. }
-            | Event::QueryCancelled => {}
+            Event::QueryStarted { .. } | Event::QueryRows(_) | Event::QueryFinished { .. } => {}
         }
         cx.notify();
+    }
+
+    /// Stop the in-flight write on the foreground connection (the status bar's Stop).
+    ///
+    /// The only sender of [`Command::Cancel`] in the app, and what makes the
+    /// service's write-cancellation machinery reachable at all: the abort seams, the
+    /// per-session `writes` registry and the engine-level kills were all in place but
+    /// had nothing to trigger them. The default `statement_timeout` is `0`, so
+    /// without this a write wedged on a row lock had neither a timeout nor a way out
+    /// short of quitting RED.
+    ///
+    /// The flag is left set: the backend answers with `Executed`, `QueryCancelled` or
+    /// an error, and *that* clears it. Clearing it here would hide the Stop while the
+    /// statement was still winding down.
+    pub(crate) fn stop_write(&mut self, cx: &mut Context<Self>) {
+        let Some(session) = self.foreground_session else {
+            return;
+        };
+        if self
+            .conn_for(Some(session))
+            .is_some_and(|c| c.write_in_flight)
+        {
+            self.service.send_to(session, Command::Cancel);
+            cx.notify();
+        }
     }
 
     /// Show or hide the schema sidebar (toggled from the status-bar control).
@@ -2204,11 +2256,25 @@ impl AppState {
         })
     }
 
+    /// Stamp `write` with the connection raising it, ready to store in
+    /// [`Self::confirm_exec`]. `None` when nothing is connected, which drops the
+    /// confirm rather than raising one that could not be routed.
+    ///
+    /// Every raise site goes through here so the owning session is captured at the
+    /// moment the user is looking at the connection, not at the moment they click
+    /// the button — see [`PendingConfirm`].
+    pub(crate) fn pending_confirm(&self, write: PendingWrite) -> Option<PendingConfirm> {
+        Some(PendingConfirm {
+            session: self.foreground_session?,
+            write,
+        })
+    }
+
     /// Whether the pending write has anything left to do. A best-effort batch whose
     /// every op the preflight refused would run nothing, so the modal's Submit stays
     /// disabled rather than firing a no-op the user reads as success.
     pub(crate) fn confirm_has_work(&self) -> bool {
-        match &self.confirm_exec {
+        match self.confirm_exec.as_ref().map(|p| &p.write) {
             Some(PendingWrite::Batch { plan, .. }) if !plan.is_empty() => {
                 plan.iter().any(|p| p.blocked.is_none())
             }
@@ -2224,7 +2290,7 @@ impl AppState {
         if let Some(PendingWrite::Batch {
             mode: red_core::BatchMode::BestEffort { allow_multi_match },
             ..
-        }) = &mut self.confirm_exec
+        }) = self.confirm_exec.as_mut().map(|p| &mut p.write)
         {
             *allow_multi_match = granted;
         }
@@ -2232,7 +2298,7 @@ impl AppState {
     }
 
     /// Run the pending write the user confirmed: a graded editor statement
-    /// or a guarded grid edit (Track B5).
+    /// or a guarded grid edit.
     pub(crate) fn confirm_destructive(&mut self, cx: &mut Context<Self>) {
         // A typed confirmation that hasn't been satisfied is not a confirmation. The
         // modal disables its run button too; this is the backstop for the paths that
@@ -2243,8 +2309,14 @@ impl AppState {
         self.confirm_input = None;
         self.confirm_count = None;
         self.confirm_review = None;
-        match self.confirm_exec.take() {
-            Some(PendingWrite::EditorSql { sql, .. }) => self.execute_sql(sql, cx),
+        // Every arm below routes to `owner`, the connection the confirm was raised
+        // on, never to whatever is foreground now. See [`PendingConfirm`].
+        let (owner, write) = match self.confirm_exec.take() {
+            Some(PendingConfirm { session, write }) => (session, Some(write)),
+            None => (SessionId::new(0), None),
+        };
+        match write {
+            Some(PendingWrite::EditorSql { sql, .. }) => self.execute_sql_on(owner, sql, cx),
             Some(PendingWrite::Batch {
                 ops,
                 sources,
@@ -2256,9 +2328,15 @@ impl AppState {
                 // without this a partial batch couldn't tell which staged change each
                 // outcome belongs to.
                 self.submitted_batch = Some((epoch, sources));
-                self.send_active(Command::ApplyBatch { epoch, ops, mode });
+                if let Some(conn) = self.conn_mut(Some(owner)) {
+                    conn.write_in_flight = true;
+                }
+                self.service
+                    .send_to(owner, Command::ApplyBatch { epoch, ops, mode });
             }
-            Some(PendingWrite::KillSession { key, mode, .. }) => self.run_kill_session(key, mode),
+            Some(PendingWrite::KillSession { key, mode, .. }) => {
+                self.run_kill_session(owner, key, mode)
+            }
             Some(PendingWrite::Import {
                 path,
                 format,
@@ -2297,13 +2375,17 @@ impl AppState {
     /// buttons (Append / Replace all). Overrides the stored mode so "Replace all"
     /// truncates first; "Append" keeps the target's rows.
     pub(crate) fn confirm_copy(&mut self, mode: CopyMode, cx: &mut Context<Self>) {
-        if let Some(PendingWrite::Copy {
-            id,
-            source_epoch,
-            target,
-            target_session,
-            mapping,
-            create,
+        if let Some(PendingConfirm {
+            write:
+                PendingWrite::Copy {
+                    id,
+                    source_epoch,
+                    target,
+                    target_session,
+                    mapping,
+                    create,
+                    ..
+                },
             ..
         }) = self.confirm_exec.take()
         {
@@ -2342,6 +2424,22 @@ impl AppState {
 
     /// Whether any modal that should trap focus is currently open. Drives the
     /// focus-trap subscription in `render`.
+    /// Whether a root-level global action should run right now.
+    ///
+    /// The root's actions are deliberate globals so they fire from any pane's focus,
+    /// but Flint's `Modal` does not swallow action dispatch and the root is an
+    /// *ancestor* of `modal_focus` — so every one of them also fired straight
+    /// through an open modal. That is not cosmetic: ⌘1-9 switched the connection out
+    /// from under a destructive confirm, and ⌘↵ re-graded and replaced the pending
+    /// confirm mid-decision. A modal is a question; nothing else acts until it is
+    /// answered.
+    ///
+    /// The modal's *own* controls are unaffected: they are dispatched inside the
+    /// modal, not through the root chain.
+    pub(crate) fn globals_enabled(&self) -> bool {
+        !self.any_modal_open()
+    }
+
     pub(crate) fn any_modal_open(&self) -> bool {
         self.confirm_exec.is_some()
             || self.confirm_close_tab.is_some()

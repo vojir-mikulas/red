@@ -1245,7 +1245,7 @@ impl AppState {
             .bg(bg_app)
             .child(tabstrip)
             .child(breadcrumb)
-            // The find bar (Track B2, Tier 1) sits above the editor when ⌘F opened
+            // The find bar sits above the editor when ⌘F opened
             // it against the query; it selects matches in place, so the editor just
             // repaints. Single-instance, so only the focused half renders it.
             .when_some(
@@ -1638,7 +1638,8 @@ impl AppState {
                     state: AiReviewState::Pending,
                 }
             });
-        self.confirm_exec = Some(crate::app::PendingWrite::EditorSql { sql, assessment });
+        self.confirm_exec =
+            self.pending_confirm(crate::app::PendingWrite::EditorSql { sql, assessment });
         // Focus the modal (or, when there is one, its type-to-confirm box) so its
         // Enter/Esc handling is heard.
         self.focus_modal = true;
@@ -1675,7 +1676,29 @@ impl AppState {
     /// writes leave the UI, so it also enforces the read-only gate, catching any
     /// caller that didn't pre-check (e.g. future inline-edit paths).
     pub(crate) fn execute_sql(&mut self, sql: String, cx: &mut Context<Self>) {
-        if matches!(&self.phase, Phase::Connected(active) if active.config.read_only) {
+        let Some(session) = self.foreground_session else {
+            return;
+        };
+        self.execute_sql_on(session, sql, cx);
+    }
+
+    /// [`execute_sql`](Self::execute_sql) against a named connection rather than the
+    /// foreground one.
+    ///
+    /// The confirm modal takes this route: the connection can change between raising
+    /// a destructive confirm and clicking Run (⌘P / ⌘1-9 are root globals), and both
+    /// the read-only gate and the namespace have to be read from the connection the
+    /// statement will actually run on.
+    pub(crate) fn execute_sql_on(
+        &mut self,
+        session: red_service::SessionId,
+        sql: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(conn) = self.conn_for(Some(session)) else {
+            return;
+        };
+        if conn.config.read_only {
             self.notify(
                 ToastVariant::Error,
                 crate::i18n::tr!(
@@ -1686,10 +1709,12 @@ impl AppState {
             );
             return;
         }
-        self.send_active(Command::Execute {
-            sql,
-            namespace: self.send_namespace(),
-        });
+        let namespace = conn.namespace_for_send();
+        if let Some(conn) = self.conn_mut(Some(session)) {
+            conn.write_in_flight = true;
+        }
+        self.service
+            .send_to(session, Command::Execute { sql, namespace });
         cx.notify();
     }
 

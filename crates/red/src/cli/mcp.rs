@@ -1,13 +1,11 @@
-//! `red mcp <connection>`: a headless **stdio** MCP server (see
-//! docs/plans/todo/mcp-stdio.md). Gives any MCP client (Claude Code, other chats)
-//! RED's read-only database tools without the GUI open.
-//!
-//! This is a dumb stdio↔JSON-RPC pump: it reads one JSON-RPC message per line
-//! from stdin, answers `initialize`/`ping` locally, and translates `tools/list`/
-//! `tools/call` into the `AiToolList`/`AiToolCall` commands the backend already
-//! guards. **All safety enforcement (tier filter, write/GUI-tool withholding,
-//! tool-call budget) lives in `red-service`**; the CLI never owns the driver. No
-//! bearer nonce: stdio is the trust boundary (the client launched this process).
+//! `red mcp <connection>`: a headless **stdio** MCP server. Gives any MCP client
+//! (Claude Code, other chats) RED's read-only database tools without the GUI open. This
+//! is a dumb stdio↔JSON-RPC pump: it reads one JSON-RPC message per line from stdin,
+//! answers `initialize`/`ping` locally, and translates `tools/list`/`tools/call` into
+//! the `AiToolList`/`AiToolCall` commands the backend already guards. **All safety
+//! enforcement (tier filter, write/GUI-tool withholding, tool-call budget) lives in
+//! `red-service`**; the CLI never owns the driver. No bearer nonce: stdio is the trust
+//! boundary (the client launched this process).
 
 use std::io::{BufRead, Write};
 
@@ -37,9 +35,20 @@ pub(crate) fn cmd_mcp(args: McpArgs) -> u8 {
     // serve tools on a connection whose assistant the user disabled. Agent
     // profiles are irrelevant to tool serving (and would cost keychain reads),
     // so only the policy fields are carried.
-    let settings = crate::settings::FileSettingsStore::open_default()
-        .map(|s| s.load_report().settings)
-        .unwrap_or_default();
+    // Fail *closed* on any failure to read the policy, including an unresolvable
+    // config dir. `Settings::default()` has `ai.enabled = true`, so
+    // `unwrap_or_default()` here served tools to an agent when RED could not tell
+    // whether the user had allowed it — the one direction this gate must not take.
+    let settings = match crate::settings::FileSettingsStore::open_default() {
+        Some(store) => store.load_report().settings,
+        None => {
+            eprintln!("cannot read settings; serving with the assistant disabled");
+            crate::settings::Settings {
+                ai: crate::settings::AiSettings::disabled(),
+                ..Default::default()
+            }
+        }
+    };
     svc.send_global(Command::ConfigureAi(red_service::AiConfig {
         agents: Vec::new(),
         default_agent: String::new(),

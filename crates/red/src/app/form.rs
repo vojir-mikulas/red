@@ -266,10 +266,10 @@ impl AppState {
                 password: self.proxy_password_input.read(cx).content().to_string(),
             }
         });
-        // Per-connection AI overrides (M-S7). `ai_enabled` and a stricter
+        // Per-connection AI overrides. `ai_enabled` and a stricter
         // `off`/`schema` tier are still hand-set in connections.toml; carry the
         // editing connection's values through so a save doesn't drop them. The
-        // **write** opt-in (Feature B) IS surfaced; the form checkbox sets
+        // **write** opt-in IS surfaced; the form checkbox sets
         // `ai_tier = "write"`, and clearing it reverts to inherit (unless a hand-set
         // off/schema is present, which is preserved).
         let prior = form

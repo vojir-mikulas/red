@@ -40,11 +40,10 @@ use crate::dispatch::{Events, emit};
 use crate::protocol::{AiContext, AiDelta, AiUsage, ConversationId, ReportTheme, RequestId};
 use crate::{Event, SessionId};
 
-/// Which engine the agent turn is grounded in. The model→tool loop, streaming,
-/// budget, write gate, and history are identical for both; only the tool
-/// catalog, the tool execution, and the system prompt differ (see
-/// `docs/plans/redis-workflow-parity.md` Part 1). A KV (Redis) turn exposes the
-/// `kv_*` read tools; a SQL turn the schema/query tools.
+/// Which engine the agent turn is grounded in. The model→tool loop, streaming, budget,
+/// write gate, and history are identical for both; only the tool catalog, the tool
+/// execution, and the system prompt differ. A KV (Redis) turn exposes the `kv_*` read
+/// tools; a SQL turn the schema/query tools.
 #[derive(Clone)]
 pub(crate) enum AiBackend {
     Sql {
@@ -240,7 +239,7 @@ impl ReportSink {
 /// Safety backstop on the model → tool → model loop: how many tool round-trips a
 /// single turn may take before we stop and report. Far above any real grounded
 /// answer; prevents a misbehaving model from looping forever. The per-conversation
-/// [`AiLimits::max_tool_calls`](red_core::AiLimits) bound (M-S7) sits on top of
+/// [`AiLimits::max_tool_calls`](red_core::AiLimits) bound sits on top of
 /// this, spanning turns rather than resetting each one.
 const MAX_TOOL_STEPS: usize = 16;
 
@@ -254,7 +253,7 @@ pub(crate) struct AiState {
     histories: HashMap<ConversationId, Vec<Message>>,
     cancels: HashMap<ConversationId, CancelToken>,
     tool_calls: HashMap<ConversationId, usize>,
-    /// Write-tool approval prompts (Feature B) awaiting the user's Allow/Deny, keyed
+    /// Write-tool approval prompts awaiting the user's Allow/Deny, keyed
     /// by request id. The turn task parks a decision sink here; `AiPermission` takes
     /// it back out and fires it, the API-key analogue of the ACP path's
     /// `AcpManager.pending`.
@@ -366,7 +365,7 @@ pub(crate) async fn run_turn(
     cancel: CancelToken,
 ) {
     let system = backend.system_prompt(&context, &policy);
-    // The tier decides which tools the model is even offered (M-S7): `off` grounds
+    // The tier decides which tools the model is even offered: `off` grounds
     // nothing, `schema` withholds row data, `read` is the full catalog. The KV
     // (Redis) backend offers its own read-only `kv_*` catalog.
     let tools = backend.catalog(&policy);
@@ -399,12 +398,12 @@ pub(crate) async fn run_turn(
         }
 
         let req = TurnRequest {
-            model: model.clone(),
+            model: &model,
             max_tokens: 8192,
             show_thinking,
-            system: system.clone(),
-            tools: tools.clone(),
-            messages: messages.clone(),
+            system: &system,
+            tools: &tools,
+            messages: &messages,
         };
 
         // Relay the provider's deltas to the UI as they stream in.
@@ -450,6 +449,19 @@ pub(crate) async fn run_turn(
         usage.cache_read_input_tokens += outcome.usage.cache_read_input_tokens;
         messages.push(outcome.message.clone());
 
+        // `MaxTokens` means the answer was cut off mid-sentence at the ceiling.
+        // Settling it with the ordinary "finished" footer makes a truncated turn
+        // indistinguishable from a complete one — the same dishonesty as swallowing
+        // a mid-stream provider error. The text already streamed stays on screen;
+        // this only labels it for what it is.
+        if outcome.stop_reason == StopReason::MaxTokens {
+            result = Err(
+                "the reply hit this agent's max-tokens ceiling and stops mid-answer; \
+                 raise the limit or ask for a shorter answer"
+                    .to_string(),
+            );
+            break;
+        }
         if outcome.stop_reason != StopReason::ToolUse {
             break;
         }
@@ -460,7 +472,7 @@ pub(crate) async fn run_turn(
             let ContentBlock::ToolUse { id, name, input } = block else {
                 continue;
             };
-            // Charge the conversation's cumulative tool-call budget (M-S7). When it
+            // Charge the conversation's cumulative tool-call budget. When it
             // is exhausted, hand the model an error result instead of running the
             // tool: it can wrap up its answer, but it can't keep looping.
             if !lock(&state).charge_tool_call(conversation_id, policy.limits.max_tool_calls) {
@@ -722,12 +734,12 @@ async fn run_subagent(
             return ("the subagent was cancelled".into(), false);
         }
         let req = TurnRequest {
-            model: model.to_string(),
+            model,
             max_tokens: 4096,
             show_thinking: false,
-            system: system.clone(),
-            tools: tools.clone(),
-            messages: messages.clone(),
+            system: &system,
+            tools: &tools,
+            messages: &messages,
         };
         // Drain the child's streamed deltas without surfacing its prose; only its
         // tool activity is shown, emitted below as children of the parent node.
@@ -844,7 +856,7 @@ async fn run_subagent(
 
 /// Apply the two membership gates every seam's catalog shares: the tier decides
 /// which tools exist at all, and any write tool is additionally withheld on a
-/// read-only connection so it's never even offered there (Feature B). One helper
+/// read-only connection so it's never even offered there. One helper
 /// so the SQL, KV, and doc catalogs gate identically.
 fn gate_catalog(all: impl IntoIterator<Item = ToolDef>, policy: &AiPolicy) -> Vec<ToolDef> {
     all.into_iter()
@@ -901,7 +913,7 @@ fn kv_subagent_system_prompt(task: &str) -> String {
 }
 
 /// Surface a write-approval prompt and block this turn until the user answers it,
-/// the API-key path's analogue of the ACP permission flow (Feature B). Parks a
+/// the API-key path's analogue of the ACP permission flow. Parks a
 /// decision sink in [`AiState`], emits an `AiPermissionRequest` carrying the exact
 /// SQL, then awaits the answer while polling the turn's cancel token (a cancelled
 /// turn, or too many outstanding prompts, denies). Returns whether to run the write.
@@ -943,7 +955,7 @@ async fn await_write_approval(
     decision
 }
 
-/// The read-only tool catalog, filtered to the policy's access tier (M-S7). Each
+/// The read-only tool catalog, filtered to the policy's access tier. Each
 /// tool is backed by a `DatabaseDriver` method and auto-runs; none can mutate.
 /// Filtering happens *here*, at construction, so a tool above the tier is never
 /// offered; the model can't call what isn't in the catalog. Shared with the MCP
@@ -1180,7 +1192,7 @@ fn truncate_summary(s: &str, max: usize) -> String {
     format!("{cut}…")
 }
 
-/// Execute one tool call against the driver, under the access policy (M-S7).
+/// Execute one tool call against the driver, under the access policy.
 /// Returns `(content, ok)`; `ok = false` becomes an `is_error` tool result the
 /// model can recover from. Shared with the MCP server so the API-key and
 /// subscription paths run identical, guarded tools.
@@ -1278,7 +1290,7 @@ fn report_tool_def() -> ToolDef {
 /// charts/data/filters) in a sandboxed, themed shell, size-check it, write it to
 /// the report dir, and announce it as a chat card. Engine-agnostic — the report
 /// pipeline is identical for SQL and Redis — so both `run_tool` and `kv_run_tool`
-/// call it (see docs/plans/redis-workflow-parity.md Part 1).
+/// call it.
 fn run_generate_report(input: &Json, report: &ReportSink) -> (String, bool) {
     let body = input
         .get("html")
@@ -1348,7 +1360,7 @@ fn run_generate_report(input: &Json, report: &ReportSink) -> (String, bool) {
     }
 }
 
-// --- Redis (KV) agent backend (see docs/plans/redis-workflow-parity.md Part 1) ---
+// --- Redis (KV) agent backend ---
 
 /// Round-trip cap on a bounded keyspace walk, so a `kv_scan_keys`/sample never
 /// loops unbounded on a huge keyspace.
@@ -2311,7 +2323,7 @@ pub(crate) async fn run_tool(
             match assess_write(name, input, policy, dialect) {
                 WriteAssessment::NeedsApproval { sql } => match driver.execute(&sql).await {
                     Ok(affected) => {
-                        // Durable record of what the agent actually changed (Feature B).
+                        // Durable record of what the agent actually changed.
                         crate::audit::record_write(&sql, affected);
                         (
                             format!(
@@ -2515,7 +2527,7 @@ pub(crate) const READ_ONLY_TOOLS: &[&str] = &[
 ];
 
 /// Whether `name` is a mutating tool: it never auto-runs and never auto-allows;
-/// it rides the per-call approval gate on both backends (Feature B). Defined as the
+/// it rides the per-call approval gate on both backends. Defined as the
 /// complement of [`READ_ONLY_TOOLS`] so a new, unlisted tool is treated as a write.
 pub(crate) fn is_write_tool(name: &str) -> bool {
     !READ_ONLY_TOOLS.contains(&name)
@@ -2535,7 +2547,7 @@ pub(crate) fn is_headless_tool(name: &str) -> bool {
     !is_write_tool(name) && !UI_ONLY_TOOLS.contains(&name)
 }
 
-/// The outcome of vetting a `propose_write` call before it runs (Feature B). The
+/// The outcome of vetting a `propose_write` call before it runs. The
 /// single source of truth, called by `run_turn` (to decide reject vs. prompt) and
 /// by `run_tool` (to re-validate before executing). Keeping it in one place means
 /// the gate the user sees and the gate the write rides can't drift apart.
@@ -2594,7 +2606,7 @@ pub(crate) fn assess_write(
     }
 }
 
-/// The Redis mutating tools (Feature B, KV backend): each rides the same per-call
+/// The Redis mutating tools (KV backend): each rides the same per-call
 /// approval gate as a SQL write.
 const KV_WRITE_TOOLS: &[&str] = &["kv_expire", "kv_delete", "kv_rename", "kv_config_set"];
 
@@ -2843,7 +2855,7 @@ enum WriteShape {
     Blocked(&'static str),
 }
 
-/// Classify a candidate write conservatively (Feature B). The hard blocks (DDL and
+/// Classify a candidate write conservatively. The hard blocks (DDL and
 /// privilege statements, an unqualified UPDATE/DELETE with no WHERE, and any chained
 /// statement) are the cases per-call approval alone shouldn't be trusted to catch
 /// (a rubber-stamped `DELETE` with no WHERE is catastrophic). False negatives are
@@ -3099,7 +3111,7 @@ fn strip_scripts(html: &str) -> String {
     out
 }
 
-/// The stable grounding instruction, tailored to the access tier (M-S7). Shared
+/// The stable grounding instruction, tailored to the access tier. Shared
 /// with the ACP path, which folds it into the agent's first prompt (ACP
 /// `session/prompt` has no system role). The tier line keeps the model's
 /// expectations in step with the catalog it actually receives, but the *catalog*
@@ -3160,7 +3172,7 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
 /// with the ACP path for the same per-turn grounding.
 pub(crate) fn user_turn(message: &str, ctx: &AiContext) -> String {
     let mut s = String::new();
-    // A reopened conversation (M-S5) seeds the prior exchange once, so the model
+    // A reopened conversation seeds the prior exchange once, so the model
     // picks up where the saved chat left off even though its session is fresh.
     if let Some(prior) = ctx
         .prior_transcript
@@ -3748,6 +3760,11 @@ pub(crate) fn doc_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
     )
 }
 
+/// How much of a proposed document/update payload the approval prompt shows.
+/// Long enough for a realistic `$set`, short enough that a huge model-supplied
+/// document cannot push the actual operation off the top of the dialog.
+const DOC_PAYLOAD_CHARS: usize = 600;
+
 /// Vet a doc write tool for the approval gate: build the human-readable operation
 /// shown in Allow/Deny, and hard-block the footguns (an unfiltered update/delete)
 /// even with approval. Tier + read-only were already checked by [`assess_write`].
@@ -3769,6 +3786,19 @@ fn assess_doc_write(name: &str, input: &Json) -> WriteAssessment {
         .get("filter")
         .map(|f| f.to_string())
         .unwrap_or_else(|| "{}".into());
+    // What will actually be written, not just what it will be matched against.
+    //
+    // The SQL path shows the entire statement; this showed only op + namespace +
+    // filter, while the executor went on to apply the `update`/`document` fields
+    // that were never displayed. A proposal of
+    // `{op:"update", filter:{email:"x"}, update:{role:"admin"}}` rendered as a bland
+    // "UPDATE db.users matching {email:x}" and a reasonable user approved a
+    // privilege escalation they never saw. What executes must be derived into what
+    // is shown — the same rule the `kv_delete` prompt now follows.
+    let payload = |key: &str| match input.get(key) {
+        Some(v) => format!("\n{}", truncate_summary(&v.to_string(), DOC_PAYLOAD_CHARS)),
+        None => String::new(),
+    };
     match name {
         "propose_doc_write" => {
             let op = s("op").unwrap_or("");
@@ -3776,7 +3806,7 @@ fn assess_doc_write(name: &str, input: &Json) -> WriteAssessment {
             let many_note = if many { " (many: ALL matches)" } else { "" };
             match op {
                 "insert" => WriteAssessment::NeedsApproval {
-                    sql: format!("INSERT one document into {ns}"),
+                    sql: format!("INSERT one document into {ns}{}", payload("document")),
                 },
                 "replace" => {
                     if !has_filter {
@@ -3785,7 +3815,10 @@ fn assess_doc_write(name: &str, input: &Json) -> WriteAssessment {
                         );
                     }
                     WriteAssessment::NeedsApproval {
-                        sql: format!("REPLACE document in {ns} matching {filter_txt}"),
+                        sql: format!(
+                            "REPLACE document in {ns} matching {filter_txt}{}",
+                            payload("document")
+                        ),
                     }
                 }
                 "update" => {
@@ -3796,7 +3829,10 @@ fn assess_doc_write(name: &str, input: &Json) -> WriteAssessment {
                         );
                     }
                     WriteAssessment::NeedsApproval {
-                        sql: format!("UPDATE {ns} matching {filter_txt}{many_note}"),
+                        sql: format!(
+                            "UPDATE {ns} matching {filter_txt}{many_note}{}",
+                            payload("update")
+                        ),
                     }
                 }
                 "delete" => {
@@ -5733,7 +5769,7 @@ mod tests {
     impl red_ai::AiProvider for ScriptedWrite {
         async fn stream_turn(
             &self,
-            _req: &red_ai::TurnRequest,
+            _req: &red_ai::TurnRequest<'_>,
             _tx: &tokio::sync::mpsc::UnboundedSender<red_ai::Delta>,
             _cancel: &CancelToken,
         ) -> red_ai::Result<red_ai::TurnOutcome> {

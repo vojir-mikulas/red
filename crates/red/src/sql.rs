@@ -301,7 +301,7 @@ fn function_engines(name: &str) -> u8 {
 /// filtered by the [`function_engines`] matrix so a MySQL connection is never offered
 /// `string_agg`, nor a Postgres one `group_concat`.
 pub fn functions_for(kind: DbKind) -> Vec<(&'static str, &'static str, &'static str)> {
-    // Redis has no SQL editor surface at all (see docs/plans/redis.md), so no
+    // Redis has no SQL editor surface at all, so no
     // bit in this matrix names it; `functions_for` returns empty for it below
     // rather than reaching an `unreachable!()` this function's own callers
     // don't (yet) structurally rule out for a Redis connection.
@@ -626,7 +626,7 @@ pub fn auto_limit(sql: &str, n: u32) -> Option<String> {
 /// optional-schema + table name, so a browse typed into the editor gets the same
 /// foreign-key affordances (in-grid accent, click-through, the reference-column
 /// tree) as one opened from the schema tree, which only fire when the result maps
-/// to one known base table (Track B7).
+/// to one known base table.
 ///
 /// Deliberately narrow: returns `None` for anything that isn't provably a
 /// single-table star select, because the FK machinery keys off the result's

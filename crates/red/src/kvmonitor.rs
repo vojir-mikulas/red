@@ -1,4 +1,4 @@
-//! The Redis diagnostics panel (see docs/plans/redis.md). Three
+//! The Redis diagnostics panel. Three
 //! related-but-distinct views behind one panel:
 //!
 //! - **Slow log** — a one-shot `SLOWLOG GET` of the server's recorded slow

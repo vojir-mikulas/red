@@ -442,7 +442,7 @@ impl AppState {
         cx.notify();
     }
 
-    // --- editing (see docs/plans/redis.md's editing phase) ---
+    // --- editing ---
 
     pub(crate) fn kv_start_editing_value(&mut self, session: SessionId, cx: &mut Context<Self>) {
         let Some(active) = self.conn_mut(Some(session)) else {
@@ -1844,8 +1844,7 @@ impl AppState {
         cx.notify();
     }
 
-    // --- stream consumer groups (see docs/plans/redis.md's "stream
-    // consumer-group management" gap) ---
+    // --- stream consumer groups ---
 
     /// Switch the stream inspector between its entries grid and its
     /// consumer-group view. Opening the Groups tab for the first time kicks

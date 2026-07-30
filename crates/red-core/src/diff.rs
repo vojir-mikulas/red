@@ -1,6 +1,6 @@
 //! Data-compare (table diff) core: the pure merge-walk that aligns two
 //! key-ordered row streams and classifies each row as added / removed / changed
-//! (see docs/plans/todo/data-diff.md). UI- and runtime-free — it operates on
+//!. UI- and runtime-free — it operates on
 //! [`Value`] rows and knows nothing about drivers, cursors, or the UI. The
 //! streaming backend job (`red-service`) feeds it one window per side and never
 //! materializes either table whole; the same [`DiffAccumulator::step`] logic is

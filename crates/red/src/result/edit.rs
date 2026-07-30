@@ -1,6 +1,6 @@
-//! Track B6: DataGrip-style staged grid editing.
+//! DataGrip-style staged grid editing.
 //!
-//! Editing is no longer a per-cell modal round-trip (the old B5 palette prompt).
+//! Editing is no longer a per-cell modal round-trip (it used to be a palette prompt per cell).
 //! The user edits cells *in place*, the changes accumulate in a per-result
 //! [`PendingChanges`] set (marked dirty in the grid), and one **Submit** flushes
 //! the whole set to the backend as one batch (`ApplyBatch`); **Revert** drops it.
@@ -75,7 +75,7 @@ impl RowKey {
 }
 
 /// One staged cell change: the new value, plus, for an inline-expanded FK column
-/// (Track B7), the referenced-table target the edit writes to. A base-table cell
+///, the referenced-table target the edit writes to. A base-table cell
 /// carries `foreign = None` and is written via its row's PK; a joined cell carries
 /// the [`ForeignEdit`] resolved when the edit began, so submit needn't re-resolve it
 /// against a possibly-evicted buffer row.
@@ -113,7 +113,7 @@ pub(crate) struct DraftRow {
     pub(crate) cells: HashMap<usize, Value>,
 }
 
-/// All staged, not-yet-submitted edits for one result (Track B6). Lives on the
+/// All staged, not-yet-submitted edits for one result. Lives on the
 /// [`ResultGrid`], so it's naturally scoped per result and cleared whenever the
 /// result is (re)opened, sorted, or filtered.
 #[derive(Default)]
@@ -208,7 +208,7 @@ pub(crate) enum EditSlot {
         key_values: Vec<(String, Value)>,
         original: Value,
         /// Set when the cell is an inline-expanded FK column: the referenced-table
-        /// write target (Track B7). `None` for an ordinary base-table cell.
+        /// write target. `None` for an ordinary base-table cell.
         foreign: Option<ForeignEdit>,
     },
     Draft {
@@ -217,7 +217,7 @@ pub(crate) enum EditSlot {
     },
 }
 
-/// An open inline cell editor (Track B6): the `TextInput` hosted in the focused
+/// An open inline cell editor: the `TextInput` hosted in the focused
 /// cell, the slot it targets, and the column metadata used to coerce the typed
 /// text. The event subscription is held (not detached) so dropping this closes the
 /// editor and unsubscribes.
@@ -299,7 +299,7 @@ impl ResultGrid {
 
         for (key, u) in &self.pending.updates {
             // Base-table cells fold into one `UPDATE … WHERE <identity>`; each inline-
-            // expanded FK cell (Track B7) is its own `UPDATE <ref> … WHERE <fk key>`
+            // expanded FK cell is its own `UPDATE <ref> … WHERE <fk key>`
             // against the referenced table it came from.
             let mut set: Vec<ColumnValue> = Vec::new();
             for (c, cell) in &u.cells {
@@ -552,7 +552,7 @@ impl AppState {
             // editable cell (fast spreadsheet-style fill) rather than walking the
             // window's focus ring out of the grid.
             // `emit_nav`: Up/Down surface as events so they move the FK suggestion
-            // highlight (Track B8) instead of leaking to the grid's row navigation.
+            // highlight instead of leaking to the grid's row navigation.
             let mut input = TextInput::new(cx).bare().emit_tab().emit_nav();
             input.set_content(prefill, cx);
             input
@@ -563,7 +563,7 @@ impl AppState {
             TextInputEvent::Cancel => this.suggest_escape_or_cancel(cx),
             TextInputEvent::Tab => this.advance_grid_edit(true, cx),
             TextInputEvent::BackTab => this.advance_grid_edit(false, cx),
-            // Drive the FK picker (Track B8) when one is open; otherwise no-op.
+            // Drive the FK picker when one is open; otherwise no-op.
             TextInputEvent::Change => this.on_grid_edit_change(cx),
             TextInputEvent::Down => this.suggest_move(1, cx),
             TextInputEvent::Up => this.suggest_move(-1, cx),
@@ -595,7 +595,7 @@ impl AppState {
         let Some(edit) = self.grid_edit.take() else {
             return;
         };
-        // A highlighted FK suggestion (Track B8) wins over the typed text — its id is
+        // A highlighted FK suggestion wins over the typed text — its id is
         // already a typed `Value`, no coercion needed.
         let value = match self.suggest_selected_value() {
             Some(v) => v,
@@ -1022,7 +1022,7 @@ impl AppState {
         }
         match self.batch_mode() {
             BatchMode::Atomic => {
-                self.confirm_exec = Some(PendingWrite::Batch {
+                self.confirm_exec = self.pending_confirm(PendingWrite::Batch {
                     ops: batch.ops,
                     sources: batch.sources,
                     epoch,
@@ -1085,7 +1085,7 @@ impl AppState {
         }) = self.pending_batch.take()
         {
             let _ = slot;
-            self.confirm_exec = Some(PendingWrite::Batch {
+            self.confirm_exec = self.pending_confirm(PendingWrite::Batch {
                 ops,
                 sources,
                 epoch,
@@ -1134,13 +1134,14 @@ impl AppState {
     /// row positions, totals, and server-assigned values re-resolve.
     pub(crate) fn on_batch_applied(
         &mut self,
+        session: Option<red_service::SessionId>,
         epoch: red_service::Epoch,
         _applied: u64,
         cx: &mut Context<Self>,
     ) {
         self.submitted_batch = None;
         let mut reload = false;
-        if let Some(grid) = self.result_by_epoch(epoch) {
+        if let Some(grid) = self.result_by_epoch_in(session, epoch) {
             // A foreign (inline-expanded FK) edit rewrites a referenced row that may
             // be shared by several base rows, so an in-place patch would leave the
             // other rows stale; reload so the whole denormalized view re-resolves,
@@ -1166,8 +1167,9 @@ impl AppState {
         if reload {
             // Reload the tab that *owns this epoch*, not the focused one: a
             // delete staged on tab A and submitted while tab B is focused must
-            // reopen A (its rows moved), not reset B's buffer and scroll.
-            self.reload_result_epoch(epoch, cx);
+            // reopen A (its rows moved), not reset B's buffer and scroll. Same for
+            // the connection — hence `session`.
+            self.reload_result_epoch(session, epoch, cx);
         }
         self.notify(ToastVariant::Success, "Changes submitted", cx);
         cx.notify();
@@ -1177,6 +1179,7 @@ impl AppState {
     /// (nothing was applied) and surface the engine/assertion message.
     pub(crate) fn on_batch_failed(
         &mut self,
+        _session: Option<red_service::SessionId>,
         _epoch: red_service::Epoch,
         message: String,
         cx: &mut Context<Self>,
@@ -1194,6 +1197,7 @@ impl AppState {
     /// misleading thing this feature could do.
     pub(crate) fn on_batch_partial(
         &mut self,
+        session: Option<red_service::SessionId>,
         epoch: red_service::Epoch,
         outcomes: Vec<red_core::OpOutcome>,
         cx: &mut Context<Self>,
@@ -1220,7 +1224,7 @@ impl AppState {
             .iter()
             .any(|o| !o.status.unfinished() && matches!(o.verb, "Delete" | "Insert"));
         let mut reload = false;
-        if let Some(grid) = self.result_by_epoch(epoch) {
+        if let Some(grid) = self.result_by_epoch_in(session, epoch) {
             let foreign = grid
                 .pending
                 .updates
@@ -1235,9 +1239,9 @@ impl AppState {
             grid.unstage_finished(&sources, &done);
         }
         if reload {
-            // Reload the epoch's own tab, not the focused one (see
-            // `on_batch_applied`).
-            self.reload_result_epoch(epoch, cx);
+            // Reload the epoch's own tab on its own connection, not the focused
+            // one (see `on_batch_applied`).
+            self.reload_result_epoch(session, epoch, cx);
         }
         // The mutations this submit started are the connection's newest, so refresh
         // the listing whether or not the panel is open: the status-bar indicator
@@ -1286,8 +1290,15 @@ impl AppState {
     /// back to it even when another tab is on screen. Reuses
     /// [`ResultGrid::reopen_spec`] so the inline FK `LEFT JOIN` set is carried
     /// through rather than lost.
-    fn reload_result_epoch(&mut self, epoch: red_service::Epoch, cx: &mut Context<Self>) {
-        let reopen = self.result_by_epoch(epoch).map(|grid| grid.reopen_spec());
-        self.apply_reopen(reopen, cx);
+    fn reload_result_epoch(
+        &mut self,
+        session: Option<red_service::SessionId>,
+        epoch: red_service::Epoch,
+        cx: &mut Context<Self>,
+    ) {
+        let reopen = self
+            .result_by_epoch_in(session, epoch)
+            .map(|grid| grid.reopen_spec());
+        self.apply_reopen_in(session, reopen, cx);
     }
 }

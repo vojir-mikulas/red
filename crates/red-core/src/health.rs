@@ -1,18 +1,14 @@
-//! The connection health report: a saved, point-in-time answer to "what is wrong
-//! in here" for a SQL connection (see
-//! `docs/plans/todo/connection-health-report.md`).
-//!
-//! The SQL analog of [`kv::RedisAnalysis`](crate::kv::RedisAnalysis), but computed
-//! the opposite way. Redis has no catalog, so its report is rolled up UI-side from
-//! a scan sweep. Every fact in *this* report already exists pre-aggregated in a
-//! catalog view, so it is a handful of bounded `SELECT`s pushed down to the
-//! server: walking rows to derive it would break the never-materialize rule and
-//! be strictly worse than asking.
-//!
-//! Nothing here is executed by RED. A finding's `suggested_sql` is text to read
-//! and paste; `CREATE INDEX` on a large production table is a locking event, and
-//! the decision to run one belongs to the operator, through the editor, behind
-//! the same guards as any other statement.
+//! The connection health report: a saved, point-in-time answer to "what is wrong in
+//! here" for a SQL connection. The SQL analog of
+//! [`kv::RedisAnalysis`](crate::kv::RedisAnalysis), but computed the opposite way.
+//! Redis has no catalog, so its report is rolled up UI-side from a scan sweep. Every
+//! fact in *this* report already exists pre-aggregated in a catalog view, so it is a
+//! handful of bounded `SELECT`s pushed down to the server: walking rows to derive it
+//! would break the never-materialize rule and be strictly worse than asking. Nothing
+//! here is executed by RED. A finding's `suggested_sql` is text to read and paste;
+//! `CREATE INDEX` on a large production table is a locking event, and the decision to
+//! run one belongs to the operator, through the editor, behind the same guards as any
+//! other statement.
 
 use crate::{DbKind, TableRef};
 

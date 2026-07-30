@@ -4,7 +4,7 @@
 //! the exception: column widths need the whole result, so it buffers (use `csv`/
 //! `json` for results that don't fit in memory).
 
-use std::io::Write;
+use std::io::{self, Write};
 
 use base64::{Engine as _, engine::general_purpose::STANDARD};
 use clap::ValueEnum;
@@ -25,6 +25,12 @@ pub enum OutFormat {
 
 /// Incremental result writer: [`start`](Self::start) once with the columns, then
 /// [`rows`](Self::rows) per window, then [`finish`](Self::finish).
+///
+/// Writes are deliberately infallible at the call site — a broken pipe must not
+/// panic (`red query … | head -n1` is ordinary shell usage) — but the *first*
+/// failure is remembered so the caller can stop and exit non-zero. Silently
+/// truncating a redirected file and then reporting success is how a seed script
+/// proceeds with corrupt data.
 pub struct Writer<W: Write> {
     format: OutFormat,
     out: W,
@@ -33,6 +39,8 @@ pub struct Writer<W: Write> {
     buffered: Vec<Vec<String>>,
     /// `json`: whether a row has been written yet (drives the comma separators).
     json_first: bool,
+    /// The first write error seen, if any. Sticky: later writes are no-ops.
+    failed: Option<io::Error>,
 }
 
 impl<W: Write> Writer<W> {
@@ -43,20 +51,42 @@ impl<W: Write> Writer<W> {
             columns: Vec::new(),
             buffered: Vec::new(),
             json_first: true,
+            failed: None,
         }
+    }
+
+    /// Record `result` if it is the first failure.
+    fn record(&mut self, result: io::Result<()>) {
+        if let Err(e) = result
+            && self.failed.is_none()
+        {
+            self.failed = Some(e);
+        }
+    }
+
+    /// Whether output has failed, and the exit code to use if so. Reported once:
+    /// a broken pipe is normal shell plumbing and exits `EXIT_OK`, while a real
+    /// write failure (a full disk, a closed file) is an error the caller must not
+    /// paper over with a success summary.
+    pub fn check_io(&mut self) -> Option<u8> {
+        let e = self.failed.as_ref()?;
+        if e.kind() == io::ErrorKind::BrokenPipe {
+            return Some(super::EXIT_OK);
+        }
+        eprintln!("error: writing output: {e}");
+        Some(super::EXIT_QUERY)
     }
 
     /// Record the columns and emit any header/preamble the format needs.
     pub fn start(&mut self, columns: &[Column]) {
         self.columns = columns.iter().map(|c| c.name.clone()).collect();
-        match self.format {
+        let r = match self.format {
             OutFormat::Csv => write_delim(&mut self.out, &self.columns, ','),
             OutFormat::Tsv => write_delim(&mut self.out, &self.columns, '\t'),
-            OutFormat::Json => {
-                let _ = write!(self.out, "[");
-            }
-            OutFormat::Table => {}
-        }
+            OutFormat::Json => write!(self.out, "["),
+            OutFormat::Table => Ok(()),
+        };
+        self.record(r);
     }
 
     /// Write one window of rows (streamed, except `table` which buffers).
@@ -73,7 +103,8 @@ impl<W: Write> Writer<W> {
                 for r in rows {
                     let sep = if self.json_first { "\n  " } else { ",\n  " };
                     self.json_first = false;
-                    let _ = write!(self.out, "{sep}{}", json_row(&self.columns, r));
+                    let w = write!(self.out, "{sep}{}", json_row(&self.columns, r));
+                    self.record(w);
                 }
             }
         }
@@ -85,21 +116,25 @@ impl<W: Write> Writer<W> {
             OutFormat::Table => self.render_table(),
             OutFormat::Json => {
                 // `[]` when empty, else close the pretty-printed array.
-                if self.json_first {
-                    let _ = writeln!(self.out, "]");
+                let r = if self.json_first {
+                    writeln!(self.out, "]")
                 } else {
-                    let _ = writeln!(self.out, "\n]");
-                }
+                    writeln!(self.out, "\n]")
+                };
+                self.record(r);
             }
             OutFormat::Csv | OutFormat::Tsv => {}
         }
-        let _ = self.out.flush();
+        // The flush is where a buffered writer surfaces a full disk, so it counts.
+        let r = self.out.flush();
+        self.record(r);
     }
 
     fn write_rows_delim(&mut self, rows: &[Vec<Value>], delim: char) {
         for r in rows {
             let cells: Vec<String> = r.iter().map(cell_text).collect();
-            write_delim(&mut self.out, &cells, delim);
+            let w = write_delim(&mut self.out, &cells, delim);
+            self.record(w);
         }
     }
 
@@ -121,9 +156,9 @@ impl<W: Write> Writer<W> {
             .enumerate()
             .map(|(i, c)| pad(c, widths[i]))
             .collect();
-        let _ = writeln!(self.out, "{}", header.join("  "));
+        let mut r = writeln!(self.out, "{}", header.join("  "));
         let rule: Vec<String> = widths.iter().map(|w| "-".repeat(*w)).collect();
-        let _ = writeln!(self.out, "{}", rule.join("  "));
+        r = r.and_then(|()| writeln!(self.out, "{}", rule.join("  ")));
         for row in &self.buffered {
             let cells: Vec<String> = (0..cols)
                 .map(|i| {
@@ -131,8 +166,9 @@ impl<W: Write> Writer<W> {
                     pad(cell, widths[i])
                 })
                 .collect();
-            let _ = writeln!(self.out, "{}", cells.join("  "));
+            r = r.and_then(|()| writeln!(self.out, "{}", cells.join("  ")));
         }
+        self.record(r);
     }
 }
 
@@ -143,9 +179,9 @@ fn cell_text(v: &Value) -> String {
 }
 
 /// Write one delimited line with RFC-4180-style quoting for the given delimiter.
-fn write_delim<W: Write>(out: &mut W, cells: &[String], delim: char) {
+fn write_delim<W: Write>(out: &mut W, cells: &[String], delim: char) -> io::Result<()> {
     let line: Vec<String> = cells.iter().map(|c| quote_field(c, delim)).collect();
-    let _ = writeln!(out, "{}", line.join(&delim.to_string()));
+    writeln!(out, "{}", line.join(&delim.to_string()))
 }
 
 /// Quote a field when it contains the delimiter, a quote, or a newline: wrap in

@@ -1,47 +1,36 @@
 //! The read-only ER (entity-relationship) diagram (parity roadmap): a pannable,
-//! zoomable map of one database, where every table is a box (name + columns,
-//! PK/FK marked) and every foreign key is a curved connector running from the
-//! referring column's row to the row it references, marked with crow's-foot
-//! cardinality (many at the child end, one at the parent end).
-//!
-//! **Read-only, always.** It visualizes the schema; it never builds a query or a
-//! join. Double-clicking a table opens a plain browse (the existing read path);
-//! dragging a box only repositions it. See `docs/plans/todo/er-diagram-tabs.md`.
-//!
-//! It lives in a **tab** (`QueryTab::er`), not an overlay, so several databases
-//! can be mapped at once and a diagram stays put while you write SQL next to it.
-//! An ER tab replaces its half entirely rather than sharing the slot with the
-//! grid the way `QueryTab::plan` does: there is no query behind a diagram, so an
-//! editor above it would be dead space.
-//!
-//! It draws **one namespace** (the database that was right-clicked), or the whole
-//! connection when given `None`, which is the honest answer on SQLite and on
-//! Postgres connections where every schema is in play. Drawing every database of
-//! a MySQL server at once was both wrong (unrelated databases share no FK edges,
-//! so the layering interleaves disconnected components into one column stack) and
-//! ruinously slow.
-//!
-//! All the data is already resident after connect: table names live in
-//! `active.schema.schemas`, columns in `active.schema.details` (eagerly prefetched),
-//! and the relation graph in `active.fk_graph`. So opening the diagram costs no new
-//! backend round-trip beyond topping up any missing table details.
-//!
-//! Boxes are absolutely-positioned divs; the connectors are painted into a single
-//! `canvas` beneath them with `paint_path`. They started out as axis-aligned divs
-//! (three per edge), which a dense schema turned into a thicket: dozens of straight
-//! lines landing on the same few pixel rows overlap exactly, and there is nowhere
-//! to hang a cardinality mark. Curves separate visually and carry their marks.
-//!
-//! **Only what is on screen is built.** `render_er` runs every frame, and
-//! `cx.notify()` fires on each mouse-move of a pan, so building all N boxes
-//! unconditionally made the one interaction a large schema needs (dragging the
-//! canvas around) the one that rebuilt everything. Nodes and edges outside the
-//! viewport are skipped, and below [`LABEL_MIN_ZOOM`] boxes paint as bare
-//! rectangles, since text shaping dominates once the whole schema is fitted.
-//!
-//! World coordinates (box positions/sizes, pan) are plain `f32`; they're converted
-//! to `Pixels` only at the div boundary, and screen positions are `world * zoom +
-//! pan`.
+//! zoomable map of one database, where every table is a box (name + columns, PK/FK
+//! marked) and every foreign key is a curved connector running from the referring
+//! column's row to the row it references, marked with crow's-foot cardinality (many at
+//! the child end, one at the parent end). **Read-only, always.** It visualizes the
+//! schema; it never builds a query or a join. Double-clicking a table opens a plain
+//! browse (the existing read path); dragging a box only repositions it. It lives in a
+//! **tab** (`QueryTab::er`), not an
+//! overlay, so several databases can be mapped at once and a diagram stays put while
+//! you write SQL next to it. An ER tab replaces its half entirely rather than sharing
+//! the slot with the grid the way `QueryTab::plan` does: there is no query behind a
+//! diagram, so an editor above it would be dead space. It draws **one namespace** (the
+//! database that was right-clicked), or the whole connection when given `None`, which
+//! is the honest answer on SQLite and on Postgres connections where every schema is in
+//! play. Drawing every database of a MySQL server at once was both wrong (unrelated
+//! databases share no FK edges, so the layering interleaves disconnected components
+//! into one column stack) and ruinously slow. All the data is already resident after
+//! connect: table names live in `active.schema.schemas`, columns in
+//! `active.schema.details` (eagerly prefetched), and the relation graph in
+//! `active.fk_graph`. So opening the diagram costs no new backend round-trip beyond
+//! topping up any missing table details. Boxes are absolutely-positioned divs; the
+//! connectors are painted into a single `canvas` beneath them with `paint_path`. They
+//! started out as axis-aligned divs (three per edge), which a dense schema turned into
+//! a thicket: dozens of straight lines landing on the same few pixel rows overlap
+//! exactly, and there is nowhere to hang a cardinality mark. Curves separate visually
+//! and carry their marks. **Only what is on screen is built.** `render_er` runs every
+//! frame, and `cx.notify()` fires on each mouse-move of a pan, so building all N boxes
+//! unconditionally made the one interaction a large schema needs (dragging the canvas
+//! around) the one that rebuilt everything. Nodes and edges outside the viewport are
+//! skipped, and below [`LABEL_MIN_ZOOM`] boxes paint as bare rectangles, since text
+//! shaping dominates once the whole schema is fitted. World coordinates (box
+//! positions/sizes, pan) are plain `f32`; they're converted to `Pixels` only at the div
+//! boundary, and screen positions are `world * zoom + pan`.
 
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};

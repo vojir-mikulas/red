@@ -94,7 +94,12 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 serde = { version = "1", features = ["derive"] }
 # Reads one GitHub Releases API response in the self-updater (red-service); kept
 # minimal so the updater takes no heavyweight HTTP dependency (it shells curl).
-serde_json = "1"
+# `raw_value` lets the ClickHouse driver read a cell's exact JSON source text.
+# Without it, serde_json widens any number that does not fit i64/u64 into f64, so a
+# Decimal128 or Int128 column came back rounded. `arbitrary_precision` would fix the
+# same thing globally, but it changes how every `Value::Number` in the workspace
+# serializes; `raw_value` is additive and touches nothing else.
+serde_json = { version = "1", features = ["raw_value"] }
 toml = "0.8"
 dirs = "5"
 # SQL beautifier for the editor's Format action. Pinned to the 0.2 line so it

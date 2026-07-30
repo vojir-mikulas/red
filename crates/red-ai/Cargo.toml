@@ -15,7 +15,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-tokio = { workspace = true, features = ["sync"] }
+# `macros` for the `select!` that races a streamed chunk against cancellation,
+# so Stop interrupts a stalled read instead of waiting for the next chunk.
+tokio = { workspace = true, features = ["macros", "sync"] }
 futures-util.workspace = true
 reqwest.workspace = true
 

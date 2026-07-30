@@ -102,18 +102,17 @@ async fn connect(config: &ConnectionConfig) -> red_core::Result<(SessionDriver, 
                     .with_scope(Some(config.database.clone())),
             ))
         }
-        // Not a `DatabaseDriver` at all — the parallel KvDriver seam (see
-        // docs/plans/redis.md). No schema-scoping equivalent: a Redis
-        // connection's logical DB index (0..15) lives in `config.database`,
-        // already threaded through `dsn`/`local_dsn` above like any other
-        // engine's database segment.
+        // Not a `DatabaseDriver` at all — the parallel KvDriver seam. No schema-scoping
+        // equivalent: a Redis connection's logical DB index (0..15) lives in
+        // `config.database`, already threaded through `dsn`/`local_dsn` above like any
+        // other engine's database segment.
         DbKind::Redis => SessionDriver::Kv(Arc::new(
             RedisDriver::connect(&dsn, config.read_only).await?,
         )),
-        // The third seam — a document store, neither SQL nor KV (see
-        // docs/plans/todo/doc-driver.md). Like Redis, no schema-scoping: a Mongo
-        // connection addresses databases/collections by name through `DocDriver`,
-        // and its default database (when the DSN names one) rides in `dsn`.
+        // The third seam — a document store, neither SQL nor KV. Like Redis, no schema-
+        // scoping: a Mongo connection addresses databases/collections by name through
+        // `DocDriver`, and its default database (when the DSN names one) rides in
+        // `dsn`.
         DbKind::Mongo => SessionDriver::Doc(Arc::new(
             MongoDriver::connect(&dsn, config.read_only).await?,
         )),

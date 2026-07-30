@@ -79,7 +79,10 @@ pub fn normalize(decl: &str) -> NormType {
     match base {
         "bool" | "boolean" => NormType::Bool,
         // MySQL's idiomatic boolean is `tinyint(1)`; wider tinyint is a small int.
-        "tinyint" if args.starts_with('1') => NormType::Bool,
+        // Exactly `1`, not a prefix: `tinyint(10)` is a display width over the full
+        // -128..127 range, and calling it a boolean creates a Postgres `boolean` on
+        // migration that then rejects every value outside 0..1.
+        "tinyint" if args.split(')').next().is_some_and(|w| w.trim() == "1") => NormType::Bool,
 
         "bigint" | "int8" | "bigserial" | "serial8" | "int64" | "uint64" | "long" => {
             NormType::BigInt
@@ -131,7 +134,7 @@ pub fn spell(kind: DbKind, t: &NormType) -> String {
         DbKind::Postgres => spell_postgres(t),
         DbKind::Mysql => spell_mysql(t),
         DbKind::Clickhouse => spell_clickhouse(t),
-        // Redis has no column/DDL model at all (see docs/plans/redis.md); it
+        // Redis has no column/DDL model at all; it
         // isn't a `DatabaseDriver`, so it can never appear in a create-table or
         // migration target picker (`write_caps().insert` is false, which the
         // pickers filter on). Degrade to an empty type rather than panicking on

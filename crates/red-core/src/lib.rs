@@ -53,16 +53,13 @@ pub enum DbKind {
     /// rollback over a non-unique sort key, so each op is preflight-counted and
     /// reported for itself (see [`DbKind::write_caps`] and [`RowEditCaps`]).
     Clickhouse,
-    /// Redis/Valkey: a key-value store, not SQL-shaped at all. Reached through
-    /// the parallel `KvDriver` seam (`red-driver`'s `redis_kv` module), not
-    /// `DatabaseDriver` — see `docs/plans/redis.md`. Read-only in R0/R1;
-    /// `write_caps` reflects that until R3 lands in-grid editing.
+    /// Redis/Valkey: a key-value store, not SQL-shaped at all. Reached through the
+    /// parallel `KvDriver` seam (`red-driver`'s `redis_kv` module), not
+    /// `DatabaseDriver` —.
     Redis,
-    /// MongoDB: a document store, neither SQL- nor Redis-shaped. Reached through
-    /// the third `DocDriver` seam (`red-driver`'s `doc` module), a
-    /// `server → databases → collections → documents` hierarchy of nested BSON
-    /// trees — see `docs/plans/todo/doc-driver.md`. Writes ride the seam, not the
-    /// SQL `WriteCaps` set, so `write_caps` stays all-`false` like Redis.
+    /// MongoDB: a document store, neither SQL- nor Redis-shaped. Reached through the
+    /// third `DocDriver` seam (`red-driver`'s `doc` module), a `server → databases →
+    /// collections → documents` hierarchy of nested BSON trees —.
     Mongo,
 }
 
@@ -166,7 +163,7 @@ impl DbKind {
                 best_effort_edit: true,
             },
             // Redis: no write path exists yet (R0/R1 are read-only browsing).
-            // R3 (see docs/plans/redis.md) adds SET/HSET/EXPIRE/DEL through the
+            // R3 adds SET/HSET/EXPIRE/DEL through the
             // KvDriver seam, not through this SQL-shaped capability set at all —
             // this stays all-`false` so any UI affordance still gated on
             // `write_caps` (rather than the connection kind) stays hidden.
@@ -175,10 +172,9 @@ impl DbKind {
                 guarded_edit: false,
                 best_effort_edit: false,
             },
-            // MongoDB: like Redis, every write rides its own seam (`DocDriver`),
-            // not this SQL capability set, so any affordance gated on `write_caps`
-            // (rather than the connection kind) stays hidden. See
-            // `docs/plans/todo/doc-driver.md`.
+            // MongoDB: like Redis, every write rides its own seam (`DocDriver`), not
+            // this SQL capability set, so any affordance gated on `write_caps` (rather
+            // than the connection kind) stays hidden.
             DbKind::Mongo => WriteCaps {
                 insert: false,
                 guarded_edit: false,
@@ -328,12 +324,11 @@ impl DbKind {
                 required: false,
                 label: "Database",
             },
-            // Postgres binds its database at connect (it cannot be switched on a
-            // live connection); the rebindable namespace is the *schema*, via
-            // `search_path`. Not settable yet: a `SET search_path` persists on a
-            // pooled/streaming client and would leak across tabs, so it needs the
-            // per-client tracking that MySQL's re-acquire-per-operation pooling
-            // makes unnecessary. Tracked in docs/plans/todo/database-context.md.
+            // Postgres binds its database at connect (it cannot be switched on a live
+            // connection); the rebindable namespace is the *schema*, via `search_path`.
+            // Not settable yet: a `SET search_path` persists on a pooled/streaming
+            // client and would leak across tabs, so it needs the per-client tracking
+            // that MySQL's re-acquire-per-operation pooling makes unnecessary.
             DbKind::Postgres => NamespaceCaps {
                 settable: false,
                 required: false,
@@ -434,9 +429,8 @@ pub struct RowEditCaps {
     pub mode: EditMode,
     /// The columns whose values, taken together, address a row for an `UPDATE`/
     /// `DELETE`. A relational primary key (composite included); on ClickHouse the
-    /// sorting-key columns **first** (so the engine can prune parts, see
-    /// `docs/plans/todo/clickhouse-writes.md` D3), then the remaining comparable
-    /// ones. Empty exactly when [`mode`](Self::mode) is [`EditMode::None`].
+    /// sorting-key columns **first**, then the remaining comparable ones. Empty exactly
+    /// when [`mode`](Self::mode) is [`EditMode::None`].
     pub identity: Vec<String>,
     /// Columns that can never be *updated*: the identity columns themselves, plus
     /// anything the engine computes (a ClickHouse `MATERIALIZED`/`ALIAS` column).
@@ -1100,16 +1094,14 @@ pub struct ConnectionConfig {
     pub color: u8,
     /// When unset (read/write), the connection allows writes: deliberate `UPDATE`s
     /// from the SQL editor and guarded, PK-keyed, previewed in-grid cell edits
-    /// (Track B5). Read-only is the safe default: the driver opens read-only and
+    ///. Read-only is the safe default: the driver opens read-only and
     /// every write path is refused up front.
     #[cfg_attr(feature = "serde", serde(default))]
     pub read_only: bool,
-    /// Encrypt the connection with TLS. For Redis this dials `rediss://`; for
-    /// MySQL it requires SSL (`require_ssl`); for ClickHouse it uses HTTPS. (A
-    /// pasted `rediss://`/`clickhouses://` or an `sslmode=require`/`require_ssl`
-    /// DSN also sets this.) The connection form surfaces it as a checkbox — see
-    /// docs/plans/redis.md's "first-class TLS toggle" item and
-    /// `security-review-2026-07.md`.
+    /// Encrypt the connection with TLS. For Redis this dials `rediss://`; for MySQL it
+    /// requires SSL (`require_ssl`); for ClickHouse it uses HTTPS. (A pasted
+    /// `rediss://`/`clickhouses://` or an `sslmode=require`/`require_ssl` DSN also sets
+    /// this.) The connection form surfaces it as a checkbox —.md`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub tls: bool,
     /// Which deployment this connection points at. Drives how strict the write
@@ -1456,8 +1448,14 @@ fn decode(s: &str) -> String {
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
+        // Both digits are checked as ASCII hex *before* slicing: a `%` followed by
+        // the lead byte of a multi-byte character (`%aé`) would otherwise slice
+        // across a char boundary and panic, and this runs on the pasted-DSN path
+        // in the connection form, where the input is whatever the user pressed.
         if bytes[i] == b'%'
             && i + 2 < bytes.len()
+            && bytes[i + 1].is_ascii_hexdigit()
+            && bytes[i + 2].is_ascii_hexdigit()
             && let Ok(byte) = u8::from_str_radix(&s[i + 1..i + 3], 16)
         {
             out.push(byte);
@@ -1624,7 +1622,7 @@ pub fn is_numeric_type(decl_type: Option<&str>) -> bool {
     decl_type.is_some_and(|t| is_int_type(t) || is_real_type(t))
 }
 
-/// A result-narrowing filter pushed into the query (Track B2). The service wraps
+/// A result-narrowing filter pushed into the query. The service wraps
 /// the open's base SQL in `SELECT * FROM (base) WHERE <predicate>` *before* the
 /// count / key-bounds probe, so the whole result (count, keyset seek, sort,
 /// export) operates on the filtered set without ever materializing it. Because
@@ -1648,7 +1646,7 @@ pub enum ResultFilter {
     /// A raw boolean SQL expression, wrapped verbatim into the `WHERE`. For users
     /// who want a precise predicate; trusted like editor SQL.
     Where(String),
-    /// A conjunction of `column = value` equalities (Track B7 foreign-key follow):
+    /// A conjunction of `column = value` equalities (foreign-key follow):
     /// one [`ColumnValue`] for a single-column FK, several for a composite. Rendered
     /// per engine to an escaped *literal* predicate (`DatabaseDriver::eq_predicate`)
     /// AND-joined; comparison context coerces each literal to the column's type, so
@@ -1746,7 +1744,7 @@ pub struct ColumnPredicate {
     pub value: Option<Value>,
 }
 
-/// A single guarded data edit (Track B5), keyed on a result's row identity. Built by
+/// A single guarded data edit, keyed on a result's row identity. Built by
 /// the UI from the result's [`RowEditCaps::identity`] + base table; a *semantic* edit
 /// carrying no SQL, so the UI stays engine-independent. The driver renders it to
 /// dialect SQL, **binds** every value (never interpolates), and asserts it touches
@@ -2124,7 +2122,7 @@ pub fn coerce_edit_value(
     Ok(Value::Text(Arc::from(text)))
 }
 
-/// A query execution plan (Track B4: EXPLAIN). A small, fully-materialized tree
+/// A query execution plan (EXPLAIN). A small, fully-materialized tree
 /// the driver builds from the engine's *native* EXPLAIN output (SQLite's
 /// `EXPLAIN QUERY PLAN` rows, Postgres's indented text plan, MySQL's `FORMAT=TREE`)
 /// so the UI renders it readably without any engine knowledge. A plan is
@@ -2182,7 +2180,7 @@ impl PlanNode {
 /// connect-time tree skeleton carries. **Programmatic objects** (routines,
 /// triggers, sequences, types) have no columns and are loaded lazily when their
 /// group node is expanded, so widening this enum did not make connecting slower
-/// (see `docs/plans/todo/schema-object-kinds.md`).
+///.
 ///
 /// Which of these an engine has at all is [`DbKind::object_kinds`]; a kind absent
 /// from that list is never queried for and never drawn.
@@ -2221,22 +2219,17 @@ impl ObjectKind {
         !self.is_relation()
     }
 
-    /// Whether an object of this kind is replaced *wholesale* — dropped and
-    /// created again from one full `CREATE` statement — rather than altered in
-    /// place.
-    ///
-    /// This is the predicate that makes an editable definition tractable: the
-    /// edited text *is* the whole object, so applying it needs no comparison of
-    /// before against after, and therefore no SQL parser (`crate::sql` is a lexer
-    /// by design). A table is the counterexample and is deliberately excluded:
-    /// changing one means `ALTER`, which means diffing two shapes — a structured
-    /// editor over the catalog, planned separately in
-    /// `docs/plans/todo/table-editing.md`.
-    ///
-    /// Three kinds are droppable but still excluded, because the drop is not
-    /// harmless: a materialized view has stored rows to lose, a sequence has
-    /// column defaults drawing from its counter, and a type cannot be dropped
-    /// while a column still uses it.
+    /// Whether an object of this kind is replaced *wholesale* — dropped and created
+    /// again from one full `CREATE` statement — rather than altered in place. This is
+    /// the predicate that makes an editable definition tractable: the edited text *is*
+    /// the whole object, so applying it needs no comparison of before against after,
+    /// and therefore no SQL parser (`crate::sql` is a lexer by design). A table is the
+    /// counterexample and is deliberately excluded: changing one means `ALTER`, which
+    /// means diffing two shapes — a structured editor over the catalog, which is its
+    /// own feature. Three kinds are droppable but
+    /// still excluded, because the drop is not harmless: a materialized view has stored
+    /// rows to lose, a sequence has column defaults drawing from its counter, and a
+    /// type cannot be dropped while a column still uses it.
     pub const fn is_replaceable(self) -> bool {
         matches!(
             self,
@@ -2345,7 +2338,7 @@ pub struct ForeignKeyMeta {
     pub ref_column: String,
 }
 
-/// One foreign-key edge of the connection-wide relation graph (Track B7). Unlike
+/// One foreign-key edge of the connection-wide relation graph. Unlike
 /// the per-table [`ForeignKeyMeta`], this carries both endpoints' namespaces and is
 /// usable in either direction: *forward* (`from_table` points out) backs "go to the
 /// referenced row", *reverse* (`to_table` is pointed at) backs "show referencing
@@ -2369,7 +2362,7 @@ pub struct FkEdge {
 /// driver's SQL wrapper agree on the same identifier for a first hop's parent.
 pub const BASE_ALIAS: &str = "_red_base";
 
-/// One inline foreign-key *column expansion* (Track B7): a `LEFT JOIN` that pulls
+/// One inline foreign-key *column expansion*: a `LEFT JOIN` that pulls
 /// selected columns of a referenced table into a browse as extra, dotted-aliased
 /// columns. The service folds an ordered `Vec<FkJoin>` into the result's base SQL
 /// (see `join_wrap`), so each hop decorates the page without changing its row count:
@@ -2804,7 +2797,7 @@ pub enum RedError {
 pub type Result<T> = std::result::Result<T, RedError>;
 
 /// The self-updater's lifecycle, surfaced from the backend to the UI titlebar
-/// pill + About tab (Phases 3–4 of docs/plans/self-update.md). macOS-only today;
+/// pill + About tab. macOS-only today;
 /// on other platforms the updater never advances past `Unknown`. A run is
 /// "stage on disk, apply on restart": the new bundle is fully swapped over the
 /// installed app *before* `ReadyToRestart`, so a restart is just a relaunch.
@@ -3260,6 +3253,22 @@ mod conn_tests {
     #[test]
     fn parse_rejects_non_url() {
         assert!(ConnectionConfig::parse_conn_str("not a url").is_none());
+    }
+
+    /// A malformed `%`-escape whose two-byte window cuts a multi-byte character
+    /// used to slice off a char boundary and panic. This is the pasted-DSN path in
+    /// the connection form, so the input is whatever the user typed.
+    #[test]
+    fn parse_survives_malformed_percent_escapes() {
+        for dsn in [
+            "postgres://user:%aé@host/db",
+            "postgres://user:%é@host/db",
+            "postgres://user:100%@host/db",
+            "postgres://user:%zz@host/db",
+        ] {
+            let parsed = ConnectionConfig::parse_conn_str(dsn);
+            assert!(parsed.is_some(), "{dsn} should parse, not panic");
+        }
     }
 
     #[test]

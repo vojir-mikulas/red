@@ -1,4 +1,4 @@
-//! The Redis Pub/Sub live monitor (see docs/plans/redis.md's live phase).
+//! The Redis Pub/Sub live monitor.
 //! One pattern subscription at a time; messages stream in via
 //! `Event::KvMessage` for as long as the subscription is open, capped so a
 //! chatty channel can't grow the log forever.

@@ -18,7 +18,7 @@ use red_service::{Command, Event, OpId};
 
 use super::{
     EXIT_OK, EXIT_QUERY, EXIT_USAGE, EventRx, PRIMARY, TARGET, backend_gone, connect_session, note,
-    progress, recv, resolve, shutdown, start,
+    outln, progress, recv, resolve, shutdown, start,
 };
 use crate::schema::quote_ident;
 
@@ -236,14 +236,14 @@ fn print_copy_plan(
         (false, CopyMode::Append) => "append into",
         (false, CopyMode::TruncateInsert) => "replace",
     };
-    println!("would {verb} {} ← {source_table}", target_label(target));
-    println!("column mapping ({} column(s)):", mapping.len());
+    outln!("would {verb} {} ← {source_table}", target_label(target));
+    outln!("column mapping ({} column(s)):", mapping.len());
     for m in mapping {
         let src = source_cols
             .get(m.source)
             .map(|c| c.name.as_str())
             .unwrap_or("?");
-        println!("  {} ← {src}", m.column);
+        outln!("  {} ← {src}", m.column);
     }
 }
 
@@ -346,7 +346,7 @@ fn split_table(table: &str) -> (Option<String>, String) {
 }
 
 /// `copy`/`migrate` are SQL-shaped (`SELECT`/`INSERT` over a `DatabaseDriver`);
-/// a Redis connection has no such driver at all (see docs/plans/redis.md), so
+/// a Redis connection has no such driver at all, so
 /// reject it up front with a clean usage error rather than connecting and
 /// failing deep inside `default_schema`'s exhaustive match.
 fn reject_kv(
@@ -374,7 +374,7 @@ fn default_schema(kind: DbKind, database: &str) -> Option<String> {
         DbKind::Mysql | DbKind::Clickhouse => (!database.is_empty()).then(|| database.to_string()),
         // `red copy`/`red migrate` are SQL-shaped (SELECT/INSERT); the CLI never
         // routes a Redis or MongoDB connection into them (they aren't SQL sources
-        // or targets; see docs/plans/redis.md and docs/plans/todo/doc-driver.md).
+        // or targets).
         DbKind::Redis | DbKind::Mongo => {
             unreachable!("{kind} isn't a copy/migrate SQL source or target")
         }
@@ -593,12 +593,12 @@ fn target_table_names(
 /// existing table, so an existing name is a skip.
 fn print_migrate_plan(tables: &[String], existing: &HashSet<String>, target_schema: Option<&str>) {
     let dest = target_schema.unwrap_or("(default schema)");
-    println!("would migrate {} table(s) into {dest}:", tables.len());
+    outln!("would migrate {} table(s) into {dest}:", tables.len());
     for t in tables {
         if existing.contains(&t.to_ascii_lowercase()) {
-            println!("  skip   {t} (already on target)");
+            outln!("  skip   {t} (already on target)");
         } else {
-            println!("  create {t}");
+            outln!("  create {t}");
         }
     }
 }

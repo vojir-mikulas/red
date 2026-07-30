@@ -16,7 +16,7 @@ const SCHEMA_SUMMARY_CAP: usize = 200;
 const TITLE_CAP: usize = 60;
 
 /// Cap on the prior-transcript digest folded back into a reopened chat's first
-/// turn (M-S5), so resuming a long conversation doesn't blow the context window.
+/// turn, so resuming a long conversation doesn't blow the context window.
 /// Keeps the most recent turns (the tail), which is what a follow-up references.
 const SEED_CAP: usize = 6_000;
 
@@ -242,7 +242,7 @@ pub(super) fn derive_title(message: &str) -> String {
 }
 
 /// Render a saved transcript as a compact `You:` / `Assistant:` digest to seed a
-/// reopened chat's next turn (M-S5). Returns `None` for an empty transcript. The
+/// reopened chat's next turn. Returns `None` for an empty transcript. The
 /// digest is capped to its tail ([`SEED_CAP`]), the recent turns a follow-up
 /// actually depends on, so resuming a long chat stays within budget.
 pub(super) fn render_transcript(

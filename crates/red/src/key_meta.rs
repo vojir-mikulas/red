@@ -1,6 +1,6 @@
 //! Persistence for per-key annotations in the Redis browser: a favorite star, a
 //! free-text note, and tags. Closes the "tag / note / favorite keys" gap the
-//! zedis comparison flagged (see docs/plans/report/red-redis-vs-zedis.md).
+//! zedis comparison flagged.
 //!
 //! Storage mirrors `recent_keys.rs`: one JSON file,
 //! `<config>/red/redis-key-meta.json`, rewritten atomically (temp + rename),

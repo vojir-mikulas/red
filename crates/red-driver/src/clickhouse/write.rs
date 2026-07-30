@@ -1,21 +1,16 @@
-//! The ClickHouse write half: what a table will let the grid change, and how.
-//!
-//! Split out of the driver proper because none of it is shaped like the rest of the
-//! engine surface. Reading ClickHouse is uniform; writing to it is a pile of
-//! engine-specific facts that have to be *derived* rather than assumed:
-//!
-//! * Only the `MergeTree` family mutates at all. `Memory`, `Log`, `File`, `Kafka`,
-//!   views and `Distributed` accept some inserts but no `ALTER … UPDATE`.
-//! * Key columns (sorting / primary / partition / sampling) are rejected by the
-//!   engine on update, and `MATERIALIZED` / `ALIAS` columns cannot be written at all.
-//! * There is no row identity. The sorting key is not unique and duplicates are
-//!   normal, so a row is addressed by a *snapshot of its values* and every write
-//!   preflights `count() == 1` before it runs.
-//! * Cost is per part, not per row: a predicate that leads with the sorting-key
-//!   columns prunes parts, one that doesn't rewrites the whole table. That is why
-//!   [`ChTableFacts::edit_caps`] puts the sorting key at the front of the identity.
-//!
-//! See `docs/plans/todo/clickhouse-writes.md` for the reasoning behind each rule.
+//! The ClickHouse write half: what a table will let the grid change, and how. Split out
+//! of the driver proper because none of it is shaped like the rest of the engine
+//! surface. Reading ClickHouse is uniform; writing to it is a pile of engine-specific
+//! facts that have to be *derived* rather than assumed: * Only the `MergeTree` family
+//! mutates at all. `Memory`, `Log`, `File`, `Kafka`, views and `Distributed` accept
+//! some inserts but no `ALTER … UPDATE`. * Key columns (sorting / primary / partition /
+//! sampling) are rejected by the engine on update, and `MATERIALIZED` / `ALIAS` columns
+//! cannot be written at all. * There is no row identity. The sorting key is not unique
+//! and duplicates are normal, so a row is addressed by a *snapshot of its values* and
+//! every write preflights `count() == 1` before it runs. * Cost is per part, not per
+//! row: a predicate that leads with the sorting-key columns prunes parts, one that
+//! doesn't rewrites the whole table. That is why [`ChTableFacts::edit_caps`] puts the
+//! sorting key at the front of the identity.
 
 use red_core::{ColumnValue, EditMode, EditOp, RedError, Result, RowEditCaps, Value};
 

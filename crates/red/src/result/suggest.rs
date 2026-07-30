@@ -1,4 +1,4 @@
-//! Track B8: the in-cell foreign-key suggestion picker.
+//! The in-cell foreign-key suggestion picker.
 //!
 //! When the open inline editor ([`GridEdit`](super::GridEdit)) targets a single-column
 //! foreign-key cell, we hang a searchable dropdown of the referenced table's existing

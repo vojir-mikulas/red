@@ -97,9 +97,14 @@ impl MysqlDriver {
         // an otherwise-valid edit back, a cross-driver behaviour difference.
         let mut builder = OptsBuilder::from_opts(opts).client_found_rows(true);
         if read_only {
-            // Runs on each new pooled connection, so writes are rejected at the
-            // engine even in autocommit (each statement is its own read-only txn).
-            builder = builder.init(vec!["SET SESSION TRANSACTION READ ONLY"]);
+            // `setup`, not `init`: mysql_async re-runs only the `setup` commands
+            // from `Conn::reset()`, which the pool performs when it reclaims a
+            // connection. Under `init` the posture silently evaporated on the first
+            // reclaim, and `open_cursor` runs arbitrary editor SQL in *autocommit*
+            // with no other read-only protection — so a `SELECT fn()` whose stored
+            // function writes would have committed behind the read-only badge.
+            // Write paths carry their own `START TRANSACTION READ ONLY` regardless.
+            builder = builder.setup(vec!["SET SESSION TRANSACTION READ ONLY"]);
         }
         let pool = Pool::new(builder);
 
@@ -851,6 +856,16 @@ impl DatabaseDriver for MysqlDriver {
             .map_err(map_my_err)?;
         let mut affected = Vec::with_capacity(statements.len());
         for sql in statements {
+            // Re-checked *between* statements, not just before `BEGIN`. `KILL` only
+            // reaches the statement currently executing, so an abort firing in the
+            // gap — or one racing a statement's completion — was a no-op and the
+            // loop ran every remaining statement through to `COMMIT`. ClickHouse is
+            // immune by construction (each statement re-enters `execute_abort`);
+            // this gives MySQL the same shape.
+            if abort.is_aborted() {
+                crate::warn_rollback(conn.query_drop("ROLLBACK").await, "execute_batch");
+                return Err(RedError::Interrupted);
+            }
             match conn.query_drop(sql).await {
                 Ok(()) => affected.push(conn.affected_rows()),
                 Err(e) => {
@@ -1590,9 +1605,14 @@ fn my_value(value: Option<&MyValue>, col: &MyColumn, max: Option<usize>) -> Valu
         Some(MyValue::Float(f)) => Value::Real(*f as f64),
         Some(MyValue::Double(f)) => Value::Real(*f),
         Some(MyValue::Bytes(bytes)) => bytes_value(bytes, col, max),
-        Some(MyValue::Date(y, mo, d, h, mi, s, us)) => {
-            Value::Text(fmt_datetime(*y, *mo, *d, *h, *mi, *s, *us).into())
-        }
+        Some(MyValue::Date(y, mo, d, h, mi, s, us)) => Value::Text(
+            fmt_datetime(
+                (*y, *mo, *d),
+                (*h, *mi, *s, *us),
+                col.column_type() == ColumnType::MYSQL_TYPE_DATE,
+            )
+            .into(),
+        ),
         Some(MyValue::Time(neg, days, h, mi, s, us)) => {
             Value::Text(fmt_time(*neg, *days, *h, *mi, *s, *us).into())
         }
@@ -1630,11 +1650,21 @@ fn bytes_value(bytes: &[u8], col: &MyColumn, max: Option<usize>) -> Value {
     }
 }
 
-fn fmt_datetime(y: u16, mo: u8, d: u8, h: u8, mi: u8, s: u8, us: u32) -> String {
+/// Render a MySQL temporal cell. `date_only` comes from the column type rather
+/// than from the value: a `DATETIME` at exactly midnight has all-zero time parts
+/// and used to render as a bare date, which reads as a `DATE` in the grid and in
+/// every export, and round-trips as one through a copy.
+fn fmt_datetime(
+    (y, mo, d): (u16, u8, u8),
+    (h, mi, s, us): (u8, u8, u8, u32),
+    date_only: bool,
+) -> String {
     let date = format!("{y:04}-{mo:02}-{d:02}");
-    match (h, mi, s, us) {
-        (0, 0, 0, 0) => date,
-        (_, _, _, 0) => format!("{date} {h:02}:{mi:02}:{s:02}"),
+    if date_only {
+        return date;
+    }
+    match us {
+        0 => format!("{date} {h:02}:{mi:02}:{s:02}"),
         _ => format!("{date} {h:02}:{mi:02}:{s:02}.{us:06}"),
     }
 }
@@ -1943,7 +1973,7 @@ mod tests {
             &driver, &schema, &authors, &books, &recent,
         )
         .await;
-        // Track B7: the connection-wide FK graph reports the same edge.
+        // The connection-wide FK graph reports the same edge.
         battery::lists_foreign_key_graph(&driver, &schema, &authors, &books).await;
 
         // Seed rows for the column-stats summary: author_id is 1,1,2,NULL (NULLs +

@@ -747,7 +747,7 @@ impl DocView {
 
 // --- update ------------------------------------------------------------------
 
-/// macOS self-update behaviour (see docs/plans/self-update.md). `auto_update =
+/// macOS self-update behaviour. `auto_update =
 /// false` is the off-switch the plan promises: no poll timer, no network. The
 /// interval is clamped to a sane floor so a stray `0` can't hammer GitHub.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -786,14 +786,14 @@ impl UpdateSettings {
 #[serde(default)]
 pub struct AiSettings {
     /// The master switch. `false` is a true kill switch: no panel entry point,
-    /// no MCP server, no agent process (M-S7). A connection can override it.
+    /// no MCP server, no agent process. A connection can override it.
     pub enabled: bool,
     /// Which backend handles turns:
     /// - `"anthropic"` (default): the Claude Messages API, billed to an API key.
     /// - `"subscription"`: Claude Code over ACP, billed to the user's Pro/Max
     ///   subscription (the agent owns its own login; no key needed).
     pub provider: String,
-    /// Database access tier the assistant's tools run at (M-S7): `"off"` (no DB
+    /// Database access tier the assistant's tools run at: `"off"` (no DB
     /// tools), `"schema"` (structure only, no row data), or `"read"` (the full
     /// read catalog). A connection can override it; unknown values resolve to
     /// `"read"`.
@@ -832,7 +832,7 @@ pub struct AiSettings {
     /// the user can find them. Created on demand; an unusable folder falls back to the
     /// temp dir rather than failing the report.
     pub report_dir: String,
-    /// Resource guards on the `read` tier (`[ai.limits]`, M-S7).
+    /// Resource guards on the `read` tier (`[ai.limits]`).
     pub limits: AiLimitsSettings,
 }
 

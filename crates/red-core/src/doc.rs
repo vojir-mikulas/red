@@ -1,14 +1,11 @@
-//! Domain types for the `DocDriver` seam (MongoDB first; see
-//! `docs/plans/todo/doc-driver.md`). The third seam, parallel to the SQL-shaped
+//! Domain types for the `DocDriver` seam. The third seam, parallel to the SQL-shaped
 //! types in `lib.rs` and the Redis-shaped ones in `kv.rs`, for engines that are
-//! neither: a `server → databases → collections → documents` hierarchy of nested
-//! BSON trees.
-//!
-//! Nothing here knows about UI, a runtime, or the `mongodb`/`bson` crates:
-//! [`DocValue`] is a *mirror* of the BSON value tree, and the conversion between
-//! the two lives entirely in `red-driver` (the version firewall, exactly like the
-//! SQL and KV families). Extended-JSON rendering is hand-rolled below so this
-//! crate stays dependency-light (no `serde_json`).
+//! neither: a `server → databases → collections → documents` hierarchy of nested BSON
+//! trees. Nothing here knows about UI, a runtime, or the `mongodb`/`bson` crates:
+//! [`DocValue`] is a *mirror* of the BSON value tree, and the conversion between the
+//! two lives entirely in `red-driver` (the version firewall, exactly like the SQL and
+//! KV families). Extended-JSON rendering is hand-rolled below so this crate stays
+//! dependency-light (no `serde_json`).
 
 use std::fmt::Write as _;
 

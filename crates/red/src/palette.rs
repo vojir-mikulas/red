@@ -113,20 +113,20 @@ pub(crate) enum Cmd {
     ToggleWatch,
     /// Beautify the active editor's SQL in place.
     FormatSql,
-    /// Submit the staged grid edits as one batch (Track B6). Opens the confirm.
+    /// Submit the staged grid edits as one batch. Opens the confirm.
     SubmitChanges,
-    /// Discard the staged grid edits (Track B6).
+    /// Discard the staged grid edits.
     RevertChanges,
-    /// Append a new draft (insert) row to the result (Track B6).
+    /// Append a new draft (insert) row to the result.
     AddRow,
-    /// Open the assistant's conversation-history picker (M-S5).
+    /// Open the assistant's conversation-history picker.
     AssistantHistory,
-    /// Start a fresh assistant chat, saving the current one (M-S5).
+    /// Start a fresh assistant chat, saving the current one.
     AssistantNewChat,
     /// Start a fresh assistant chat on a specific agent, by index into
     /// `usable_agents` (the "New chat with \<agent\>" entries).
     AssistantNewChatWith(usize),
-    /// Reveal the conversations directory in the OS file manager (M-S5).
+    /// Reveal the conversations directory in the OS file manager.
     RevealConversationStorage,
     /// Open the side-by-side split (a second query pane on the right).
     SplitRight,
@@ -407,7 +407,7 @@ impl AppState {
     }
 
     /// Which contract the **active result's** existing rows can be edited under
-    /// (Track B5). Three gates in one, all of which must agree: the connection is
+    ///. Three gates in one, all of which must agree: the connection is
     /// writable, the engine has *some* edit contract, and the table this result
     /// browses reported one (see [`red_core::RowEditCaps`]).
     ///
@@ -700,7 +700,7 @@ impl AppState {
                     item("cmd:disconnect", "connection: disconnect"),
                     Cmd::Disconnect,
                 ));
-                // Assistant conversation history (M-S5), only with the panel open.
+                // Assistant conversation history, only with the panel open.
                 if self.assistant.is_some() {
                     out.push((
                         item("cmd:ai-new-chat", "agent: new chat"),

@@ -13,3 +13,7 @@
 shell-disconnect = [Dísçöññéçt]
 
 shell-tab_chooser_hint = [Çhöösé whát tö öpéñ íñ thís táb  ·  préss 1–6 ör ↵]
+
+shell-stop_write = [Stöp]
+
+shell-stop_write.help = [Ásk thé sérvér tö stöp thé rúññíñg státéméñt]

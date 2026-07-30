@@ -1,19 +1,13 @@
-//! The connection health report view (see
-//! `docs/plans/todo/connection-health-report.md`).
-//!
-//! Two of RED's three driver seams could already answer "what is wrong in here":
-//! Redis has the keyspace analysis panel, Mongo has `audit_collection`. The seam
-//! most people actually connect to could not. This closes that.
-//!
-//! The report hangs off the **connection**, not a query, so it is a whole-half tab
-//! body ([`TabView::Health`]) like the ER diagram rather than something in the
-//! result pane. It is persisted per connection by [`crate::health_store`], so
-//! re-opening it after a restart shows the last run with an honest "as of" line
-//! instead of a blank panel.
-//!
-//! **Nothing here runs anything.** A finding's `suggested_sql` gets a Copy button
-//! and an "Open as query" that pastes into an ordinary tab. `CREATE INDEX` on a
-//! large production table is a locking event; the decision belongs to the
+//! The connection health report view. Two of RED's three driver seams could already
+//! answer "what is wrong in here": Redis has the keyspace analysis panel, Mongo has
+//! `audit_collection`. The seam most people actually connect to could not. This closes
+//! that. The report hangs off the **connection**, not a query, so it is a whole-half
+//! tab body ([`TabView::Health`]) like the ER diagram rather than something in the
+//! result pane. It is persisted per connection by [`crate::health_store`], so re-
+//! opening it after a restart shows the last run with an honest "as of" line instead of
+//! a blank panel. **Nothing here runs anything.** A finding's `suggested_sql` gets a
+//! Copy button and an "Open as query" that pastes into an ordinary tab. `CREATE INDEX`
+//! on a large production table is a locking event; the decision belongs to the
 //! operator, taken through the editor where every existing guard applies.
 
 use flint::prelude::*;

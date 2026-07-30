@@ -234,7 +234,7 @@ impl AppState {
                 ignored_source.join(", ")
             ));
         }
-        self.confirm_exec = Some(PendingWrite::Copy {
+        self.confirm_exec = self.pending_confirm(PendingWrite::Copy {
             id: peek.id,
             source_epoch: peek.source_epoch,
             target: peek.target,

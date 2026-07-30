@@ -1,5 +1,5 @@
 //! The cell detail inspector: a focused, right-docked pane that shows the
-//! *whole* value under the grid cursor (Track B1). The grid intentionally
+//! *whole* value under the grid cursor. The grid intentionally
 //! truncates: fat cells arrive as [`Value::Capped`] and even resident whole cells
 //! are bounded by the driver's display cap. The inspector is where you see a long
 //! `TEXT` wrapped, a JSON document pretty-printed, or a `BLOB` as a hex dump.
@@ -166,7 +166,7 @@ pub(crate) struct InspectorState {
     full: Option<InspectedFull>,
     /// The in-flight full-fetch, if any; its reply is matched by `id`.
     pending: Option<PendingInspect>,
-    /// An open inline edit (Track B5): the value field + the cell it targets. The
+    /// An open inline edit: the value field + the cell it targets. The
     /// inspector becomes the editor: type a new value and Save. Cleared when the
     /// target cell moves off, on Save (the confirm takes over), or on Cancel.
     editing: Option<InspectorEdit>,
@@ -209,7 +209,7 @@ struct PreviewKey {
     format: ValueFormat,
 }
 
-/// An in-progress inline cell edit hosted in the inspector (Track B5). The editor
+/// An in-progress inline cell edit hosted in the inspector. The editor
 /// is a multiline [`CodeEditor`] (not a single-line field), so the value is edited
 /// *as the pane shows it*: a pretty-printed JSON document stays formatted and a long
 /// text keeps its line breaks. It's seeded with `prefill` (the displayed body), and
@@ -645,7 +645,7 @@ impl AppState {
         self.active_edit_target().is_some()
     }
 
-    /// Begin an inline edit of the focused cell in the inspector (Track B5). No-op
+    /// Begin an inline edit of the focused cell in the inspector. No-op
     /// when the cell isn't editable (read-only / not edit-enabled connection, not a
     /// single-table keyed browse, the PK column, or a blob cell; but a *large* text
     /// cell loaded in full is now editable; see [`Self::inspector_edit_context`]).
@@ -724,7 +724,7 @@ impl AppState {
     }
 
     /// Save the inline edit: coerce the typed value to the column's type and stage
-    /// it into the result's change-set (Track B6), the same set the in-grid editor
+    /// it into the result's change-set, the same set the in-grid editor
     /// feeds. A coercion failure toasts the reason and keeps the field open to fix.
     pub(crate) fn save_inspector_edit(&mut self, cx: &mut Context<Self>) {
         let Some(insp) = &self.inspector else { return };
@@ -902,7 +902,7 @@ impl AppState {
                     .on_click(cx.listener(|this, _, _, cx| this.close_inspector(cx))),
             );
 
-        // While an inline edit is open (Track B5) the body *is* the value editor and
+        // While an inline edit is open the body *is* the value editor and
         // the footer offers Save / Cancel; the inspector becomes the editor. The
         // editor inherits the body's mono typography from its container, so the value
         // is edited in the very font/size it was just shown in.

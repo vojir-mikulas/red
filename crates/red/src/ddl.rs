@@ -3,7 +3,7 @@
 //! Red could describe an object's columns long before it could show you what the
 //! object *is*. For a view or a routine that distinction is the whole object, so
 //! this fills a real hole rather than adding a convenience: the definition is the
-//! thing being browsed (see `docs/plans/todo/object-ddl-and-schema-diff.md`).
+//! thing being browsed.
 //!
 //! The driver does the engine-specific work (`DatabaseDriver::object_ddl`):
 //! `SHOW CREATE` verbatim on MySQL / SQLite / ClickHouse, a catalog assembly with
@@ -20,7 +20,7 @@
 //! ([`ObjectKind::is_replaceable`]): the edited text is the whole object, so
 //! applying it is a drop plus the user's `CREATE`, with nothing to diff and so no
 //! SQL parser involved. A table needs `ALTER` and is deliberately not editable
-//! here (see `docs/plans/todo/table-editing.md`).
+//! here.
 
 use flint::prelude::*;
 use flint::{Button, ButtonSize, ButtonVariant, ToastVariant};

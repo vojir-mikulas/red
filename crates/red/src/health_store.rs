@@ -1,20 +1,14 @@
-//! Persistence for the SQL connection health report (see
-//! `docs/plans/todo/connection-health-report.md`).
-//!
-//! Structurally a copy of `redis_analysis.rs`, and deliberately so: the two are
-//! the same object (one saved, point-in-time report per connection, revisitable
-//! after a restart) for two different seams, and the Redis one had already made
-//! every decision worth making. One report per connection, the latest run
-//! overwriting the previous, keyed by the same `conn_id` the query-history store
-//! uses.
-//!
-//! Storage mirrors `history.rs`: one JSON file, `<config>/red/health.json`,
-//! rewritten atomically (temp + rename), owner-only (`0o600`) on Unix. A missing
-//! or corrupt file is simply "no saved reports"; one bad file never blocks
-//! startup (fail-open, like the other persisted-data loaders).
-//!
-//! No history and no trend: a report is a thing you ask for, and keeping a series
-//! would make it a monitoring feature, which this deliberately is not.
+//! Persistence for the SQL connection health report. Structurally a copy of
+//! `redis_analysis.rs`, and deliberately so: the two are the same object (one saved,
+//! point-in-time report per connection, revisitable after a restart) for two different
+//! seams, and the Redis one had already made every decision worth making. One report
+//! per connection, the latest run overwriting the previous, keyed by the same `conn_id`
+//! the query-history store uses. Storage mirrors `history.rs`: one JSON file,
+//! `<config>/red/health.json`, rewritten atomically (temp + rename), owner-only
+//! (`0o600`) on Unix. A missing or corrupt file is simply "no saved reports"; one bad
+//! file never blocks startup (fail-open, like the other persisted-data loaders). No
+//! history and no trend: a report is a thing you ask for, and keeping a series would
+//! make it a monitoring feature, which this deliberately is not.
 
 use std::collections::HashMap;
 use std::path::PathBuf;

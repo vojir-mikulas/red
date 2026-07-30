@@ -83,7 +83,17 @@ pub(crate) fn numeric_to_string(raw: &[u8]) -> Option<String> {
 }
 
 /// `timestamp` micros-since-2000 → `YYYY-MM-DD HH:MM:SS[.ffffff]`.
+///
+/// Postgres encodes the two infinity sentinels as `i64::MAX` / `i64::MIN` rather
+/// than as a representable instant, so they are special-cased before the civil-date
+/// arithmetic: without this a `valid_until timestamptz DEFAULT 'infinity'` — an
+/// ordinary pattern — displayed and exported as a year-292-million date.
 pub(crate) fn timestamp_to_string(micros: i64) -> String {
+    match micros {
+        i64::MAX => return "infinity".to_string(),
+        i64::MIN => return "-infinity".to_string(),
+        _ => {}
+    }
     let days = micros.div_euclid(USECS_PER_DAY);
     let rem = micros.rem_euclid(USECS_PER_DAY);
     let (y, m, d) = civil_from_days(days + PG_EPOCH_UNIX_DAYS);
@@ -91,13 +101,23 @@ pub(crate) fn timestamp_to_string(micros: i64) -> String {
 }
 
 /// `timestamptz` is stored as UTC micros-since-2000; render with an explicit
-/// `+00` so a reader never mistakes it for a local wall-clock time.
+/// `+00` so a reader never mistakes it for a local wall-clock time. The infinity
+/// sentinels carry no zone, so they pass through as themselves.
 pub(crate) fn timestamptz_to_string(micros: i64) -> String {
+    if micros == i64::MAX || micros == i64::MIN {
+        return timestamp_to_string(micros);
+    }
     format!("{}+00", timestamp_to_string(micros))
 }
 
-/// `date` days-since-2000 → `YYYY-MM-DD`.
+/// `date` days-since-2000 → `YYYY-MM-DD`. `date` uses the 32-bit infinity
+/// sentinels; see [`timestamp_to_string`].
 pub(crate) fn date_to_string(days: i32) -> String {
+    match days {
+        i32::MAX => return "infinity".to_string(),
+        i32::MIN => return "-infinity".to_string(),
+        _ => {}
+    }
     let (y, m, d) = civil_from_days(days as i64 + PG_EPOCH_UNIX_DAYS);
     ymd(y, m, d)
 }

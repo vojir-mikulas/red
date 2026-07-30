@@ -222,7 +222,7 @@ pub enum Command {
         schema: String,
         table: String,
     },
-    /// Load the connection-wide foreign-key graph (Track B7) for FK click-through
+    /// Load the connection-wide foreign-key graph for FK click-through
     /// and inline FK column expansion. Sent once after connect; replied with
     /// `ForeignKeysLoaded`. A failure is swallowed (the feature degrades to absent),
     /// never surfaced as a toast; FK navigation is an optional enhancement.
@@ -245,13 +245,13 @@ pub enum Command {
     /// `(sort_col, pk)` keyset key (fast seek) or, failing that, wraps the base in
     /// `ORDER BY <position>` and pages by `OFFSET`. `None` is the unsorted open.
     ///
-    /// `filter` narrows the result (Track B2): the backend wraps `sql` in
+    /// `filter` narrows the result: the backend wraps `sql` in
     /// `SELECT * FROM (sql) WHERE <predicate>` *before* the count / key-bounds
     /// probe, so the total, the seek key, sort, and export all operate on the
     /// filtered set. The wrap preserves `SELECT *`, so the key column survives and
     /// keyset paging is unaffected. `None` is the unfiltered open.
     ///
-    /// `joins` (Track B7, inline FK expansion) decorates a table browse with extra,
+    /// `joins` (inline FK expansion) decorates a table browse with extra,
     /// dotted-aliased columns pulled from referenced tables: the backend wraps the
     /// (already-filtered) base in `SELECT _red_base.*, <ref cols> FROM (base) AS
     /// _red_base LEFT JOIN …` (see `DatabaseDriver::fk_join_wrap`). Base columns
@@ -309,7 +309,7 @@ pub enum Command {
     CloseResult {
         epoch: Epoch,
     },
-    /// One page of a Redis keyspace scan (see docs/plans/redis.md's R1):
+    /// One page of a Redis keyspace scan:
     /// `SCAN` (looping, budgeted, optionally `MATCH`-filtered on `pattern` and
     /// `TYPE`-filtered on `type_filter`, a type label like `"hash"`) plus a
     /// pipelined metadata fetch, via the session's `KvDriver`. Stateless like
@@ -335,7 +335,7 @@ pub enum Command {
         cursor: ScanCursor,
         budget: ScanBudget,
     },
-    /// Exact-key jump (see docs/plans/redis.md): resolve one key's metadata
+    /// Exact-key jump: resolve one key's metadata
     /// directly, bypassing `SCAN`. Replied with `KvKeyProbed` carrying
     /// `None` when the key doesn't exist — that's a normal outcome, not an
     /// `Event::Error`.
@@ -370,7 +370,7 @@ pub enum Command {
         key: String,
     },
     /// One page of a big hash/set/zset's elements, for the inspector's
-    /// big-collection sub-grid (see docs/plans/redis.md). Stateless like
+    /// big-collection sub-grid. Stateless like
     /// `KvFetchScan`: `cursor` is the caller-supplied `next_cursor` from the
     /// previous `KvCollectionPageReady`. Replied with `KvCollectionPageReady`.
     KvReadCollectionPage {
@@ -390,7 +390,7 @@ pub enum Command {
         count: usize,
     },
     /// One page of a big stream's entries, newest-first, for the inspector's
-    /// stream view (see docs/plans/redis.md's R4). Streams have no `*SCAN`
+    /// stream view. Streams have no `*SCAN`
     /// cursor, so unlike `KvReadCollectionPage` this pages by entry-ID range:
     /// `before` is the previous `KvStreamPageReady`'s `next_before` (the oldest
     /// ID loaded so far), or `None` to start at the newest entry. Replied with
@@ -401,11 +401,10 @@ pub enum Command {
         before: Option<String>,
         count: usize,
     },
-    /// A stream's consumer groups (`XINFO GROUPS`), for the inspector's
-    /// consumer-group management view (see docs/plans/redis.md's "stream
-    /// consumer-group management" gap). `epoch` scopes cancellation like the
-    /// other inspector reads; the reply's staleness is checked UI-side by
-    /// `key`. Replied with `KvStreamGroupsReady`.
+    /// A stream's consumer groups (`XINFO GROUPS`), for the inspector's consumer-group
+    /// management view. `epoch` scopes cancellation like the other inspector reads; the
+    /// reply's staleness is checked UI-side by `key`. Replied with
+    /// `KvStreamGroupsReady`.
     KvStreamGroups {
         epoch: Epoch,
         key: String,
@@ -437,12 +436,11 @@ pub enum Command {
         group: String,
         action: KvStreamActionReq,
     },
-    /// Run an arbitrary command through the console (see
-    /// docs/plans/redis.md). `epoch` scopes cancellation only; console
-    /// history is UI-side. A server-reported command error (WRONGTYPE, a
-    /// bad arity, ...) is normal console output via `KvCommandResult`'s
-    /// `RespValue::Error`, not `Event::Error` — that's reserved for a
-    /// genuine transport/connection failure or the read-only gate.
+    /// Run an arbitrary command through the console. `epoch` scopes cancellation only;
+    /// console history is UI-side. A server-reported command error (WRONGTYPE, a bad
+    /// arity, ...) is normal console output via `KvCommandResult`'s `RespValue::Error`,
+    /// not `Event::Error` — that's reserved for a genuine transport/connection failure
+    /// or the read-only gate.
     KvCommand {
         epoch: Epoch,
         argv: Vec<String>,
@@ -506,18 +504,16 @@ pub enum Command {
         keys: Vec<String>,
         target_session: SessionId,
     },
-    /// Start a live Pub/Sub pattern subscription (see docs/plans/redis.md's
-    /// R4). `epoch` identifies this subscription; messages stream back as
-    /// `KvMessage` until `CloseResult { epoch }` stops it (the same generic
-    /// epoch-scoped teardown every other open Kv/SQL thing uses — see that
+    /// Start a live Pub/Sub pattern subscription. `epoch` identifies this subscription;
+    /// messages stream back as `KvMessage` until `CloseResult { epoch }` stops it (the
+    /// same generic epoch-scoped teardown every other open Kv/SQL thing uses — see that
     /// command's doc comment).
     KvSubscribe {
         epoch: Epoch,
         pattern: String,
     },
     /// Read the server's `notify-keyspace-events` setting, for the keyspace-
-    /// notification watcher (see docs/plans/redis.md's "keyspace-notification
-    /// live tooling" gap). Replied with `KvNotifyConfigReady`.
+    /// notification watcher. Replied with `KvNotifyConfigReady`.
     KvNotifyConfig {
         epoch: Epoch,
     },
@@ -529,8 +525,8 @@ pub enum Command {
         epoch: Epoch,
         flags: String,
     },
-    /// Fetch the server's slow-command log (see docs/plans/redis.md's "slowlog
-    /// viewer" gap). `epoch` scopes cancellation; replied with `KvSlowlogReady`.
+    /// Fetch the server's slow-command log. `epoch` scopes cancellation; replied with
+    /// `KvSlowlogReady`.
     KvSlowlog {
         epoch: Epoch,
         count: usize,
@@ -542,15 +538,14 @@ pub enum Command {
     KvSlowlogReset {
         epoch: Epoch,
     },
-    /// Start a live `MONITOR` firehose (see docs/plans/redis.md's "MONITOR-based
-    /// live command profiler" gap). Like `KvSubscribe`, `epoch` identifies the
+    /// Start a live `MONITOR` firehose. Like `KvSubscribe`, `epoch` identifies the
     /// stream and lines push back as `KvMonitorLine` until `CloseResult { epoch }`
     /// tears it down.
     KvMonitor {
         epoch: Epoch,
     },
     /// Fetch the connected clients (`CLIENT LIST`) for the diagnostics panel's
-    /// clients viewer (see docs/plans/redis.md's "CLIENT LIST viewer" gap).
+    /// clients viewer.
     /// Replied with `KvClientListReady`.
     KvClientList {
         epoch: Epoch,
@@ -563,10 +558,9 @@ pub enum Command {
         epoch: Epoch,
         id: i64,
     },
-    /// List the databases on a MongoDB deployment (`listDatabases`), the top of
-    /// the document browser's `db -> collection` tree (see
-    /// docs/plans/todo/doc-driver.md). Replied with `DocDatabases`; failures
-    /// surface as `DocError`. Rejected on a non-document session.
+    /// List the databases on a MongoDB deployment (`listDatabases`), the top of the
+    /// document browser's `db -> collection` tree. Replied with `DocDatabases`;
+    /// failures surface as `DocError`. Rejected on a non-document session.
     DocListDatabases {
         epoch: Epoch,
     },
@@ -607,15 +601,20 @@ pub enum Command {
         db: String,
         coll: String,
     },
-    /// Run a read-only aggregation `pipeline` (extended-JSON array of stages) into
-    /// the grid — the Query panel's run. Parse/run failures reply `DocError`;
-    /// success replies `DocAggregateReady`. Cancellable/epoch-superseded like a
-    /// page fetch.
+    /// Run an aggregation `pipeline` (extended-JSON array of stages) into the grid
+    /// — the Query panel's run. Parse/run failures reply `DocError`; success replies
+    /// `DocAggregateReady`. Cancellable/epoch-superseded like a page fetch.
+    ///
+    /// Usually a read, but `$out`/`$merge` write, and `$out` *replaces the target
+    /// collection outright*. With `confirmed: false` such a pipeline is not run: the
+    /// service replies `DocPipelineConfirm` and the UI must re-send with `true`,
+    /// the same host-side dance `DocApplyWrite` uses for a drop.
     DocAggregate {
         epoch: Epoch,
         db: String,
         coll: String,
         pipeline: String,
+        confirmed: bool,
     },
     /// `explain` the current find `filter` (extended-JSON, `None` = match all),
     /// for the Documents panel's plan readout. Replied with `DocPlanReady`, or
@@ -706,7 +705,7 @@ pub enum Command {
         token: u64,
     },
     /// Fetch a bounded list of a referenced table's existing ids (+ an optional label
-    /// column) for the in-cell foreign-key picker (Track B8). `epoch` scopes the reply
+    /// column) for the in-cell foreign-key picker. `epoch` scopes the reply
     /// to the still-open result; `target`/`id_column`/`label_column` name the referenced
     /// table and columns (resolved UI-side from the FK graph). Replied with `LookupReady`
     /// (or the pane-scoped `LookupFailed`), keyed by `target` so a result with several FK
@@ -719,7 +718,7 @@ pub enum Command {
         label_column: Option<String>,
         limit: usize,
     },
-    /// Load the enum-typed columns of `table` and their allowed values (Track B8: the
+    /// Load the enum-typed columns of `table` and their allowed values (the
     /// in-cell enum picker), replied with `EnumsLoaded`. Requested lazily the first time
     /// an editable table's cell is edited; the UI caches the result per table. Empty on
     /// engines without enums. Idempotent and cheap (one catalog query).
@@ -739,7 +738,7 @@ pub enum Command {
         /// 1046 while the `SELECT` beside it works.
         namespace: Option<String>,
     },
-    /// Apply a batch of guarded, identity-keyed data edits (Track B6) on the active
+    /// Apply a batch of guarded, identity-keyed data edits on the active
     /// session. The driver renders each `op` to dialect SQL and binds every value;
     /// `mode` picks which contract it runs under (see [`BatchMode`]), because the two
     /// are different promises rather than a strictness dial.
@@ -781,7 +780,7 @@ pub enum Command {
         ops: Vec<EditOp>,
     },
     /// Run `EXPLAIN` (or `EXPLAIN ANALYZE` when `analyze`) for `sql` and report a
-    /// normalized plan (Track B4). `epoch` is the active tab's result epoch so a
+    /// normalized plan. `epoch` is the active tab's result epoch so a
     /// stale reply (tab switched / query re-run) is dropped. Plain explain never
     /// executes the statement; `analyze` does (the UI gates it to read queries).
     Explain {
@@ -867,7 +866,7 @@ pub enum Command {
         id: OpId,
     },
     /// Compare two tables by a shared key and report which rows are added /
-    /// removed / changed (see docs/plans/todo/data-diff.md). The envelope's
+    /// removed / changed. The envelope's
     /// [`SessionId`] is the **left** connection; `right_session` is where `right`
     /// lives (equal to the left for a same-connection diff, another open
     /// connection for a cross-connection one). Both ends are pinned for the diff's
@@ -961,7 +960,7 @@ pub enum Command {
     /// row-capped) and streams `AiDelta` events, ending with `AiTurnFinished` or
     /// `AiError`. `conversation_id` lets the UI route deltas to the right thread
     /// and cancel a specific turn. `agent` is the id of the agent profile *this*
-    /// conversation is bound to (M-S6); turns carry it so several chats on
+    /// conversation is bound to; turns carry it so several chats on
     /// different agents (API-key, subscription, Codex, local) can run concurrently,
     /// rather than every turn following one global provider. An empty or unknown id
     /// resolves to the default agent / a clear `AiError`.
@@ -1001,7 +1000,7 @@ pub enum Command {
     AiForget {
         conversation_id: ConversationId,
     },
-    /// Answer a pending agent tool-permission prompt (M-S2, subscription path).
+    /// Answer a pending agent tool-permission prompt (subscription path).
     /// `allow` runs the tool; otherwise it's denied. Routed to the parked request
     /// by `request_id` so a stale answer for a superseded prompt is dropped.
     AiPermission {
@@ -1214,7 +1213,7 @@ pub enum Event {
         table: String,
         detail: TableDetail,
     },
-    /// The connection-wide foreign-key graph (Track B7), in response to
+    /// The connection-wide foreign-key graph, in response to
     /// `LoadForeignKeys`. Cached on the connected session for click-through.
     ForeignKeysLoaded {
         graph: Vec<FkEdge>,
@@ -1331,6 +1330,10 @@ pub enum Event {
         ok: usize,
         failed: usize,
         first_error: Option<String>,
+        /// Whether the run was stopped before reaching the end of the file, so the
+        /// UI can say "stopped after N" rather than reporting a partial import as a
+        /// finished one. Mirrors `KvBatchDone { aborted }`.
+        aborted: bool,
     },
     /// One command in a `KvBatch` completed. `req` (= the batch's `req_base` +
     /// this command's index) matches the pre-seeded console entry to fill in;
@@ -1483,6 +1486,14 @@ pub enum Event {
         epoch: Epoch,
         summary: String,
     },
+    /// A `DocAggregate` whose pipeline ends in a write stage needs confirmation
+    /// before it runs. Carries the original `pipeline` back so the UI can re-send it
+    /// with `confirmed: true`, plus a `prompt` naming what it will overwrite.
+    DocPipelineConfirm {
+        epoch: Epoch,
+        pipeline: String,
+        prompt: String,
+    },
     /// A destructive `DocApplyWrite` needs confirmation before it runs. Carries
     /// the original `write` back so the UI can re-send it with `confirmed: true`,
     /// plus a `prompt` describing what will happen.
@@ -1610,7 +1621,7 @@ pub enum Event {
         statements: usize,
         affected: usize,
     },
-    /// A guarded edit batch (Track B6) committed on its result's session. Echoes
+    /// A guarded edit batch committed on its result's session. Echoes
     /// `epoch` so the UI patches/refetches the right result (and drops a reply for a
     /// superseded one). `applied` is the total ops committed.
     BatchApplied {
@@ -1811,7 +1822,7 @@ pub enum Event {
         conversation_id: ConversationId,
         message: String,
     },
-    /// The subscription agent wants to run a tool RED didn't auto-allow (M-S2):
+    /// The subscription agent wants to run a tool RED didn't auto-allow:
     /// the panel shows a confirm prompt and answers with `Command::AiPermission`.
     /// `title` is what the agent intends to do; `detail` is a compact rendering of
     /// the tool's input, if any. Scoped to its conversation, shown inline.
@@ -1954,14 +1965,14 @@ pub struct AiConfig {
     pub default_agent: String,
     /// Surface a summarized "thinking…" affordance (adaptive thinking).
     pub show_thinking: bool,
-    /// The global AI master switch (`[ai] enabled`, M-S7). When `false`, the
+    /// The global AI master switch (`[ai] enabled`). When `false`, the
     /// service refuses turns and never starts an MCP server or agent: a true kill
     /// switch. A connection's `ai_enabled` override can flip it per session.
     pub enabled: bool,
-    /// The global access tier (`[ai] tier`, M-S7) deciding which DB tools the model
+    /// The global access tier (`[ai] tier`) deciding which DB tools the model
     /// is offered. A connection's `ai_tier` override can tighten it per session.
     pub tier: AiTier,
-    /// The global resource guards (`[ai.limits]`, M-S7): row cap, statement
+    /// The global resource guards (`[ai.limits]`): row cap, statement
     /// timeout, result byte cap, and per-conversation tool-call budget.
     pub limits: AiLimits,
 }
@@ -1986,7 +1997,7 @@ pub struct AiContext {
     pub last_error: Option<String>,
     /// A textual snapshot of the selected rows, if any.
     pub selection: Option<String>,
-    /// A rendered digest of an earlier, persisted conversation (M-S5), set only on
+    /// A rendered digest of an earlier, persisted conversation, set only on
     /// the first turn after a saved chat is reopened. The backend starts a fresh
     /// session (the agent/history isn't restored), so this folds the prior exchange
     /// back into the prompt as context; the conversation continues coherently

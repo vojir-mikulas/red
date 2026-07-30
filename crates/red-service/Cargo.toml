@@ -27,7 +27,7 @@ hyper-util.workspace = true
 http-body-util.workspace = true
 bytes.workspace = true
 uuid.workspace = true
-# Resolve the user config dir for the AI write-audit log (Feature B).
+# Resolve the user config dir for the AI write-audit log .
 dirs.workspace = true
 
 [dev-dependencies]

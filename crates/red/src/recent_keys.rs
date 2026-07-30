@@ -1,13 +1,11 @@
-//! Persistence for the Redis inspector's "recently viewed keys" list (see
-//! docs/plans/redis-workflow-parity.md Part 2). The History dock's Keys section
-//! reads it, and — unlike the in-memory-only first cut — it survives a restart
-//! so the browsing history a user builds up isn't lost when they reconnect.
-//!
-//! Storage mirrors `redis_analysis.rs`: one JSON file,
-//! `<config>/red/redis-recent-keys.json`, rewritten atomically (temp + rename),
-//! owner-only (`0o600`) on Unix, keyed by the same `conn_id` the query-history
-//! and analysis stores use. A missing or corrupt file is simply "no history";
-//! one bad file never blocks startup (fail-open, like the other loaders).
+//! Persistence for the Redis inspector's "recently viewed keys" list. The History
+//! dock's Keys section reads it, and — unlike the in-memory-only first cut — it
+//! survives a restart so the browsing history a user builds up isn't lost when they
+//! reconnect. Storage mirrors `redis_analysis.rs`: one JSON file, `<config>/red/redis-
+//! recent-keys.json`, rewritten atomically (temp + rename), owner-only (`0o600`) on
+//! Unix, keyed by the same `conn_id` the query-history and analysis stores use. A
+//! missing or corrupt file is simply "no history"; one bad file never blocks startup
+//! (fail-open, like the other loaders).
 
 use std::collections::HashMap;
 use std::path::PathBuf;

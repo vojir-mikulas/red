@@ -1,4 +1,4 @@
-//! Conversation history: persisted AI chats, one JSON file per conversation (M-S5).
+//! Conversation history: persisted AI chats, one JSON file per conversation.
 //!
 //! The assistant panel streams an ephemeral transcript; saved conversations are
 //! what the user keeps. Each lives as one file under
@@ -47,7 +47,7 @@ pub(crate) struct Conversation {
     /// Display title, derived from the first user message at save time.
     pub title: String,
     /// Which backend produced it (`"subscription"`, `"anthropic"`, …), recorded
-    /// for display and for a future per-chat binding (M-S6). Informational in M-S5,
+    /// for display and for a future per-chat binding. Informational for now,
     /// where a single active chat runs on the current `[ai] provider`.
     pub provider: String,
     /// Unix seconds when first saved.

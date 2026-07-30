@@ -25,7 +25,7 @@ use super::*;
 ///
 /// Inserts **commit per chunk** (v1), so the returned committed count is meaningful
 /// even on error/cancel: a mid-file failure leaves earlier chunks committed (atomic
-/// whole-file import is a future option; see `docs/plans/data-import.md`). `cancel`
+/// whole-file import is a future option). `cancel`
 /// is checked between rows. Returns `(rows committed, error-or-None)`.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn run_import_blocking(
@@ -563,22 +563,26 @@ fn is_text_decl(ty: Option<&str>) -> bool {
     let Some(t) = ty.map(str::to_ascii_lowercase) else {
         return false;
     };
-    matches!(t.as_str(), "name" | "citext" | "clob")
+    // `citext` is deliberately absent. It is a text type, but Postgres declares it
+    // `COLLATABLE = false`, so the `COLLATE "C"` this flag turns on is rejected
+    // outright ("collations are not supported by type citext") and the diff fails at
+    // `open_cursor`. Its own comparisons are case-insensitive anyway, so no
+    // collation decoration would give the merge-walk what it wants; ordering it
+    // undecorated is the best available answer rather than erroring.
+    matches!(t.as_str(), "name" | "clob")
         || t.contains("char")
         || t.contains("text")
         || t.contains("string")
 }
 
-/// Compare two tables by a shared key: read both sides key-ordered at full fidelity
-/// and merge-walk them, classifying each row as added / removed / changed (see
-/// docs/plans/todo/data-diff.md). The structural counterpart to [`copy_job`] — same
-/// two-cursor read seam and bounded windows, but instead of writing the source into
-/// the target it aligns the two streams and records their differences.
-///
-/// Columns are aligned by name (case-insensitive): the compared set is those present
-/// on both sides (in the left table's order); columns on only one side are reported
-/// but never compared. `key` must be a compared column. Both cursors open full
-/// fidelity so a long TEXT/blob compares byte-exact (a `Value::Capped` would never
+/// Compare two tables by a shared key: read both sides key-ordered at full fidelity and
+/// merge-walk them, classifying each row as added / removed / changed. The structural
+/// counterpart to [`copy_job`] — same two-cursor read seam and bounded windows, but
+/// instead of writing the source into the target it aligns the two streams and records
+/// their differences. Columns are aligned by name (case-insensitive): the compared set
+/// is those present on both sides (in the left table's order); columns on only one side
+/// are reported but never compared. `key` must be a compared column. Both cursors open
+/// full fidelity so a long TEXT/blob compares byte-exact (a `Value::Capped` would never
 /// equal the whole cell it was truncated from, reading every long cell as "changed").
 /// One window per side is resident, so memory is bounded by the window + the diff-row
 /// cap, never by table size. `cancel` is checked between windows.

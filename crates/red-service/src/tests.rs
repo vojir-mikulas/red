@@ -425,7 +425,7 @@ async fn loads_and_describes_schema() {
 }
 
 /// Explain a query: the `Explain` command replies with a `PlanReady` carrying a
-/// non-empty plan and echoing the request epoch (Track B4). A bad statement comes
+/// non-empty plan and echoing the request epoch. A bad statement comes
 /// back as a pane-local `PlanFailed`, not a global `Error`.
 #[tokio::test]
 async fn explains_a_query() {
@@ -473,7 +473,7 @@ async fn explains_a_query() {
     }
 }
 
-/// Apply a guarded edit batch (Track B6): `ApplyBatch` on a writable session replies
+/// Apply a guarded edit batch: `ApplyBatch` on a writable session replies
 /// `BatchApplied` echoing the result epoch, and a batch whose op matches no row comes
 /// back as a pane-local `BatchFailed`, not a global `Error`.
 ///
@@ -904,7 +904,7 @@ async fn sql_review_declines_when_no_agent_is_configured() {
     send(&handle, Command::Shutdown);
 }
 
-/// Inline FK expansion (Track B7): an `OpenResult` carrying a `LEFT JOIN` spec
+/// Inline FK expansion: an `OpenResult` carrying a `LEFT JOIN` spec
 /// decorates a table browse with the referenced table's columns, reported *inline,
 /// right after the FK column they expand from*, without changing the row count (the
 /// orphan-FK row survives with NULL joined cells) or the keyset key. `channel`'s FK
@@ -1011,7 +1011,7 @@ async fn fk_join_expands_referenced_columns_inline() {
     std::fs::remove_file(&path).ok();
 }
 
-/// A `WHERE` filter on an inline-expanded FK column (Track B7): the join runs
+/// A `WHERE` filter on an inline-expanded FK column: the join runs
 /// *before* the filter, so a predicate can reference the joined dotted-alias column
 /// (`"tier_id.name"`), and the total / rows narrow to the matching referenced rows
 /// while the base PK stays the seek key.

@@ -34,8 +34,8 @@ pub(crate) enum Forward {
 }
 
 /// A session's driver: the SQL-shaped `DatabaseDriver` seam, the Redis-shaped
-/// `KvDriver` seam (`docs/plans/redis.md`), or the document-shaped `DocDriver`
-/// seam (MongoDB; `docs/plans/todo/doc-driver.md`). Every SQL command handler
+/// `KvDriver` seam, or the document-shaped `DocDriver`
+/// seam (MongoDB). Every SQL command handler
 /// needs the first and has no meaning for the others, so [`SessionDriver::as_sql`]
 /// is how those handlers reject a non-SQL session with a clean `Event::Error`
 /// instead of a type error or a silent no-op.
@@ -59,7 +59,7 @@ impl SessionDriver {
     }
 
     /// Borrow the KV driver, or `None` on a non-KV session. Used by the `Kv*`
-    /// command handlers (see docs/plans/redis.md) to reject a mismatched session.
+    /// command handlers to reject a mismatched session.
     #[allow(dead_code)]
     pub(crate) fn as_kv(&self) -> Option<&Arc<dyn KvDriver>> {
         match self {
@@ -69,7 +69,7 @@ impl SessionDriver {
     }
 
     /// Borrow the document driver, or `None` on a non-document session. Used by
-    /// the `Doc*` command handlers (see docs/plans/todo/doc-driver.md) to reject a
+    /// the `Doc*` command handlers to reject a
     /// mismatched session, the same way `as_sql`/`as_kv` do.
     #[allow(dead_code)]
     pub(crate) fn as_doc(&self) -> Option<&Arc<dyn DocDriver>> {
@@ -147,6 +147,14 @@ pub(crate) enum Slot {
     /// The latest value-inspector read (`KvReadValue` / `KvReadListWindow` /
     /// `KvReadStringFull`): opening a new key supersedes the prior fetch.
     KvValue,
+    /// A running `KvImport` (the "Import keys…" modal).
+    ///
+    /// Its own slot rather than sharing [`Slot::KvValue`] with the batch console
+    /// and every inspector value read on the same epoch: sharing meant an ordinary
+    /// value read could silently abort a 500k-command import mid-file, and only the
+    /// blocking modal made that rare rather than routine. The `Slot` enum exists
+    /// precisely to keep sibling operations from cancelling each other.
+    KvImport,
     /// The latest `KvReadCollectionPage` (the inspector's big-collection
     /// sub-grid). Kept apart from [`Slot::KvValue`] so a sibling value read
     /// (e.g. re-selecting the key) can't abort an in-progress page scan and
@@ -245,7 +253,7 @@ pub(crate) struct SessionState {
     /// engine-dependent) would otherwise have to be told by the UI, which is a
     /// second source of truth for something the session already knows.
     pub(crate) kind: red_core::DbKind,
-    /// This connection's optional AI policy overrides (M-S7), captured at connect
+    /// This connection's optional AI policy overrides, captured at connect
     /// from its [`ConnectionConfig`](red_core::ConnectionConfig). Layered over the
     /// global `[ai]` policy when a turn runs on this session, so a sensitive
     /// connection can disable the assistant or pin its tier without touching the
@@ -306,7 +314,7 @@ impl Drop for PinGuard {
     }
 }
 
-/// A connection's optional AI policy overrides (M-S7), carried from its
+/// A connection's optional AI policy overrides, carried from its
 /// [`ConnectionConfig`](red_core::ConnectionConfig) to the session so a turn can
 /// resolve the effective policy. `None` fields inherit the global `[ai]` policy.
 #[derive(Clone, Copy, Default)]
@@ -404,7 +412,7 @@ pub(crate) enum ConnectOutcome {
     Session {
         id: SessionId,
         generation: u64,
-        /// The connection's AI policy overrides (M-S7), captured at connect so the
+        /// The connection's AI policy overrides, captured at connect so the
         /// resulting session carries them.
         ai_override: AiOverride,
         /// The connection's read-only posture, captured at connect for the AI policy.

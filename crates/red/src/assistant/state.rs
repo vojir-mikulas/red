@@ -41,7 +41,7 @@ const REVEAL_MIN_STEP: usize = 2;
 const SELECTABLE_BUBBLE_WINDOW: usize = 60;
 
 impl AppState {
-    /// Whether the AI assistant is enabled for the current context (M-S7): the
+    /// Whether the AI assistant is enabled for the current context: the
     /// active connection's `ai_enabled` override, falling back to the global
     /// `[ai] enabled`. `false` is a true kill switch: the panel can't be opened,
     /// its status-bar toggle is hidden, and the backend refuses turns and starts
@@ -55,7 +55,7 @@ impl AppState {
         }
     }
 
-    /// The AI access tier in effect for the current context (Feature B): the active
+    /// The AI access tier in effect for the current context: the active
     /// connection's `ai_tier` override, falling back to the global `[ai] tier`.
     /// Drives the "writes" safety badge; `Write` means the agent can propose
     /// data changes (each one still gated by per-statement approval).
@@ -90,7 +90,7 @@ impl AppState {
     }
 
     /// Open or close the assistant panel (⌘L). Only meaningful while connected and
-    /// while the assistant is enabled for this connection (M-S7).
+    /// while the assistant is enabled for this connection.
     pub(crate) fn toggle_assistant(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !matches!(self.phase, Phase::Connected(_)) || !self.ai_enabled() {
             return;
@@ -354,7 +354,7 @@ impl AppState {
         self.send_turn(message, cx);
     }
 
-    /// A one-tap context action (M-S4): "Explain error" / "Optimize query". Each is
+    /// A one-tap context action: "Explain error" / "Optimize query". Each is
     /// just a canned prompt; `ai_context` already folds in the live error / editor
     /// SQL, so the turn is grounded without the user retyping it. Shared by both
     /// providers (it rides the same `AiTurn` path).
@@ -377,7 +377,7 @@ impl AppState {
 
     /// The shared turn-dispatch core: record the user message on whichever chat owns
     /// `conversation_id` (sidebar *or* agent tab), then send `Command::AiTurn`. The
-    /// chat's own agent binding (M-S6) decides which backend runs it, so concurrent
+    /// chat's own agent binding decides which backend runs it, so concurrent
     /// chats on different agents each route correctly.
     fn dispatch_turn(
         &mut self,
@@ -401,7 +401,7 @@ impl AppState {
                     return false;
                 }
                 // A reopened chat seeds its prior transcript into this one turn so
-                // the model resumes coherently despite a fresh session (M-S5).
+                // the model resumes coherently despite a fresh session.
                 context.prior_transcript = chat.pending_seed.take();
                 // Title the chat from its first user message (used as the saved name).
                 if chat.title.is_none() {
@@ -455,7 +455,7 @@ impl AppState {
             .map(f)
     }
 
-    // --- conversation history (M-S5) ---------------------------------------
+    // --- conversation history ---------------------------------------
 
     /// Save the active chat's composer text into it, but only while it's the one
     /// editable draft (nothing sent yet). This is what lets the draft keep its
@@ -606,7 +606,7 @@ impl AppState {
         conversation_id: red_service::ConversationId,
         cx: &mut Context<Self>,
     ) {
-        // Tell the backend to drop this conversation's history/agent (M-S5) so its
+        // Tell the backend to drop this conversation's history/agent so its
         // state doesn't linger for the whole session. Session-less: it's keyed by
         // conversation_id on the shared AI state, and works even while disconnected.
         self.service
@@ -614,6 +614,23 @@ impl AppState {
         // Mint a replacement id up front to avoid borrowing `self` twice.
         let replacement_id = red_service::ConversationId::new(self.next_conversation_id);
         let replacement_provider = self.default_ai_provider();
+        // A chat closed with an Allow/Deny prompt on screen has to answer it, the way
+        // the finished and errored paths do. Closing without an answer strands the
+        // agent's decision sink, and enough of those in one run exhaust the pending
+        // cap — after which every later approval is auto-denied with no prompt at all.
+        let stranded = self
+            .assistant
+            .as_mut()
+            .and_then(|s| {
+                s.chats
+                    .iter_mut()
+                    .find(|c| c.conversation_id == conversation_id)
+            })
+            .and_then(|c| c.pending_permission.take())
+            .map(|p| p.request_id);
+        if let Some(request_id) = stranded {
+            self.deny_stranded_permission(conversation_id, request_id);
+        }
         if let Some(state) = self.assistant.as_mut() {
             let Some(idx) = state
                 .chats
@@ -642,7 +659,7 @@ impl AppState {
 
     /// Set the active chat's provider, but only before its first message; the
     /// binding is locked once a turn is sent (a backend conversation is bound to
-    /// it). Drives the empty-chat provider picker (M-S6).
+    /// it). Drives the empty-chat provider picker.
     pub(crate) fn set_active_chat_provider(&mut self, provider: String, cx: &mut Context<Self>) {
         let mut picked = None;
         if let Some(state) = self.assistant.as_mut() {
@@ -962,7 +979,7 @@ impl AppState {
         cx.notify();
     }
 
-    /// Store the agent's advertised slash commands on their chat (M-S4). Refreshes
+    /// Store the agent's advertised slash commands on their chat. Refreshes
     /// the composer's command mirror if it's the active chat, so `/` offers them.
     pub(crate) fn on_ai_commands_available(
         &mut self,
@@ -1297,7 +1314,7 @@ impl AppState {
         let reduce_motion = cx.reduce_motion();
         // Route to whichever chat owns the turn, not just the active one, and
         // across both surfaces (sidebar + agent tabs), so a background chat keeps
-        // streaming while another is shown (M-S6).
+        // streaming while another is shown.
         let grew_text = self.with_chat_mut(conversation_id, |chat| {
             let mut grew = false;
             match delta {
@@ -1462,7 +1479,7 @@ impl AppState {
             for m in &mut chat.messages {
                 settle_running_nodes(&mut m.activity);
             }
-            // Persist the now-complete exchange so it survives a restart (M-S5).
+            // Persist the now-complete exchange so it survives a restart.
             persist_chat(chat);
             follow_if_at_bottom(chat);
             stranded
@@ -1511,7 +1528,7 @@ impl AppState {
         }
     }
 
-    /// The agent asked to run a tool RED didn't auto-allow (M-S2): show the prompt
+    /// The agent asked to run a tool RED didn't auto-allow: show the prompt
     /// on its originating chat (the switcher flags a background one).
     pub(crate) fn on_ai_permission_request(
         &mut self,

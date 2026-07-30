@@ -1,10 +1,9 @@
-//! Shared support types for the root app state (`crate::app`).
-//!
-//! Extracted from `app/mod.rs` per docs/plans/guidelines-conformance.md (Workstream
-//! D): the ~35 `Phase`/`FormState`/`QueryTab`/`ActiveConn`/notification/pending-write
-//! value types and their inherent impls live here, so `mod.rs` keeps just `AppState`
-//! and the core state machine. Re-exported unchanged via `pub(crate) use types::*`,
-//! so every existing `crate::app::Foo` path is unmoved.
+//! Shared support types for the root app state (`crate::app`). Extracted from
+//! `app/mod.rs` to keep that file to the state machine itself: the ~35
+//! `Phase`/`FormState`/`QueryTab`/`ActiveConn`/notification/pending-write value types
+//! and their inherent impls live here, so `mod.rs` keeps just `AppState` and the core
+//! state machine. Re-exported unchanged via `pub(crate) use types::*`, so every
+//! existing `crate::app::Foo` path is unmoved.
 
 use std::time::Duration;
 
@@ -718,8 +717,8 @@ pub(crate) struct FormState {
     /// confirmations are. The form offers a suggestion from the host and name but
     /// never applies one on its own; see [`ConnEnv::suggest`].
     pub env: ConnEnv,
-    /// Encrypt the connection with TLS (see `docs/plans/redis.md`'s TLS toggle
-    /// item). Off by default; only offered for network engines.
+    /// Encrypt the connection with TLS. Off by default; only offered for network
+    /// engines.
     pub tls: bool,
     /// `Some(index)` when editing an existing connection, `None` when adding.
     pub editing: Option<usize>,
@@ -739,7 +738,7 @@ pub(crate) struct FormState {
     pub proxy_enabled: bool,
     /// Which proxy protocol the form has selected (SOCKS5 / HTTP CONNECT).
     pub proxy_kind: ProxyKind,
-    /// Opt this connection into the AI **write** tier (Feature B): the assistant may
+    /// Opt this connection into the AI **write** tier: the assistant may
     /// propose INSERT/UPDATE/DELETE, each gated by per-statement approval. Off by
     /// default; ignored on a read-only connection. Maps to `ai_tier = "write"`.
     pub ai_allow_writes: bool,
@@ -892,7 +891,21 @@ impl ConfirmInput {
     }
 }
 
-/// A write awaiting the confirm modal (Track B5 generalized the destructive-confirm
+/// A [`PendingWrite`] together with the connection it belongs to.
+///
+/// The session is stamped when the confirm is *raised*, and the write is sent to
+/// that session on confirm — never to whichever connection happens to be foreground
+/// when the button is clicked. ⌘P / ⌘⇧P / ⌘1-9 are deliberate root-level globals, so
+/// the connection can change while the modal is open; before this, confirming a
+/// `DROP TABLE` staged on connection A after switching to B ran the `DROP` on **B**,
+/// with B's namespace.
+#[derive(Clone)]
+pub(crate) struct PendingConfirm {
+    pub(crate) session: SessionId,
+    pub(crate) write: PendingWrite,
+}
+
+/// A write awaiting the confirm modal (generalized the destructive-confirm
 /// path to carry either). Confirming runs it; cancelling drops it.
 #[derive(Clone)]
 pub(crate) enum PendingWrite {
@@ -904,7 +917,7 @@ pub(crate) enum PendingWrite {
         sql: String,
         assessment: red_core::sql::Assessment,
     },
-    /// A staged grid edit batch (Track B6): the previewed, parameterized
+    /// A staged grid edit batch: the previewed, parameterized
     /// [`EditOp`]s sent as one `Command::ApplyBatch` on confirm. `epoch` scopes the
     /// reply to its result.
     Batch {
@@ -1029,7 +1042,7 @@ pub(crate) struct PendingCopyNewTable {
     pub schema: String,
 }
 
-/// The editable grid cell under the cursor (Track B6): its row's identity values,
+/// The editable grid cell under the cursor: its row's identity values,
 /// position (absolute row, data column), and the focused column's declared type /
 /// current value. Built by [`ResultGrid::edit_target`] and consumed by the inline
 /// editor + the inspector edit, which coerce a typed value against `decl_type` and
@@ -1055,7 +1068,7 @@ pub(crate) struct EditContext {
 }
 
 /// The referenced-table target for editing an inline-expanded foreign-key column
-/// (Track B7). A joined column shows a value from a *referenced* table, so writing
+///. A joined column shows a value from a *referenced* table, so writing
 /// it back is an `UPDATE <ref> SET <col> = ? WHERE <ref key> = <fk value>`, a
 /// different table and row than the base browse's PK edit. Resolved single-hop only
 /// (the referenced row is identified by the FK value resident in the base row);
@@ -1237,7 +1250,7 @@ pub(crate) struct QueryTab {
     pub editor: Entity<CodeEditor>,
     /// The open result browsed in the grid: a table preview or an editor run.
     pub result: Option<ResultGrid>,
-    /// The query plan (Track B4, EXPLAIN), when one is open. Occupies the result
+    /// The query plan (EXPLAIN), when one is open. Occupies the result
     /// pane in place of the grid; running a query clears it. `None` is the grid.
     pub plan: Option<crate::plan::PlanView>,
     /// This tab's live watch (re-run on an interval), or `None`. Transient: a
@@ -1469,6 +1482,15 @@ pub(crate) struct ActiveConn {
     pub conn_id: String,
     pub config: ConnectionConfig,
     pub version: String,
+    /// A write (`Execute` / `ApplyBatch`) is in flight on this connection.
+    ///
+    /// The read path has the query ticker for this; writes had nothing, which is
+    /// why the write-cancellation machinery in the service — the abort seams, the
+    /// per-session `writes` registry, the engine-level kills — was unreachable:
+    /// `Command::Cancel` had no sender anywhere in the UI. This flag is what puts a
+    /// Stop in front of the user, and the default `statement_timeout` is 0, so
+    /// without it a wedged write has neither a timeout nor a way out.
+    pub write_in_flight: bool,
     /// Width of the Schema side-panel (the second left-dock column). Retained while
     /// it's hidden so toggling it back restores the previous width.
     pub sidebar_w: Pixels,
@@ -1483,16 +1505,16 @@ pub(crate) struct ActiveConn {
     pub inspector_w: Pixels,
     pub inspector_drag: Option<DragAnchor>,
     pub schema: SchemaState,
-    /// The connection-wide foreign-key graph (Track B7), prefetched once after
+    /// The connection-wide foreign-key graph, prefetched once after
     /// connect. Empty until it lands (or when the engine has no FKs); drives the
     /// in-grid FK click-through. See `Command::LoadForeignKeys`.
     pub fk_graph: Vec<FkEdge>,
-    /// Cached FK lookup lists for the in-cell picker (Track B8), keyed by referenced
+    /// Cached FK lookup lists for the in-cell picker, keyed by referenced
     /// `(schema, table)`. Populated lazily the first time an FK cell of that target is
     /// edited (`Command::FetchLookup` → `Event::LookupReady`); reused across edits and
     /// results on this connection. Bounded by the number of distinct FK targets touched.
     pub lookup_cache: std::collections::HashMap<(String, String), Vec<red_core::LookupRow>>,
-    /// Cached enum columns per `(schema, table)` for the in-cell enum picker (Track B8):
+    /// Cached enum columns per `(schema, table)` for the in-cell enum picker:
     /// `{ column → [variant, …] }`, loaded once per table the first time one of its cells
     /// is edited (`Command::LoadEnums` → `Event::EnumsLoaded`). An absent table means "not
     /// loaded yet"; a present-but-column-absent means "not an enum".
@@ -1578,7 +1600,7 @@ pub(crate) struct ActiveConn {
     pub mutations_loading: bool,
     pub server_w: Pixels,
     pub server_drag: Option<DragAnchor>,
-    /// Whether the Columns panel (inline FK expansion, Track B7) is shown in the left
+    /// Whether the Columns panel (inline FK expansion) is shown in the left
     /// dock, i.e. the recursive tree that picks referenced columns into the active
     /// browse.
     /// Per-connection UI state; the picked columns live on the result grid.
@@ -1594,7 +1616,7 @@ pub(crate) struct ActiveConn {
     /// read-only report, so it hangs off the connection). `None` when closed.
     /// See [`crate::diff_view`].
     pub diff: Option<crate::diff_view::DiffReport>,
-    /// The Redis shell's dynamic tab set (see docs/plans/redis-workflow-parity.md);
+    /// The Redis shell's dynamic tab set;
     /// `Some` only for a `DbKind::Redis` session, set up in `on_connected`.
     /// `None` for every SQL engine. Constructed here (needs `cx` to make the
     /// default Browse tab's filter `TextInput`); `on_connected` fires that
@@ -1654,6 +1676,7 @@ impl ActiveConn {
             conn_id,
             config,
             version,
+            write_in_flight: false,
             sidebar_w: px(240.),
             sidebar_drag: None,
             sidebar_collapsed: false,
@@ -1740,6 +1763,24 @@ impl ActiveConn {
             return None;
         }
         self.active()
+            .and_then(|t| t.namespace.clone())
+            .or_else(|| self.namespace.clone())
+    }
+
+    /// The namespace of the tab that owns `epoch`, for a command routed by epoch
+    /// rather than by focus (a batch reply's reload, a watch tick).
+    ///
+    /// `None` when no tab owns it or the engine's namespace is fixed at connect, in
+    /// which case the caller falls back to [`namespace_for_send`](Self::namespace_for_send).
+    /// Reading the *focused* tab's namespace instead reopens the owning tab bound to
+    /// someone else's database.
+    pub(crate) fn namespace_for_epoch(&self, epoch: red_service::Epoch) -> Option<String> {
+        if !self.config.kind.namespace_caps().settable {
+            return None;
+        }
+        self.tabs
+            .iter()
+            .find(|t| t.result.as_ref().is_some_and(|g| g.epoch == epoch))
             .and_then(|t| t.namespace.clone())
             .or_else(|| self.namespace.clone())
     }

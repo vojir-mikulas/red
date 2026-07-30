@@ -74,16 +74,21 @@ impl Message {
 
 /// Everything one model turn needs. The system prompt and tool catalog are stable
 /// across a conversation, so the provider caches them (Anthropic `cache_control`).
-#[derive(Debug, Clone)]
-pub struct TurnRequest {
-    pub model: String,
+///
+/// Borrowed rather than owned, because the agentic loop rebuilds one of these per
+/// tool step (up to `MAX_TOOL_STEPS`) and `Message` is all owned `String`s: cloning
+/// the growing transcript and the whole tool-catalog JSON schema on every step
+/// copied tens of megabytes on a saturated turn, for data the provider only reads.
+#[derive(Debug, Clone, Copy)]
+pub struct TurnRequest<'a> {
+    pub model: &'a str,
     pub max_tokens: u32,
     /// Visible "thinking…" summary affordance when `true` (Anthropic adaptive
     /// thinking with `display: "summarized"`).
     pub show_thinking: bool,
-    pub system: String,
-    pub tools: Vec<ToolDef>,
-    pub messages: Vec<Message>,
+    pub system: &'a str,
+    pub tools: &'a [ToolDef],
+    pub messages: &'a [Message],
 }
 
 /// A streamed increment of the current turn, pushed over the provider's channel

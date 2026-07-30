@@ -388,26 +388,45 @@ fn flatten(s: &SchemaState, filter: &str) -> Vec<VisibleRow> {
 
             // The group's own rows after the filter, so an all-miss group can be
             // skipped rather than drawn as an empty expanded folder.
-            let group_rows: Vec<_> = members
-                .iter()
-                .filter_map(|obj| {
-                    let obj_match = !filtering || hit(&obj.name);
-                    let col_hit = filtering
-                        && s.details
-                            .get(&(schema.name.clone(), obj.name.clone()))
-                            .is_some_and(|d| d.columns.iter().any(|c| hit(&c.name)));
-                    (!filtering || schema_match || obj_match || col_hit)
-                        .then_some((*obj, obj_match, col_hit))
-                })
-                .collect();
-            if filtering && !schema_match && group_rows.is_empty() {
+            //
+            // Built only when it will actually be read. A collapsed, unfiltered
+            // group emits no member rows, and unfiltered the "filtered" list is
+            // every member anyway — so materializing it was a `Vec` plus a tuple per
+            // object, for every group in every namespace, on every frame. Flint's
+            // `Tree` is `uniform_list`-backed, so rendering is already O(visible);
+            // this is what kept the *flatten* O(total).
+            let needs_rows = group_open || filtering;
+            let group_rows: Vec<_> = if needs_rows {
+                members
+                    .iter()
+                    .filter_map(|obj| {
+                        let obj_match = !filtering || hit(&obj.name);
+                        let col_hit = filtering
+                            && s.details
+                                .get(&(schema.name.clone(), obj.name.clone()))
+                                .is_some_and(|d| d.columns.iter().any(|c| hit(&c.name)));
+                        (!filtering || schema_match || obj_match || col_hit)
+                            .then_some((*obj, obj_match, col_hit))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            // Unfiltered, every member survives, so "nothing left after the filter"
+            // is exactly "no members".
+            let empty_after_filter = if needs_rows {
+                group_rows.is_empty()
+            } else {
+                members.is_empty()
+            };
+            if filtering && !schema_match && empty_after_filter {
                 continue;
             }
 
             // A loaded group that filtered down to nothing is still a leaf: it has
             // no rows to disclose *right now*, and a chevron over nothing reads as
             // a group that closed itself.
-            let no_rows = loaded && group_rows.is_empty();
+            let no_rows = loaded && empty_after_filter;
             out.push(VisibleRow {
                 item: if no_rows {
                     TreeItem::leaf(1)
@@ -1323,7 +1342,7 @@ impl AppState {
 
     /// Open `SELECT * FROM schema.table` (optionally pre-filtered) in a reused
     /// pristine tab or a fresh one: the shared path for the sidebar preview and the
-    /// FK click-through (Track B7). The editor is pre-filled with the base SQL; a
+    /// FK click-through. The editor is pre-filled with the base SQL; a
     /// `filter` narrows the result without changing the shown query.
     pub(crate) fn open_table_browse(
         &mut self,

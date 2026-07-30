@@ -1,4 +1,4 @@
-//! The AI write-audit log (Feature B). Every data-modifying statement the
+//! The AI write-audit log. Every data-modifying statement the
 //! assistant executes (already gated by tier, the read-only check, the
 //! destructive-shape blocklist, and explicit per-call user approval) is also
 //! appended here, so there's a durable, after-the-fact record of exactly what the

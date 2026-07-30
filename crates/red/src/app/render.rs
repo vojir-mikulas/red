@@ -270,7 +270,7 @@ impl Render for AppState {
             window.focus(&self.ai_login_code.focus_handle(cx), cx);
         }
 
-        // An inline cell edit just opened in the inspector (Track B5); focus its
+        // An inline cell edit just opened in the inspector; focus its
         // field so the user types the new value immediately.
         if self.focus_inspector_edit {
             self.focus_inspector_edit = false;
@@ -279,7 +279,7 @@ impl Render for AppState {
             }
         }
 
-        // An inline cell edit just opened in the grid (Track B6); focus its field.
+        // An inline cell edit just opened in the grid; focus its field.
         if self.focus_grid_edit {
             self.focus_grid_edit = false;
             if let Some(handle) = self.grid_edit_focus(cx) {
@@ -381,15 +381,15 @@ impl Render for AppState {
             Phase::Disconnected => self.render_connect(window, cx).into_any_element(),
             Phase::Connecting(conn) => self.render_connecting(conn, window, cx).into_any_element(),
             // Redis has no SQL surface at all yet (R0; keyspace browsing lands
-            // in R1, see docs/plans/redis.md) — a dedicated minimal shell
+            // in R1) — a dedicated minimal shell
             // instead of the SQL workspace's editor/grid/schema tree, which
             // all assume a `DatabaseDriver` session.
             Phase::Connected(active) if active.config.kind == red_core::DbKind::Redis => self
                 .render_redis_shell(active, window, cx)
                 .into_any_element(),
-            // MongoDB is a document store, not SQL: a dedicated browse/inspector
-            // shell instead of the editor/grid/schema workspace (which assumes a
-            // `DatabaseDriver` session). See docs/plans/todo/doc-driver.md.
+            // MongoDB is a document store, not SQL: a dedicated browse/inspector shell
+            // instead of the editor/grid/schema workspace (which assumes a
+            // `DatabaseDriver` session).
             Phase::Connected(active) if active.config.kind == red_core::DbKind::Mongo => self
                 .render_mongo_shell(active, window, cx)
                 .into_any_element(),
@@ -404,7 +404,7 @@ impl Render for AppState {
         let confirm = self
             .confirm_exec
             .clone()
-            .map(|pending| self.render_confirm(pending, cx));
+            .map(|pending| self.render_confirm(pending.write, cx));
 
         let confirm_close = self
             .confirm_close_tab
@@ -466,17 +466,33 @@ impl Render for AppState {
             // from any phase, even when no field or editor is focused.
             .key_context("RedRoot")
             .track_focus(&self.root_focus)
-            .on_action(cx.listener(|this, _: &ToggleCommandPalette, _, cx| this.toggle_palette(cx)))
+            // Every listener in this chain guards on `globals_enabled`: the root is
+            // an *ancestor* of `modal_focus` and Flint's `Modal` does not swallow
+            // action dispatch, so without it these all fire straight through an open
+            // confirm. See `AppState::globals_enabled`.
+            .on_action(cx.listener(|this, _: &ToggleCommandPalette, _, cx| {
+                if this.globals_enabled() {
+                    this.toggle_palette(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &SwitchConnection, window, cx| {
-                this.toggle_switcher(window, cx)
+                if this.globals_enabled() {
+                    this.toggle_switcher(window, cx);
+                }
             }))
             // ⌘⇧P flips to the previous connection; ⌘1–9 jump to the n-th in the
-            // switcher's order. True globals (like ⌘P), so they fire from any focus.
+            // switcher's order. True globals (like ⌘P), so they fire from any focus —
+            // but not from under a modal, which is what let a confirmed `DROP` land
+            // on whichever connection the user had switched to meanwhile.
             .on_action(cx.listener(|this, _: &SwitchToPreviousConnection, _, cx| {
-                this.switch_to_previous(cx)
+                if this.globals_enabled() {
+                    this.switch_to_previous(cx);
+                }
             }))
             .on_action(cx.listener(|this, action: &SwitchToConnectionSlot, _, cx| {
-                this.switch_to_slot(action.0, cx)
+                if this.globals_enabled() {
+                    this.switch_to_slot(action.0, cx);
+                }
             }))
             .on_action(cx.listener(|this, _: &GoToRow, _, cx| this.open_goto_prompt(cx)))
             .on_action(cx.listener(|this, _: &CopyResult, _, cx| this.copy_result_selection(cx)))
@@ -488,14 +504,16 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &ToggleAssistant, window, cx| {
                 this.toggle_assistant(window, cx)
             }))
-            .on_action(
-                cx.listener(|this, _: &ToggleFilter, window, cx| {
-                    this.toggle_filter_bar(window, cx)
-                }),
-            )
-            .on_action(
-                cx.listener(|this, _: &FindInResult, window, cx| this.toggle_find_bar(window, cx)),
-            )
+            .on_action(cx.listener(|this, _: &ToggleFilter, window, cx| {
+                if this.globals_enabled() {
+                    this.toggle_filter_bar(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &FindInResult, window, cx| {
+                if this.globals_enabled() {
+                    this.toggle_find_bar(window, cx);
+                }
+            }))
             // Saved queries (B3): ⇧⌘S opens the name prompt; ⇧⌘O the picker.
             .on_action(cx.listener(|this, _: &SaveQuery, _, cx| this.open_save_prompt(cx)))
             .on_action(cx.listener(|this, _: &OpenSavedQueries, _, cx| this.open_saved_picker(cx)))
@@ -505,10 +523,26 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &FormatSql, _, cx| this.format_active_sql(cx)))
             // App-chrome actions (tabs · sidebar · schema reload), bound in the
             // central keymap to `RedRoot` so they fire from any pane's focus.
-            .on_action(cx.listener(|this, _: &NewTab, _, cx| this.new_query(cx)))
-            .on_action(cx.listener(|this, _: &CloseTab, _, cx| this.close_active_tab(cx)))
-            .on_action(cx.listener(|this, _: &NextTab, window, cx| this.next_tab(window, cx)))
-            .on_action(cx.listener(|this, _: &PrevTab, window, cx| this.prev_tab(window, cx)))
+            .on_action(cx.listener(|this, _: &NewTab, _, cx| {
+                if this.globals_enabled() {
+                    this.new_query(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CloseTab, _, cx| {
+                if this.globals_enabled() {
+                    this.close_active_tab(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &NextTab, window, cx| {
+                if this.globals_enabled() {
+                    this.next_tab(window, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PrevTab, window, cx| {
+                if this.globals_enabled() {
+                    this.prev_tab(window, cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &ToggleHistory, _, cx| this.toggle_history(cx)))
             .on_action(
@@ -516,6 +550,9 @@ impl Render for AppState {
             )
             .on_action(cx.listener(|this, _: &RefreshSchema, _, cx| this.refresh_active(cx)))
             .on_action(cx.listener(|this, _: &SearchSchema, window, cx| {
+                if !this.globals_enabled() {
+                    return;
+                }
                 // A Mongo connection's ⌘F (from the tree or root, where the grid's
                 // Table-scoped FindInResult doesn't reach) focuses the sidebar
                 // collection search, mirroring the SQL "search schema" idiom.
@@ -542,8 +579,16 @@ impl Render for AppState {
                 this.cycle_focus(false, window, cx)
             }))
             // Side-by-side split (⌘\ toggles it, ⌥⌘\ jumps to the other half).
-            .on_action(cx.listener(|this, _: &ToggleSplit, _, cx| this.toggle_split(cx)))
-            .on_action(cx.listener(|this, _: &FocusOtherHalf, _, cx| this.focus_other_half(cx)))
+            .on_action(cx.listener(|this, _: &ToggleSplit, _, cx| {
+                if this.globals_enabled() {
+                    this.toggle_split(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &FocusOtherHalf, _, cx| {
+                if this.globals_enabled() {
+                    this.focus_other_half(cx);
+                }
+            }))
             .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| this.toggle_shortcuts(cx)))
             .on_action(cx.listener(|this, _: &ShowChangelog, _, cx| this.toggle_whats_new(cx)))
             .on_action(cx.listener(|this, _: &ShowErDiagram, _, cx| {
@@ -557,7 +602,7 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &ReportBug, _, cx| {
                 this.open_external(crate::app::ISSUES_URL, cx)
             }))
-            // --- staged grid editing (Track B6) ---
+            // --- staged grid editing ---
             // Enter/F2 in the "Table" context: on a Mongo document grid or a Redis
             // key list it opens the inspector on the keyboard cursor; otherwise it
             // begins an in-place SQL cell edit (the same binding, the right thing
@@ -571,6 +616,9 @@ impl Render for AppState {
             // through to running the active query (so the key still does the
             // expected thing on a clean grid).
             .on_action(cx.listener(|this, _: &SubmitChanges, _, cx| {
+                if !this.globals_enabled() {
+                    return;
+                }
                 if this.has_pending_changes() {
                     this.submit_changes(cx);
                 } else {
@@ -585,9 +633,13 @@ impl Render for AppState {
             // ⌘↵ runs the active tab's query from any pane, or tests the connection
             // while the form is open. ⌘N on the welcome screen adds a connection.
             .on_action(cx.listener(|this, _: &RunQuery, _, cx| {
+                // The connection form is the one modal that wants ⌘↵: it means
+                // "test this connection". Everywhere else, re-grading and replacing
+                // the pending confirm mid-decision is the opposite of what a confirm
+                // is for.
                 if this.form.is_some() {
                     this.test_connection(cx);
-                } else {
+                } else if this.globals_enabled() {
                     this.run_editor_query(cx);
                 }
             }))
@@ -699,7 +751,7 @@ impl Render for AppState {
                 self.tab_context_menu
                     .map(|(i, pos)| self.render_tab_menu(i, pos, cx)),
             )
-            // The in-cell FK suggestion dropdown (Track B8) anchors to the editor
+            // The in-cell FK suggestion dropdown anchors to the editor
             // cell but mounts here so it paints above the grid and escapes its clip.
             .children(self.render_cell_suggest(window, cx))
             // The middle-click autoscroll origin marker: rooted at the window

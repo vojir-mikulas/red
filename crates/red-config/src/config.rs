@@ -79,11 +79,11 @@ struct RawConnection {
     /// configs, where it defaults to off.
     #[serde(default)]
     tls: bool,
-    /// Optional per-connection AI master-switch override (M-S7). Absent inherits
+    /// Optional per-connection AI master-switch override. Absent inherits
     /// the global `[ai] enabled`.
     #[serde(default)]
     ai_enabled: Option<bool>,
-    /// Optional per-connection AI access-tier override (M-S7): `off`/`schema`/
+    /// Optional per-connection AI access-tier override: `off`/`schema`/
     /// `read`. Absent inherits the global `[ai] tier`.
     #[serde(default)]
     ai_tier: Option<AiTier>,
@@ -260,8 +260,8 @@ struct WriteConnection {
     /// TLS toggle; omitted when off so pre-TLS files round-trip byte-for-byte.
     #[serde(skip_serializing_if = "is_false")]
     tls: bool,
-    /// Per-connection AI overrides (M-S7); omitted when unset so they inherit the
-    /// global `[ai]` policy and pre-M-S7 files round-trip unchanged. Scalar keys,
+    /// Per-connection AI overrides; omitted when unset so they inherit the
+    /// global `[ai]` policy and pre-files round-trip unchanged. Scalar keys,
     /// so they stay ahead of the `ssh` sub-table.
     #[serde(skip_serializing_if = "Option::is_none")]
     ai_enabled: Option<bool>,
@@ -433,7 +433,12 @@ pub fn load() -> Vec<StoredConnection> {
             // atomically rewrites the file from that empty state, losing every
             // saved connection. A `.bak` copy is the escape hatch.
             let backup = path.with_extension("toml.bak");
-            if let Err(be) = std::fs::write(&backup, &text) {
+            // Owner-only, like `save`. A legacy hand-edited file can legitimately
+            // still carry plaintext passwords (that is why the migration exists), so
+            // a plain `std::fs::write` here created a world-readable copy of them at
+            // the default umask — one typo away, in the one code path that runs
+            // *because* the file was malformed.
+            if let Err(be) = write_private(&backup, &text) {
                 tracing::warn!("failed to back up malformed config: {be}");
             }
             tracing::warn!(
@@ -535,6 +540,25 @@ pub fn save(connections: &[StoredConnection]) -> Result<()> {
     Ok(())
 }
 
+/// Write `contents` to `path`, owner-only on Unix.
+///
+/// The permission bits are the point: everything this crate writes can hold a
+/// credential, so `std::fs::write` (which creates at the umask, typically 0644) is
+/// never the right call here.
+fn write_private(path: &std::path::Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(path)?;
+    f.write_all(contents.as_bytes())
+}
+
 /// Render the connection list to the exact TOML bytes [`save`] writes, so a
 /// caller can hash them ahead of a save to suppress the watcher's self-reload.
 pub fn serialize(connections: &[StoredConnection]) -> Result<String> {
@@ -580,7 +604,7 @@ mod tests {
                     color: 3,
                     read_only: false,
                     tls: false,
-                    // Per-connection AI overrides (M-S7) must round-trip; conn-a
+                    // Per-connection AI overrides must round-trip; conn-a
                     // leaves them unset to confirm they're omitted and inherited.
                     ai_enabled: Some(false),
                     ai_tier: Some(AiTier::Schema),

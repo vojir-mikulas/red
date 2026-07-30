@@ -1,4 +1,4 @@
-//! Find (Track B2, Tier 1): a small strip that highlights and steps through
+//! Find: a small strip that highlights and steps through
 //! matches of a substring, in whichever pane is focused: the **result grid**
 //! (loaded rows) or the **query editor** (its text). Distinct from the filter bar
 //! (⌘⇧F), which re-opens the result with a SQL predicate over the *whole* set:

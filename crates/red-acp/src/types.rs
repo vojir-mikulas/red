@@ -119,7 +119,7 @@ pub struct McpGrounding {
 }
 
 /// A tool-call permission the agent asked for that RED did **not** auto-allow
-/// (M-S2). The conversation forwards it out of band for a user decision and
+///. The conversation forwards it out of band for a user decision and
 /// blocks the agent's tool call until the answer arrives on `decide`: sending
 /// `true` runs the tool, `false` (or dropping the sender) denies it.
 #[derive(Debug)]
@@ -141,7 +141,7 @@ pub struct AcpConfig {
     pub cwd: PathBuf,
     /// The DB grounding server, if a session is connected.
     pub mcp: Option<McpGrounding>,
-    /// Tool names to auto-approve without prompting (M-S2): RED's read-only DB
+    /// Tool names to auto-approve without prompting: RED's read-only DB
     /// tools. A permission request that matches one of these runs silently; the
     /// agent is already capability-restricted to no filesystem/terminal.
     pub allow_tools: Vec<String>,

@@ -31,7 +31,7 @@ use crate::{Event, SessionId};
 const MCP_SERVER_NAME: &str = "red-db";
 
 /// How long a conversation may sit untouched before the idle sweep tears its
-/// agent down (M-S3). An idle agent is a parked subprocess plus an open MCP port;
+/// agent down. An idle agent is a parked subprocess plus an open MCP port;
 /// a fresh prompt after teardown just restarts it (a new agent session, so the
 /// grounding instruction is re-folded). Mirrors `dispatch::IDLE_EVICT` for
 /// sessions: a conversation outlives its DB session's idle window so a brief
@@ -66,10 +66,16 @@ struct Conversation {
 #[derive(Default)]
 pub(crate) struct AcpManager {
     conversations: HashMap<ConversationId, Conversation>,
-    /// Permission prompts (M-S2) awaiting the user's answer, keyed by request id.
+    /// Permission prompts awaiting the user's answer, keyed by request id.
     /// The relay task parks the agent's decision sink here; `AiPermission` takes
     /// it back out and fires it. Capped so a runaway agent can't grow it forever.
-    pending: HashMap<RequestId, oneshot::Sender<bool>>,
+    ///
+    /// Each entry remembers its conversation so the teardown paths can prune it.
+    /// Without that the cap was a slow leak with a hard floor: entries were removed
+    /// only by an explicit answer, so every chat closed on a live prompt stranded
+    /// one forever, and after [`MAX_PENDING_PERMISSIONS`] such events *every* later
+    /// approval was silently auto-denied with no prompt shown, until restart.
+    pending: HashMap<RequestId, (ConversationId, oneshot::Sender<bool>)>,
     /// Monotonic id handed to each surfaced permission prompt.
     next_request_id: u64,
     /// Crash-restart bookkeeping per conversation, so a reliably-crashing agent
@@ -130,14 +136,47 @@ impl AcpManager {
 
     /// Park a permission decision sink and return the request id to surface, or
     /// `None` (deny by dropping `decide`) when too many are already outstanding.
-    fn park_permission(&mut self, decide: oneshot::Sender<bool>) -> Option<RequestId> {
+    fn park_permission(
+        &mut self,
+        conversation_id: ConversationId,
+        decide: oneshot::Sender<bool>,
+    ) -> Option<RequestId> {
         if self.pending.len() >= MAX_PENDING_PERMISSIONS {
             return None;
         }
         let id = RequestId::new(self.next_request_id);
         self.next_request_id += 1;
-        self.pending.insert(id, decide);
+        self.pending.insert(id, (conversation_id, decide));
         Some(id)
+    }
+
+    /// Deny and drop every parked prompt belonging to `conversation_id`.
+    ///
+    /// Dropping the sink is the deny: the agent's `request_permission` call sees a
+    /// closed channel and treats it as refusal. Called wherever a conversation goes
+    /// away, so a prompt whose chat no longer exists can never be answered and must
+    /// not keep occupying a slot.
+    fn deny_pending_for(&mut self, conversation_id: ConversationId) {
+        let before = self.pending.len();
+        self.pending
+            .retain(|_, (owner, _)| *owner != conversation_id);
+        let denied = before - self.pending.len();
+        if denied > 0 {
+            tracing::debug!("denied {denied} stranded ACP permission prompt(s)");
+        }
+    }
+
+    /// Deny every parked prompt whose conversation is no longer live. The sweep the
+    /// eviction paths share, so none of them has to remember the pending map.
+    fn prune_pending(&mut self) {
+        let live: std::collections::HashSet<ConversationId> =
+            self.conversations.keys().copied().collect();
+        let before = self.pending.len();
+        self.pending.retain(|_, (owner, _)| live.contains(owner));
+        let denied = before - self.pending.len();
+        if denied > 0 {
+            tracing::debug!("denied {denied} ACP permission prompt(s) for evicted conversations");
+        }
     }
 
     /// Record a crash-restart for `conversation_id` and report whether another is
@@ -175,7 +214,7 @@ impl AcpManager {
     /// Answer a parked permission prompt (the panel's Allow/Deny). A stale id (the
     /// prompt was already resolved or the agent went away) is a no-op.
     pub(crate) fn resolve_permission(&mut self, request_id: RequestId, allow: bool) {
-        if let Some(decide) = self.pending.remove(&request_id) {
+        if let Some((_, decide)) = self.pending.remove(&request_id) {
             let _ = decide.send(allow);
         }
     }
@@ -235,9 +274,10 @@ impl AcpManager {
             tracing::debug!("tore down {dropped} ACP conversation(s) for a closed session");
         }
         self.prune_restarts();
+        self.prune_pending();
     }
 
-    /// Reclaim conversations idle past [`IDLE_TEARDOWN`] (M-S3), skipping any with
+    /// Reclaim conversations idle past [`IDLE_TEARDOWN`], skipping any with
     /// a turn in flight. Called from the dispatch idle sweep, mirroring the
     /// session-eviction pass; a parked agent is a subprocess plus an MCP port we
     /// can release and lazily rebuild on the next prompt.
@@ -251,10 +291,11 @@ impl AcpManager {
             tracing::debug!("evicted {dropped} idle ACP conversation(s)");
         }
         self.prune_restarts();
+        self.prune_pending();
     }
 
     /// Drop every conversation not mid-turn so its next prompt re-spawns the agent
-    /// and re-runs the ACP handshake (M-S4); used after a Settings re-auth so live
+    /// and re-runs the ACP handshake; used after a Settings re-auth so live
     /// chats pick up the newly signed-in account. A conversation with a turn in
     /// flight is left alone, the same way the idle sweep skips it.
     pub(crate) fn drop_idle(&mut self) {
@@ -267,11 +308,12 @@ impl AcpManager {
         self.prune_restarts();
     }
 
-    /// Tear down a conversation the UI has closed or deleted (M-S5), freeing its
+    /// Tear down a conversation the UI has closed or deleted, freeing its
     /// agent subprocess and MCP port now rather than waiting for the idle sweep.
     /// Dropping the `Conversation` unwinds the same way as [`Self::evict_session`].
     pub(crate) fn forget(&mut self, conversation_id: ConversationId) {
         self.restarts.remove(&conversation_id);
+        self.deny_pending_for(conversation_id);
         if self.conversations.remove(&conversation_id).is_some() {
             tracing::debug!("forgetting closed ACP conversation {conversation_id}");
         }
@@ -292,6 +334,9 @@ impl AcpManager {
             self.conversations.clear();
         }
         self.restarts.clear();
+        // Dropping the parked permission sinks denies them, which is what a
+        // shutdown owes any prompt still on screen.
+        self.pending.clear();
         // Dropping the parked code sinks cancels any in-flight sign-in.
         self.logins.clear();
     }
@@ -626,7 +671,7 @@ async fn ensure_conversation(
     report_dir: Option<PathBuf>,
 ) -> Result<(AcpConversation, bool), String> {
     let mut guard = manager.lock().await;
-    // Restart on crash (M-S3): a conversation whose connection task has ended
+    // Restart on crash: a conversation whose connection task has ended
     // (agent exited / crashed) can't serve another turn, so drop it and fall
     // through to a fresh start: a new agent session, so grounding re-folds.
     if guard
@@ -649,7 +694,7 @@ async fn ensure_conversation(
     }
     if !guard.conversations.contains_key(&conversation_id) {
         // Host the DB grounding server bound to this session's driver and gated by
-        // the access policy (M-S7), then bring the agent up with it attached. The
+        // the access policy, then bring the agent up with it attached. The
         // policy is captured for the agent's lifetime; a settings change takes
         // effect on the next agent restart (reconnect / idle teardown / re-auth).
         // The report sink (Feature C): `generate_report` runs inside the MCP server
@@ -665,7 +710,7 @@ async fn ensure_conversation(
             url: mcp.url().to_string(),
             token: mcp.token().to_string(),
         };
-        // Permission policy (M-S2): auto-allow the DB tools the tier actually
+        // Permission policy: auto-allow the DB tools the tier actually
         // exposes; route anything else (including a tool above the tier) to the
         // user via the relay task below. The agent is also capability-restricted
         // (no fs/terminal) in `red-acp`.
@@ -700,7 +745,7 @@ async fn ensure_conversation(
             command,
             cwd,
             mcp: Some(grounding),
-            // Auto-allow only the read-only tools; the write tools (Feature B) are
+            // Auto-allow only the read-only tools; the write tools are
             // deliberately excluded so every write is routed to the user for an
             // explicit Allow/Deny, never silently run by the agent. The MCP path
             // never even offers writes, so this is belt-and-braces for both seams.
@@ -744,7 +789,7 @@ async fn ensure_conversation(
     Ok((entry.agent.clone(), first_turn))
 }
 
-/// Relay non-auto-allowed permission requests (M-S2) from one conversation to the
+/// Relay non-auto-allowed permission requests from one conversation to the
 /// UI: park the agent's decision sink, surface an `AiPermissionRequest`, and let
 /// `Command::AiPermission` answer it. Ends when the conversation is torn down (the
 /// agent drops its sender, closing `perm_rx`).
@@ -762,7 +807,11 @@ async fn permission_relay(
             decide,
         } = perm;
         // Park the decision sink; dropping it on overflow denies the call.
-        let Some(request_id) = manager.lock().await.park_permission(decide) else {
+        let Some(request_id) = manager
+            .lock()
+            .await
+            .park_permission(conversation_id, decide)
+        else {
             tracing::warn!("too many pending AI permission prompts; denying");
             continue;
         };

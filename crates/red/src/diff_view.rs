@@ -1,9 +1,9 @@
 //! Data-compare (table diff) UI: the trigger's progress toast, the terminal-event
-//! handlers, and the full-screen read-only **diff report** overlay (see
-//! docs/plans/todo/data-diff.md). The backend (`red-service`) does the merge-walk
-//! and streams back a bounded [`DiffFinished`](red_service::Event::DiffFinished)
-//! payload; this renders it. Like the ER diagram, the report hangs off the
-//! connection (schema-wide, not a result tab) so it survives tab churn.
+//! handlers, and the full-screen read-only **diff report** overlay. The backend (`red-
+//! service`) does the merge-walk and streams back a bounded
+//! [`DiffFinished`](red_service::Event::DiffFinished) payload; this renders it. Like
+//! the ER diagram, the report hangs off the connection (schema-wide, not a result tab)
+//! so it survives tab churn.
 
 use gpui::{AnyElement, Context, ScrollHandle, div, prelude::*, px};
 use red_core::diff::{DiffColumnPlan, DiffKind, DiffRow, DiffSummary};

@@ -73,6 +73,14 @@ const DOC_PAGE_ROWS: usize = 100;
 /// surface real type drift, small enough to stay cheap on a big collection.
 const DOC_SCHEMA_SAMPLE: usize = 200;
 
+/// Bytes of a Pub/Sub payload carried to the UI before truncation.
+///
+/// The monitor panel shows a preview, not the whole message, so this costs nothing
+/// a reader would notice — and it is the only bound on a channel whose payloads are
+/// entirely user-controlled. Without it the message-per-second limiter admits a
+/// firehose of megabyte payloads at full rate.
+const KV_MESSAGE_CAP: usize = 8 * 1024;
+
 /// How long the confirm dialog's advisory AI review (`AssessSql`) may run.
 ///
 /// Longer than the row-count cap because a model round-trip is slower than a
@@ -538,14 +546,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     // The AI assistant's configured agents (built from `ConfigureAi.agents`), keyed
     // by id: an API agent carries its pre-built provider (None until a key is set)
     // and model; an ACP agent carries its resolved launch command. *Which* agent a
-    // turn uses is decided per-turn by `AiTurn.agent` (M-S6), so several
+    // turn uses is decided per-turn by `AiTurn.agent`, so several
     // conversations on different agents run concurrently. A turn runs as a spawned
     // task off this loop (like exports), sharing `ai_state` for its conversation
     // history and cancel registry.
     let mut ai_agents: HashMap<String, AiProfileRuntime> = HashMap::new();
     let mut ai_default_agent = String::new();
     let mut ai_show_thinking = false;
-    // The global AI access policy (M-S7): master switch, access tier, and resource
+    // The global AI access policy: master switch, access tier, and resource
     // guards, set by `ConfigureAi`. A turn layers the session's per-connection
     // overrides over this and enforces the result in the shared tool layer, so it
     // covers both backends and the agent can't bypass it.
@@ -567,7 +575,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             },
             _ = sweep.tick() => {
                 evict_idle(&mut sessions, foreground, &events);
-                // Reclaim long-idle subscription agents too (M-S3). Off the loop,
+                // Reclaim long-idle subscription agents too. Off the loop,
                 // like the other ACP calls, since the manager is behind a tokio
                 // Mutex a slow start may be holding.
                 let manager = ai_acp.clone();
@@ -597,7 +605,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 if let Some(mut old) = sessions.remove(&id) {
                     old.teardown();
                     // The new driver replaces the old one, so any subscription
-                    // agent bound to the old session must go too (M-S3); the next
+                    // agent bound to the old session must go too; the next
                     // turn lazily rebinds a fresh agent to the new driver.
                     let manager = ai_acp.clone();
                     tokio::spawn(async move { manager.lock().await.evict_session(Some(id)) });
@@ -609,7 +617,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 *generation += 1;
                 let generation = *generation;
                 // Capture the connection's AI overrides before `config` moves into
-                // the dial task, so the resulting session carries them (M-S7).
+                // the dial task, so the resulting session carries them.
                 let ai_override = AiOverride {
                     enabled: config.ai_enabled,
                     tier: config.ai_tier,
@@ -718,7 +726,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
             } => {
                 // The turn grounds in the connected session's driver, either the
                 // SQL `DatabaseDriver` or the Redis `KvDriver` seam (each has its
-                // own tool catalog; see docs/plans/redis-workflow-parity.md Part 1).
+                // own tool catalog).
                 let session_driver = session_id
                     .and_then(|id| sessions.get(&id))
                     .map(|s| (s.driver.clone(), s.kind));
@@ -734,7 +742,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
 
-                // Resolve the effective AI policy (M-S7): the session's per-connection
+                // Resolve the effective AI policy: the session's per-connection
                 // overrides layered over the global one. The master switch is checked
                 // here, before anything spawns; a disabled assistant starts no MCP
                 // server and no agent process, it just reports the refusal.
@@ -984,8 +992,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 allow,
             } => {
                 // Answer a parked permission prompt. It belongs to exactly one
-                // backend: the subscription path's ACP manager (M-S2 tool prompts) or
-                // the API-key path's AiState (Feature B write prompts). Their request-
+                // backend: the subscription path's ACP manager (tool prompts) or
+                // the API-key path's AiState (write prompts). Their request-
                 // id spaces are disjoint (AiState offsets its ids), so resolving both
                 // is safe: only the owning side has the id. The API-key resolve is a
                 // quick sync lock; the ACP one awaits, so it runs off the loop.
@@ -1102,7 +1110,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     state.teardown();
                 }
                 // Tear down any subscription agent grounded in this session: its
-                // MCP server holds a now-dead driver clone (M-S3).
+                // MCP server holds a now-dead driver clone.
                 let manager = ai_acp.clone();
                 tokio::spawn(async move { manager.lock().await.evict_session(Some(id)) });
                 // Invalidate any in-flight connect for this id so its late outcome
@@ -1342,7 +1350,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         }
                         None => None,
                     };
-                    // Inline FK expansion (Track B7): decorate the base with the chosen
+                    // Inline FK expansion: decorate the base with the chosen
                     // referenced columns, interleaved next to the FK column they expand
                     // from (the base column order comes from `detail`). The join runs
                     // *before* the filter so a `WHERE` can reference the expanded
@@ -1364,7 +1372,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     let pred: Option<String> = match &filter {
                         None => None,
                         Some(ResultFilter::Where(expr)) => Some(expr.clone()),
-                        // FK follow (Track B7): an escaped literal `col = v [AND …]`
+                        // FK follow: an escaped literal `col = v [AND …]`
                         // predicate from the driver. Empty pairs (shouldn't occur)
                         // degrade to no filter rather than an invalid `WHERE ()`.
                         Some(ResultFilter::Eq(pairs)) if !pairs.is_empty() => {
@@ -2263,13 +2271,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     );
                     continue;
                 };
-                // Register an abort under the epoch (same `KvValue` slot as
-                // `KvBatch`) so a `KvBatchStop` and session teardown can stop a
-                // 500k-command import between commands — otherwise the spawned
-                // task owns its driver `Arc` and keeps writing after the UI shows
-                // the connection gone.
+                // Register an abort under the epoch so a `KvBatchStop` and session
+                // teardown can stop a 500k-command import between commands —
+                // otherwise the spawned task owns its driver `Arc` and keeps writing
+                // after the UI shows the connection gone. Its own `Slot::KvImport`,
+                // not the batch console's `KvValue`: a sibling value read on the
+                // same epoch must not abort the import.
                 let entry = state.inflight.entry(epoch).or_default();
-                let abort = entry.supersede(Slot::KvValue);
+                let abort = entry.supersede(Slot::KvImport);
                 let events = events.clone();
                 tokio::spawn(async move {
                     // Sequential so dependent commands (e.g. HSET after DEL) keep
@@ -2277,8 +2286,10 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     // per command via `driver.command`.
                     let (mut ok, mut failed) = (0usize, 0usize);
                     let mut first_error = None;
+                    let mut aborted = false;
                     for argv in &commands {
                         if abort.is_aborted() {
+                            aborted = true;
                             break;
                         }
                         if argv.is_empty() {
@@ -2302,6 +2313,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             ok,
                             failed,
                             first_error,
+                            aborted,
                         },
                     );
                 });
@@ -2655,7 +2667,25 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         match tokio::time::timeout(Duration::from_millis(500), sub.stream.next())
                             .await
                         {
-                            Ok(Some(msg)) => {
+                            Ok(Some(mut msg)) => {
+                                // Cap each payload *before* the rate limiter sees it.
+                                // The limiter bounds messages per second, which is
+                                // the right shape for MONITOR (Redis truncates that
+                                // server-side) but not for Pub/Sub: those payloads
+                                // are user-controlled and untruncated, so a firehose
+                                // of 1 MB messages at the admitted rate could queue
+                                // gigabytes across a few seconds of UI stall. The
+                                // panel shows a preview either way.
+                                if msg.payload.len() > KV_MESSAGE_CAP {
+                                    let mut cut = KV_MESSAGE_CAP;
+                                    while cut > 0 && !msg.payload.is_char_boundary(cut) {
+                                        cut -= 1;
+                                    }
+                                    let full = msg.payload.len();
+                                    msg.payload.truncate(cut);
+                                    msg.payload
+                                        .push_str(&format!("… [{full} bytes, truncated]"));
+                                }
                                 // Rate-limit a firehose subscription (`PSUBSCRIBE *`)
                                 // so it can't outgrow the event channel.
                                 let (admit, dropped) = rate.admit();
@@ -3173,6 +3203,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 db,
                 coll,
                 pipeline,
+                confirmed,
             } => {
                 let Some((state, driver)) =
                     require_doc_driver_mut(&mut sessions, session_id, &events)
@@ -3209,20 +3240,40 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // Aggregation is a read surface with two write stages hiding in it:
                 // `$out`/`$merge` write collections (`$merge` even cross-database),
                 // so a read-only connection must refuse them like any other write.
-                if state.read_only
-                    && let Some(stage) = red_core::doc::pipeline_write_stage(&stages)
-                {
-                    emit(
-                        &events,
-                        session_id,
-                        Event::DocError {
-                            epoch,
-                            message: format!(
-                                "write stage `{stage}` is not allowed on a read-only connection"
-                            ),
-                        },
-                    );
-                    continue;
+                if let Some(stage) = red_core::doc::pipeline_write_stage(&stages) {
+                    if state.read_only {
+                        emit(
+                            &events,
+                            session_id,
+                            Event::DocError {
+                                epoch,
+                                message: format!(
+                                    "write stage `{stage}` is not allowed on a read-only connection"
+                                ),
+                            },
+                        );
+                        continue;
+                    }
+                    // On a writable connection it still needs the confirm. `$out`
+                    // atomically *replaces* the entire target collection — the same
+                    // destruction as drop-and-recreate — while dropping a collection
+                    // requires the full confirm dance. Gated host-side, so neither
+                    // the UI nor an agent can execute one straight from a Run button.
+                    if !confirmed {
+                        emit(
+                            &events,
+                            session_id,
+                            Event::DocPipelineConfirm {
+                                epoch,
+                                pipeline,
+                                prompt: format!(
+                                    "This pipeline ends in `{stage}`, which overwrites the \
+                                     target collection. This cannot be undone."
+                                ),
+                            },
+                        );
+                        continue;
+                    }
                 }
                 // Share the browse's abort slot: only one read runs at a time, so a
                 // new aggregate (or a page fetch) supersedes the prior in-flight one.
@@ -3638,17 +3689,18 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     }) => {
                         let (provider, model) = (provider.clone(), model.clone());
                         Box::pin(async move {
+                            let messages = vec![red_ai::Message::user_text(statement)];
                             let request = red_ai::TurnRequest {
-                                model,
+                                model: &model,
                                 // A couple of sentences. The cap is the backstop,
                                 // not the instruction; the prompt asks for brevity.
                                 max_tokens: 300,
                                 show_thinking: false,
-                                system: prompt,
+                                system: &prompt,
                                 // No tools, deliberately: one completion, no agentic
                                 // loop, no way to read a row or take an action.
-                                tools: Vec::new(),
-                                messages: vec![red_ai::Message::user_text(statement)],
+                                tools: &[],
+                                messages: &messages,
                             };
                             // The receiver is held, not dropped: deltas are
                             // irrelevant here, but a dead channel would surface as
@@ -3657,7 +3709,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 tokio::sync::mpsc::unbounded_channel::<red_ai::Delta>();
                             let cancel = red_ai::CancelToken::new();
                             provider
-                                .stream_turn(&red_ai::TurnRequest { ..request }, &dtx, &cancel)
+                                .stream_turn(&request, &dtx, &cancel)
                                 .await
                                 .map(|outcome| review_note(&outcome))
                                 .map_err(|e| e.to_string())
@@ -3880,6 +3932,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             session_id,
                             Event::Error(RedError::Timeout.to_string()),
                         ),
+                        // A user cancel, not a failure. The read path reports this as
+                        // `QueryCancelled`; reporting it as an error toast on the
+                        // write path would tell the user their own Stop broke
+                        // something.
+                        Err(RedError::Interrupted) => {
+                            emit(&events, session_id, Event::QueryCancelled)
+                        }
                         Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
                     }
                 });
@@ -4212,6 +4271,22 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     );
                     continue;
                 };
+                // Defense in depth, matching `CopyToTable`. The driver enforces
+                // read-only too, but only once the job is under way — so without
+                // this the user gets a mid-import driver failure with rows already
+                // attempted, instead of a clean refusal before anything ran.
+                if state.read_only {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::ImportFailed {
+                            id,
+                            rows: 0,
+                            message: "this connection is read-only".into(),
+                        },
+                    );
+                    continue;
+                }
                 // Reuse the session's transfer-cancel registry (a shared id space
                 // with exports) so a `CancelImport` can flip the flag.
                 let cancel = Arc::new(AtomicBool::new(false));
@@ -4619,6 +4694,12 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let Some(dst_state) = sessions.get(&target_session) else {
                     migrate_fail!("target connection isn't open")
                 };
+                // Defense in depth, matching `CopyToTable`: never create tables on
+                // or write to a read-only destination, even if a stale command
+                // reaches here past the UI's target filter.
+                if dst_state.read_only {
+                    migrate_fail!("target connection is read-only — can't create tables there")
+                }
                 let Some(dst) = dst_state.driver.as_sql().cloned() else {
                     migrate_fail!("target isn't a SQL connection")
                 };
@@ -4724,7 +4805,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     }
 
     // The window closed or the service is shutting down. Explicitly tear down any
-    // live subscription agents (M-S3): the permission-relay tasks hold `Arc` clones
+    // live subscription agents: the permission-relay tasks hold `Arc` clones
     // of the manager, so dropping the loop's own `Arc` alone would leave a
     // reference cycle and orphan the agent subprocesses. Clearing the map drops
     // their command channels, which unwinds the cycle and reaps the processes.

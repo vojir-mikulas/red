@@ -1,12 +1,11 @@
-//! The MongoDB browser (`MongoView`), the document-store shell parallel to the
-//! Redis `kvbrowse::RedisView`. A `database -> collection` tree on the left and a
-//! tabbed work area on the right: each open collection is its own tab (with a
-//! per-collection filter bar, document grid, schema/indexes panels, aggregation
-//! editor, and inspector), and tabs live in an optional side-by-side split — the
-//! same `TabWorkspace` plumbing the SQL and Redis shells share. It speaks the
-//! `Doc*` `Command`/`Event` pair (see `red-service`'s protocol) and never touches
-//! the `DocDriver` directly, the same UI/driver separation the other shells keep.
-//! See `docs/plans/mongo-workspace.md`.
+//! The MongoDB browser (`MongoView`), the document-store shell parallel to the Redis
+//! `kvbrowse::RedisView`. A `database -> collection` tree on the left and a tabbed work
+//! area on the right: each open collection is its own tab (with a per-collection filter
+//! bar, document grid, schema/indexes panels, aggregation editor, and inspector), and
+//! tabs live in an optional side-by-side split — the same `TabWorkspace` plumbing the
+//! SQL and Redis shells share. It speaks the `Doc*` `Command`/`Event` pair (see `red-
+//! service`'s protocol) and never touches the `DocDriver` directly, the same UI/driver
+//! separation the other shells keep.
 
 mod form;
 mod render;
@@ -136,6 +135,10 @@ pub(crate) struct MongoView {
     /// originating collection's epoch so a confirmed re-send lands on it. Rendered
     /// as a modal over the shell.
     pending_write: Option<(Epoch, DocWrite, String)>,
+    /// A `$out`/`$merge` pipeline awaiting the same confirm as a destructive write:
+    /// `(epoch, pipeline, prompt)`. Kept apart from [`Self::pending_write`] because
+    /// it re-sends a `DocAggregate`, not a `DocApplyWrite`; both drive the one modal.
+    pending_pipeline: Option<(Epoch, String, String)>,
     /// The open tabs (one collection each, plus blank chooser tabs).
     tabs: Vec<MongoTab>,
     /// Index into `tabs` of the Primary half's visible tab.
@@ -577,6 +580,7 @@ impl MongoView {
             expanded: BTreeSet::new(),
             error: None,
             pending_write: None,
+            pending_pipeline: None,
             tabs: vec![MongoTab {
                 id: 0,
                 title: "New tab".to_string(),
@@ -732,6 +736,14 @@ impl MongoView {
             _ => None,
         })
     }
+
+    /// [`coll_by_epoch_mut`](Self::coll_by_epoch_mut) by shared reference.
+    fn coll_by_epoch(&self, epoch: Epoch) -> Option<&CollView> {
+        self.tabs.iter().find_map(|t| match &t.state {
+            MongoTabState::Collection(c) if c.epoch == epoch => Some(&**c),
+            _ => None,
+        })
+    }
 }
 
 impl AppState {
@@ -834,7 +846,7 @@ impl AppState {
         // Accumulate columns from the resident documents (so they don't flicker as
         // the window scrolls onto documents of other shapes), and resize the
         // List/JSON virtualized lists to the resident count.
-        let resident: Vec<Document> = current
+        let resident: Vec<std::rc::Rc<Document>> = current
             .window
             .borrow()
             .resident()
@@ -842,7 +854,11 @@ impl AppState {
             .iter()
             .cloned()
             .collect();
-        merge_columns(&mut current.columns, &resident, max_columns);
+        merge_columns(
+            &mut current.columns,
+            resident.iter().map(std::rc::Rc::as_ref),
+            max_columns,
+        );
         let n = resident.len();
         current.list_labels.clear();
         current.json_labels.clear();
@@ -1221,6 +1237,7 @@ impl AppState {
                 db,
                 coll,
                 pipeline,
+                confirmed: false,
             },
         );
         cx.notify();
@@ -1734,6 +1751,32 @@ impl AppState {
                 },
             );
             cx.notify();
+            return;
+        }
+        // The other thing this modal can be holding: a `$out`/`$merge` pipeline.
+        let pipeline = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+            .and_then(|v| v.pending_pipeline.take());
+        if let Some((epoch, pipeline, _)) = pipeline {
+            let target = self
+                .conn_for(Some(session))
+                .and_then(|a| a.doc_view.as_ref())
+                .and_then(|v| v.coll_by_epoch(epoch))
+                .map(|c| (c.db.clone(), c.coll.clone()));
+            if let Some((db, coll)) = target {
+                self.service.send_to(
+                    session,
+                    Command::DocAggregate {
+                        epoch,
+                        db,
+                        coll,
+                        pipeline,
+                        confirmed: true,
+                    },
+                );
+            }
+            cx.notify();
         }
     }
 
@@ -1744,8 +1787,34 @@ impl AppState {
             .and_then(|a| a.doc_view.as_mut())
         {
             view.pending_write = None;
+            // The Query panel's spinner was armed by the run that raised this; a
+            // declined confirm leaves it spinning otherwise.
+            if let Some((epoch, _, _)) = view.pending_pipeline.take()
+                && let Some(c) = view.coll_by_epoch_mut(epoch)
+            {
+                c.query_loading = false;
+            }
             cx.notify();
         }
+    }
+
+    /// A pipeline write stage needs the destructive confirm before it runs.
+    pub(crate) fn on_doc_pipeline_confirm(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: Epoch,
+        pipeline: String,
+        prompt: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
+            return;
+        };
+        view.pending_pipeline = Some((epoch, pipeline, prompt));
+        if let Some(c) = view.coll_by_epoch_mut(epoch) {
+            c.query_loading = false;
+        }
+        cx.notify();
     }
 
     /// Close the inspector (edit or compose).
@@ -1899,7 +1968,7 @@ fn doc_field_text(doc: &Document, cell_cap: usize) -> String {
 
 fn sample_columns(docs: &[Document], max_columns: usize) -> Vec<String> {
     let mut cols = vec!["_id".to_string()];
-    merge_columns(&mut cols, docs, max_columns);
+    merge_columns(&mut cols, docs.iter(), max_columns);
     cols
 }
 
@@ -1908,7 +1977,11 @@ fn sample_columns(docs: &[Document], max_columns: usize) -> Vec<String> {
 /// accumulate as the window scrolls onto documents of other shapes rather than
 /// flickering when a field is absent from the current resident set. Seeds `_id`
 /// on an empty `cols`.
-fn merge_columns(cols: &mut Vec<String>, docs: &[Document], max_columns: usize) {
+fn merge_columns<'a>(
+    cols: &mut Vec<String>,
+    docs: impl IntoIterator<Item = &'a Document>,
+    max_columns: usize,
+) {
     if cols.is_empty() {
         cols.push("_id".to_string());
     }

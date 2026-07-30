@@ -32,6 +32,8 @@ kv-imported_commands = Imported { $ok } command(s)
 
 kv-imported_with_failures = Imported { $ok }, { $failed } failed{ $detail }
 
+kv-import_stopped = Import stopped after { $ok } command(s); { $failed } failed
+
 kv-actions = Actions
 
 kv-toggle_namespace_tree = Toggle namespace tree

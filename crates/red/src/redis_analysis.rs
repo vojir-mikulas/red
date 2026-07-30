@@ -1,16 +1,12 @@
-//! Persistence for the Redis keyspace-analysis report (see docs/plans/redis.md's
-//! "persistent database analysis report" gap).
-//!
-//! Unlike the ephemeral biggest-keys sampler, an analysis report is *saved* so
-//! it can be revisited after a restart — the whole point of it being a
-//! point-in-time report rather than a live sample. One report is kept per
-//! connection (the latest run overwrites the previous), keyed by the same
-//! `conn_id` the query-history store uses.
-//!
-//! Storage mirrors `history.rs`: one JSON file, `<config>/red/redis-analysis.json`,
-//! rewritten atomically (temp + rename), owner-only (`0o600`) on Unix. A missing
-//! or corrupt file is simply "no saved reports"; one bad file never blocks
-//! startup (fail-open, like the other persisted-data loaders).
+//! Persistence for the Redis keyspace-analysis report. Unlike the ephemeral biggest-
+//! keys sampler, an analysis report is *saved* so it can be revisited after a restart —
+//! the whole point of it being a point-in-time report rather than a live sample. One
+//! report is kept per connection (the latest run overwrites the previous), keyed by the
+//! same `conn_id` the query-history store uses. Storage mirrors `history.rs`: one JSON
+//! file, `<config>/red/redis-analysis.json`, rewritten atomically (temp + rename),
+//! owner-only (`0o600`) on Unix. A missing or corrupt file is simply "no saved
+//! reports"; one bad file never blocks startup (fail-open, like the other persisted-
+//! data loaders).
 
 use std::collections::HashMap;
 use std::path::PathBuf;

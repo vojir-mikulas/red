@@ -121,6 +121,40 @@ impl Dialect {
             Dialect::Generic | Dialect::Postgres | Dialect::ClickHouse
         )
     }
+
+    /// Whether `/* /* */ */` nests, so the outer comment ends at the *last* `*/`
+    /// rather than the first. Postgres alone nests, and nesting exists there
+    /// precisely so a block of code containing comments can be commented out;
+    /// ending at the first `*/` hands the rest of the block to the engine as live
+    /// SQL. SQLite and MySQL do not nest, and ClickHouse's lexer says so in as
+    /// many words, so guessing "yes" for them would hide live SQL from the gates —
+    /// the opposite failure. `Generic` takes the non-nesting reading for the same
+    /// reason it reads `#` as an operator: err towards seeing more as live SQL.
+    fn nested_block_comments(self) -> bool {
+        matches!(self, Dialect::Postgres)
+    }
+
+    /// Whether `/*!` at `i` opens a MySQL *executable* comment, whose body the
+    /// server runs as ordinary SQL (`/*!50000 DROP TABLE t */` drops the table).
+    /// Reading one as a comment is the exact failure this module's doc names: the
+    /// engine executes it while every gate scanning the stripped copy sees
+    /// nothing. `/*+ … */` optimizer hints are *not* this — they are hints, not
+    /// statements — and stay comments.
+    fn executable_comment_at(self, b: &[u8], i: usize) -> bool {
+        matches!(self, Dialect::MySql) && b[i..].starts_with(b"/*!")
+    }
+}
+
+/// The index at which a MySQL executable comment's body starts: past `/*!` and
+/// past the optional version gate (`/*!50000 `), which is a directive rather than
+/// SQL. A non-matching version means the server skips the body, so keeping the
+/// digits out of the stripped copy only ever grades *more* conservatively.
+fn exec_comment_body(b: &[u8], i: usize) -> usize {
+    let mut j = i + 3;
+    while j < b.len() && b[j].is_ascii_digit() {
+        j += 1;
+    }
+    j
 }
 
 /// Break `sql` into its top-level statements, each trimmed, with blank and
@@ -190,8 +224,13 @@ pub fn statement_ranges(sql: &str, dialect: Dialect) -> Vec<Range<usize>> {
             b'-' if dialect.dash_comment_at(b, i) => i = line_comment_end(b, i + 2),
             // MySQL `# line comment` to end of line.
             b'#' if dialect.hash_comments() => i = line_comment_end(b, i + 1),
-            // `/* block comment */`.
-            b'/' if i + 1 < n && b[i + 1] == b'*' => i = skip_block_comment(b, i),
+            // `/* block comment */`. A MySQL `/*!…*/` is live SQL, but it is kept
+            // whole here rather than scanned into: the server parses the marker
+            // itself, so breaking the body at an inner `;` would send it a
+            // fragment starting `/*!50000` and a fragment ending `*/`. It stays one
+            // statement; [`strip_noise`] is what makes its body visible to the
+            // gates.
+            b'/' if i + 1 < n && b[i + 1] == b'*' => i = skip_block_comment(b, i, dialect),
             // Dollar-quoted body (`$$…$$` / `$tag$…$tag$`). Falls through to a
             // normal byte when the `$` isn't actually a dollar-quote opener
             // (e.g. a `$1` positional parameter).
@@ -278,10 +317,32 @@ fn opens_block(b: &[u8], word: &[u8], from: usize, dialect: Dialect) -> bool {
             return word.eq_ignore_ascii_case(b"if") && then_follows(b, at, dialect);
         }
     }
-    !matches!(
-        next_word(b, from),
-        Some((next, _)) if next.eq_ignore_ascii_case(b"not") || next.eq_ignore_ascii_case(b"exists")
-    )
+    // The `IF [NOT] EXISTS` of a header (`DROP TABLE IF EXISTS t`) opens nothing,
+    // but `IF NOT EXISTS (SELECT …) THEN` is a block whose condition happens to
+    // start with the same two words — so the shape alone does not settle it and a
+    // top-level `THEN` before the statement's own separator has to decide.
+    //
+    // Only `IF` has this ambiguity. For `WHILE`, `CASE`, `LOOP` and `REPEAT` a
+    // following `NOT` is an ordinary predicate (`WHILE NOT done DO`), and
+    // rejecting those left the `END WHILE` unmatched, closing the enclosing
+    // `BEGIN` early and cutting the routine body in half.
+    if word.eq_ignore_ascii_case(b"if") && if_exists_header(b, from) {
+        return then_follows(b, from, dialect);
+    }
+    true
+}
+
+/// Whether the `IF` ending at `from` is followed by the `EXISTS` / `NOT EXISTS`
+/// of a DDL header rather than by an ordinary condition.
+fn if_exists_header(b: &[u8], from: usize) -> bool {
+    let Some((first, after)) = next_word(b, from) else {
+        return false;
+    };
+    if first.eq_ignore_ascii_case(b"exists") {
+        return true;
+    }
+    first.eq_ignore_ascii_case(b"not")
+        && matches!(next_word(b, after), Some((w, _)) if w.eq_ignore_ascii_case(b"exists"))
 }
 
 /// Whether a top-level `THEN` appears at or after `from` before the statement's
@@ -307,7 +368,7 @@ fn then_follows(b: &[u8], from: usize, dialect: Dialect) -> bool {
             q @ (b'\'' | b'"' | b'`') => i = skip_quoted(b, i, q, quote_escapes(b, i, q, dialect)),
             b'-' if dialect.dash_comment_at(b, i) => i = line_comment_end(b, i + 2),
             b'#' if dialect.hash_comments() => i = line_comment_end(b, i + 1),
-            b'/' if i + 1 < n && b[i + 1] == b'*' => i = skip_block_comment(b, i),
+            b'/' if i + 1 < n && b[i + 1] == b'*' => i = skip_block_comment(b, i, dialect),
             c if is_word_byte(c) => {
                 let end = word_end(b, i);
                 if depth == 0 && b[i..end].eq_ignore_ascii_case(b"then") {
@@ -508,13 +569,27 @@ fn line_comment_end(b: &[u8], from: usize) -> usize {
 }
 
 /// Index just past the `*/` closing the block comment opened at `i` (or
-/// end-of-input if unterminated).
-fn skip_block_comment(b: &[u8], i: usize) -> usize {
+/// end-of-input if unterminated). Counts nesting depth where the dialect nests
+/// (see [`Dialect::nested_block_comments`]), so a `/* … /* … */ … */` ends where
+/// the engine ends it.
+fn skip_block_comment(b: &[u8], i: usize, dialect: Dialect) -> usize {
     let n = b.len();
+    let nests = dialect.nested_block_comments();
+    let mut depth = 1usize;
     let mut j = i + 2;
     while j + 1 < n {
         if b[j] == b'*' && b[j + 1] == b'/' {
-            return j + 2;
+            depth -= 1;
+            if depth == 0 {
+                return j + 2;
+            }
+            j += 2;
+            continue;
+        }
+        if nests && b[j] == b'/' && b[j + 1] == b'*' {
+            depth += 1;
+            j += 2;
+            continue;
         }
         j += 1;
     }
@@ -600,34 +675,64 @@ pub fn first_keyword(sql: &str) -> &str {
 /// ends — the drift the module doc says these primitives exist to prevent.
 pub fn strip_noise(sql: &str, dialect: Dialect) -> String {
     let b = sql.as_bytes();
-    let n = b.len();
-    let mut out = Vec::with_capacity(n);
-    let mut i = 0;
-    while i < n {
+    let mut out = Vec::with_capacity(b.len());
+    strip_into(&mut out, b, 0..b.len(), dialect);
+    // Blanked spans begin and end on ASCII bytes and everything else is copied
+    // verbatim, so the buffer is valid UTF-8 by construction; the fallback is
+    // unreachable but cheaper than a panic path.
+    String::from_utf8(out).unwrap_or_else(|_| sql.to_string())
+}
+
+/// Strip `b[span]` into `out`, one output byte per input byte. Split out of
+/// [`strip_noise`] so a MySQL executable comment can recurse into its own body
+/// with the markers blanked around it, which keeps the whole result
+/// byte-offset-preserving without a second pass.
+fn strip_into(out: &mut Vec<u8>, b: &[u8], span: Range<usize>, dialect: Dialect) {
+    let end = span.end;
+    let mut i = span.start;
+    while i < end {
         let from = i;
         match b[i] {
             q @ (b'\'' | b'"' | b'`') => {
-                i = skip_quoted(b, i, q, quote_escapes(b, i, q, dialect));
-                blank_span(&mut out, b, from, i);
+                i = skip_quoted(b, i, q, quote_escapes(b, i, q, dialect)).min(end);
+                blank_span(out, b, from, i);
             }
             b'-' if dialect.dash_comment_at(b, i) => {
-                i = line_comment_end(b, i + 2);
-                blank_span(&mut out, b, from, i);
+                i = line_comment_end(b, i + 2).min(end);
+                blank_span(out, b, from, i);
             }
             b'#' if dialect.hash_comments() => {
-                i = line_comment_end(b, i + 1);
-                blank_span(&mut out, b, from, i);
+                i = line_comment_end(b, i + 1).min(end);
+                blank_span(out, b, from, i);
             }
-            b'/' if i + 1 < n && b[i + 1] == b'*' => {
-                i = skip_block_comment(b, i);
-                blank_span(&mut out, b, from, i);
+            // MySQL runs the body of `/*!…*/`, so the gates have to see it. Blank
+            // the markers, strip the body as live SQL — the direction the module
+            // doc calls the unsafe one to get wrong.
+            b'/' if dialect.executable_comment_at(b, i) => {
+                let close = skip_block_comment(b, i, dialect).min(end);
+                let body = exec_comment_body(b, i).min(close);
+                // Unterminated: there is no `*/` to blank, so the body runs to the end.
+                let body_end = if b[..close].ends_with(b"*/") {
+                    close - 2
+                } else {
+                    close
+                }
+                .max(body);
+                blank_span(out, b, from, body);
+                strip_into(out, b, body..body_end, dialect);
+                blank_span(out, b, body_end, close);
+                i = close;
+            }
+            b'/' if i + 1 < end && b[i + 1] == b'*' => {
+                i = skip_block_comment(b, i, dialect).min(end);
+                blank_span(out, b, from, i);
             }
             // A dollar-quoted body is a string literal by another name; its
             // content must be as invisible to the gates as any other literal.
             b'$' if dialect.dollar_quotes() => match dollar_quote_end(b, i) {
-                Some(end) => {
-                    i = end;
-                    blank_span(&mut out, b, from, i);
+                Some(stop) => {
+                    i = stop.min(end);
+                    blank_span(out, b, from, i);
                 }
                 None => {
                     out.push(b'$');
@@ -640,10 +745,6 @@ pub fn strip_noise(sql: &str, dialect: Dialect) -> String {
             }
         }
     }
-    // Blanked spans begin and end on ASCII bytes and everything else is copied
-    // verbatim, so the buffer is valid UTF-8 by construction; the fallback is
-    // unreachable but cheaper than a panic path.
-    String::from_utf8(out).unwrap_or_else(|_| sql.to_string())
 }
 
 /// Blank `b[from..to]` into `out` as spaces, keeping newlines so the copy holds
@@ -881,12 +982,86 @@ SELECT 2";
         assert_eq!(s.len(), 3, "got {s:#?}");
     }
 
+    /// `NOT` after a block opener is an ordinary predicate, not the `IF NOT EXISTS`
+    /// of a header. Rejecting it left `END WHILE` closing the enclosing `BEGIN`, so
+    /// the routine was cut mid-body and a bare `END` went to the server on its own.
+    #[test]
+    fn not_after_a_block_opener_still_opens_the_block() {
+        for opener in [
+            "WHILE NOT @done DO SET @a = 1; END WHILE",
+            "IF NOT @flag THEN SET @a = 1; END IF",
+            "REPEAT SET @a = 1; UNTIL NOT @done END REPEAT",
+        ] {
+            let script = format!("CREATE PROCEDURE p() BEGIN {opener}; END; SELECT 1");
+            let s = split_statements(&script);
+            assert_eq!(s.len(), 2, "{opener}: got {s:#?}");
+            assert!(s[0].ends_with("END"), "{opener}: got {s:#?}");
+            assert_eq!(s[1], "SELECT 1");
+        }
+    }
+
+    /// The header form still opens nothing — but `IF NOT EXISTS (…) THEN` is a
+    /// block whose condition starts with the same two words, and only a top-level
+    /// `THEN` tells them apart.
+    #[test]
+    fn if_not_exists_header_and_block_are_told_apart() {
+        let s = split_statements(
+            "CREATE PROCEDURE p() BEGIN DROP TABLE IF EXISTS tmp; \
+             CREATE TABLE IF NOT EXISTS t (a INT); END; SELECT 1",
+        );
+        assert_eq!(s.len(), 2, "got {s:#?}");
+        let s = split_statements(
+            "CREATE PROCEDURE p() BEGIN IF NOT EXISTS (SELECT 1 FROM t) THEN \
+             SET @a = 1; END IF; END; SELECT 1",
+        );
+        assert_eq!(s.len(), 2, "got {s:#?}");
+        assert!(s[0].ends_with("END"), "got {s:#?}");
+    }
+
+    /// Postgres nests `/* /* */ */` — nesting exists precisely so code containing
+    /// comments can be commented out. Ending at the first `*/` handed the rest of
+    /// the block to the engine as live SQL.
+    #[test]
+    fn postgres_block_comments_nest() {
+        let script = "/*\nSELECT 1; /* inner */\nDROP TABLE scratch;\n*/\nSELECT 2";
+        let s = super::split_statements(script, Dialect::Postgres);
+        assert_eq!(s.len(), 1, "got {s:#?}");
+        assert!(s[0].ends_with("SELECT 2"), "got {s:#?}");
+        // MySQL and SQLite do not nest, and guessing that they do would hide live
+        // SQL from the gates — the opposite failure.
+        let s = super::split_statements(script, Dialect::MySql);
+        assert_eq!(s.len(), 2, "got {s:#?}");
+    }
+
     /// A bare `BEGIN` is transaction control, not a routine body: it must still end
     /// at its own `;` rather than swallowing everything after it.
     #[test]
     fn transaction_begin_is_not_a_compound_body() {
         let s = split_statements("BEGIN; UPDATE t SET a = 1; COMMIT;");
         assert_eq!(s, vec!["BEGIN", "UPDATE t SET a = 1", "COMMIT"]);
+    }
+
+    /// MySQL runs the body of `/*!…*/`, so [`strip_noise`] has to leave it visible
+    /// to the gates that scan the stripped copy — while other dialects, where it
+    /// really is a comment, keep blanking it.
+    #[test]
+    fn mysql_executable_comment_body_survives_stripping() {
+        let sql = "/*!50000 DROP TABLE users */";
+        let stripped = super::strip_noise(sql, Dialect::MySql);
+        assert_eq!(stripped.len(), sql.len(), "offsets must be preserved");
+        assert!(stripped.contains("DROP TABLE users"), "got {stripped:?}");
+        assert!(
+            !stripped.contains("50000"),
+            "the version gate is a directive"
+        );
+        let stripped = super::strip_noise(sql, Dialect::Postgres);
+        assert!(stripped.trim().is_empty(), "got {stripped:?}");
+        // A literal inside the body is still a literal.
+        let sql = "/*! UPDATE t SET note = 'where' */";
+        let stripped = super::strip_noise(sql, Dialect::MySql);
+        assert_eq!(stripped.len(), sql.len());
+        assert!(stripped.contains("UPDATE t SET note ="), "got {stripped:?}");
+        assert!(!stripped.contains("where"), "got {stripped:?}");
     }
 
     /// `DELIMITER` is a client directive: honoured as the separator for what

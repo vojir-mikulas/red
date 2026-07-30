@@ -247,17 +247,15 @@ pub(super) fn parse_stream_entries(v: &redis::Value) -> Vec<StreamEntry> {
     out
 }
 
-/// Pipeline `TYPE`/`PTTL`/`OBJECT ENCODING`/`MEMORY USAGE` for a batch of keys
-/// into one round trip (see docs/plans/redis.md's "the N+1 metadata
-/// problem"). `.ignore_errors()` keeps a single key that expired between
-/// `SCAN` and this call from failing the whole batch: `OBJECT ENCODING` on a
-/// vanished key is the one sub-command that comes back as a RESP error
-/// (`TYPE` reports `"none"`, `PTTL`/`MEMORY USAGE` report `-2`/nil), and with
-/// `ignore_errors()` set that position decodes as a `Value::ServerError`,
-/// which `redis::from_redis_value` turns into a plain `Err` we treat as
-/// "unavailable" rather than aborting the batch. Rejected alternative: a Lua
-/// script batching all keys in one `EVAL` — breaks under Redis Cluster's
-/// `CROSSSLOT` check once a scanned batch spans slots on the same node (see
+/// Pipeline `TYPE`/`PTTL`/`OBJECT ENCODING`/`MEMORY USAGE` for a batch of keys into one
+/// round trip. `.ignore_errors()` keeps a single key that expired between `SCAN` and
+/// this call from failing the whole batch: `OBJECT ENCODING` on a vanished key is the
+/// one sub-command that comes back as a RESP error (`TYPE` reports `"none"`,
+/// `PTTL`/`MEMORY USAGE` report `-2`/nil), and with `ignore_errors()` set that position
+/// decodes as a `Value::ServerError`, which `redis::from_redis_value` turns into a
+/// plain `Err` we treat as "unavailable" rather than aborting the batch. Rejected
+/// alternative: a Lua script batching all keys in one `EVAL` — breaks under Redis
+/// Cluster's `CROSSSLOT` check once a scanned batch spans slots on the same node (see
 /// the plan's seam-decision section).
 pub(super) async fn fetch_key_meta_batch(
     conn: &mut MultiplexedConnection,

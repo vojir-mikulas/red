@@ -47,17 +47,34 @@ use crate::{
 /// lazily (nothing opened until the first fetch) to respect the cold-start budget.
 const FETCH_POOL_CAP: usize = 4;
 
-/// A live PostgreSQL session. Holds the shared `Client` (cursor, introspection,
-/// `execute`) plus a small lazily-grown pool of warm connections the cancellable
-/// one-shot fetches borrow; see `FETCH_POOL_CAP`.
+/// A live PostgreSQL session. Holds the shared `Client` (introspection, `execute`)
+/// plus a small lazily-grown pool of warm connections the cancellable one-shot
+/// fetches *and* the streaming cursors borrow; see `FETCH_POOL_CAP`.
 pub struct PostgresDriver {
     client: Arc<Client>,
     version: String,
     dsn: String,
     read_only: bool,
-    /// Idle fetch connections, returned after each one-shot fetch. A free list, not
-    /// a semaphore: `acquire` opens a fresh connection when it's empty.
-    pool: StdMutex<Vec<Arc<Client>>>,
+    /// Idle fetch connections, returned after each one-shot fetch and when a cursor
+    /// is dropped. A free list, not a semaphore: `acquire` opens a fresh connection
+    /// when it's empty.
+    ///
+    /// Shared by `Arc` because a [`PgCursor`] outlives the call that opened it and
+    /// has to hand its connection back on drop.
+    pool: Arc<StdMutex<Vec<Arc<Client>>>>,
+}
+
+/// Return `client` to the free list, dropping it if dead or the pool is at cap.
+/// Free-standing so both [`PostgresDriver::release`] and `PgCursor`'s `Drop` — which
+/// has no driver reference, only the shared pool — hand connections back the same way.
+fn release_to(pool: &StdMutex<Vec<Arc<Client>>>, client: Arc<Client>) {
+    if client.is_closed() {
+        return;
+    }
+    let mut pool = lock(pool);
+    if pool.len() < FETCH_POOL_CAP {
+        pool.push(client);
+    }
 }
 
 /// No bind parameters; `query_raw` needs a typed iterator, so spell out the kind.
@@ -126,6 +143,18 @@ impl PostgresDriver {
             let _ = connection.await;
         });
 
+        // The literal escaping in `red_core` and in `pg_literal` builds strings for
+        // the modern default (`standard_conforming_strings = on`, where `\` is an
+        // ordinary character). That is an ordinary GUC a legacy server or a
+        // per-database `ALTER DATABASE … SET` can flip, and under `off` a cell value
+        // ending in `\` — attacker-controlled on a shared database, and reachable
+        // through FK-follow predicates and Cmp filters — escapes the closing quote.
+        // Pin it rather than assume it.
+        client
+            .batch_execute("SET standard_conforming_strings = on")
+            .await
+            .map_err(|e| RedError::Connect(e.to_string()))?;
+
         if read_only {
             client
                 .batch_execute("SET default_transaction_read_only = on")
@@ -144,7 +173,7 @@ impl PostgresDriver {
             version,
             dsn: dsn.to_string(),
             read_only,
-            pool: StdMutex::new(Vec::new()),
+            pool: Arc::new(StdMutex::new(Vec::new())),
         })
     }
 
@@ -166,13 +195,7 @@ impl PostgresDriver {
     /// is at cap). Call only *after* disarming the fetch's cancel, so a late abort
     /// can't fire against a connection that's about to serve someone else.
     fn release(&self, client: Arc<Client>) {
-        if client.is_closed() {
-            return;
-        }
-        let mut pool = lock(&self.pool);
-        if pool.len() < FETCH_POOL_CAP {
-            pool.push(client);
-        }
+        release_to(&self.pool, client);
     }
 
     /// Open one fetch connection with the same read-only posture as the main client.
@@ -183,6 +206,10 @@ impl PostgresDriver {
         tokio::spawn(async move {
             let _ = connection.await;
         });
+        client
+            .batch_execute("SET standard_conforming_strings = on")
+            .await
+            .map_err(|e| RedError::Connect(e.to_string()))?;
         if self.read_only {
             client
                 .batch_execute("SET default_transaction_read_only = on")
@@ -228,35 +255,45 @@ impl DatabaseDriver for PostgresDriver {
         self.version.clone()
     }
 
-    /// Unchanged for now. Postgres binds its *database* at connect and cannot
-    /// switch it on a live connection; the rebindable namespace is the schema, via
-    /// `search_path`. Unlike MySQL's re-acquire-per-operation pool, a
-    /// `SET search_path` here is **sticky**: it persists on the long-lived
-    /// `client` and on free-list clients (which are never reset on release), so it
-    /// would leak into later operations and across tabs. Doing it safely needs
-    /// per-client tracking or `SET LOCAL` inside each operation's transaction —
-    /// see docs/plans/todo/database-context.md. Until then `namespace_caps()`
-    /// reports `settable: false` and the UI does not offer a picker.
+    /// Unchanged for now. Postgres binds its *database* at connect and cannot switch it
+    /// on a live connection; the rebindable namespace is the schema, via `search_path`.
+    /// Unlike MySQL's re-acquire-per-operation pool, a `SET search_path` here is
+    /// **sticky**: it persists on the long-lived `client` and on free-list clients
+    /// (which are never reset on release), so it would leak into later operations and
+    /// across tabs. Doing it safely needs per-client tracking or `SET LOCAL` inside
+    /// each operation's transaction —.
     fn scoped(self: Arc<Self>, _namespace: Option<&str>) -> Arc<dyn DatabaseDriver> {
         self
     }
 
+    /// A cursor gets a pooled connection of its own, held for its whole lifetime.
+    ///
+    /// tokio-postgres answers pipelined requests strictly in order over one
+    /// connection, so two cursors sharing the shared `client` could not interleave:
+    /// the second cursor's `prepare` cannot complete until the first has streamed to
+    /// the end through a channel nobody is draining. The same-connection `DiffTables`
+    /// does exactly that interleaving, and hung on any table bigger than a test
+    /// fixture. Cancellation is connection-scoped for the same reason — a cursor's
+    /// own connection means its cancel hits its own query and nothing else.
     async fn open_cursor(&self, sql: &str, opts: QueryOptions) -> Result<Box<dyn QueryCursor>> {
-        let (stmt, columns) = prepare_columns(&self.client, sql).await?;
-        let stream = self
-            .client
+        let client = self.acquire().await?;
+        let (stmt, columns) = prepare_columns(&client, sql).await?;
+        let stream = client
             .query_raw(&stmt, no_params())
             .await
             .map_err(driver_err)?;
 
         // Out-of-band cancel: a separate cancel request over a fresh connection.
-        let cancel = pg_cancel_token(&self.client);
+        let cancel = pg_cancel_token(&client);
 
         Ok(Box::new(PgCursor {
             columns,
             stream: Mutex::new(Box::pin(stream)),
             cancel,
             full: opts.full_fidelity,
+            exhausted: AtomicBool::new(false),
+            client: Some(client),
+            pool: self.pool.clone(),
         }))
     }
 
@@ -848,6 +885,16 @@ impl DatabaseDriver for PostgresDriver {
             client.batch_execute("BEGIN").await.map_err(driver_err)?;
             let mut affected = Vec::with_capacity(statements.len());
             for sql in statements {
+                // Re-checked *between* statements, not just before `BEGIN`. The
+                // out-of-band cancel only reaches the statement currently executing,
+                // so an abort that fires in the gap — or one that races a
+                // statement's completion — was a no-op, and the loop ran every
+                // remaining statement through to `COMMIT`. A 200-statement script
+                // could blow through its timeout and still report success.
+                if abort.is_aborted() {
+                    crate::warn_rollback(client.batch_execute("ROLLBACK").await, "execute_batch");
+                    return Err(RedError::Interrupted);
+                }
                 match client.execute(sql.as_str(), &[]).await {
                     Ok(n) => affected.push(n),
                     Err(e) => {
@@ -1763,11 +1810,14 @@ impl DatabaseDriver for PostgresDriver {
         progress: UnboundedSender<u64>,
     ) -> Result<u64> {
         let sql = format!("SELECT * FROM ({}) AS _red", strip_trailing(sql));
-        let (stmt, columns) = prepare_columns(&self.client, &sql).await?;
+        // Its own pooled connection, for the reason `open_cursor` documents: an
+        // export streams for as long as the table is big, and on the shared client
+        // every other request would queue behind it.
+        let conn = self.acquire().await?;
+        let (stmt, columns) = prepare_columns(&conn, &sql).await?;
         let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
-        let stream = self
-            .client
+        let stream = conn
             .query_raw(&stmt, no_params())
             .await
             .map_err(driver_err)?;
@@ -1798,6 +1848,10 @@ impl DatabaseDriver for PostgresDriver {
             writer.write_row(&cells).map_err(driver_err)?;
             throttle.tick(writer.written());
         }
+        // The loop only ends when the stream is exhausted, so the connection is
+        // clean here. Every other exit closes it by dropping `conn`, which is what a
+        // half-answered connection deserves.
+        self.release(conn);
         writer.finish().map_err(driver_err)
     }
 }
@@ -1811,6 +1865,33 @@ struct PgCursor {
     /// Read cells at full fidelity (the table-copy read) rather than the display
     /// fat-cell cap; see [`QueryOptions::full_fidelity`](red_core::QueryOptions).
     full: bool,
+    /// Whether the stream ran to its end. A connection is only safe to reuse once
+    /// the server has finished answering on it; see [`PgCursor::drop`].
+    exhausted: AtomicBool,
+    /// The connection this cursor streams over, held for its whole lifetime and
+    /// handed back on drop. `Option` only so `drop` can move it out.
+    client: Option<Arc<Client>>,
+    pool: Arc<StdMutex<Vec<Arc<Client>>>>,
+}
+
+/// Hand the connection back when the cursor goes away — including when the service
+/// drops a superseded cursor, which is the common case.
+///
+/// An unexhausted cursor's connection still has rows queued server-side, so
+/// returning it to the pool would hand the next borrower someone else's result. Fire
+/// the cancel and let the connection close instead: correctness over reuse, and the
+/// cancel is what stops the server streaming a result nobody will ever read.
+impl Drop for PgCursor {
+    fn drop(&mut self) {
+        let Some(client) = self.client.take() else {
+            return;
+        };
+        if self.exhausted.load(Ordering::Relaxed) {
+            release_to(&self.pool, client);
+        } else {
+            self.cancel.cancel();
+        }
+    }
 }
 
 #[async_trait]
@@ -1834,6 +1915,9 @@ impl QueryCursor for PgCursor {
                 Some(Ok(row)) => rows.push(pg_row(&row, cap)),
                 Some(Err(e)) => return Err(map_pg_err(e)),
                 None => {
+                    // The server is done answering, so the connection is clean and
+                    // `drop` can return it to the pool.
+                    self.exhausted.store(true, Ordering::Relaxed);
                     return Ok(RowWindow {
                         rows,
                         exhausted: true,
@@ -1874,6 +1958,14 @@ const PG_PARAM_CAP: usize = 60_000;
 /// text-family columns (and an unknown / absent type, e.g. a key bind) keep `::text`.
 fn pg_cast(value: &Value, decl_type: Option<&str>) -> String {
     match value {
+        // `pg_value` decodes a `BOOL` cell as `Value::Integer`, and Postgres has no
+        // int8→bool cast at all — not even an explicit one — so a plain `::int8`
+        // into a `boolean` column fails with 42804 and takes every copy and
+        // migration of a bool column with it. `int4` is the width the bool cast is
+        // defined on, hence the two hops.
+        Value::Integer(_) if decl_type.is_some_and(is_pg_bool_type) => {
+            "::int8::int4::bool".to_string()
+        }
         Value::Integer(_) => "::int8".to_string(),
         Value::Real(_) => "::float8".to_string(),
         Value::Blob(_) => "::bytea".to_string(),
@@ -1883,6 +1975,15 @@ fn pg_cast(value: &Value, decl_type: Option<&str>) -> String {
             _ => "::text".to_string(),
         },
     }
+}
+
+/// Whether a Postgres column type names the boolean type, under either spelling
+/// (`information_schema.udt_name` reports `bool`, `format_type` says `boolean`).
+fn is_pg_bool_type(name: &str) -> bool {
+    matches!(
+        name.trim().to_ascii_lowercase().as_str(),
+        "bool" | "boolean"
+    )
 }
 
 /// Whether a Postgres column type (the `typname` we store as `decl_type`) is a
@@ -2412,7 +2513,7 @@ mod tests {
             &driver, &schema, &authors, &books, &recent,
         )
         .await;
-        // Track B7: the connection-wide FK graph reports the same edge.
+        // The connection-wide FK graph reports the same edge.
         battery::lists_foreign_key_graph(&driver, &schema, &authors, &books).await;
 
         // Seed a few rows so the column-stats summary has data: author_id is

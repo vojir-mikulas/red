@@ -1,4 +1,4 @@
-//! The result filter bar (Track B2): a small input strip above the grid that
+//! The result filter bar: a small input strip above the grid that
 //! narrows the whole result by pushing a predicate into the query. Distinct from
 //! find-in-result (which only highlights loaded rows), a filter **re-opens** the
 //! result under a new epoch with the predicate wrapped in, so the count, the
@@ -1263,7 +1263,7 @@ impl AppState {
 /// outside the two text modes), and its built terms (empty outside `Column`).
 /// `fallback` is the mode to use when nothing is applied.
 ///
-/// An FK-follow `Eq` filter (Track B7) has no text form of its own, so it seeds
+/// An FK-follow `Eq` filter has no text form of its own, so it seeds
 /// the `WHERE` box with the equivalent expression; applying that replaces it.
 fn bar_seed(
     applied: Option<&ResultFilter>,

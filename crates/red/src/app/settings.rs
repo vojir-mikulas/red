@@ -176,7 +176,7 @@ impl AppState {
             self.ai_configured = !self.usable_agents.is_empty();
             self.service
                 .send_global(Command::ConfigureAi(crate::app::ai_config(&self.settings)));
-            // If that just flipped the master switch off (M-S7), close any open
+            // If that just flipped the master switch off, close any open
             // panel so the kill switch is immediate.
             if self.assistant.is_some() && !self.ai_enabled() {
                 self.assistant = None;

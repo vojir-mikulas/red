@@ -1,6 +1,6 @@
 //! Recent result filters: the predicates a user has actually applied, kept per
 //! connection **and** per browsed table so the same table offers the same filters
-//! next time it is opened (see `docs/plans/todo/result-filter-ux.md`, phase 4).
+//! next time it is opened.
 //!
 //! Query history (`history.rs`) logs statements; this logs the narrowings applied
 //! on top of one. They are separate stores because they are recalled from

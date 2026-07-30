@@ -144,7 +144,7 @@ impl AppState {
             return self.with_agent_menu(view, cx);
         }
 
-        // The chat-list switcher replaces the transcript while open (M-S6).
+        // The chat-list switcher replaces the transcript while open.
         if state.show_list {
             let view = self.render_assistant_list(state, header, &theme, cx);
             return self.with_agent_menu(view, cx);
@@ -418,7 +418,7 @@ impl AppState {
                 ))
         };
 
-        // The chat switcher (M-S6): toggles a list of all open chats. A red dot
+        // The chat switcher: toggles a list of all open chats. A red dot
         // flags a background chat that needs attention (a parked permission).
         let needs_attention = state
             .chats
@@ -568,7 +568,7 @@ impl AppState {
                     .text_color(theme.text)
                     .child(agent_label)
                     // A "writes" badge when this connection opted into the write tier
-                    // (Feature B), so the user knows the agent can propose data changes
+                    //, so the user knows the agent can propose data changes
                     // (each one still gated by per-statement approval).
                     .when(self.ai_tier_effective() == red_core::AiTier::Write, |row| {
                         row.child(
@@ -973,7 +973,7 @@ impl AppState {
         el.into_any_element()
     }
 
-    /// The context-action chips (M-S4): "Explain error" when the active result
+    /// The context-action chips: "Explain error" when the active result
     /// failed, "Optimize query" when the editor holds SQL. Shared by both providers
     /// (they ride the same `AiTurn`). Hidden while a turn streams, or when neither
     /// applies. Docked above the composer so they're reachable regardless of scroll.
@@ -1040,7 +1040,7 @@ impl AppState {
         Some(row.into_any_element())
     }
 
-    /// The tool-permission prompt (M-S2): what the agent wants to do, plus
+    /// The tool-permission prompt: what the agent wants to do, plus
     /// Allow/Deny. Docked above the composer so it's visible regardless of scroll;
     /// the agent is blocked until the user answers.
     fn render_permission(
@@ -1822,7 +1822,7 @@ fn stream_caret(theme: &flint::Theme, reduce_motion: bool) -> AnyElement {
     .into_any_element()
 }
 
-/// The token/cost footer (M-S4): a compact, dim strip under the composer showing
+/// The token/cost footer: a compact, dim strip under the composer showing
 /// the latest turn's accounting. The subscription path reports the tokens in
 /// context plus a running session cost; the API-key path reports per-turn tokens
 /// and no cost. Only non-zero/present fields render.

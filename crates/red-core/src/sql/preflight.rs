@@ -35,15 +35,22 @@ use super::{Dialect, first_keyword, split_statements, strip_noise};
 /// - `TRUNCATE [TABLE] t` and `DROP TABLE t` -> `SELECT 1 FROM t`, so a
 ///   confirmation can say how much lives in the table before it goes.
 pub fn count_preflight(sql: &str, dialect: Dialect) -> Option<String> {
-    let statements: Vec<&str> = split_statements(sql, dialect)
+    // Filter on the stripped copy, matching [`super::risk::assess`]: a MySQL
+    // `/*!…*/` reads as comment-only in the raw text but the server runs its body,
+    // and a batch that looks single-statement here would be preflighted as if the
+    // hidden statement were not there.
+    let statements: Vec<(&str, String)> = split_statements(sql, dialect)
         .into_iter()
-        .filter(|s| !first_keyword(s).is_empty())
+        .map(|stmt| {
+            let stripped = strip_noise(stmt, dialect);
+            (stmt, stripped)
+        })
+        .filter(|(_, stripped)| !first_keyword(stripped).is_empty())
         .collect();
     // A batch has no single "how many rows will this touch" answer.
-    let [stmt] = statements.as_slice() else {
+    let [(stmt, stripped)] = statements.as_slice() else {
         return None;
     };
-    let stripped = strip_noise(stmt, dialect);
     let lower = stripped.to_ascii_lowercase();
 
     // `RETURNING` would be swept into the sliced tail and make the count query

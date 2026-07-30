@@ -8,6 +8,7 @@
 //! and a text CSV/JSON of raw binary is rarely what a user wants. Binary-faithful
 //! export is a later format option.
 
+use std::borrow::Cow;
 use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
@@ -17,8 +18,23 @@ use tokio::sync::mpsc::UnboundedSender;
 
 /// Strip surrounding whitespace and a single trailing `;` so a user statement can
 /// be wrapped in `SELECT * FROM (<sql>) AS _red` for paging/count/export.
-pub(crate) fn strip_trailing(sql: &str) -> &str {
-    sql.trim().strip_suffix(';').unwrap_or(sql.trim()).trim()
+///
+/// A statement whose last line carries a line comment (`SELECT 1 -- note`, an
+/// ordinary editor habit) gets a newline appended: without it the wrapper's own
+/// `)` lands *inside* that comment, the engine sees an unbalanced paren, and
+/// count, paging and export all fail for the whole query.
+///
+/// The check is deliberately loose — any `--` or `#` on the last line, string
+/// literal or not. A false positive appends a newline that changes nothing; a
+/// false negative breaks the query.
+pub(crate) fn strip_trailing(sql: &str) -> Cow<'_, str> {
+    let trimmed = sql.trim().strip_suffix(';').unwrap_or(sql.trim()).trim();
+    let last_line = trimmed.rsplit('\n').next().unwrap_or(trimmed);
+    if last_line.contains("--") || last_line.contains('#') {
+        Cow::Owned(format!("{trimmed}\n"))
+    } else {
+        Cow::Borrowed(trimmed)
+    }
 }
 
 /// Rows between throttled progress emits (also bounded by [`PROGRESS_INTERVAL`]).

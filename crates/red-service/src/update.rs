@@ -1,4 +1,4 @@
-//! The self-updater (Phase 3 of docs/plans/self-update.md): poll GitHub Releases,
+//! The self-updater: poll GitHub Releases,
 //! download a newer build, swap it over the installed app, and report
 //! `ReadyToRestart`. The relaunch itself is a UI concern (spawn the new build +
 //! exit). The check loop, API fetch, semver comparison, and download-host pinning

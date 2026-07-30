@@ -178,7 +178,7 @@ async fn run_connection(
     let ready_closure = ready.clone();
     let cwd = config.cwd.clone();
     let mcp = config.mcp.clone();
-    // Permission policy (M-S2): the auto-allow catalog and the user-decision sink,
+    // Permission policy: the auto-allow catalog and the user-decision sink,
     // shared into the request handler (which the connection may invoke per call).
     let allow_tools = Arc::new(config.allow_tools.clone());
     let permissions = config.permissions.clone();
@@ -200,7 +200,7 @@ async fn run_connection(
             },
             agent_client_protocol::on_receive_notification!(),
         )
-        // Permission requests (M-S2): auto-allow RED's read-only DB tools (the
+        // Permission requests: auto-allow RED's read-only DB tools (the
         // agent is already capability-restricted to no filesystem/terminal); route
         // anything else to the user for a decision, defaulting to deny.
         .on_receive_request(
@@ -359,11 +359,19 @@ async fn run_turns(
 
         // Await the turn while staying responsive to cancel. A closed channel
         // (None) during a turn also means "stop", so cancel and let it wind down.
+        //
+        // `closed` is what keeps that from becoming a spin: once the channel is
+        // closed `recv()` returns `None` immediately and forever, so the arm fired
+        // every iteration — pegging a core and queueing an unbounded stream of
+        // `CancelNotification`s at the agent, indefinitely if it was wedged. One
+        // cancel is the whole message; after that the arm just stops being armed.
+        let mut closed = false;
         let outcome = loop {
             tokio::select! {
                 result = &mut prompt => break result,
-                ctl = cmd_rx.recv() => match ctl {
+                ctl = cmd_rx.recv(), if !closed => match ctl {
                     Some(Cmd::Cancel) | None => {
+                        closed = ctl.is_none();
                         let _ = conn.send_notification(CancelNotification::new(session_id.clone()));
                     }
                     Some(Cmd::Prompt { done, .. }) => {
@@ -657,7 +665,7 @@ fn restricted_capabilities() -> ClientCapabilities {
         .terminal(false)
 }
 
-/// Decide one permission request (M-S2): `true` allows the agent's tool call.
+/// Decide one permission request: `true` allows the agent's tool call.
 /// RED's read-only DB tools auto-allow; anything else is forwarded to the user
 /// (via `permissions`) and blocks on their answer, defaulting to deny when no UI
 /// is wired or the sink has gone away.

@@ -1,4 +1,4 @@
-//! Domain types for the `KvDriver` seam (Redis; see `docs/plans/redis.md`).
+//! Domain types for the `KvDriver` seam (Redis).
 //! Parallel to the SQL-shaped `ResultPage`/`RowWindow`/`KeySpec` in `lib.rs`,
 //! but nothing here assumes a table/column model or an orderable key.
 
@@ -55,10 +55,9 @@ impl KvType {
     }
 }
 
-/// One key's row in the keyspace browser: everything the grid's
-/// `key | type | TTL | size | encoding` columns need, fetched in one
-/// pipelined round trip per scanned batch (see `docs/plans/redis.md`'s
-/// "the N+1 metadata problem").
+/// One key's row in the keyspace browser: everything the grid's `key | type | TTL |
+/// size | encoding` columns need, fetched in one pipelined round trip per scanned
+/// batch.
 #[derive(Debug, Clone)]
 pub struct KeyMeta {
     pub key: String,
@@ -91,13 +90,12 @@ pub struct ScanBudget {
     pub want: usize,
 }
 
-/// An opaque keyspace-scan position (see docs/plans/redis.md's cluster
-/// fan-out). Callers treat it as a token: begin from [`ScanCursor::START`],
-/// echo back whatever [`KvScanPage::next_cursor`] the previous page carried,
-/// and stop on `exhausted` — never inspect or construct the `Cluster` shape
-/// themselves. On a standalone/Sentinel server it wraps a single `SCAN`
-/// cursor; on a Cluster, `SCAN` is per-node, so it also tracks which master
-/// is being walked (the driver advances to the next master when one exhausts).
+/// An opaque keyspace-scan position. Callers treat it as a token: begin from
+/// [`ScanCursor::START`], echo back whatever [`KvScanPage::next_cursor`] the previous
+/// page carried, and stop on `exhausted` — never inspect or construct the `Cluster`
+/// shape themselves. On a standalone/Sentinel server it wraps a single `SCAN` cursor;
+/// on a Cluster, `SCAN` is per-node, so it also tracks which master is being walked
+/// (the driver advances to the next master when one exhausts).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScanCursor {
     /// Standalone/Sentinel: one `SCAN` cursor (`0` = start/end, disambiguated
@@ -268,12 +266,11 @@ impl KvStreamActionReq {
     }
 }
 
-/// A collection value below vs. at/above the small-collection threshold (see
-/// docs/plans/redis.md's "big collections inside a single key"): `Loaded`
-/// carries every element, fetched once in `read_value`; `Large` carries only
-/// the O(1) length probe (`HLEN`/`SCARD`/`ZCARD`/`LLEN`) and nothing else —
-/// the caller pages the rest on demand via `read_collection_page`/
-/// `read_list_window` rather than ever issuing a `*GETALL`/`*MEMBERS` on it.
+/// A collection value below vs. at/above the small-collection threshold: `Loaded`
+/// carries every element, fetched once in `read_value`; `Large` carries only the O(1)
+/// length probe (`HLEN`/`SCARD`/`ZCARD`/`LLEN`) and nothing else — the caller pages the
+/// rest on demand via `read_collection_page`/`read_list_window` rather than ever
+/// issuing a `*GETALL`/`*MEMBERS` on it.
 #[derive(Debug, Clone)]
 pub enum KvCollection<T> {
     Loaded(Vec<T>),
@@ -433,7 +430,7 @@ pub enum KvEdit {
 }
 
 /// One entry of the server's slow-command log (`SLOWLOG GET`), for the
-/// diagnostics panel (see docs/plans/redis.md's "slowlog viewer" gap). Redis
+/// diagnostics panel. Redis
 /// records a command here when its execution time exceeds
 /// `slowlog-log-slower-than` microseconds; the log is a fixed-size ring, so
 /// this is always a bounded, recent view.
@@ -455,10 +452,9 @@ pub struct SlowlogEntry {
     pub client_name: String,
 }
 
-/// One connected client, from a `CLIENT LIST` reply line (see docs/plans/redis.md's
-/// "CLIENT LIST viewer" gap). Only the fields the viewer surfaces are kept;
-/// `CLIENT LIST` carries many more, but a curated set reads better than a raw
-/// dump and stays stable across server versions that add/rename fields.
+/// One connected client, from a `CLIENT LIST` reply line. Only the fields the viewer
+/// surfaces are kept; `CLIENT LIST` carries many more, but a curated set reads better
+/// than a raw dump and stays stable across server versions that add/rename fields.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ClientInfo {
     /// The client's unique connection id (`id=`), the handle `CLIENT KILL ID`
@@ -640,6 +636,15 @@ const READ_SUBCOMMANDS: &[(&str, &str)] = &[
 /// `EVAL "redis.call('flushall')" 0` is `FLUSHALL` with extra steps — so a
 /// name-based gate that skipped them would be a one-line bypass. `MIGRATE`
 /// moves keys to an arbitrary remote server (exfiltration shaped like a copy).
+///
+/// The second group destroys data without saying so in its name, which is exactly
+/// why it belongs here: gating on the obvious verbs only means a hostile or
+/// careless line reads as ordinary while doing the same damage. `GETDEL` is `DEL`
+/// with a read attached; `LTRIM k 1 0` empties a list and `XTRIM`/`SPOP` remove
+/// entries the same way; `RENAME` overwrites its destination (which is why the
+/// driver's own rename path uses `RENAMENX`); `RESTORE … REPLACE` and `COPY …
+/// REPLACE` overwrite whatever is already there; `PERSIST`/`EXPIRE` at 0 removes
+/// the key outright.
 const DESTRUCTIVE_COMMANDS: &[&str] = &[
     "FLUSHALL",
     "FLUSHDB",
@@ -655,6 +660,25 @@ const DESTRUCTIVE_COMMANDS: &[&str] = &[
     "EVALSHA",
     "FCALL",
     "MIGRATE",
+    // Destructive by effect rather than by name.
+    "GETDEL",
+    "LTRIM",
+    "XTRIM",
+    "SPOP",
+    "RENAME",
+    "XDEL",
+    "LPOP",
+    "RPOP",
+    "LREM",
+    "SREM",
+    "ZREM",
+    "ZREMRANGEBYSCORE",
+    "ZREMRANGEBYRANK",
+    "ZREMRANGEBYLEX",
+    "HDEL",
+    "SETRANGE",
+    "RESTORE",
+    "COPY",
 ];
 
 /// `(command, subcommand)` pairs that are destructive only in a specific form,
@@ -685,7 +709,7 @@ const DESTRUCTIVE_SUBCOMMANDS: &[(&str, &str)] = &[
 ];
 
 /// Classify a raw console command line for the read-only gate and the
-/// destructive-command confirm (see docs/plans/redis.md's console phase).
+/// destructive-command confirm.
 /// Unknown commands default to [`OpClass::Write`] (the safer default under a
 /// read-only connection) but never [`OpClass::Destructive`] on their own, so a
 /// typo doesn't trigger a confirm prompt for no reason.
@@ -772,12 +796,11 @@ pub struct KvMessage {
     pub payload: String,
 }
 
-/// One decoded keyspace notification (see docs/plans/redis.md's "keyspace-
-/// notification live tooling" gap): a key and the event that happened to it, in
-/// which logical database. Redis delivers these over Pub/Sub on two mirror
-/// channel families — `__keyspace@<db>__:<key>` (payload is the event) and
-/// `__keyevent@<db>__:<event>` (payload is the key) — both of which decode to
-/// this same shape via [`parse_keyspace_channel`].
+/// One decoded keyspace notification: a key and the event that happened to it, in which
+/// logical database. Redis delivers these over Pub/Sub on two mirror channel families —
+/// `__keyspace@<db>__:<key>` (payload is the event) and `__keyevent@<db>__:<event>`
+/// (payload is the key) — both of which decode to this same shape via
+/// [`parse_keyspace_channel`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeyspaceEvent {
     pub db: i64,
@@ -833,12 +856,10 @@ impl KeyspaceScope {
     }
 }
 
-/// A persisted, point-in-time keyspace analysis report (see docs/plans/redis.md's
-/// "persistent database analysis report" gap): a type/namespace/expiry rollup
-/// over a sample of the keyspace. Distinct from the ephemeral biggest-keys
-/// sampler in that it's saved per connection and can be revisited after a
-/// restart. Derives serde (behind the `serde` feature) so the app edge can
-/// store it as JSON.
+/// A persisted, point-in-time keyspace analysis report: a type/namespace/expiry rollup
+/// over a sample of the keyspace. Distinct from the ephemeral biggest-keys sampler in
+/// that it's saved per connection and can be revisited after a restart. Derives serde
+/// (behind the `serde` feature) so the app edge can store it as JSON.
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 #[derive(Debug, Clone, PartialEq)]
 pub struct RedisAnalysis {

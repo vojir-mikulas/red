@@ -468,7 +468,7 @@ impl DocDriver for MongoDriver {
 
     async fn insert(&self, db: &str, coll: &str, docs: &[Document]) -> Result<u64> {
         self.ensure_writable()?;
-        let bson: Vec<BsonDocument> = docs.iter().map(document_to_bson).collect();
+        let bson: Vec<BsonDocument> = docs.iter().map(insert_document_to_bson).collect();
         let result = self
             .client
             .database(db)
@@ -489,7 +489,7 @@ impl DocDriver for MongoDriver {
     ) -> Result<u64> {
         self.ensure_writable()?;
         let coll = self.client.database(db).collection::<BsonDocument>(coll);
-        let filter = doc_to_bson_document(filter);
+        let filter = write_filter_to_bson(filter)?;
         let modified = match change {
             // A `$set` patch merges the given fields; a `Replace` swaps the whole
             // document (single-match only — `replaceMany` doesn't exist).
@@ -519,19 +519,31 @@ impl DocDriver for MongoDriver {
 
     async fn replace(&self, db: &str, coll: &str, id: &DocValue, doc: &Document) -> Result<()> {
         self.ensure_writable()?;
-        self.client
+        let result = self
+            .client
             .database(db)
             .collection::<BsonDocument>(coll)
             .replace_one(doc! { "_id": doc_to_bson(id) }, document_to_bson(doc))
             .await
-            .map(|_| ())
-            .map_err(query_err)
+            .map_err(query_err)?;
+        // Matching nothing means the document was deleted (or its `_id` changed)
+        // between being loaded and being saved. Discarding the `UpdateResult` here
+        // reported that as a successful save while writing nothing at all; the SQL
+        // edit path treats exactly this staleness as an error, and so does this.
+        if result.matched_count == 0 {
+            return Err(RedError::Query(
+                "the document no longer exists - it was deleted or its _id changed \
+                 since it was loaded"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     async fn delete(&self, db: &str, coll: &str, filter: &Filter, many: bool) -> Result<u64> {
         self.ensure_writable()?;
         let coll = self.client.database(db).collection::<BsonDocument>(coll);
-        let filter = doc_to_bson_document(filter);
+        let filter = write_filter_to_bson(filter)?;
         let deleted = if many {
             coll.delete_many(filter)
                 .await
@@ -810,14 +822,45 @@ fn doc_to_bson(v: &DocValue) -> Bson {
     }
 }
 
-/// Convert a [`DocValue`] to a BSON document for a filter/projection/sort. A
-/// non-document value (a malformed filter) degrades to an empty document — match
-/// everything — rather than erroring the browse.
+/// Convert a [`DocValue`] to a BSON document for a filter/projection/sort on a
+/// **read**. A non-document value (a malformed filter) degrades to an empty
+/// document — match everything — rather than erroring the browse.
 fn doc_to_bson_document(v: &DocValue) -> BsonDocument {
     match doc_to_bson(v) {
         Bson::Document(d) => d,
         _ => BsonDocument::new(),
     }
+}
+
+/// The same conversion for a **write** filter, refusing where the read path
+/// degrades.
+///
+/// "Match everything" is a harmless empty browse on a read. On `update`/`delete` it
+/// is the difference between touching nothing and rewriting or emptying the whole
+/// collection, so a filter that does not parse to a document has to be an error
+/// here — the catastrophic default the shared helper was one refactor away from.
+fn write_filter_to_bson(v: &DocValue) -> Result<BsonDocument> {
+    match doc_to_bson(v) {
+        Bson::Document(d) => Ok(d),
+        _ => Err(RedError::Query(
+            "a write filter must be a document".to_string(),
+        )),
+    }
+}
+
+/// A [`Document`] as BSON for an **insert**, with a null `_id` dropped.
+///
+/// [`Document`] always carries an `_id`, and `Document::from_doc_value` fills in
+/// `Null` when the source had none — which is every composed document, cloned
+/// document and "New document" form. Sending that literal `_id: null` lets the
+/// *first* such insert succeed and makes every later one fail on the unique index;
+/// omitting the key lets the server generate an ObjectId, which is what was meant.
+fn insert_document_to_bson(doc: &Document) -> BsonDocument {
+    let mut out = document_to_bson(doc);
+    if out.get("_id") == Some(&Bson::Null) {
+        out.remove("_id");
+    }
+    out
 }
 
 /// AND the user `base` filter with an `_id` range bound (`op` is `"$gt"` /

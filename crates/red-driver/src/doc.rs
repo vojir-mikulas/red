@@ -1,15 +1,13 @@
-//! `DocDriver`: the third seam, for document stores (MongoDB today; see
-//! `docs/plans/todo/doc-driver.md`). Neither SQL-shaped (`DatabaseDriver`) nor
-//! Redis-shaped (`KvDriver`): a `server → databases → collections → documents`
-//! hierarchy of nested BSON trees, queried by `find`/`aggregate` rather than SQL
-//! or `GET`/`SET`. Object-safe like the other two seams, held as
-//! `Arc<dyn DocDriver>`, one impl per engine.
-//!
-//! The read path (catalog + windowed `find` + count, plus
+//! `DocDriver`: the third seam, for document stores. Neither SQL-shaped
+//! (`DatabaseDriver`) nor Redis-shaped (`KvDriver`): a `server → databases →
+//! collections → documents` hierarchy of nested BSON trees, queried by
+//! `find`/`aggregate` rather than SQL or `GET`/`SET`. Object-safe like the other two
+//! seams, held as `Arc<dyn DocDriver>`, one impl per engine. The read path (catalog +
+//! windowed `find` + count, plus
 //! `infer_schema`/`aggregate`/`indexes`/`explain`/`distinct`, the streaming server
 //! cursor, and extended-JSON parsing) and the write path
-//! (`insert`/`update`/`replace`/`delete` + collection/index DDL), each write
-//! refused on a read-only connection.
+//! (`insert`/`update`/`replace`/`delete` + collection/index DDL), each write refused on
+//! a read-only connection.
 
 use async_trait::async_trait;
 use red_core::Result;

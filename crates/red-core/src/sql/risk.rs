@@ -203,15 +203,23 @@ fn bare_name(reference: &str) -> &str {
 /// Blank and comment-only input grades [`RiskLevel::Safe`] with no risks, matching
 /// the "nothing runnable" reading the rest of the module uses.
 pub fn assess(sql: &str, dialect: Dialect) -> Assessment {
-    let statements: Vec<&str> = split_statements(sql, dialect)
+    // Both the "is there anything runnable here" filter and the grading itself read
+    // the stripped copy. Filtering the *raw* text instead would drop a MySQL
+    // `/*!50000 DROP TABLE t */` as comment-only and grade the batch Safe, while the
+    // server runs the body — [`strip_noise`] is what makes it visible.
+    let statements: Vec<(&str, String)> = split_statements(sql, dialect)
         .into_iter()
-        .filter(|s| !first_keyword(s).is_empty())
+        .map(|stmt| {
+            let stripped = strip_noise(stmt, dialect);
+            (stmt, stripped)
+        })
+        .filter(|(_, stripped)| !first_keyword(stripped).is_empty())
         .collect();
     let total = statements.len();
     let mut level = RiskLevel::Safe;
     let mut risks = Vec::new();
-    for (index, stmt) in statements.iter().enumerate() {
-        let (stmt_level, mut stmt_risks) = assess_one(stmt, dialect);
+    for (index, (stmt, stripped)) in statements.iter().enumerate() {
+        let (stmt_level, mut stmt_risks) = assess_one(stmt, stripped, dialect);
         level = level.max(stmt_level);
         // Flag *where* the danger is only when it could be overlooked. In a single
         // statement the user is already looking at it.
@@ -223,7 +231,7 @@ pub fn assess(sql: &str, dialect: Dialect) -> Assessment {
     // A batch has no single target, and callers that need one (a typed confirm, a
     // row-count preflight) must not be handed an arbitrary member of it.
     let table = match statements.as_slice() {
-        [only] => target_object(only),
+        [(only, _)] => target_object(only),
         _ => None,
     };
     Assessment {
@@ -233,9 +241,9 @@ pub fn assess(sql: &str, dialect: Dialect) -> Assessment {
     }
 }
 
-/// Grade one statement. Split out so [`assess`] owns only the batch reasoning.
-fn assess_one(stmt: &str, dialect: Dialect) -> (RiskLevel, Vec<Risk>) {
-    let stripped = strip_noise(stmt, dialect);
+/// Grade one statement, given its [`strip_noise`] copy. Split out so [`assess`]
+/// owns only the batch reasoning.
+fn assess_one(stmt: &str, stripped: &str, dialect: Dialect) -> (RiskLevel, Vec<Risk>) {
     let lower = stripped
         .trim()
         .trim_end_matches(';')
@@ -250,7 +258,12 @@ fn assess_one(stmt: &str, dialect: Dialect) -> (RiskLevel, Vec<Risk>) {
         // legal as a subquery. Grading them `Write` costs nothing (nothing confirms
         // at `Write` by default) and keeps the grading honest about being the
         // conservative direction.
-        "select" | "explain" | "values" | "pragma" => (RiskLevel::Safe, Vec::new()),
+        "select" | "values" | "pragma" => (RiskLevel::Safe, Vec::new()),
+        // `EXPLAIN` plans without running — except `EXPLAIN ANALYZE`, which on
+        // Postgres and MySQL 8.0.18+ *runs* the statement it is given. Grading the
+        // whole form Safe hands the confirm gate and any read-only AI tier a write
+        // channel, so the inner statement is graded instead.
+        "explain" => explain_risk(stmt, stripped, &lower, dialect),
         // A CTE is a read *unless* its body writes, which Postgres permits.
         "with" => {
             if ["insert", "update", "delete", "merge"]
@@ -341,6 +354,58 @@ fn assess_one(stmt: &str, dialect: Dialect) -> (RiskLevel, Vec<Risk>) {
         // nothing here has established it is worse.
         _ => (RiskLevel::Write, Vec::new()),
     }
+}
+
+/// Grade an `EXPLAIN`. A plain `EXPLAIN` (and SQLite's `EXPLAIN QUERY PLAN`)
+/// plans without running, so it is a read; `EXPLAIN ANALYZE` runs the statement
+/// it is handed on Postgres and MySQL 8.0.18+, so the honest grade is whatever
+/// that inner statement's own grade is.
+///
+/// `stripped` is the byte-offset-preserving [`strip_noise`] copy of `stmt`, which
+/// is what lets the inner statement be sliced out of both at a single offset and
+/// graded as itself — literals and quoting intact for `target_object`.
+fn explain_risk(
+    stmt: &str,
+    stripped: &str,
+    lower: &str,
+    dialect: Dialect,
+) -> (RiskLevel, Vec<Risk>) {
+    if !has_word(lower, "analyze") {
+        return (RiskLevel::Safe, Vec::new());
+    }
+    match inner_statement_at(stripped) {
+        Some(at) => assess_one(&stmt[at..], &stripped[at..], dialect),
+        // `ANALYZE` is present but nothing recognisable follows it. Escalate when
+        // unsure: `Write` is the same floor the unrecognised arm below uses.
+        None => (RiskLevel::Write, Vec::new()),
+    }
+}
+
+/// The byte offset in `stripped` of the first word that begins a statement, used
+/// to find what an `EXPLAIN` wraps. `explain` itself is absent from the list so
+/// the scan always advances past it.
+fn inner_statement_at(stripped: &str) -> Option<usize> {
+    const VERBS: [&str; 13] = [
+        "select", "insert", "update", "delete", "merge", "replace", "with", "create", "drop",
+        "alter", "truncate", "call", "values",
+    ];
+    let b = stripped.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        if !super::is_word_byte(b[i]) {
+            i += 1;
+            continue;
+        }
+        let end = super::word_end(b, i);
+        if VERBS
+            .iter()
+            .any(|v| stripped[i..end].eq_ignore_ascii_case(v))
+        {
+            return Some(i);
+        }
+        i = end;
+    }
+    None
 }
 
 /// The `n`th whitespace-separated word of an already-lower-cased, noise-stripped
@@ -507,6 +572,54 @@ mod tests {
     /// [`Dialect::Generic`]; the per-dialect lexing has its own tests in `sql`.
     fn assess(sql: &str) -> Assessment {
         super::assess(sql, Dialect::Generic)
+    }
+
+    /// MySQL executes the body of `/*!…*/`. Grading it as a comment made the whole
+    /// statement read as blank, so `red exec` ran the `DROP` with no prompt at all.
+    #[test]
+    fn mysql_executable_comment_is_graded_by_its_body() {
+        let hidden = super::assess("/*!50000 DROP TABLE users */", Dialect::MySql);
+        assert_eq!(hidden.level, RiskLevel::Critical, "got {hidden:#?}");
+        assert_eq!(
+            hidden.level,
+            super::assess("DROP TABLE users", Dialect::MySql).level
+        );
+        // Everywhere else it really is a comment, so it stays "nothing runnable".
+        assert_eq!(
+            super::assess("/*!50000 DROP TABLE users */", Dialect::Postgres).level,
+            RiskLevel::Safe
+        );
+    }
+
+    /// `EXPLAIN ANALYZE <DML>` runs the DML on Postgres and MySQL 8.0.18+, so it
+    /// has to be graded as the statement it wraps rather than as a plan.
+    #[test]
+    fn explain_analyze_is_graded_as_the_statement_it_runs() {
+        assert_eq!(
+            assess("EXPLAIN ANALYZE DELETE FROM orders").level,
+            assess("DELETE FROM orders").level
+        );
+        assert_eq!(
+            assess("EXPLAIN ANALYZE DELETE FROM orders").level,
+            RiskLevel::Risky
+        );
+        assert_eq!(
+            assess("EXPLAIN (ANALYZE, BUFFERS) DROP TABLE orders").confirm_target(),
+            Some("orders")
+        );
+        // A plan is still a plan: neither of these executes anything.
+        assert_eq!(
+            assess("EXPLAIN SELECT * FROM orders").level,
+            RiskLevel::Safe
+        );
+        assert_eq!(
+            assess("EXPLAIN QUERY PLAN SELECT * FROM orders").level,
+            RiskLevel::Safe
+        );
+        assert_eq!(
+            assess("EXPLAIN ANALYZE SELECT * FROM orders").level,
+            RiskLevel::Safe
+        );
     }
 
     #[test]

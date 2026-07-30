@@ -3,6 +3,8 @@
 //! prompt and tool catalog behind a `cache_control` breakpoint so long sessions
 //! re-read them from cache instead of re-billing them every turn.
 
+use std::time::Duration;
+
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use serde_json::{Value as Json, json};
@@ -41,10 +43,30 @@ pub struct AnthropicProvider {
     base_url: String,
 }
 
+/// How long to wait for the TCP+TLS handshake before giving up.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+/// How long to wait for *any* further bytes once the stream is open.
+///
+/// A streaming turn can legitimately be quiet while the model thinks, so this is
+/// generous — but it must exist. Without it a connection that stalls without
+/// erroring (laptop suspend/resume, an expired NAT mapping, a proxy that accepts
+/// and never answers) left `stream.next()` pending forever: the turn never
+/// finished, never errored, and the panel's composer stayed disabled until RED was
+/// restarted.
+const READ_TIMEOUT: Duration = Duration::from_secs(120);
+
 impl AnthropicProvider {
     pub fn new(api_key: impl Into<String>) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: reqwest::Client::builder()
+                .connect_timeout(CONNECT_TIMEOUT)
+                .read_timeout(READ_TIMEOUT)
+                .tcp_keepalive(Some(Duration::from_secs(30)))
+                .build()
+                // A builder failure here means the TLS backend could not
+                // initialise; the default client would fail on the first request
+                // anyway, so fall back rather than make `new` fallible.
+                .unwrap_or_else(|_| reqwest::Client::new()),
             api_key: api_key.into(),
             base_url: DEFAULT_BASE_URL.to_string(),
         }
@@ -57,7 +79,7 @@ impl AnthropicProvider {
         self
     }
 
-    fn build_body(&self, req: &TurnRequest) -> Json {
+    fn build_body(&self, req: &TurnRequest<'_>) -> Json {
         let mut body = json!({
             "model": req.model,
             "max_tokens": req.max_tokens,
@@ -105,7 +127,7 @@ impl AnthropicProvider {
 impl AiProvider for AnthropicProvider {
     async fn stream_turn(
         &self,
-        req: &TurnRequest,
+        req: &TurnRequest<'_>,
         tx: &UnboundedSender<Delta>,
         cancel: &CancelToken,
     ) -> Result<TurnOutcome> {
@@ -146,10 +168,17 @@ impl AiProvider for AnthropicProvider {
         let mut buf: Vec<u8> = Vec::new();
         let mut stream = resp.bytes_stream();
 
-        while let Some(chunk) = stream.next().await {
-            if cancel.is_cancelled() {
-                return Err(AiError::Cancelled);
+        while let Some(chunk) = {
+            // `select!`, not a flag polled between chunks: Stop flips a token, and a
+            // loop parked in `stream.next()` never woke to read it — so Stop did
+            // nothing at all on a stalled connection. Racing the read against the
+            // cancellation makes it abortive.
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Err(AiError::Cancelled),
+                next = stream.next() => next,
             }
+        } {
             let chunk = chunk.map_err(|e| AiError::Network(e.to_string()))?;
             buf.extend_from_slice(&chunk);
 
@@ -184,6 +213,13 @@ struct TurnAccumulator {
     stop_reason: Option<StopReason>,
     usage: Usage,
     refused: bool,
+    /// A mid-stream `{"type":"error"}` frame, which Anthropic sends for
+    /// `overloaded_error` / `internal_server_error` *after* a 200 and before
+    /// closing the stream cleanly.
+    error: Option<String>,
+    /// Whether the protocol-terminating `message_stop` arrived. Without tracking
+    /// it, a half-closed stream is indistinguishable from a finished one.
+    stopped: bool,
 }
 
 /// A content block under construction, indexed by its SSE `index`.
@@ -318,14 +354,43 @@ impl TurnAccumulator {
                     self.usage.output_tokens = u_get(u, "output_tokens");
                 }
             }
+            // The provider reports mid-stream failures in-band, over an HTTP 200
+            // that then closes cleanly. Ignoring these arm meant half an answer was
+            // presented with a normal "finished" footer and persisted as a complete
+            // exchange, telling the user nothing.
+            Some("error") => {
+                let kind = event
+                    .pointer("/error/type")
+                    .and_then(Json::as_str)
+                    .unwrap_or("error");
+                let message = event
+                    .pointer("/error/message")
+                    .and_then(Json::as_str)
+                    .unwrap_or_default();
+                self.error = Some(format!("{kind}: {}", truncate(message, 400)));
+            }
+            Some("message_stop") => self.stopped = true,
             _ => {}
         }
     }
 
     fn finish(self) -> Result<TurnOutcome> {
+        if let Some(message) = self.error {
+            return Err(AiError::Provider(message));
+        }
         if self.refused {
             return Err(AiError::Refused);
         }
+        // EOF without `message_stop` is a half-closed stream: the bytes stopped
+        // arriving but the turn never completed. Reporting it as a finished answer
+        // is the same lie as swallowing the error frame above.
+        if !self.stopped {
+            return Err(AiError::Network(
+                "the response ended before the model finished; the answer above is incomplete"
+                    .into(),
+            ));
+        }
+        let mut bad_tool_json = None;
         let content: Vec<ContentBlock> = self
             .blocks
             .into_iter()
@@ -339,11 +404,28 @@ impl TurnAccumulator {
                     Some(ContentBlock::RedactedThinking { data })
                 }
                 PartialBlock::ToolUse { id, name, json } => {
-                    let input = serde_json::from_str(&json).unwrap_or_else(|_| json!({}));
+                    // A stream cut mid-`input_json_delta` leaves unparseable JSON.
+                    // Silently substituting `{}` turned truncated arguments into a
+                    // *different, valid* tool call — `kv_delete` with no filter is
+                    // not a harmless default. An empty accumulator is the ordinary
+                    // no-argument case and stays `{}`.
+                    let input = match serde_json::from_str(&json) {
+                        Ok(v) => v,
+                        Err(_) if json.trim().is_empty() => json!({}),
+                        Err(e) => {
+                            bad_tool_json = Some(format!("{name}: {e}"));
+                            json!({})
+                        }
+                    };
                     Some(ContentBlock::ToolUse { id, name, input })
                 }
             })
             .collect();
+        if let Some(detail) = bad_tool_json {
+            return Err(AiError::Provider(format!(
+                "the model's tool arguments arrived incomplete ({detail})"
+            )));
+        }
 
         Ok(TurnOutcome {
             message: Message {
@@ -426,25 +508,34 @@ mod tests {
     use super::*;
     use crate::types::ToolDef;
 
-    fn req() -> TurnRequest {
-        TurnRequest {
-            model: "claude-opus-4-8".into(),
-            max_tokens: 1024,
-            show_thinking: true,
-            system: "You are a SQL analyst.".into(),
-            tools: vec![ToolDef {
+    /// The borrowed bits of a [`TurnRequest`], owned by the caller's stack.
+    fn req_parts() -> (Vec<ToolDef>, Vec<Message>) {
+        (
+            vec![ToolDef {
                 name: "list_schema".into(),
                 description: "List tables.".into(),
                 input_schema: json!({ "type": "object", "properties": {} }),
             }],
-            messages: vec![Message::user_text("hi")],
+            vec![Message::user_text("hi")],
+        )
+    }
+
+    fn req<'a>(tools: &'a [ToolDef], messages: &'a [Message]) -> TurnRequest<'a> {
+        TurnRequest {
+            model: "claude-opus-4-8",
+            max_tokens: 1024,
+            show_thinking: true,
+            system: "You are a SQL analyst.",
+            tools,
+            messages,
         }
     }
 
     #[test]
     fn body_caches_system_and_tools_and_sets_thinking() {
         let p = AnthropicProvider::new("k");
-        let body = p.build_body(&req());
+        let (tools, messages) = req_parts();
+        let body = p.build_body(&req(&tools, &messages));
         assert_eq!(body["system"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["tools"][0]["cache_control"]["type"], "ephemeral");
         assert_eq!(body["thinking"]["type"], "adaptive");
@@ -463,6 +554,9 @@ mod tests {
             json!({"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"t1","name":"list_schema"}}),
             json!({"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"x\":1}"}}),
             json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":7}}),
+            // A real stream always ends with this; `finish` now requires it, because
+            // EOF without it means the connection dropped mid-answer.
+            json!({"type":"message_stop"}),
         ];
         for e in events {
             acc.handle_event(&e, &tx);
@@ -491,6 +585,71 @@ mod tests {
             }
         }
         assert!(saw_text);
+    }
+
+    /// The provider reports overload and internal errors *in band*, over an HTTP 200
+    /// that then closes cleanly. Swallowing that frame showed half an answer with a
+    /// normal "finished" footer and persisted it as a complete exchange.
+    #[test]
+    fn mid_stream_error_frame_fails_the_turn() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = TurnAccumulator::default();
+        for e in [
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Half an "}}),
+            json!({"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}),
+        ] {
+            acc.handle_event(&e, &tx);
+        }
+        let err = acc.finish().expect_err("an error frame must fail the turn");
+        assert!(matches!(err, AiError::Provider(_)), "got {err:?}");
+        assert!(err.to_string().contains("overloaded_error"), "got {err}");
+    }
+
+    /// A stream that just stops — no `message_stop` — is a half-closed connection,
+    /// not a finished answer.
+    #[test]
+    fn eof_without_message_stop_is_a_network_error() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = TurnAccumulator::default();
+        for e in [
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"Half an "}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn"}}),
+        ] {
+            acc.handle_event(&e, &tx);
+        }
+        assert!(matches!(acc.finish(), Err(AiError::Network(_))));
+    }
+
+    /// Truncated tool arguments must not silently become a *different, valid* call.
+    #[test]
+    fn truncated_tool_json_fails_rather_than_defaulting() {
+        let (tx, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut acc = TurnAccumulator::default();
+        for e in [
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"kv_delete"}}),
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"{\"pattern\":\"user:"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+            json!({"type":"message_stop"}),
+        ] {
+            acc.handle_event(&e, &tx);
+        }
+        let err = acc
+            .finish()
+            .expect_err("truncated tool input must not default to {}");
+        assert!(matches!(err, AiError::Provider(_)), "got {err:?}");
+
+        // A tool genuinely called with no arguments still works.
+        let mut acc = TurnAccumulator::default();
+        for e in [
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"t1","name":"list_schema"}}),
+            json!({"type":"message_delta","delta":{"stop_reason":"tool_use"}}),
+            json!({"type":"message_stop"}),
+        ] {
+            acc.handle_event(&e, &tx);
+        }
+        assert!(acc.finish().is_ok());
     }
 
     #[test]

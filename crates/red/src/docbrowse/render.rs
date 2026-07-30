@@ -85,12 +85,21 @@ impl AppState {
             .doc_view
             .as_ref()
             .and_then(|v| {
-                v.pending_write.as_ref().map(|(_, write, prompt)| {
-                    // Only a single-document delete is suppressible by the setting;
-                    // drops and many-writes stay behind the server's confirm gate.
-                    let suppressible = matches!(write, DocWrite::Delete { many: false, .. });
-                    (v.session, prompt.clone(), suppressible)
-                })
+                v.pending_write
+                    .as_ref()
+                    .map(|(_, write, prompt)| {
+                        // Only a single-document delete is suppressible by the setting;
+                        // drops and many-writes stay behind the server's confirm gate.
+                        let suppressible = matches!(write, DocWrite::Delete { many: false, .. });
+                        (v.session, prompt.clone(), suppressible)
+                    })
+                    // A `$out`/`$merge` pipeline drives the same modal. Never
+                    // suppressible: `$out` replaces the whole target collection.
+                    .or_else(|| {
+                        v.pending_pipeline
+                            .as_ref()
+                            .map(|(_, _, prompt)| (v.session, prompt.clone(), false))
+                    })
             })
             .map(|(session, prompt, suppressible)| {
                 self.render_doc_confirm(session, prompt, suppressible, &theme, &view)

@@ -40,6 +40,11 @@ impl SqliteDriver {
         }
     }
 
+    /// How long a read waits out another connection's write transaction before
+    /// reporting "database is locked". Long enough to ride out a normal write,
+    /// short enough that a genuinely stuck writer still surfaces as an error.
+    const BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
     fn open(path: &Path, read_only: bool) -> Result<Connection> {
         let flags = if read_only {
             OpenFlags::SQLITE_OPEN_READ_ONLY
@@ -48,7 +53,13 @@ impl SqliteDriver {
         } else {
             OpenFlags::default()
         };
-        Connection::open_with_flags(path, flags).map_err(driver_err)
+        let conn = Connection::open_with_flags(path, flags).map_err(driver_err)?;
+        // SQLite's default is to fail a contended read *instantly* with
+        // SQLITE_BUSY ("database is locked"), so any concurrent writer — another
+        // app, or RED's own write connection mid-transaction — turns an ordinary
+        // browse into an error. Waiting briefly is what every other engine does.
+        conn.busy_timeout(Self::BUSY_TIMEOUT).map_err(driver_err)?;
+        Ok(conn)
     }
 }
 
@@ -1520,7 +1531,7 @@ mod tests {
         )
         .await;
 
-        // Track B7: the FK graph reports the same edge, and an `eq_predicate` follow
+        // The FK graph reports the same edge, and an `eq_predicate` follow
         // narrows `books` to the two rows referencing author 1.
         battery::lists_foreign_key_graph(&driver, "main", "authors", "books").await;
         battery::filters_eq(

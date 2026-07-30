@@ -1,9 +1,8 @@
-//! The Redis command console: a `redis-cli`-style REPL panel (see
-//! docs/plans/redis.md). A reply is matched to the most recent history entry
-//! still awaiting one with the same `argv`, on the assumption a human types
-//! one command, waits, reads the reply, then types the next — good enough
-//! without per-command ids; a burst of rapid-fire submissions could in
-//! principle match a reply to the wrong entry.
+//! The Redis command console: a `redis-cli`-style REPL panel. A reply is matched to the
+//! most recent history entry still awaiting one with the same `argv`, on the assumption
+//! a human types one command, waits, reads the reply, then types the next — good enough
+//! without per-command ids; a burst of rapid-fire submissions could in principle match
+//! a reply to the wrong entry.
 
 use gpui::{Context, Entity, ScrollHandle, Window, div, prelude::*, px};
 use red_core::kv::{OpClass, RespValue, classify_command, tokenize_command};
@@ -347,7 +346,8 @@ impl AppState {
             .map(|a| a.conn_id.clone())
             .unwrap_or_default();
         if !conn_id.is_empty() {
-            self.query_history.record(&conn_id, &argv.join(" "));
+            self.query_history
+                .record(&conn_id, &crate::kvbrowse::join_redis_argv(&argv));
         }
         let Some(console) = self
             .conn_mut(Some(session))
@@ -462,7 +462,8 @@ impl AppState {
             .unwrap_or_default();
         if !conn_id.is_empty() {
             for argv in &commands {
-                self.query_history.record(&conn_id, &argv.join(" "));
+                self.query_history
+                    .record(&conn_id, &crate::kvbrowse::join_redis_argv(argv));
             }
         }
         let Some(console) = self
@@ -715,7 +716,7 @@ impl AppState {
                 };
                 console.recall = new_idx;
                 let content = new_idx
-                    .map(|i| console.history[i].argv.join(" "))
+                    .map(|i| crate::kvbrowse::join_redis_argv(&console.history[i].argv))
                     .unwrap_or_default();
                 Some((content, console.input.clone()))
             })
@@ -890,7 +891,7 @@ impl AppState {
 
         let mut entries: Vec<gpui::AnyElement> = Vec::new();
         for entry in &console.history {
-            let line = entry.argv.join(" ");
+            let line = crate::kvbrowse::join_redis_argv(&entry.argv);
             entries.push(
                 div()
                     .font_family(mono.clone())
@@ -944,7 +945,10 @@ impl AppState {
                         .flex_1()
                         .text_size(theme.scale(11.5))
                         .text_color(theme.text)
-                        .child(format!("Run \"{}\"? This can't be undone.", argv.join(" "))),
+                        .child(format!(
+                            "Run \"{}\"? This can't be undone.",
+                            crate::kvbrowse::join_redis_argv(argv)
+                        )),
                 )
                 .child(
                     Button::new("kv-console-confirm", "Run")

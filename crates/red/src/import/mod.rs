@@ -16,11 +16,6 @@
 //! human-readable reason (unsupported engine, decryption failure, …), so an import
 //! can never quietly drop a connection.
 
-// Phase 1 lands the parse/decrypt core ahead of the UI that consumes it; the
-// public surface is exercised by this module's tests. Removed in Phase 3 when the
-// welcome-screen / ⌘K entry points call `run`.
-#![allow(dead_code)]
-
 use std::path::Path;
 
 use anyhow::Result;
@@ -71,6 +66,11 @@ pub struct ImportedConnection {
     pub source_name: String,
     /// The source tool's folder/group, if any. RED has no folder model yet; kept
     /// for the preview and possible name-prefixing, never silently dropped.
+    #[allow(
+        dead_code,
+        reason = "parsed and carried deliberately: RED has no folder model yet, and \
+                  dropping it at parse time would mean re-deriving it when it does"
+    )]
     pub folder: Option<String>,
     /// A non-fatal caveat surfaced in the preview (e.g. "password unavailable").
     pub warning: Option<String>,

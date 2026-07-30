@@ -1,5 +1,5 @@
 //! Schema compare: what differs between two schemas, and the DDL that reconciles
-//! them (see `docs/plans/todo/object-ddl-and-schema-diff.md`).
+//! them.
 //!
 //! The structural sibling of [`crate::diff`], which compares *data*. Both are
 //! pure: no drivers, no cursors, no UI, no runtime. This one takes the

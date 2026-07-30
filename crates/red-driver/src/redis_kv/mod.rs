@@ -1,6 +1,6 @@
 //! `KvDriver` over a real Redis/Valkey server. Standalone/Sentinel today;
 //! Cluster topology is detected (so the UI can hide the DB-index switch) but
-//! its scan fan-out lands with R1 (see `docs/plans/redis.md`).
+//! its scan fan-out lands with R1.
 
 use std::time::Duration;
 
@@ -25,10 +25,8 @@ pub use topology::{SentinelMaster, sentinel_masters};
 
 use parse::*;
 
-/// Below this many elements, `read_value` fetches a hash/set/zset/list in
-/// full (one round trip); at/above it, only the length is reported and the
-/// caller pages the rest (see docs/plans/redis.md's "a few hundred elements"
-/// guidance).
+/// Below this many elements, `read_value` fetches a hash/set/zset/list in full (one
+/// round trip); at/above it, only the length is reported and the caller pages the rest.
 const SMALL_COLLECTION_THRESHOLD: u64 = 200;
 /// How many times a cluster scan retries the *same* master + cursor on a
 /// transient error before giving up on that master. Retrying in place (rather
@@ -66,7 +64,7 @@ const CLUSTER_SLOTS: u16 = 16384;
 static SENTINEL_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A live Redis Cluster's per-master fan-out state, discovered at connect via
-/// `CLUSTER SLOTS` (see docs/plans/redis.md's cluster fan-out gap). `SCAN` is
+/// `CLUSTER SLOTS`. `SCAN` is
 /// per-node in a cluster, and single-key commands must reach the node that
 /// owns the key's slot, so a plain `MultiplexedConnection` to one seed node
 /// (what `RedisDriver::conn` is) only ever sees ~1/N of the keyspace. This
@@ -114,7 +112,7 @@ impl RedisDriver {
     /// first (`SENTINEL get-master-addr-by-name`), then the real connection is
     /// made to that master. Resolving fresh at each connect is how failover is
     /// picked up. This rides the connection string exactly like a pasted
-    /// `rediss://` rides TLS today (see docs/plans/redis.md's Sentinel gap),
+    /// `rediss://` rides TLS today,
     /// so no dedicated form field is required.
     pub async fn connect(dsn: &str, read_only: bool) -> Result<Self> {
         let dsn = resolve_sentinel(dsn).await?;
@@ -269,13 +267,12 @@ impl RedisDriver {
         })
     }
 
-    /// Cluster scan: walk the masters in order, `SCAN`ning each to exhaustion
-    /// before advancing to the next (see docs/plans/redis.md's cluster
-    /// fan-out). Metadata is fetched per round trip against the node the keys
-    /// came from — every `SCAN`ned key is owned by that node, so its pipelined
-    /// `TYPE`/`PTTL`/`OBJECT ENCODING`/`MEMORY USAGE` never crosses a shard.
-    /// Position is carried across pages as `ScanCursor::Cluster { node,
-    /// cursor }`, so this is stateless per call like the standalone path.
+    /// Cluster scan: walk the masters in order, `SCAN`ning each to exhaustion before
+    /// advancing to the next. Metadata is fetched per round trip against the node the
+    /// keys came from — every `SCAN`ned key is owned by that node, so its pipelined
+    /// `TYPE`/`PTTL`/`OBJECT ENCODING`/`MEMORY USAGE` never crosses a shard. Position
+    /// is carried across pages as `ScanCursor::Cluster { node, cursor }`, so this is
+    /// stateless per call like the standalone path.
     async fn scan_cluster(
         &self,
         cl: &ClusterState,
@@ -1099,12 +1096,23 @@ impl KvDriver for RedisDriver {
         // same slot, so a cross-slot rename surfaces Redis's own `CROSSSLOT`
         // error (an inherent cluster constraint, not something to paper over).
         let mut conn = self.route(from);
-        redis::cmd("RENAME")
+        // `RENAMENX`, not `RENAME`. Plain `RENAME` *overwrites* the destination, so
+        // a typo'd new name silently destroyed whatever lived under it — with no
+        // confirm and, unlike `DEL`, no recycle-bin snapshot to undo from. Refusing
+        // is the only honest answer for an operation the user believes is a rename;
+        // deleting the destination first is a decision only they can make.
+        let renamed: i64 = redis::cmd("RENAMENX")
             .arg(from)
             .arg(to)
             .query_async(&mut conn)
             .await
-            .map_err(|e| RedError::Driver(e.to_string()))
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        if renamed == 0 {
+            return Err(RedError::Query(format!(
+                "a key named {to:?} already exists - delete it first, or pick another name"
+            )));
+        }
+        Ok(())
     }
 
     async fn delete_keys(&self, keys: &[String]) -> Result<u64> {

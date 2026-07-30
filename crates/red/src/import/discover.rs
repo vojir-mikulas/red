@@ -209,6 +209,11 @@ fn flatpak_homes() -> Vec<PathBuf> {
 
 /// Whether a user-supplied path looks like a valid source directory for `source`,
 /// so a "Browse…" picker can validate before importing.
+#[allow(
+    dead_code,
+    reason = "the manual Browse… path is not wired up yet; the auto-discovery flow \
+              uses the same predicate through `discover`"
+)]
 pub fn looks_valid(source: ImportSource, dir: &Path) -> bool {
     match source {
         ImportSource::DBeaver => dir.join("data-sources.json").is_file(),

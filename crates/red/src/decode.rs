@@ -1,5 +1,5 @@
 //! Hand-rolled decoders for binary value formats the inspector's lens can show
-//! (see docs/plans/redis.md's "binary value decoders" gap): MessagePack,
+//!: MessagePack,
 //! schemaless Protocol Buffers, and Python pickle. Each takes raw bytes and
 //! returns a human-readable rendering, or `None` when the bytes aren't that
 //! format (the caller then falls back to raw/hex).

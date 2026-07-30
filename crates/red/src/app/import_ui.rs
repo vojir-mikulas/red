@@ -1,4 +1,4 @@
-//! Connection-import wizard + commit (`docs/plans/connection-import.md`).
+//! Connection-import wizard + commit.
 //!
 //! The parse/decrypt core lives in [`crate::import`]; this is the app-side glue.
 //! A two-step wizard: pick which tools to import from (DBeaver / DBGate), scan

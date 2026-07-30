@@ -28,6 +28,19 @@ impl AppState {
         self.parked.get_mut(&id).map(|b| b.as_mut())
     }
 
+    /// The connection owning `session`, foreground or parked. The read-only twin of
+    /// [`conn_mut`](Self::conn_mut), for the paths that must act on the connection a
+    /// piece of work *belongs to* rather than whichever one is on screen.
+    pub(crate) fn conn_for(&self, session: Option<SessionId>) -> Option<&ActiveConn> {
+        let id = session?;
+        if self.foreground_session == Some(id)
+            && let Phase::Connected(active) = &self.phase
+        {
+            return Some(active);
+        }
+        self.parked.get(&id).map(|b| b.as_ref())
+    }
+
     /// The most-recently-foregrounded warm parked session, if any: the
     /// "previous connection" the ⌘⇧P toggle returns to, and the fall-back when the
     /// foreground session disconnects. (`parked` is a `HashMap`, so this picks by
@@ -151,18 +164,16 @@ impl AppState {
                 // Restore the persisted recently-viewed keys for this
                 // connection before the first render reads them.
                 self.kv_seed_recent_keys(id, &conn_id);
-                // Redis has no schema/FK concept; kick off the keyspace
-                // browser's first scan + header stat instead (R1, see
-                // docs/plans/redis.md).
+                // Redis has no schema/FK concept; kick off the keyspace browser's first
+                // scan + header stat instead.
                 self.kv_start_browse(id, cx);
             } else if is_mongo {
-                // MongoDB has no SQL schema either; kick off the document
-                // browser's first load (the databases list). See
-                // docs/plans/todo/doc-driver.md.
+                // MongoDB has no SQL schema either; kick off the document browser's
+                // first load (the databases list).
                 self.doc_start_browse(id, cx);
             } else {
                 // Kick off the schema-tree skeleton load for the sidebar, and
-                // background-prefetch the FK graph (Track B7) so grid FK columns can be
+                // background-prefetch the FK graph so grid FK columns can be
                 // marked before any click. Both run off the connect path.
                 self.service.send_to(id, Command::LoadObjects);
                 // One aggregate query for the whole connection, so the tree can

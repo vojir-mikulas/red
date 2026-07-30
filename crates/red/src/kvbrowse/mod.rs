@@ -1,4 +1,4 @@
-//! The Redis keyspace browser (R1, see docs/plans/redis.md): a forward-only
+//! The Redis keyspace browser (R1): a forward-only
 //! list of `SCAN`ned keys with their type/TTL/size/encoding. Deliberately
 //! its own thing, not built on the SQL result grid's `GridBuffer`
 //! (`crate::result::buffer`) — that's tied to offset/keyset paging an
@@ -34,7 +34,7 @@ mod tabs;
 use render::render_string_preview;
 
 /// The `SCAN ... COUNT` hint per round trip (default `10` is far too low for
-/// a large keyspace; see docs/plans/redis.md item 3).
+/// a large keyspace).
 const SCAN_COUNT_HINT: u32 = 200;
 
 /// Wall-clock budget per `KvFetchScan` round trip, so a selective `MATCH`
@@ -299,13 +299,11 @@ pub(crate) const KV_NEW_TAB_CHOICES: [(KvPanel, &str); 6] = [
     (KvPanel::Keyspace, "Live keyspace notifications"),
 ];
 
-/// A `redis-cli --bigkeys`-style sample (see docs/plans/redis.md's "beyond
-/// R4" list): an extended, bounded keyspace walk collecting metadata for
-/// every key it passes (reusing the same pipelined `scan_keys` the live
-/// browse uses), sorted by `approx_bytes` once the sample completes. Opt-in
-/// and separate from the live browse grid, since it implies a full-ish
-/// keyspace walk rather than the live browse's "just enough to fill the
-/// viewport" pull.
+/// A `redis-cli --bigkeys`-style sample: an extended, bounded keyspace walk collecting
+/// metadata for every key it passes (reusing the same pipelined `scan_keys` the live
+/// browse uses), sorted by `approx_bytes` once the sample completes. Opt-in and
+/// separate from the live browse grid, since it implies a full-ish keyspace walk rather
+/// than the live browse's "just enough to fill the viewport" pull.
 pub(crate) struct BigKeysState {
     /// A dedicated epoch, distinct from the browse's own: this is a
     /// different scan run entirely, not a continuation of the live browse,
@@ -335,12 +333,11 @@ const BIG_KEYS_TOP_N: usize = 200;
 const ANALYSIS_SAMPLE_CAP: usize = 200_000;
 const ANALYSIS_SAMPLE_MS: u64 = 12_000;
 
-/// One connection's keyspace-analysis run + the report it's showing (see
-/// docs/plans/redis.md's "persistent database analysis report" gap). The scan
-/// reuses the biggest-keys sampler's chained `KvFetchScan` loop, but rolls the
-/// collected metadata up into a persisted `RedisAnalysis` instead of a
-/// biggest-keys list. `report` is `None` until either a run finishes or a saved
-/// report is loaded for the connection.
+/// One connection's keyspace-analysis run + the report it's showing. The scan reuses
+/// the biggest-keys sampler's chained `KvFetchScan` loop, but rolls the collected
+/// metadata up into a persisted `RedisAnalysis` instead of a biggest-keys list.
+/// `report` is `None` until either a run finishes or a saved report is loaded for the
+/// connection.
 pub(crate) struct AnalysisState {
     /// A dedicated scan epoch, distinct from the browse/big-keys epochs.
     pub(crate) epoch: red_service::Epoch,
@@ -570,7 +567,7 @@ fn kv_creatable_types() -> [KvType; 6] {
 }
 
 /// One entry in a connection's "recently viewed keys" list — browser-history
-/// for the keyspace (see docs/plans/redis-workflow-parity.md Part 2). In-memory,
+/// for the keyspace. In-memory,
 /// newest-first, capped; recorded whenever the inspector opens on a key.
 #[derive(Clone)]
 pub(crate) struct RecentKey {
@@ -610,7 +607,7 @@ const MAX_RECENT_KEYS: usize = 50;
 
 /// The per-kind state a Redis tab holds. Heterogeneous, unlike the SQL side's
 /// homogeneous `QueryTab` — a Browse tab and a Monitor tab are structurally
-/// different, so the tab wraps this enum (see docs/plans/redis-workflow-parity.md).
+/// different, so the tab wraps this enum.
 pub(crate) enum RedisTabState {
     /// A blank tab awaiting a kind choice: its body shows the type chooser
     /// (mirrors the SQL side's blank query tab). Picking a kind converts it in
@@ -664,9 +661,7 @@ pub(crate) struct RedisView {
     pub(crate) active_tab: usize,
     /// Monotonic id source for `RedisTab::id`.
     pub(crate) tab_seq: u64,
-    /// `DBSIZE`, fetched once at connect (connection-level, shared by every
-    /// Browse tab — see docs/plans/redis.md on why there's no cheap filtered
-    /// count).
+    /// `DBSIZE`, fetched once at connect.
     pub(crate) db_size: Option<u64>,
     /// Recently-viewed keys, newest-first (browser-history for the keyspace),
     /// shown in the History dock's Keys section.
@@ -675,10 +670,9 @@ pub(crate) struct RedisView {
     pub(crate) tab_scroll: ScrollHandle,
     /// The gap a dragged tab would land in during a reorder, or `None`.
     pub(crate) tab_drop_target: Option<usize>,
-    /// The side-by-side split (reuses the SQL side's [`SplitState`]); `None` is
-    /// the ordinary single-pane layout. `active_tab` is the Primary half's
-    /// active tab; `split.secondary` the Secondary half's. See
-    /// docs/plans/redis-workflow-parity.md Part 3 Phase 2.
+    /// The side-by-side split (reuses the SQL side's [`SplitState`]); `None` is the
+    /// ordinary single-pane layout. `active_tab` is the Primary half's active tab;
+    /// `split.secondary` the Secondary half's.
     pub(crate) split: Option<SplitState>,
     /// The tab whose right-click context menu is open, as `(id, position)`.
     pub(crate) tab_menu: Option<(u64, gpui::Point<gpui::Pixels>)>,
@@ -762,11 +756,10 @@ pub(crate) struct AnnotateState {
     pub(crate) tags: Entity<TextInput>,
 }
 
-/// Quote a Redis key for a redis-cli command line: bare when it is a simple
+/// Quote a Redis argument for a redis-cli command line: bare when it is a simple
 /// token, otherwise double-quoted with `"` and `\` escaped (redis-cli's own
-/// quoting rules). Only used to seed the Console, which the user still reviews
-/// before running.
-fn quote_redis_arg(arg: &str) -> String {
+/// quoting rules).
+pub(crate) fn quote_redis_arg(arg: &str) -> String {
     let simple = !arg.is_empty()
         && arg
             .bytes()
@@ -776,6 +769,20 @@ fn quote_redis_arg(arg: &str) -> String {
     } else {
         format!("\"{}\"", arg.replace('\\', "\\\\").replace('"', "\\\""))
     }
+}
+
+/// Re-render an argv as the command line it came from, quoting each argument.
+///
+/// Every place a command is *shown* or *stored* has to use this rather than a plain
+/// space join. `DEL "a b"` is one key containing a space; joined bare it reads as
+/// two, so the confirm bar asked about a different command than the one that would
+/// run, and the history dock's re-run genuinely deleted keys `a` and `b` instead of
+/// `a b`. Shown-vs-executed drift is the exact thing the confirm exists to prevent.
+pub(crate) fn join_redis_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|a| quote_redis_arg(a))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The natural "read the whole value" command to pre-fill the Console with for a
@@ -793,11 +800,10 @@ fn kv_read_command(kv_type: &KvType, key: &str) -> String {
     }
 }
 
-/// The value inspector for one selected key: its value (or just a big
-/// collection's length, per `KvValue`/`KvCollection`), and, for a big
-/// collection, the paged sub-grid state (see docs/plans/redis.md's "big
-/// collections inside a single key"). Replaces `Value::Capped`'s byte-length
-/// triage with an element-count triage one level down, same idea.
+/// The value inspector for one selected key: its value (or just a big collection's
+/// length, per `KvValue`/`KvCollection`), and, for a big collection, the paged sub-grid
+/// state. Replaces `Value::Capped`'s byte-length triage with an element-count triage
+/// one level down, same idea.
 pub(crate) struct KvInspector {
     pub(crate) key: String,
     pub(crate) kv_type: KvType,
@@ -825,7 +831,7 @@ pub(crate) struct KvInspector {
     pub(crate) collection_scroll: UniformListScrollHandle,
 
     // --- big-stream paging (only populated once `value` reports a
-    // `KvValue::Stream(KvCollection::Large)`; see docs/plans/redis.md's R4).
+    // `KvValue::Stream(KvCollection::Large)`).
     // Streams page by entry-ID range rather than the `*SCAN` cursor the other
     // collections use, so they get their own accumulator instead of reusing
     // `collection_rows`. Entries accumulate newest-first, oldest-continued.
@@ -838,14 +844,12 @@ pub(crate) struct KvInspector {
     pub(crate) stream_loading: bool,
     pub(crate) stream_scroll: UniformListScrollHandle,
 
-    /// Consumer-group management state for a stream key (see
-    /// docs/plans/redis.md's "stream consumer-group management" gap). Only
-    /// meaningful when `kv_type` is `Stream`; its `view` toggles the stream
-    /// body between the entries grid and the groups view. Loaded lazily the
-    /// first time the user switches to the Groups tab.
+    /// Consumer-group management state for a stream key. Only meaningful when `kv_type`
+    /// is `Stream`; its `view` toggles the stream body between the entries grid and the
+    /// groups view. Loaded lazily the first time the user switches to the Groups tab.
     pub(crate) stream_groups: StreamGroupsState,
 
-    // --- editing (see docs/plans/redis.md's editing phase) ---
+    // --- editing ---
     // Each editable field gets one persistent `TextInput`, created once when
     // the inspector opens rather than lazily, so a click just flips a
     // visibility flag instead of constructing a fresh entity mid-render
@@ -869,10 +873,9 @@ pub(crate) struct KvInspector {
     pub(crate) rename_editor: Entity<TextInput>,
     pub(crate) editing_key: bool,
     pub(crate) confirm_delete: bool,
-    /// The lens the string value is rendered through (Auto/Raw/JSON/Hex +
-    /// binary decoders), reusing the SQL inspector's `ValueFormat` (see
-    /// docs/plans/redis.md's "binary value decoders" gap). Only meaningful for
-    /// a `KvValue::Str`.
+    /// The lens the string value is rendered through (Auto/Raw/JSON/Hex + binary
+    /// decoders), reusing the SQL inspector's `ValueFormat`. Only meaningful for a
+    /// `KvValue::Str`.
     pub(crate) str_format: crate::inspector::ValueFormat,
     /// True while a "Load full value" `KvReadStringFull` is in flight (the
     /// string was `read_value`-capped and the user asked for the whole thing);
@@ -885,7 +888,7 @@ pub(crate) struct KvInspector {
     pub(crate) edit_after_load: bool,
 
     // --- collection-element editing (hash field / set member / zset member /
-    // list element add/edit/delete; see docs/plans/redis.md's editing phase).
+    // list element add/edit/delete).
     /// The two shared inputs the element popover uses: `elem_name` is the
     /// hash field / set member / list value; `elem_value` is the hash value or
     /// zset score. Persistent like the other inspector editors.
@@ -984,7 +987,7 @@ impl BrowseState {
         cx.subscribe(&filter, move |this, input, event: &TextInputEvent, cx| {
             // Only the active (visible, focused) tab can receive input events
             // in the no-split shell, so routing to the active Browse tab is
-            // unambiguous here (see docs/plans/redis-workflow-parity.md).
+            // unambiguous here.
             let mode = this
                 .conn_mut(Some(session))
                 .and_then(|a| a.kv_view.as_ref())
@@ -2131,6 +2134,24 @@ impl AppState {
     }
 
     pub(crate) fn kv_cancel_import(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        // Stop the *run*, not just the dialog. Dropping the modal state left the
+        // spawned task writing to Redis with the UI showing nothing, which is the
+        // one thing a Cancel button must not do.
+        let running = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.import.as_ref())
+            .is_some_and(|i| i.running);
+        if running {
+            let epoch = self
+                .conn_for(Some(session))
+                .and_then(|a| a.kv_view.as_ref())
+                .and_then(|v| v.active_browse())
+                .map(|b| b.epoch)
+                .unwrap_or(red_service::Epoch::ZERO);
+            self.service
+                .send_to(session, red_service::Command::KvBatchStop { epoch });
+        }
         let closed = self
             .conn_mut(Some(session))
             .and_then(|a| a.kv_view.as_mut())
@@ -2254,13 +2275,27 @@ impl AppState {
         ok: usize,
         failed: usize,
         first_error: Option<String>,
+        aborted: bool,
         cx: &mut Context<Self>,
     ) {
         if let Some(view) = self.conn_mut(session).and_then(|a| a.kv_view.as_mut()) {
             view.import = None;
         }
         self.refocus_root = true;
-        let (variant, msg) = if failed == 0 {
+        // A stopped import is not a finished one. Toasting "Imported N" for a file
+        // that halted at line N of 500k tells the user the seed landed when most of
+        // it never ran.
+        let (variant, msg) = if aborted {
+            (
+                ToastVariant::Warning,
+                crate::i18n::tr!(
+                    "kv.import_stopped",
+                    "Import stopped after {ok} command(s); {failed} failed",
+                    ok = ok,
+                    failed = failed,
+                ),
+            )
+        } else if failed == 0 {
             (
                 ToastVariant::Success,
                 crate::i18n::tr!("kv.imported_commands", "Imported {ok} command(s)", ok = ok),
@@ -3014,9 +3049,8 @@ fn fuzzy_score(query: &str, target: &str) -> Option<i32> {
     Some(score)
 }
 
-/// `"no expiry"` for `None` (Redis `PTTL -1`), else a coarse "expires in Xm"
-/// countdown — a static snapshot at fetch time, not a live tick (see
-/// docs/plans/redis.md's deferred-polish list). Mirrors `connect.rs::fmt_ago`'s
+/// `"no expiry"` for `None` (Redis `PTTL -1`), else a coarse "expires in Xm" countdown
+/// — a static snapshot at fetch time, not a live tick. Mirrors `connect.rs::fmt_ago`'s
 /// bucket shape, inverted (time remaining, not elapsed).
 fn fmt_ttl(ttl: Option<Duration>) -> String {
     let Some(ttl) = ttl else {

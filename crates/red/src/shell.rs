@@ -357,6 +357,30 @@ impl AppState {
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_server_panel(cx)))
             });
 
+        // The Stop for an in-flight write. Reads/exports have their own stops (the
+        // grid's ticker, the transfer toast); a write had none, which left the whole
+        // write-cancellation path in the service unreachable — and the default
+        // `statement_timeout` is 0, so a write stuck on a lock had no other way out.
+        let stop_write = active.write_in_flight.then(|| {
+            div()
+                .id("statusbar-stop-write")
+                .flex()
+                .flex_shrink_0()
+                .items_center()
+                .gap_1()
+                .px_2()
+                .cursor_pointer()
+                .text_color(theme.red)
+                .hover(|s| s.bg(theme.bg_elevated))
+                .tooltip(Tooltip::text(crate::i18n::tr!(
+                    "shell.stop_write.help",
+                    "Ask the server to stop the running statement"
+                )))
+                .child(crate::icons::icon("circle-x", theme.scale(10.), theme.red))
+                .child(crate::i18n::tr!("shell.stop_write", "Stop"))
+                .on_click(cx.listener(|this, _, _, cx| this.stop_write(cx)))
+        });
+
         let status_left = div()
             .flex()
             .items_center()
@@ -487,7 +511,7 @@ impl AppState {
         // Assistant toggle, pinned to the far-right of the status bar (mirrors the
         // schema sidebar toggle on the left). Accent-tinted while the panel is open.
         // Hidden entirely when the assistant is disabled for this connection (the
-        // M-S7 kill switch): no entry point, not just a no-op button.
+        // kill switch): no entry point, not just a no-op button.
         let assistant_enabled = self.ai_enabled();
         let assistant_open = self.assistant.is_some();
         let assistant_toggle = div()
@@ -539,7 +563,8 @@ impl AppState {
                     .child(history_toggle)
                     .child(sidebar_toggle)
                     .child(columns_toggle)
-                    .child(status_left),
+                    .child(status_left)
+                    .children(stop_write),
             )
             .child(
                 // Counts + assistant toggle stay fixed-width and always visible.
@@ -748,11 +773,9 @@ impl AppState {
             .into_any_element()
     }
 
-    /// One split half: its own tab strip (only this half's tabs, styled 1:1 with
-    /// the SQL editor's strip) over the active tab's panel body. A mouse-down
-    /// anywhere in the half focuses it, so buttons/inputs act on the half the
-    /// user just touched (the focus-aware `active_*` routing; see
-    /// docs/plans/redis-workflow-parity.md).
+    /// One split half: its own tab strip (only this half's tabs, styled 1:1 with the
+    /// SQL editor's strip) over the active tab's panel body. A mouse-down anywhere in
+    /// the half focuses it, so buttons/inputs act on the half the user just touched.
     fn render_kv_half(
         &self,
         active: &ActiveConn,
@@ -1685,7 +1708,7 @@ impl AppState {
     }
 
     /// The connected shell for a Redis (KV) session: the same top bar as the
-    /// SQL workspace: the keyspace browser (R1, see docs/plans/redis.md)
+    /// SQL workspace: the keyspace browser (R1)
     /// instead of the editor/grid/schema tree, which all assume a
     /// `DatabaseDriver` session.
     pub(crate) fn render_redis_shell(
@@ -1853,7 +1876,7 @@ impl AppState {
             .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx)));
 
         // Agent toggle, pinned far-right (mirrors the SQL shell). Hidden entirely
-        // when the assistant is disabled for this connection (the M-S7 kill
+        // when the assistant is disabled for this connection (kill
         // switch): no entry point, not just a no-op button.
         let assistant_enabled = self.ai_enabled();
         let assistant_open = self.assistant.is_some();
@@ -2274,7 +2297,7 @@ impl AppState {
             .into_any_element()
     }
 
-    /// The lower pane for tab `tab_idx`: its query plan (Track B4) when one is open,
+    /// The lower pane for tab `tab_idx`: its query plan when one is open,
     /// else the result grid; both share the slot. Picks per-tab (not per-focus) so
     /// each half shows its own tab's view.
     fn render_results_slot(

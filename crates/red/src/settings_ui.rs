@@ -1525,7 +1525,7 @@ fn ai_agents_section(state: &AppState, theme: &Theme, cx: &mut Context<AppState>
             .on_click(cx.listener(move |this, _, _, cx| this.set_default_agent(&id, cx)))
             .into_any_element()
         };
-        // Re-auth / switch account (M-S4) lives here, not in the chat panel: an ACP
+        // Re-auth / switch account lives here, not in the chat panel: an ACP
         // agent owns its own `/login`, so this asks the backend to spawn it for a
         // fresh handshake (it pops its own browser when signed out). API agents
         // carry a key, not a login, so they get no button.

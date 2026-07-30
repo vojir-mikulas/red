@@ -350,7 +350,7 @@ pub(crate) fn qualify_table(table: &TableRef, quote: impl Fn(&str) -> String) ->
 /// auto-increment column is re-spelled per dialect (SQLite `INTEGER PRIMARY KEY`,
 /// Postgres `serial`/`bigserial`, MySQL `… AUTO_INCREMENT`) so the migrated table keeps
 /// auto-numbering. Indexes and foreign keys are **not** emitted here; they ride a
-/// deferred pass after the data loads (`docs/plans/database-migration.md` Phase 3).
+/// deferred pass after the data loads.
 /// Identifiers are quoted by `quote`; the only interpolated type text comes from the
 /// fixed per-engine spelling table, never raw user input.
 pub(crate) fn create_table_sql(
@@ -592,7 +592,7 @@ pub(crate) fn contains_clause(
 }
 
 /// Render the AND-chain of `column = value` equalities behind every driver's
-/// [`eq_predicate`](DatabaseDriver::eq_predicate) (Track B7 FK follow): only the
+/// [`eq_predicate`](DatabaseDriver::eq_predicate) (FK follow): only the
 /// identifier `quote` differs per engine. Each value becomes a SQL *literal* (see
 /// [`sql_literal`]) compared with `=`: no column cast, so the comparison stays
 /// index-usable and the engine coerces the untyped literal to the column's type.
@@ -736,7 +736,7 @@ fn cmp_op_sql(op: CmpOp) -> &'static str {
 /// Wrap `base` so each [`FkJoin`]'s selected columns ride **inline, next to the
 /// foreign-key column they expand from**: the shared half of every relational
 /// driver's [`fk_join_wrap`](DatabaseDriver::fk_join_wrap) (inline FK expansion,
-/// Track B7). Only the identifier `quote` differs per engine.
+/// ). Only the identifier `quote` differs per engine.
 ///
 /// `base_cols` is the base result's columns in their natural order (from
 /// `describe_table`). The projection emits each base column in turn and, right after
@@ -1187,7 +1187,7 @@ pub trait DatabaseDriver: Send + Sync {
         Ok(RowEditCaps::guarded(detail))
     }
 
-    /// The enum-typed columns of `table` and their allowed values (Track B8: the
+    /// The enum-typed columns of `table` and their allowed values (the
     /// in-cell enum picker), `{ column → [variant, …] }`. Used to offer a value
     /// dropdown when editing an enum cell. The default returns nothing (engines
     /// without an enum concept, or where it isn't editable); Postgres (`pg_enum`) and
@@ -1202,7 +1202,7 @@ pub trait DatabaseDriver: Send + Sync {
     }
 
     /// The connection-wide foreign-key graph: every declared FK edge across the
-    /// visible namespaces (Track B7), for click-through and the relation tree. One
+    /// visible namespaces, for click-through and the relation tree. One
     /// catalog pass where the engine allows (Postgres/MySQL `information_schema`);
     /// SQLite loops `PRAGMA foreign_key_list` over its tables. Read-only and cached
     /// by the caller (loaded once per connection). An engine without relational FKs
@@ -1232,7 +1232,7 @@ pub trait DatabaseDriver: Send + Sync {
     /// which the caller reads as "no filter".
     fn cmp_predicate(&self, preds: &[ColumnPredicate]) -> String;
 
-    /// Wrap `base` so each inline FK expansion (Track B7) `LEFT JOIN`s its referenced
+    /// Wrap `base` so each inline FK expansion `LEFT JOIN`s its referenced
     /// table and selects the chosen columns *inline, next to the FK column they expand
     /// from*, the inline sibling of [`eq_predicate`](Self::eq_predicate). `base_cols`
     /// is the base result's columns in order (so the projection can interleave). Returns
@@ -1284,7 +1284,7 @@ pub trait DatabaseDriver: Send + Sync {
     ) -> Result<ColumnStats>;
 
     /// A bounded list of a referenced table's existing ids (and an optional label
-    /// column) for the in-cell foreign-key picker (Track B8): `SELECT DISTINCT
+    /// column) for the in-cell foreign-key picker: `SELECT DISTINCT
     /// <id>[, <label>] FROM <target> ORDER BY <id> LIMIT <limit>` (see `lookup_sql`),
     /// read back through the tested [`fetch_page`](Self::fetch_page) path so no engine
     /// needs its own body. `target`/`id_column`/`label_column` are quoted with the
@@ -1402,7 +1402,7 @@ pub trait DatabaseDriver: Send + Sync {
     /// each in order, COMMIT; on any error ROLLBACK the whole batch and return the
     /// error, so the set lands all-or-nothing. Returns the per-statement affected
     /// counts (same length/order as `statements`). Backs the assistant's approved
-    /// multi-statement changeset (Feature B): the model proposes N statements, the
+    /// multi-statement changeset: the model proposes N statements, the
     /// user approves them as a unit, and they commit together or not at all. An empty
     /// batch is a no-op returning an empty vec without opening a transaction. A
     /// read-only driver rejects the writes at the engine. (An engine without
@@ -1420,7 +1420,7 @@ pub trait DatabaseDriver: Send + Sync {
             .await
     }
 
-    /// Apply a batch of guarded, PK-keyed data edits (Track B6) **atomically** in a
+    /// Apply a batch of guarded, PK-keyed data edits **atomically** in a
     /// single transaction: render each `op` to dialect SQL with every value **bound**
     /// (see `edit_sql`), run them in order, and assert each touches exactly one row,
     /// rolling the *whole* batch back and returning `edit_count_err` (or the
@@ -1563,7 +1563,7 @@ pub trait DatabaseDriver: Send + Sync {
     /// `PRIMARY KEY` are carried, and the `CREATE` runs through the same transaction
     /// wrapper as [`execute`](DatabaseDriver::execute) (shared body:
     /// `create_table_sql`). Defaults, indexes, foreign keys, and auto-increment are
-    /// **not** emitted in v1 (see `docs/plans/database-migration.md`). Idempotent
+    /// **not** emitted in v1. Idempotent
     /// (`IF NOT EXISTS`). A read-only driver (ClickHouse) rejects it at the engine, so
     /// it is never a migration target. Returns the engine's affected-row count (0 for
     /// DDL on most engines).
@@ -1676,18 +1676,14 @@ pub trait DatabaseDriver: Send + Sync {
         ))
     }
 
-    /// The object's definition, as SQL. Read-only, and the only way to see what a
-    /// view or a routine actually *is*.
-    ///
-    /// Three of the four engines have a `SHOW CREATE`-shaped statement and return
-    /// the server's own text verbatim, which is the honest answer. Postgres has
-    /// none, so its driver assembles the statement from the catalog and says so in
-    /// a header comment: this is a **reading** aid, not a migration artifact, and
-    /// nothing in RED executes what it returns (see
-    /// `docs/plans/todo/object-ddl-and-schema-diff.md`).
-    ///
-    /// No default impl: every engine can answer something for at least its tables,
-    /// and a silent empty default would ship as a blank panel.
+    /// The object's definition, as SQL. Read-only, and the only way to see what a view
+    /// or a routine actually *is*. Three of the four engines have a `SHOW
+    /// CREATE`-shaped statement and return the server's own text verbatim, which is the
+    /// honest answer. Postgres has none, so its driver assembles the statement from the
+    /// catalog and says so in a header comment: this is a **reading** aid, not a
+    /// migration artifact, and nothing in RED executes what it returns. No default
+    /// impl: every engine can answer something for at least its tables, and a silent
+    /// empty default would ship as a blank panel.
     async fn object_ddl(
         &self,
         namespace: &str,
@@ -1722,7 +1718,7 @@ pub trait DatabaseDriver: Send + Sync {
     }
 
     /// Run the engine's `EXPLAIN` for `sql` and return a normalized [`QueryPlan`]
-    /// (Track B4). Plain `explain` (`analyze = false`) never executes the
+    ///. Plain `explain` (`analyze = false`) never executes the
     /// statement; it's read-only-safe for any SQL. `analyze = true` runs
     /// `EXPLAIN ANALYZE`, which *executes* the statement to gather actuals; the
     /// caller gates that to read queries (SQLite has no ANALYZE and ignores the

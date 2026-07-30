@@ -73,6 +73,20 @@ macro_rules! progress {
 }
 pub(crate) use progress;
 
+/// Print a line to **stdout**, ignoring a write failure.
+///
+/// `println!` panics on `EPIPE`, so `red migrate prod --to dev --dry-run | head -n1`
+/// exited 101 with panic spew — breaking both the exit-code contract and the
+/// no-panic rule. The table path of `cmd_connections` already writes this way; this
+/// is that, spelled once.
+macro_rules! outln {
+    ($($arg:tt)*) => {{
+        use std::io::Write as _;
+        let _ = writeln!(std::io::stdout(), $($arg)*);
+    }};
+}
+pub(crate) use outln;
+
 /// The service's event stream: `(session, event)` items.
 type EventRx = UnboundedReceiver<(Option<SessionId>, Event)>;
 
@@ -154,6 +168,9 @@ struct QueryArgs {
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutFormat::Table)]
     format: OutFormat,
+    /// Skip the confirmation prompt for risky/destructive statements (scripts/CI).
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Args)]
@@ -255,7 +272,7 @@ fn cmd_connections(args: ConnectionsArgs) -> u8 {
                 })
             })
             .collect();
-        println!("{}", serde_json::Value::Array(items));
+        outln!("{}", serde_json::Value::Array(items));
         return EXIT_OK;
     }
     if saved.is_empty() {
@@ -297,7 +314,7 @@ fn cmd_test(args: ConnArgs) -> u8 {
     let code = loop {
         match recv(&mut events) {
             Some(Event::TestSucceeded { version }) => {
-                println!("ok: {version}");
+                outln!("ok: {version}");
                 break EXIT_OK;
             }
             Some(Event::TestFailed { message }) => {
@@ -331,6 +348,29 @@ fn cmd_query(args: QueryArgs) -> u8 {
             return EXIT_USAGE;
         }
     };
+    // `red exec` grades its script because the GUI's confirm gate is UI-side only.
+    // The same argument applies here: `open_cursor` runs whatever it is given —
+    // Postgres' `query_raw` happily executes DDL, and SQLite's cursor thread
+    // prepares and steps arbitrary SQL — so `red query prod 'DROP TABLE users'`
+    // dropped the table and exited 0. A genuine read always grades Safe or Write,
+    // so this costs legitimate use nothing.
+    let dialect = red_core::sql::Dialect::of(config.kind);
+    let assessment = red_core::sql::assess(&sql, dialect);
+    if assessment.level >= red_core::sql::RiskLevel::Risky {
+        let what = assessment
+            .confirm_target()
+            .map(|t| format!(" (targets `{t}`)"))
+            .unwrap_or_default();
+        if let Some(code) = confirm_destructive(
+            args.yes,
+            &format!(
+                "This runs a {:?} statement{what}. This may be irreversible.",
+                assessment.level
+            ),
+        ) {
+            return code;
+        }
+    }
     let (svc, mut events) = start();
     if let Err(code) = connect(&svc, &mut events, config) {
         shutdown(&svc);
@@ -339,8 +379,9 @@ fn cmd_query(args: QueryArgs) -> u8 {
 
     // Full fidelity: the CLI wants whole values, not the grid's fat-cell cap
     // (which would render long text/blobs as truncated `Value::Capped`).
+    const WINDOW: usize = 1000;
     let opts = QueryOptions {
-        window: 1000,
+        window: WINDOW,
         timeout: None,
         full_fidelity: true,
     };
@@ -358,12 +399,30 @@ fn cmd_query(args: QueryArgs) -> u8 {
     let code = loop {
         match recv(&mut events) {
             Some(Event::QueryStarted { columns }) => writer.start(&columns),
-            Some(Event::QueryRows(window)) => writer.rows(&window.rows),
+            Some(Event::QueryRows(window)) => {
+                // The service emits `QueryFinished` only once the cursor is
+                // exhausted; short of that it parks waiting for the next
+                // `FetchMore`. Without this ask, any result over one window printed
+                // its first page and then blocked forever — and under the default
+                // `--format table`, which buffers until `finish()`, printed nothing
+                // at all.
+                let more = !window.exhausted;
+                writer.rows(&window.rows);
+                if let Some(code) = writer.check_io() {
+                    break code;
+                }
+                if more {
+                    svc.send_to(PRIMARY, Command::FetchMore { max: WINDOW });
+                }
+            }
             Some(Event::QueryFinished {
                 rows_streamed,
                 elapsed,
             }) => {
                 writer.finish();
+                if let Some(code) = writer.check_io() {
+                    break code;
+                }
                 note!("{rows_streamed} rows in {elapsed:?}");
                 break EXIT_OK;
             }
@@ -481,8 +540,10 @@ pub(crate) fn confirm_destructive(yes: bool, warning: &str) -> Option<u8> {
     if std::io::stdin().read_line(&mut answer).is_err()
         || !matches!(answer.trim(), "y" | "Y" | "yes" | "Yes")
     {
+        // Non-zero: `red copy … && ./run-tests` must not proceed after the user
+        // answered "n". Declining is not success.
         eprintln!("aborted");
-        return Some(EXIT_OK);
+        return Some(EXIT_USAGE);
     }
     None
 }
@@ -658,8 +719,11 @@ fn resolve(conn: &str) -> Result<ConnectionConfig, String> {
     } else {
         names.join(", ")
     };
+    // Never echo `conn` itself: an unrecognised DSN is most often a typo'd scheme,
+    // and the argument still carries `user:password@host`, which would land in the
+    // shell history and in CI logs. Report the shape, not the secret.
     Err(format!(
-        "no saved connection named {conn:?}, and it isn't a recognised DSN.\nknown connections: {known}"
+        "no saved connection named, and not a recognised DSN.\nknown connections: {known}"
     ))
 }
 
@@ -702,6 +766,12 @@ fn hydrate_secrets(id: &str, config: &mut ConnectionConfig) {
 /// neither is given, stdin. Erroring only when stdin is an interactive terminal
 /// (so `red exec conn` with nothing to run doesn't hang waiting for typing).
 fn read_sql(inline: Option<String>, file: Option<&Path>) -> Result<String, String> {
+    // Refuse rather than pick: passing both is a mistake, and silently running the
+    // inline SQL while the user is looking at the file they named is the worst
+    // possible resolution of it.
+    if inline.is_some() && file.is_some() {
+        return Err("pass SQL inline or with --file, not both".into());
+    }
     if let Some(sql) = inline {
         return Ok(sql);
     }

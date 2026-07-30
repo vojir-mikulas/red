@@ -10,7 +10,7 @@
 //! streams. The model can read schema and run capped `SELECT`s on its own; in M1
 //! it cannot mutate anything.
 //!
-//! The panel hosts **several conversations at once** (M-S6): each [`ChatSession`]
+//! The panel hosts **several conversations at once**: each [`ChatSession`]
 //! carries its own transcript, streaming state, and **provider binding**, so one
 //! chat can run on the Claude subscription (ACP) while another runs on the API-key
 //! backend, live simultaneously. The composer/transcript show the *active* chat;
@@ -41,7 +41,7 @@ pub(crate) enum ChatRole {
     Assistant,
 }
 
-/// A one-tap context action shown in the panel (M-S4). Each maps to a canned
+/// A one-tap context action shown in the panel. Each maps to a canned
 /// prompt; the live error / editor SQL it refers to is folded in by `ai_context`.
 #[derive(Clone, Copy)]
 pub(crate) enum QuickAction {
@@ -202,7 +202,7 @@ impl ChatMessage {
     }
 }
 
-/// A pending agent tool-permission prompt (M-S2, subscription path): the agent
+/// A pending agent tool-permission prompt (subscription path): the agent
 /// wants to run a tool RED didn't auto-allow. The panel shows Allow/Deny and the
 /// answer routes back as `Command::AiPermission`, keyed by `request_id`.
 pub(crate) struct PendingPermission {
@@ -211,7 +211,7 @@ pub(crate) struct PendingPermission {
     pub(crate) detail: Option<SharedString>,
 }
 
-/// One open conversation. The panel holds several of these (M-S6); the active one
+/// One open conversation. The panel holds several of these; the active one
 /// drives the composer/transcript while the rest keep streaming in the background.
 /// Each carries its own provider binding, so chats on different backends coexist.
 pub(crate) struct ChatSession {
@@ -228,29 +228,29 @@ pub(crate) struct ChatSession {
     pub(crate) status: Option<SharedString>,
     /// The last turn's error, shown inline (not as a global toast).
     pub(crate) error: Option<SharedString>,
-    /// A tool-permission prompt awaiting the user's Allow/Deny (M-S2). At most one
+    /// A tool-permission prompt awaiting the user's Allow/Deny. At most one
     /// is shown at a time; the agent blocks on the answer.
     pub(crate) pending_permission: Option<PendingPermission>,
-    /// The most recent finished turn's token/cost accounting (M-S4), shown as a
+    /// The most recent finished turn's token/cost accounting, shown as a
     /// compact footer. `None` until the first turn completes.
     pub(crate) last_usage: Option<red_service::AiUsage>,
     /// Which agent this chat runs on: the agent profile's id (`"subscription"`,
     /// `"anthropic"`, `"codex"`, …). Chosen at creation (defaulting to the resolved
-    /// default agent) and persisted as the conversation's binding (M-S5); turns carry
-    /// it so the right backend handles them (M-S6). Locked once the first message is
+    /// default agent) and persisted as the conversation's binding; turns carry
+    /// it so the right backend handles them. Locked once the first message is
     /// sent. (Field name kept as `provider`; it's the serialized key saved chats
     /// already use.)
     pub(crate) provider: String,
     /// The chat's title, derived from its first user message; the saved file's
     /// display name. `None` until the first turn is sent.
     pub(crate) title: Option<String>,
-    /// The backing file's stem once this chat has been saved (M-S5), so later turns
+    /// The backing file's stem once this chat has been saved, so later turns
     /// overwrite the same file. `None` for a never-saved chat.
     pub(crate) file_stem: Option<String>,
     /// Unix seconds this chat was first saved, kept stable across re-saves.
     pub(crate) created_unix: Option<u64>,
     /// A reopened conversation's prior transcript, folded into the *next* turn's
-    /// context so the model resumes where it left off (M-S5). Taken (cleared) when
+    /// context so the model resumes where it left off. Taken (cleared) when
     /// that turn is sent; the backend session is fresh, so this seeds it once.
     pub(crate) pending_seed: Option<String>,
     /// A never-sent chat's prepared prompt, preserved across switches so the one
@@ -420,7 +420,7 @@ pub(crate) struct AssistantState {
     pub(super) _sub: gpui::Subscription,
     pub(super) _key_sub: gpui::Subscription,
     pub(super) _search_sub: gpui::Subscription,
-    /// The open conversations (M-S6). Never empty while the panel is open.
+    /// The open conversations. Never empty while the panel is open.
     pub(crate) chats: Vec<ChatSession>,
     /// Index of the active chat in `chats`: the one the composer/transcript show.
     pub(crate) active: usize,

@@ -150,11 +150,38 @@ fn format_from(bundle: &Bundle, key: &str, args: Option<&FluentArgs>) -> Option<
     let mut errors = Vec::new();
     let text = bundle.format_pattern(pattern, args, &mut errors);
     if !errors.is_empty() {
-        // Chiefly a missing argument, which Fluent renders as the placeable's own
-        // name. Worth a log because it reaches the user as literal `$count`.
-        tracing::warn!(%key, ?errors, "error formatting catalog string");
+        // A message that exists but fails to format is a **miss**, not a hit.
+        // Fluent renders the failure as the placeable's own name, so returning
+        // `Some` here put a literal `{$count}` on screen — the one degradation the
+        // module's own charter says cannot happen. `None` drops to the next bundle
+        // (English), and from there to the callsite English, which is the whole
+        // point of the chain.
+        warn_once(key, &errors);
+        return None;
     }
     Some(text.into_owned())
+}
+
+/// Log a formatting failure at most once per key.
+///
+/// The unguarded `warn!` sat on the render path, so one bad translation line
+/// warn-spammed at frame rate — `kv.monitor_streaming` re-renders per MONITOR
+/// line. The first report is the useful one; the next ten thousand are noise that
+/// buries it.
+fn warn_once(key: &str, errors: &[fluent_bundle::FluentError]) {
+    use std::collections::HashSet;
+    use std::sync::{Mutex, OnceLock};
+
+    static SEEN: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(HashSet::new()));
+    let Ok(mut seen) = seen.lock() else {
+        return;
+    };
+    // Bounded: a poisoned catalog cannot grow this without bound, and the cap is
+    // far above the number of distinct keys any build has.
+    if seen.len() < 4096 && seen.insert(key.to_string()) {
+        tracing::warn!(%key, ?errors, "error formatting catalog string; falling back");
+    }
 }
 
 /// Resolves a key against the active locale, then `en`.
@@ -353,9 +380,13 @@ pub(crate) fn apply(setting: &str) {
 /// query before a second language ships, because a macOS `.app` launched from
 /// Finder inherits no `LANG` at all and would silently read as English.
 fn detect_system() -> String {
+    // `filter(|v| !v.is_empty())`: POSIX says a variable that is *set but empty*
+    // does not select a locale, so the search falls through to the next one.
+    // Stopping at an empty `LC_ALL` — which plenty of shells export — read as
+    // "no locale" and forced English.
     let raw = ["LC_ALL", "LC_MESSAGES", "LANG"]
         .iter()
-        .find_map(|k| std::env::var(k).ok())
+        .find_map(|k| std::env::var(k).ok().filter(|v| !v.is_empty()))
         .unwrap_or_default();
 
     // `cs_CZ.UTF-8` -> `cs`. The territory and codeset are dropped because

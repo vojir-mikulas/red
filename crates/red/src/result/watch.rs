@@ -1,5 +1,5 @@
 //! Watch mode: re-run this tab's query every N seconds, flash what changed, and
-//! report the row delta (see `docs/plans/todo/watch-mode.md`).
+//! report the row delta.
 //!
 //! Redis has had auto-refresh since the browse-topbar overhaul; the SQL grid had
 //! no refresh at all (⌘R is *Refresh schema*). The archetype is a job/queue

@@ -42,7 +42,10 @@ use red_core::{
     ExportFormat, FkEdge, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError,
     Result, ResultPage, RowEditCaps, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
+use std::borrow::Cow;
+
 use serde_json::Value as Json;
+use serde_json::value::RawValue;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, OnceCell};
 use uuid::Uuid;
@@ -57,7 +60,60 @@ mod write;
 
 /// A collected (bounded) read: the result columns, their raw ClickHouse type
 /// strings (for value mapping), and the raw JSON cell rows.
-type RowBlock = (Vec<Column>, Vec<String>, Vec<Vec<Json>>);
+type RowBlock = (Vec<Column>, Vec<String>, Vec<Vec<Cell>>);
+
+/// One JSON cell exactly as ClickHouse serialised it, kept as raw source text
+/// rather than a parsed [`Json`].
+///
+/// Parsing loses data this driver has to keep. `serde_json` without
+/// `arbitrary_precision` widens any number that does not fit `i64`/`u64` into
+/// `f64`, and ClickHouse leaves `Decimal` unquoted
+/// (`output_format_json_quote_decimals` defaults to 0), so a
+/// `Decimal128(30, 10)` arrived as a bare JSON number, became a double, and was
+/// re-rendered *from the double* — wrong digits in the grid and in every export,
+/// with nothing to indicate it. Asking the server to quote decimals instead would
+/// mean changing a setting per request, which a ClickHouse user whose profile is
+/// `readonly = 1` is not allowed to do.
+///
+/// The accessors below mirror the [`Json`] ones the metadata queries used, with
+/// the "…or a quoted number" fallback folded in: which of the two forms a counter
+/// arrives in depends on server settings, and every caller wanted both.
+#[derive(Debug, Clone)]
+pub(super) struct Cell(Box<RawValue>);
+
+impl Cell {
+    /// The cell's raw JSON source (`"abc"` with its quotes, `1.5` verbatim).
+    fn raw(&self) -> &str {
+        self.0.get()
+    }
+
+    /// The content of a JSON string cell, unescaped. `None` for every other shape,
+    /// matching `serde_json::Value::as_str`.
+    fn as_str(&self) -> Option<Cow<'_, str>> {
+        let raw = self.raw();
+        let body = raw.strip_prefix('"')?.strip_suffix('"')?;
+        if !body.contains('\\') {
+            return Some(Cow::Borrowed(body));
+        }
+        serde_json::from_str::<String>(raw).ok().map(Cow::Owned)
+    }
+
+    /// The cell as `i64`: a bare JSON integer, or one that arrived quoted.
+    fn as_i64(&self) -> Option<i64> {
+        match self.as_str() {
+            Some(s) => s.parse().ok(),
+            None => self.raw().parse().ok(),
+        }
+    }
+
+    /// The cell as `f64`: a bare JSON number, or one that arrived quoted.
+    fn as_f64(&self) -> Option<f64> {
+        match self.as_str() {
+            Some(s) => s.parse().ok(),
+            None => self.raw().parse().ok(),
+        }
+    }
+}
 
 /// An opened streaming read: columns + types, the live response, and the stream
 /// bytes already buffered past the two header lines.
@@ -334,22 +390,16 @@ impl ClickhouseDriver {
              WHERE c.database = {db:String} AND c.table = {tbl:String} ORDER BY c.position"
             .to_string();
         let (_, _, rows) = self.run_simple(base, &table_params(schema, table)).await?;
-        let text = |row: &Vec<Json>, i: usize| {
-            row.get(i)
-                .and_then(Json::as_str)
-                .unwrap_or_default()
-                .to_string()
-        };
-        let flag = |row: &Vec<Json>, i: usize| row.get(i).and_then(json_to_i64).unwrap_or(0) == 1;
+        let flag = |row: &Vec<Cell>, i: usize| cell_num(row, i) == 1;
         let mut engine = String::new();
         let columns: Vec<write::ChColumn> = rows
             .iter()
             .map(|row| {
-                engine = text(row, 7);
+                engine = cell_text(row, 7);
                 write::ChColumn {
-                    name: text(row, 0),
-                    type_name: text(row, 1),
-                    default_kind: text(row, 2),
+                    name: cell_text(row, 0),
+                    type_name: cell_text(row, 1),
+                    default_kind: cell_text(row, 2),
                     in_sorting_key: flag(row, 3),
                     in_primary_key: flag(row, 4),
                     in_partition_key: flag(row, 5),
@@ -395,7 +445,7 @@ impl ClickhouseDriver {
                         .map(|row| {
                             let cell = |i: usize| {
                                 row.get(i)
-                                    .and_then(Json::as_str)
+                                    .and_then(Cell::as_str)
                                     .unwrap_or_default()
                                     .to_string()
                             };
@@ -549,7 +599,7 @@ impl ClickhouseDriver {
             Ok((_, _, rows)) => rows
                 .first()
                 .and_then(|r| r.first())
-                .and_then(json_to_i64)
+                .and_then(Cell::as_i64)
                 .unwrap_or(0)
                 .max(0) as u64,
             Err(e) => return blocked(format!("couldn't check which rows this matches: {e}")),
@@ -667,7 +717,7 @@ impl DatabaseDriver for ClickhouseDriver {
         let query_id = new_query_id();
         let cancelled = Arc::new(AtomicBool::new(false));
         let cancel = self.cursor_cancel_token(&query_id, cancelled.clone());
-        let (columns, types, resp, buf) = self.open_stream(strip_trailing(sql), &query_id).await?;
+        let (columns, types, resp, buf) = self.open_stream(&strip_trailing(sql), &query_id).await?;
         Ok(Box::new(ChCursor {
             columns,
             types,
@@ -702,19 +752,19 @@ impl DatabaseDriver for ClickhouseDriver {
         for row in &rows {
             let db = row
                 .first()
-                .and_then(Json::as_str)
+                .and_then(Cell::as_str)
                 .unwrap_or_default()
                 .to_string();
             let name = row
                 .get(1)
-                .and_then(Json::as_str)
+                .and_then(Cell::as_str)
                 .unwrap_or_default()
                 .to_string();
-            let engine = row.get(2).and_then(Json::as_str).unwrap_or_default();
+            let engine = row.get(2).and_then(Cell::as_str).unwrap_or_default();
             // A MaterializedView is a stored, incrementally-populated relation and
             // a plain View is a query rewrite; they behave differently enough (one
             // has parts and a size, the other does not) to draw apart.
-            let kind = match engine {
+            let kind = match engine.as_ref() {
                 "MaterializedView" => ObjectKind::MaterializedView,
                 e if e.ends_with("View") => ObjectKind::View,
                 _ => ObjectKind::Table,
@@ -750,11 +800,8 @@ impl DatabaseDriver for ClickhouseDriver {
         Ok(rows
             .iter()
             .filter_map(|row| {
-                let name = row.first().and_then(Json::as_str)?;
-                let count = row
-                    .get(1)
-                    .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
-                    .unwrap_or(0);
+                let name = row.first().and_then(Cell::as_str)?;
+                let count = row.get(1).and_then(Cell::as_i64).unwrap_or(0);
                 Some((
                     name.to_string(),
                     ObjectKind::Function,
@@ -789,7 +836,7 @@ impl DatabaseDriver for ClickhouseDriver {
             .await?;
         Ok(rows
             .iter()
-            .filter_map(|row| row.first().and_then(Json::as_str))
+            .filter_map(|row| row.first().and_then(Cell::as_str))
             .map(|name| ObjectMeta {
                 name: name.to_string(),
                 kind: ObjectKind::Function,
@@ -811,22 +858,22 @@ impl DatabaseDriver for ClickhouseDriver {
             .map(|row| {
                 let name = row
                     .first()
-                    .and_then(Json::as_str)
+                    .and_then(Cell::as_str)
                     .unwrap_or_default()
                     .to_string();
                 let type_name = row
                     .get(1)
-                    .and_then(Json::as_str)
+                    .and_then(Cell::as_str)
                     .unwrap_or_default()
                     .to_string();
-                let in_pk = row.get(2).and_then(json_to_i64).unwrap_or(0) == 1;
+                let in_pk = row.get(2).and_then(Cell::as_i64).unwrap_or(0) == 1;
                 // `default_expression` is empty for a column without one; keep the
                 // schema tree's "no default" as `None` rather than an empty string.
                 let default = row
                     .get(3)
-                    .and_then(Json::as_str)
+                    .and_then(Cell::as_str)
                     .filter(|s| !s.is_empty())
-                    .map(str::to_string);
+                    .map(Cow::into_owned);
                 ColumnMeta {
                     not_null: !type_name.starts_with("Nullable("),
                     primary_key: in_pk,
@@ -1009,7 +1056,7 @@ impl DatabaseDriver for ClickhouseDriver {
         Ok(rows
             .first()
             .and_then(|r| r.first())
-            .and_then(json_to_i64)
+            .and_then(Cell::as_i64)
             .unwrap_or(0))
     }
 
@@ -1133,8 +1180,8 @@ impl DatabaseDriver for ClickhouseDriver {
         let (_, _, rows) = self.run_collect(base, &[], abort).await?;
         Ok(rows.first().and_then(|r| {
             match (
-                r.first().and_then(json_to_i64),
-                r.get(1).and_then(json_to_i64),
+                r.first().and_then(Cell::as_i64),
+                r.get(1).and_then(Cell::as_i64),
             ) {
                 (Some(lo), Some(hi)) => Some((lo, hi)),
                 _ => None,
@@ -1227,23 +1274,17 @@ impl DatabaseDriver for ClickhouseDriver {
              ORDER BY is_done ASC, create_time DESC LIMIT 200"
             .to_string();
         let (_, _, rows) = self.run_simple(base, &[]).await?;
-        let text = |row: &Vec<Json>, i: usize| {
-            row.get(i)
-                .and_then(Json::as_str)
-                .unwrap_or_default()
-                .to_string()
-        };
         Ok(rows
             .iter()
             .map(|row| red_core::MutationInfo {
-                database: text(row, 0),
-                table: text(row, 1),
-                id: text(row, 2),
-                command: text(row, 3),
-                created: text(row, 4),
-                parts_to_do: row.get(5).and_then(json_to_i64).unwrap_or(0),
-                done: row.get(6).and_then(json_to_i64).unwrap_or(0) == 1,
-                fail_reason: Some(text(row, 7)).filter(|s| !s.is_empty()),
+                database: cell_text(row, 0),
+                table: cell_text(row, 1),
+                id: cell_text(row, 2),
+                command: cell_text(row, 3),
+                created: cell_text(row, 4),
+                parts_to_do: row.get(5).and_then(Cell::as_i64).unwrap_or(0),
+                done: row.get(6).and_then(Cell::as_i64).unwrap_or(0) == 1,
+                fail_reason: Some(cell_text(row, 7)).filter(|s| !s.is_empty()),
             })
             .collect())
     }
@@ -1421,19 +1462,14 @@ impl DatabaseDriver for ClickhouseDriver {
                 &[],
             )
             .await?;
-        let num = |row: &Vec<Json>, i: usize| -> i64 {
-            row.get(i)
-                .and_then(|v| v.as_i64().or_else(|| v.as_str()?.parse().ok()))
-                .unwrap_or(0)
-        };
         let mut totals = SizeTotals::default();
         for row in &rows {
-            let db = row.first().and_then(Json::as_str).unwrap_or_default();
-            let name = row.get(1).and_then(Json::as_str).unwrap_or_default();
+            let db = row.first().and_then(Cell::as_str).unwrap_or_default();
+            let name = row.get(1).and_then(Cell::as_str).unwrap_or_default();
             if scope.as_deref().is_some_and(|s| s != db) {
                 continue;
             }
-            let bytes = num(row, 2).max(0) as u64;
+            let bytes = cell_num(row, 2).max(0) as u64;
             totals.bytes += bytes;
             totals.table_count += 1;
             report.tables.push(TableSize {
@@ -1445,7 +1481,7 @@ impl DatabaseDriver for ClickhouseDriver {
                 // Parts carry no separate index size: the sparse primary index is
                 // a rounding error next to the data and is not reported apart.
                 index_bytes: 0,
-                estimated_rows: num(row, 3),
+                estimated_rows: cell_num(row, 3),
             });
         }
         report.totals = totals;
@@ -1464,13 +1500,13 @@ impl DatabaseDriver for ClickhouseDriver {
             .await
             .unwrap_or_default();
         for row in &parts {
-            let db = row.first().and_then(Json::as_str).unwrap_or_default();
-            let name = row.get(1).and_then(Json::as_str).unwrap_or_default();
+            let db = row.first().and_then(Cell::as_str).unwrap_or_default();
+            let name = row.get(1).and_then(Cell::as_str).unwrap_or_default();
             if scope.as_deref().is_some_and(|s| s != db) {
                 continue;
             }
-            let partition = row.get(2).and_then(Json::as_str).unwrap_or_default();
-            let n = num(row, 3);
+            let partition = row.get(2).and_then(Cell::as_str).unwrap_or_default();
+            let n = cell_num(row, 3);
             report.findings.push(Finding {
                 severity: if n > 1000 {
                     Severity::Bad
@@ -1490,8 +1526,8 @@ impl DatabaseDriver for ClickhouseDriver {
                 ),
                 suggested_sql: Some(format!(
                     "OPTIMIZE TABLE {}.{} PARTITION {partition};",
-                    self.quote_ident(db),
-                    self.quote_ident(name)
+                    self.quote_ident(&db),
+                    self.quote_ident(&name)
                 )),
             });
         }
@@ -1517,32 +1553,25 @@ impl DatabaseDriver for ClickhouseDriver {
                 &[],
             )
             .await?;
-        let text = |row: &Vec<Json>, i: usize| {
-            row.get(i)
-                .and_then(Json::as_str)
-                .map(str::to_string)
-                .filter(|s| !s.is_empty())
-        };
+        let opt_text =
+            |row: &Vec<Cell>, i: usize| Some(cell_text(row, i)).filter(|s| !s.is_empty());
         let sessions = rows
             .iter()
             .map(|row| red_core::ServerSession {
-                key: red_core::SessionKey(text(row, 0).unwrap_or_default()),
-                user: text(row, 1),
-                application: text(row, 2),
-                client_addr: text(row, 3),
-                database: text(row, 4),
+                key: red_core::SessionKey(opt_text(row, 0).unwrap_or_default()),
+                user: opt_text(row, 1),
+                application: opt_text(row, 2),
+                client_addr: opt_text(row, 3),
+                database: opt_text(row, 4),
                 // ClickHouse reports no per-query state word; every row here is by
                 // definition executing, and saying so beats an empty column.
                 state: "executing".to_string(),
                 wait: None,
                 blocked_by: Vec::new(),
-                query: text(row, 6),
+                query: opt_text(row, 6),
                 // `elapsed` is a Float64 that the JSON-compact reply may render as
                 // either a number or a quoted string depending on settings.
-                elapsed_secs: row
-                    .get(5)
-                    .and_then(|v| v.as_f64().or_else(|| v.as_str()?.parse().ok()))
-                    .unwrap_or(0.0),
+                elapsed_secs: row.get(5).and_then(Cell::as_f64).unwrap_or(0.0),
                 // RED's own reads run under their own query ids and finish before
                 // this list is rendered, so nothing here is ever RED itself.
                 is_self: false,
@@ -1616,7 +1645,7 @@ impl DatabaseDriver for ClickhouseDriver {
         let ddl = rows
             .first()
             .and_then(|row| row.first())
-            .and_then(Json::as_str)
+            .and_then(Cell::as_str)
             .ok_or_else(|| RedError::Driver(format!("{name} not found in {namespace}")))?;
         // ClickHouse renders the statement with literal `\n` escapes in the
         // JSON-compact reply; the JSON decode already resolved those, so this is
@@ -1634,7 +1663,7 @@ impl DatabaseDriver for ClickhouseDriver {
         let text = rows
             .iter()
             .filter_map(|r| r.first())
-            .filter_map(Json::as_str)
+            .filter_map(Cell::as_str)
             .collect::<Vec<_>>()
             .join("\n");
         Ok(crate::plan::from_indent_tree(&text))
@@ -1678,9 +1707,8 @@ impl DatabaseDriver for ClickhouseDriver {
                     continue;
                 }
                 bail_if_cancelled!();
-                let raw: Vec<Json> = serde_json::from_slice(&line).map_err(driver_err)?;
                 writer
-                    .write_row(&ch_row(&raw, &types, None))
+                    .write_row(&parse_row_line(&line, &types, None)?)
                     .map_err(driver_err)?;
                 throttle.tick(writer.written());
             }
@@ -1696,9 +1724,8 @@ impl DatabaseDriver for ClickhouseDriver {
                     // every row, but be safe).
                     if !buf.iter().all(u8::is_ascii_whitespace) {
                         bail_if_cancelled!();
-                        let raw: Vec<Json> = serde_json::from_slice(&buf).map_err(driver_err)?;
                         writer
-                            .write_row(&ch_row(&raw, &types, None))
+                            .write_row(&parse_row_line(&buf, &types, None)?)
                             .map_err(driver_err)?;
                         buf.clear();
                     }
@@ -2059,24 +2086,36 @@ fn parse_block(body: &[u8]) -> Result<RowBlock> {
         .collect();
     let mut rows = Vec::new();
     for l in lines {
-        rows.push(serde_json::from_slice::<Vec<Json>>(l).map_err(driver_err)?);
+        // `Box<RawValue>` rather than a derived `Deserialize` on `Cell`: red-driver
+        // takes no direct `serde` dependency, and the map is one move per cell.
+        let line: Vec<Box<RawValue>> = serde_json::from_slice(l).map_err(driver_err)?;
+        rows.push(line.into_iter().map(Cell).collect());
     }
     Ok((columns, types, rows))
 }
 
 /// Parse one streamed JSON-array line into a display row.
 fn parse_row_line(line: &[u8], types: &[String], cap: Option<CellCap>) -> Result<Vec<Value>> {
-    let raw: Vec<Json> = serde_json::from_slice(line).map_err(driver_err)?;
-    Ok(ch_row(&raw, types, cap))
+    // Borrowed `&RawValue` rather than [`Cell`]'s `Box`: the line outlives the map,
+    // so the hot streaming path needs no per-cell allocation at all.
+    let raw: Vec<&RawValue> = serde_json::from_slice(line).map_err(driver_err)?;
+    Ok(raw
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let ty = types.get(i).map(String::as_str).unwrap_or("");
+            ch_value(v.get(), ty, CellCap::caps(cap, i))
+        })
+        .collect())
 }
 
 /// Map one raw JSON row to display [`Value`]s, per the column types and any cell cap.
-fn ch_row(raw: &[Json], types: &[String], cap: Option<CellCap>) -> Vec<Value> {
+fn ch_row(raw: &[Cell], types: &[String], cap: Option<CellCap>) -> Vec<Value> {
     raw.iter()
         .enumerate()
         .map(|(i, v)| {
             let ty = types.get(i).map(String::as_str).unwrap_or("");
-            ch_value(v, ty, CellCap::caps(cap, i))
+            ch_value(v.raw(), ty, CellCap::caps(cap, i))
         })
         .collect()
 }
@@ -2086,40 +2125,56 @@ fn ch_row(raw: &[Json], types: &[String], cap: Option<CellCap>) -> Vec<Value> {
 /// classification: integers (numbers, or quoted strings for the 64-bit widths) →
 /// [`Value::Integer`]; floats → [`Value::Real`]; everything else (decimal, date,
 /// uuid, enum, and the composite `Array`/`Tuple`/`Map`) → text, capped if oversized.
-fn ch_value(v: &Json, ch_type: &str, max: Option<usize>) -> Value {
-    match v {
-        Json::Null => Value::Null,
-        Json::Bool(b) => Value::Integer(*b as i64),
-        Json::Number(n) => {
-            if is_ch_int(ch_type)
-                && let Some(i) = n.as_i64()
-            {
-                return Value::Integer(i);
+///
+/// `raw` is the cell's JSON *source text* (see [`Cell`]), so a value that fits no
+/// Rust scalar falls through to text with the digits the server actually sent.
+fn ch_value(raw: &str, ch_type: &str, max: Option<usize>) -> Value {
+    match raw.as_bytes().first() {
+        None => Value::Null,
+        Some(b'n') => Value::Null,
+        Some(b't') => Value::Integer(1),
+        Some(b'f') => Value::Integer(0),
+        // A JSON string: the 64-bit widths arrive quoted, and so does everything
+        // ClickHouse renders as text (date, uuid, enum, and — once the server is
+        // asked to — decimal).
+        Some(b'"') => {
+            let body = raw
+                .strip_prefix('"')
+                .and_then(|s| s.strip_suffix('"'))
+                .unwrap_or(raw);
+            if body.contains('\\') {
+                match serde_json::from_str::<String>(raw) {
+                    Ok(s) => ch_scalar(&s, ch_type, max),
+                    Err(_) => text_value(body, max),
+                }
+            } else {
+                ch_scalar(body, ch_type, max)
             }
-            if is_ch_float(ch_type)
-                && let Some(f) = n.as_f64()
-            {
-                return Value::Real(f);
-            }
-            // Decimal and out-of-i64-range integers keep their exact JSON text.
-            text_value(&n.to_string(), max)
         }
-        Json::String(s) => {
-            if is_ch_int(ch_type)
-                && let Ok(i) = s.parse::<i64>()
-            {
-                return Value::Integer(i);
-            }
-            if is_ch_float(ch_type)
-                && let Ok(f) = s.parse::<f64>()
-            {
-                return Value::Real(f);
-            }
-            text_value(s, max)
-        }
-        // Composite (Array / Tuple / Map / Nested): render the compact JSON text.
-        other => text_value(&other.to_string(), max),
+        // Composite (Array / Tuple / Map / Nested): the source text is already the
+        // compact JSON rendering, so it needs no re-serialisation.
+        Some(b'[' | b'{') => text_value(raw, max),
+        // A bare JSON number. Classified from its text, never through `f64` unless
+        // the column really is a float.
+        _ => ch_scalar(raw, ch_type, max),
     }
+}
+
+/// Classify one scalar cell's text against the declared ClickHouse type. Anything
+/// that is not an in-range `Int*`/`Float*` keeps its text verbatim — which is what
+/// makes `Decimal`, `Int128` and `Int256` exact.
+fn ch_scalar(s: &str, ch_type: &str, max: Option<usize>) -> Value {
+    if is_ch_int(ch_type)
+        && let Ok(i) = s.parse::<i64>()
+    {
+        return Value::Integer(i);
+    }
+    if is_ch_float(ch_type)
+        && let Ok(f) = s.parse::<f64>()
+    {
+        return Value::Real(f);
+    }
+    text_value(s, max)
 }
 
 /// A text [`Value`], capped to a display prefix when `max` is set.
@@ -2199,14 +2254,18 @@ fn ch_params(bound: &[Value]) -> Vec<(String, String)> {
         .collect()
 }
 
-/// Coerce a JSON cell to `i64` for `count` / `key_bounds` / `is_in_primary_key`:
-/// a JSON number directly, or a quoted 64-bit integer string parsed.
-fn json_to_i64(v: &Json) -> Option<i64> {
-    match v {
-        Json::Number(n) => n.as_i64(),
-        Json::String(s) => s.parse().ok(),
-        _ => None,
-    }
+/// The `i`th cell of a metadata row as an owned string; empty when the cell is
+/// absent or is not a JSON string.
+fn cell_text(row: &[Cell], i: usize) -> String {
+    row.get(i)
+        .and_then(Cell::as_str)
+        .unwrap_or_default()
+        .into_owned()
+}
+
+/// The `i`th cell of a metadata row as `i64`; `0` when absent or unparseable.
+fn cell_num(row: &[Cell], i: usize) -> i64 {
+    row.get(i).and_then(Cell::as_i64).unwrap_or(0)
 }
 
 /// Pull `written_rows` out of an `X-ClickHouse-Summary` header value (a JSON object
@@ -2275,6 +2334,46 @@ mod tests {
 
     fn test_url() -> Option<String> {
         std::env::var("RED_TEST_CLICKHOUSE_URL").ok()
+    }
+
+    /// The cell mapping runs off raw JSON source text, so a value too wide for any
+    /// Rust scalar keeps the digits the server sent. Parsing through `serde_json`'s
+    /// `Number` rounded these through `f64` and re-rendered the double — the grid
+    /// and every export showed a number that was never in the database.
+    #[test]
+    fn wide_numerics_keep_every_digit() {
+        // ClickHouse leaves Decimal unquoted by default, so this arrives bare.
+        let exact = "12345678901234567.8901234567";
+        assert_eq!(
+            ch_value(exact, "Decimal128(30, 10)", None),
+            Value::Text(exact.into())
+        );
+        assert_eq!(
+            ch_value(exact, "Nullable(Decimal(38, 10))", None),
+            Value::Text(exact.into())
+        );
+        // Int128/Int256 exceed i64 either way round.
+        let big = "170141183460469231731687303715884105727";
+        assert_eq!(ch_value(big, "Int128", None), Value::Text(big.into()));
+        assert_eq!(
+            ch_value(&format!("\"{big}\""), "Int256", None),
+            Value::Text(big.into())
+        );
+        // The ordinary widths still classify as scalars.
+        assert_eq!(ch_value("42", "Int32", None), Value::Integer(42));
+        assert_eq!(ch_value("\"42\"", "Int64", None), Value::Integer(42));
+        assert_eq!(ch_value("1.5", "Float64", None), Value::Real(1.5));
+        assert_eq!(ch_value("null", "Int32", None), Value::Null);
+        assert_eq!(ch_value("true", "Bool", None), Value::Integer(1));
+        // Strings keep their escapes decoded; composites keep their JSON text.
+        assert_eq!(
+            ch_value(r#""a\nb""#, "String", None),
+            Value::Text("a\nb".into())
+        );
+        assert_eq!(
+            ch_value("[1,2,3]", "Array(Int32)", None),
+            Value::Text("[1,2,3]".into())
+        );
     }
 
     macro_rules! url_or_skip {

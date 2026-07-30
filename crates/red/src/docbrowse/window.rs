@@ -58,7 +58,14 @@ pub(super) struct DocWindow {
     total: Option<usize>,
     /// Ordinal of `docs.front()` in the whole (filtered) collection.
     anchor: usize,
-    docs: VecDeque<Document>,
+    /// The resident run.
+    ///
+    /// `Rc<Document>` rather than `Document`: the render snapshots this whole run
+    /// into its row closure every frame, and a `Document` is a deep tree of owned
+    /// `String`s, binaries and nested documents. At ~2 × MARGIN_PAGES × page that
+    /// was ~800 deep tree copies per frame to hand a closure that reads about forty
+    /// of them. Sharing makes the snapshot a refcount bump per document.
+    docs: VecDeque<Rc<Document>>,
     /// The run's first document is the collection's true first (`_id`-least).
     at_start: bool,
     /// The run's last document is the collection's true last.
@@ -112,12 +119,14 @@ impl DocWindow {
 
     /// The document at absolute ordinal `ord`, if resident.
     pub(super) fn doc_at(&self, ord: usize) -> Option<&Document> {
-        ord.checked_sub(self.anchor).and_then(|i| self.docs.get(i))
+        ord.checked_sub(self.anchor)
+            .and_then(|i| self.docs.get(i))
+            .map(Rc::as_ref)
     }
 
     /// The resident run and the ordinal of its first document, for a render that
     /// clones the visible slice into its closure.
-    pub(super) fn resident(&self) -> (usize, &VecDeque<Document>) {
+    pub(super) fn resident(&self) -> (usize, &VecDeque<Rc<Document>>) {
         (self.anchor, &self.docs)
     }
 
@@ -330,7 +339,7 @@ impl DocWindow {
                     self.anchor = 0;
                     self.at_start = true;
                 }
-                self.docs.extend(docs);
+                self.docs.extend(docs.into_iter().map(Rc::new));
                 self.at_end = short;
                 if short && let Some(total) = self.total {
                     // The run now touches the true last document, so its ordinals
@@ -345,7 +354,7 @@ impl DocWindow {
                 // The reply is ascending; pushing each to the front in reverse
                 // restores order ahead of the run.
                 for doc in docs.into_iter().rev() {
-                    self.docs.push_front(doc);
+                    self.docs.push_front(Rc::new(doc));
                 }
                 self.anchor = self.anchor.saturating_sub(n);
                 if short || self.anchor == 0 {
@@ -354,7 +363,7 @@ impl DocWindow {
                 }
             }
             DocSeek::Jump { skip } => {
-                self.docs = docs.into();
+                self.docs = docs.into_iter().map(Rc::new).collect();
                 self.at_end = short;
                 let skip = skip as usize;
                 self.anchor = match self.total {
@@ -506,7 +515,7 @@ mod tests {
         let mut w = pending(DocWindow::new(PAGE), 1);
         w.total = Some(TOTAL);
         w.anchor = 9_950;
-        w.docs = docs(9_951..=9_960).into();
+        w.docs = docs(9_951..=9_960).into_iter().map(Rc::new).collect();
         w = pending(w, 2);
         let after = Some(DocValue::Int64(9_960));
         w.apply(DocSeek::Forward { after }, docs(9_961..=9_995), 2, None);
@@ -519,7 +528,7 @@ mod tests {
         let mut w = pending(DocWindow::new(PAGE), 1);
         w.total = Some(TOTAL);
         w.anchor = 500;
-        w.docs = docs(501..=700).into();
+        w.docs = docs(501..=700).into_iter().map(Rc::new).collect();
         let before = DocValue::Int64(501);
         w.apply(
             DocSeek::Backward { before },
@@ -541,7 +550,7 @@ mod tests {
     fn jump_lands_at_the_exact_ordinal() {
         let mut w = pending(DocWindow::new(PAGE), 1);
         w.total = Some(TOTAL);
-        w.docs = docs(1..=10).into();
+        w.docs = docs(1..=10).into_iter().map(Rc::new).collect();
         w.apply(
             DocSeek::Jump { skip: 6_700 },
             docs(6_701..=6_700 + PAGE as i64),
@@ -556,7 +565,7 @@ mod tests {
     #[test]
     fn stale_and_mismatched_replies_are_dropped() {
         let mut w = pending(DocWindow::new(PAGE), 2);
-        w.docs = docs(1..=10).into();
+        w.docs = docs(1..=10).into_iter().map(Rc::new).collect();
 
         // Wrong seq: a reply for a superseded request.
         w.apply(DocSeek::Jump { skip: 50 }, docs(51..=60), 1, None);
@@ -577,7 +586,7 @@ mod tests {
         w.total = Some(TOTAL);
         w.anchor = 0;
         w.at_start = true;
-        w.docs = docs(1..=1000).into();
+        w.docs = docs(1..=1000).into_iter().map(Rc::new).collect();
         w.evict(300, 800);
         assert_eq!(w.anchor, 300);
         assert_eq!(w.docs.len(), 500);

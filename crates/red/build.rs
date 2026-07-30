@@ -1,7 +1,7 @@
 //! Build provenance baked into the binary at compile time. Emits two env vars,
 //! `RED_GIT_SHA` (short commit) and `RED_BUILD_DATE` (UTC `YYYY-MM-DD`), that the
 //! About tab surfaces so a build is unambiguous in bug reports and update checks
-//! (Phase 2 of docs/plans/self-update.md). Best-effort: a source archive with no
+//!. Best-effort: a source archive with no
 //! git degrades the SHA to "unknown" rather than failing the build.
 
 use std::process::Command;

@@ -84,7 +84,7 @@ struct CellColors {
     num: Hsla,
     cyan: Hsla,
     faint: Hsla,
-    /// The brand accent, used to mark a foreign-key cell as navigable (Track B7).
+    /// The brand accent, used to mark a foreign-key cell as navigable.
     accent: Hsla,
 }
 
@@ -107,7 +107,7 @@ fn render_cell(
         CellKind::Uuid => c.muted,
         CellKind::Json => c.cyan,
     };
-    // A foreign-key cell (Track B7) reads in the brand accent to signal it's a
+    // A foreign-key cell reads in the brand accent to signal it's a
     // navigable reference, except NULL/blob, which keep their faint style cue.
     let color = if is_fk && !matches!(cell.kind, CellKind::Null | CellKind::Blob) {
         c.accent
@@ -130,7 +130,7 @@ fn render_cell(
     let italic = matches!(cell.kind, CellKind::Null | CellKind::Blob);
     div()
         .text_color(if struck { c.faint } else { color })
-        // A row pending deletion (Track B6) reads struck-through, so the marking is
+        // A row pending deletion reads struck-through, so the marking is
         // legible without relying on the soft red tint alone.
         .when(struck, |d| d.line_through())
         .when(italic, |d| d.italic())
@@ -379,7 +379,7 @@ impl AppState {
                     .items_center()
                     .gap_1()
                     // "+ Row" appends a draft (insert) row, shown only on an
-                    // editable keyed browse of a writable connection (Track B6).
+                    // editable keyed browse of a writable connection.
                     .when(self.insert_enabled() && grid.insertable_browse(), |d| {
                         d.child(
                             Button::new("result-add-row", "+ Row")
@@ -392,7 +392,7 @@ impl AppState {
                         // ⌘⇧F: open / focus the filter bar. With a filter applied
                         // the button becomes a chip naming it (`WHERE amount > 100`)
                         // with its own ✕, so a narrowed grid can't be mistaken for a
-                        // whole one and an FK-follow filter is visible too (Track B2).
+                        // whole one and an FK-follow filter is visible too.
                         match &grid.filter {
                             None => Button::new("result-filter", "Filter")
                                 .variant(ButtonVariant::Ghost)
@@ -527,10 +527,10 @@ impl AppState {
         let ncols = grid.columns.len();
         let buffer_range = grid.buffer.clone();
         let buffer_row = grid.buffer.clone();
-        // Forward-FK data columns (Track B7), snapshotted into the row closure so the
+        // Forward-FK data columns, snapshotted into the row closure so the
         // paint path stays alloc-free: a membership test, computed off-frame.
         let fk_cols = grid.fk_cols.clone();
-        // Inline-expanded reference columns (Track B7), snapshotted for the cell-bg
+        // Inline-expanded reference columns, snapshotted for the cell-bg
         // hook so a faint wash marks them as derived, not base-table, data.
         let joined_cols = grid.joined_cols.clone();
         let joined_tint = Hsla { a: 0.05, ..cyan };
@@ -556,7 +556,7 @@ impl AppState {
             r
         });
 
-        // Staged-edit overlay (Track B6): the dirty cells + deleted rows for this
+        // Staged-edit overlay: the dirty cells + deleted rows for this
         // frame, shared (via `Rc`) between the cell renderer and the cell-tint hook.
         // Tints: a soft amber under a staged cell, a soft red under a row pending
         // deletion (the selection highlight still wins on top).
@@ -564,7 +564,7 @@ impl AppState {
         let dirty_tint = Hsla { a: 0.22, ..num };
         let delete_tint = Hsla { a: 0.16, ..red };
         let (overlay_cells, overlay_bg) = (overlay.clone(), overlay.clone());
-        // Find-in-result highlight (Track B2, Tier 1): the resident cells matching
+        // Find-in-result highlight : the resident cells matching
         // the open find bar's term get a soft accent tint via the same `cell_bg`
         // hook. The focused match is *also* the grid selection, so the selection
         // highlight marks "current" on top of this. Keyed by `(ordinal, data col)`.
@@ -627,7 +627,7 @@ impl AppState {
                 EditSlot::Row { row, data_col, .. } => Some((*row, *data_col, e.input.clone())),
                 EditSlot::Draft { .. } => None,
             });
-        // When the FK picker (Track B8) is open, the editor cell also hosts a
+        // When the FK picker is open, the editor cell also hosts a
         // bounds-capturing canvas so the dropdown can anchor below it.
         let suggest_anchor: Option<Entity<Option<gpui::Bounds<Pixels>>>> = is_focused
             .then_some(self.cell_suggest.as_ref())
@@ -763,7 +763,7 @@ impl AppState {
                         this.focus_pane(Pane::Grid, window, cx);
                         this.result_select(abs_row, table_col, extend, cx);
                         // Double-click edits the cell in place when it's editable
-                        // (Track B6); otherwise it reveals the detail inspector.
+                        //; otherwise it reveals the detail inspector.
                         if inspect {
                             this.begin_grid_edit(cx);
                             if this.grid_edit.is_none() {
@@ -893,7 +893,7 @@ impl AppState {
                         "offset"
                     }),
             )
-            // Staged-edit controls (Track B6): a count + Submit / Revert, shown only
+            // Staged-edit controls: a count + Submit / Revert, shown only
             // when the change-set is non-empty. Submit opens the confirm preview.
             .when_some(grid.pending.summary(), |f, summary| {
                 f.child(div().text_color(border_soft).child("·"))
@@ -955,9 +955,9 @@ impl AppState {
 
         let grid_pane = container
             .child(toolbar)
-            // The filter bar (Track B2) sits between the toolbar and the grid when
+            // The filter bar sits between the toolbar and the grid when
             // open; narrowing re-opens the result so the grid below just repaints.
-            // The find bar (Tier 1) sits alongside it and only highlights loaded
+            // The find bar sits alongside it and only highlights loaded
             // rows. Both are built at the top of this function (single-instance
             // overlays, so they render in the focused half only).
             .children(filter_bar)
@@ -1005,7 +1005,7 @@ impl AppState {
                     .child(table)
                     .child(scrollbar),
             )
-            // Draft (insert) rows pinned below the grid (Track B6).
+            // Draft (insert) rows pinned below the grid.
             .when_some(
                 is_focused
                     .then(|| self.render_draft_rows(grid, cx))
@@ -1203,7 +1203,7 @@ impl AppState {
         }
     }
 
-    /// The draft (insert) rows zone (Track B6), pinned below the grid: one row per
+    /// The draft (insert) rows zone, pinned below the grid: one row per
     /// staged `INSERT`, each cell click-to-edit, a leading ✕ to drop the draft.
     /// Tracks the grid's horizontal scroll so its columns stay column-aligned with
     /// the grid, and scrolls vertically on its own handle past
@@ -1302,7 +1302,7 @@ impl AppState {
                             .border_r_1()
                             .border_color(line)
                             .child(input.clone())
-                            // Anchor the FK picker (Track B8) below this draft cell.
+                            // Anchor the FK picker below this draft cell.
                             .when_some(
                                 self.cell_suggest
                                     .as_ref()
@@ -1466,7 +1466,7 @@ impl AppState {
         pos: Point<Pixels>,
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
-        // Editing entries (Track B6) appear only when the focused cell / row is
+        // Editing entries appear only when the focused cell / row is
         // editable on a writable connection's keyed browse.
         let editable_cell = self.active_edit_target().is_some();
         // `row_edit_enabled` already resolves against the active result's reported
@@ -1491,7 +1491,7 @@ impl AppState {
                         cx.notify();
                     })),
             );
-        // "Filter by" (Track B2): narrow the result to the focused cell's value
+        // "Filter by": narrow the result to the focused cell's value
         // without writing SQL. Each item builds a `ResultFilter::Cmp` term, which
         // the driver renders and escapes, so the cell's value never reaches the
         // query as text. Hidden when no cell is focused (or its row was evicted).
@@ -1562,7 +1562,7 @@ impl AppState {
             }
             menu = menu.separator().submenu(sub);
         }
-        // FK navigation (Track B7): jump to the referenced row or list the tables that
+        // FK navigation: jump to the referenced row or list the tables that
         // reference this one. Both need the FK graph to have edges for the focused
         // column/table.
         let (fk_forward, fk_reverse) = self.fk_menu();
@@ -1596,7 +1596,7 @@ impl AppState {
                 }),
             ));
         }
-        // Inline FK expansion (Track B7): pull the focused FK cell's referenced
+        // Inline FK expansion: pull the focused FK cell's referenced
         // columns into the grid (a ✓ marks ones already shown), hide a joined
         // column, or clear them all. The per-column list comes from the referenced
         // table's prefetched detail; the Columns panel is the fuller, recursive UI.

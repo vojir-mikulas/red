@@ -571,7 +571,7 @@ impl GridBuffer {
     }
 
     /// Replace data column `col` of the resident row at ordinal `ix` with `value`,
-    /// rebuilding its display cell and clipped-flag (Track B5 optimistic update after
+    /// rebuilding its display cell and clipped-flag (optimistic update after
     /// a committed edit). No-op if the row isn't resident or `col` is out of range.
     pub(super) fn patch_cell(&mut self, ix: usize, col: usize, value: Value) {
         let row = match &mut self.mode {

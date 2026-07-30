@@ -5,7 +5,7 @@
 //! The log is centralized on [`AppState`] (one store across all connections) but
 //! each entry carries its `conn_id`, so the History panel shows only the active
 //! connection's history while the file keeps everything, the groundwork for a
-//! future cross-connection history sidebar (see `docs/plans/query-history.md`).
+//! future cross-connection history sidebar.
 //!
 //! Storage is one JSON file, `<config>/red/history.json`, rewritten atomically
 //! (temp + rename) on every change: the same crash-safe discipline as
@@ -173,15 +173,32 @@ impl QueryHistory {
         self.entries.truncate(MAX_TOTAL);
     }
 
-    /// Write the whole log to disk atomically. A failure is logged, not fatal:
-    /// history is best-effort, never worth interrupting a query over.
+    /// Write the whole log to disk atomically, **off the UI thread**.
+    ///
+    /// This runs on every ⌘↵. Done inline it deep-cloned up to `MAX_TOTAL`
+    /// entries, pretty-printed the lot, and called `sync_all()` — `F_FULLFSYNC` on
+    /// macOS, which waits on the physical device — all on the GPUI thread, so every
+    /// statement run cost a visible stall. The clone is the price of moving it; the
+    /// fsync is what it buys back. `filters.rs` and `key_meta.rs` document the same
+    /// trade from the other side (they skip the fsync instead).
+    ///
+    /// Ordering is not guaranteed between two persists in flight, and does not need
+    /// to be: each writes the *whole* log, and the temp-file + rename makes the file
+    /// on disk always one complete snapshot. A racing pair leaves whichever landed
+    /// last, which is one run's worth of history at worst.
+    ///
+    /// A failure is logged, not fatal: history is best-effort, never worth
+    /// interrupting a query over.
     fn persist(&self) {
         let Some(path) = self.path.clone() else {
             return;
         };
-        if let Err(e) = save(&path, &self.entries) {
-            tracing::warn!("failed to save query history: {e}");
-        }
+        let entries = self.entries.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = save(&path, &entries) {
+                tracing::warn!("failed to save query history: {e}");
+            }
+        });
     }
 }
 

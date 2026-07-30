@@ -1381,7 +1381,7 @@ impl AppState {
             .into_any_element()
     }
 
-    /// The AI write opt-in (Feature B): lets the assistant propose INSERT/UPDATE/
+    /// The AI write opt-in: lets the assistant propose INSERT/UPDATE/
     /// DELETE on this connection, each gated by per-statement approval. Shown only
     /// when the assistant is enabled and the connection is *writable*; write access
     /// is meaningless (and blocked) on a read-only connection, so unticking
@@ -1598,7 +1598,7 @@ impl AppState {
                                     .child(crate::i18n::tr!("connect.read_only", "Read-only")),
                             )
                             // TLS toggle — network engines only (a file engine has no
-                            // wire to encrypt). See docs/plans/redis.md's TLS item.
+                            // wire to encrypt).
                             .when(!form.kind.is_file(), |row| {
                                 row.child(
                                     Toggle::new("tls", form.tls)
