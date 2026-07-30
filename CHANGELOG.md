@@ -6,174 +6,69 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-07-30
+
 ### Added
-- Server panel for SQL connections, listing what the database is doing right now:
-  every session with its user, database, state, elapsed time, and statement,
-  longest-running first. Sessions waiting on a lock are marked, the ones blocking
-  them are marked too, and a summary line names how many are stuck behind how
-  few. A session can be stopped either by cancelling its statement or by
-  terminating it outright, behind a confirmation that names who and what is being
-  stopped; RED never offers to stop its own connection, never offers either on a
-  read-only connection, and never exposes stopping a session to the AI assistant.
-  The ClickHouse mutations list now lives in this panel as a second view rather
-  than a dock of its own. It opens from the connection itself: click
-  `user@host:port` in the status bar, where the green dot is. Background work
-  still running shows its count on that same chip, so an edit that outlived its
-  submit stays visible with the panel shut.
-- Show DDL, on any object in the schema tree. Tables, views, routines, triggers,
-  sequences and types open their definition in a read-only tab with the SQL
-  highlighted, plus Copy and "Open as query", which pastes the text into an
-  ordinary tab rather than running it. Three engines answer with their own `SHOW
-  CREATE` verbatim; PostgreSQL, which has no such statement, gets a definition
-  assembled from the catalog that states in a header comment exactly what it does
-  and does not cover.
-- Schema comparison. Compare the current schema against another and get what
-  differs: objects on one side only, and per table the columns, indexes and
-  foreign keys added, removed or changed. Columns are compared by type rather
-  than by spelling, so a `varchar(255)` and a `character varying(255)` are
-  recognised as the same column across engines, and anything RED's type model
-  cannot classify is flagged as uncertain instead of asserted. The reconciling
-  DDL can be generated into a query tab; it is additive by default, comments out
-  every destructive statement unless you ask for them, and never runs itself.
-- Connection health report, the SQL counterpart to the Redis keyspace analysis:
-  what is big, what is unused, and what is about to hurt. Table and index sizes,
-  indexes that have never been used, foreign keys with no supporting index,
-  tables with no primary key, vacuum lag and sequential-scan-heavy tables on
-  PostgreSQL; sizes, missing keys, MyISAM tables and unused or redundant indexes
-  on MySQL; parts-per-partition on ClickHouse; free pages on SQLite. Checks that
-  cannot run on your server are listed as such rather than silently skipped, so
-  an empty findings list means the checks ran. The report is saved per connection
-  and survives a restart, and each finding's suggested fix is text to copy, never
-  something RED runs for you.
-- Watch mode for a result. Re-run this tab's query every few seconds, with the
-  cells that changed flashing, a row-count delta, and the scroll position kept.
-  It only ever re-runs read-only queries, pauses when the window is in the
-  background or the tab has unsaved edits, skips a tick while the previous run is
-  still going, stops itself after three consecutive failures, and floors its
-  interval higher on connections tagged as production. Configurable under
-  `[sql] watch_default_secs` / `watch_min_secs`.
-- The schema tree now shows materialized views, functions, procedures, triggers,
-  sequences and user-defined types, not just tables and views, grouped by kind
-  under each namespace. The programmatic kinds load when their group is expanded
-  rather than at connect, so connecting to a server with many schemas is exactly
-  as fast as before.
-- In-grid editing on ClickHouse. New rows can be added and submitted like on any
-  other engine, and existing rows can be updated and deleted under a contract
-  that matches what an OLAP engine can actually promise: each change is checked
-  against the rows it currently matches before it runs, is applied on its own
-  rather than inside a transaction, and reports its own outcome, so a submit says
-  "3 of 5 changes applied" and names what stopped the rest instead of claiming a
-  success it can't back. Changes that can't run safely, such as editing a
-  sorting-key column or a row that has since changed, are refused before the
-  confirmation rather than by the engine afterwards.
-- The confirmation for a ClickHouse submit shows the statements that will really
-  run, how many rows each currently matches, and the three things worth knowing
-  before agreeing: the writes are asynchronous, they are not one transaction, and
-  the engine rewrites data by part, so a one-cell edit can cost far more than the
-  row it changes. Where a change matches several rows -- normal on an engine with
-  no unique row identity -- it is refused until you explicitly say to apply it to
-  all of them.
-- Mutations panel for ClickHouse connections, listing the background work the
-  engine is still applying after a submit returns, with the parts remaining, any
-  failure reason, and a per-row cancel. The status bar tints while anything is
-  running, so an edit that outlived its submit stays visible without the panel
-  open.
-- Tables with a composite primary key are now editable on PostgreSQL, MySQL and
-  SQLite. Rows are addressed by the whole key rather than a single column, so
-  join tables and other multi-column keys no longer browse as read-only.
-- Bulk import into a ClickHouse table from the result toolbar, alongside the new
-  draft-row insert.
-- Search across every setting, in the settings panel's sidebar. Typing a name
-  finds the setting wherever it is filed, so finding one no longer means guessing
-  which category it was put under. Each row also shows the key you would edit in
-  `settings.toml`, marks itself when it differs from the shipped default, and
-  offers a Reset that puts just that one back.
-- Settings pages for Redis and MongoDB. Redis gains the filter mode new browse
-  tabs start in, how many keys one tab keeps in memory, and how much of a list or
-  stream the inspector pulls at a time; MongoDB gains the view a collection opens
-  in (Table, List, or JSON) and how many columns the table samples. MongoDB had
-  no settings at all before, and Redis had a single row filed under Behavior.
-- Stored routines can be written in the editor. A `CREATE TRIGGER`, `PROCEDURE`,
-  `FUNCTION` or `EVENT` whose body is a `BEGIN … END` block now runs as the one
-  statement it is, instead of being cut at the first `;` inside the body and
-  bounced back as a syntax error. `DELIMITER $$` is honoured too, being a client
-  directive rather than SQL, so a script pasted from documentation runs as written
-  instead of reaching a server that has never heard of it. The caret's statement,
-  the gutter run markers, and the confirmation all treat the whole body as one
-  statement.
-- Groundwork for translating RED's interface, with a Language setting under
-  Appearance that follows the operating system by default. English is still the
-  only language available, so nothing changes on screen yet; a language that is
-  only partly translated will fall back to English string by string rather than
-  leaving gaps.
+- Server panel listing live database sessions, with lock waits and their
+  blockers marked and a guarded cancel/terminate per session; opens from the
+  status-bar connection chip. The ClickHouse mutations list now lives here too.
+- Show DDL on any schema-tree object, in a read-only highlighted tab with Copy
+  and "Open as query".
+- Schema comparison: diff the current schema against another, with type-aware
+  column matching and additive reconciling DDL generated into a query tab.
+- Connection health report for SQL engines: sizes, unused indexes, missing
+  keys and other per-engine checks, saved per connection.
+- Watch mode: re-run a tab's read-only query every few seconds, with changed
+  cells flashing, a row-count delta, and the scroll position kept.
+- The schema tree now shows materialized views, functions, procedures,
+  triggers, sequences and user-defined types, loaded lazily per group.
+- In-grid editing on ClickHouse, with per-change safety checks and honest
+  per-statement outcomes instead of a claimed all-or-nothing success.
+- The ClickHouse submit confirmation shows the real statements and matched row
+  counts; a change matching several rows needs explicit approval.
+- Mutations panel for ClickHouse listing background work still applying after
+  a submit, with per-row cancel and a status-bar indicator.
+- Tables with a composite primary key are now editable on PostgreSQL, MySQL
+  and SQLite.
+- Bulk import into a ClickHouse table from the result toolbar.
+- Search across every setting, with each row showing its `settings.toml` key,
+  a modified marker, and a per-setting Reset.
+- Settings pages for Redis and MongoDB.
+- Stored routines can be written in the editor: a `BEGIN … END` body runs as
+  the one statement it is, and `DELIMITER $$` is honoured.
+- Groundwork for translating the interface: a Language setting under
+  Appearance (English-only for now), with per-string fallback to English.
 
 ### Changed
-- The app is now called RED, in capitals, everywhere it names itself: the
-  welcome screen, the macOS menu bar, the window title, and the About page. The
-  application itself is renamed to match, so the icon in the Dock or the
-  applications menu reads RED. Saved connections, settings, and stored passwords
-  are untouched and carry over as they are.
-- Settings are now organised by what a setting is about rather than by which
-  engine came first. Grid settings apply to every grid, and the confirmation
-  rules that already governed Redis and MongoDB deletes now live under Safety
-  instead of under Query. In the file, `[grid]` is now `[data]`, `[redis]` is
-  `[kv]`, and `[query]` has split into `[sql]` and `[safety]`. Existing settings
-  files are migrated on load and saved in the new shape, so nothing needs
-  changing by hand.
-- Row density, page size, and the maximum cell size now apply to the Redis key
-  browser and the MongoDB document grid as well as to SQL results. Those two
-  previously ignored your settings and used fixed values.
-- The reference settings file shipped with RED documents every section again.
-  Automatic updates, vim navigation, and the Redis settings had been missing from
-  it entirely.
-- Editing affordances now follow the table, not just the connection: a table the
-  engine cannot modify, such as a ClickHouse `Memory` table or a view, shows a
-  one-line reason under the grid instead of edit controls that would fail on use.
-  Columns the engine computes for itself are shown as computed in a new row and
-  never offered for editing.
-- The AI assistant no longer describes a multi-statement changeset as always
-  committing together or not at all, which was untrue on ClickHouse. It now says
-  which engines roll back and warns that on ClickHouse the statements before a
-  failure may have applied.
+- The app is now called RED, in capitals, everywhere it names itself; saved
+  connections, settings and passwords carry over unchanged.
+- Settings are reorganised by topic: `[grid]` is now `[data]`, `[redis]` is
+  `[kv]`, and `[query]` split into `[sql]` and `[safety]`; existing files
+  migrate automatically.
+- Row density, page size and maximum cell size now apply to the Redis key
+  browser and MongoDB document grid as well as SQL results.
+- The reference settings file documents every section again.
+- Editing affordances follow the table: a table the engine cannot modify shows
+  a one-line reason instead of edit controls, and computed columns are never
+  offered for editing.
+- The AI assistant no longer claims a multi-statement changeset always commits
+  together or not at all, which was untrue on ClickHouse.
 
 ### Fixed
-- A write or DDL statement run from the editor ignored the database picked for the
-  tab, so on a MySQL connection that dialled no database anything naming no
-  database of its own — a `CREATE TRIGGER`, most visibly — failed with "no
-  Database selected" while the `SELECT` beside it worked. Writes now resolve
-  unqualified names in the same database reads do.
-- On MySQL 8, a query run against one database could leave the connection there
-  for whatever ran next, because the server does not restore a pooled
-  connection's original database when it is reused. A tab left on the connection's
-  own database could therefore resolve unqualified names in another tab's
-  database. Every statement now binds the database it means, and a connection that
-  never switches database pays nothing for it.
-- A definition can now be edited from the tab that shows it. Views, triggers,
-  functions and procedures — the objects a database replaces wholesale rather than
-  alters — get an Edit button beside Copy, which unlocks the definition and
-  pre-fills the drop that has to precede re-creating it. Apply runs the buffer, so
-  what executes is what you read, through the same confirmation and read-only lock
-  as a typed statement, and the tab then re-reads the object so it shows what the
-  server stored. Tables are deliberately not editable here: changing one means
-  `ALTER`, which is a different feature.
-- Clicking a trigger, routine, sequence or type in the schema tree now opens its
-  definition, the way clicking a table opens its rows. Those rows previously did
-  nothing at all on a click, leaving the definition reachable only by right-click.
-  Their menu also no longer offers "New query here", which belongs to a table and
-  says nothing about a trigger.
-- Creating an object no longer leaves the schema tree showing the old one. A write
-  refreshed only the tables and views, so a newly created trigger, routine,
-  sequence or type stayed invisible until reconnect — and the first one of its kind
-  in a database doubly so, since a group whose count still said zero is not drawn
-  at all. A write now refreshes the tree the same way ⌘R does.
-- The editor no longer underlines a trigger or stored-routine definition as if its
-  syntax were unknown columns. `BEFORE`, `FOR EACH ROW`, and the trigger's own
-  name were each flagged as a column of whichever table the body happened to read.
-  Trigger and routine words are also highlighted as keywords now.
-- Staging more than six new rows in the grid no longer hides the ones past the
-  sixth. The zone below the grid stops growing there so it never eats the results,
-  but it now scrolls through the whole change-set, with a scrollbar when there is
-  more than fits, and adding or tabbing into a row brings that row into view.
+- Writes and DDL run from the editor now resolve unqualified names in the
+  tab's database, fixing MySQL's "No database selected" on `CREATE TRIGGER`.
+- On MySQL 8, a query no longer leaves its database bound to the pooled
+  connection for whatever runs next.
+- Views, triggers, functions and procedures can be edited from the tab showing
+  their definition, through the usual confirmation and read-only lock.
+- Clicking a trigger, routine, sequence or type in the schema tree opens its
+  definition, the way clicking a table opens its rows.
+- Creating a trigger, routine, sequence or type now refreshes the schema tree
+  immediately instead of only after a reconnect.
+- The editor no longer underlines trigger and routine syntax as unknown
+  columns, and highlights those words as keywords.
+- Staging more than six new rows no longer hides the ones past the sixth: the
+  change-set zone below the grid scrolls through the whole set.
 
 ## [0.19.0] - 2026-07-28
 
