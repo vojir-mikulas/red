@@ -34,6 +34,9 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   window is, amber past three quarters and red past nine tenths, in place of the
   strip of token counts below the composer. The full breakdown — tokens in
   context, cached and out, and the running session cost — is on its tooltip.
+- The AI assistant's prompt box starts four lines tall and grows with what you
+  type, up to eight, before it starts scrolling. Wrapped lines count, so a long
+  paragraph opens the box up the same way pressing Return does.
 - ⌘\ now splits the focused pane rather than toggling a fixed two-pane split;
   existing `keymap.toml` files that bind it keep working unchanged. Pane widths
   are held as proportions, so resizing the window now widens every pane in step

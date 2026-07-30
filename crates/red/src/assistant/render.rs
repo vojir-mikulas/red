@@ -450,10 +450,11 @@ impl AppState {
             .border_1()
             .border_color(theme.border)
             .bg(theme.bg_input)
+            // No height here: the editor is built with `.rows(4..=8)`, so it sizes
+            // itself to the draft and the card grows with it.
             .child(
                 div()
                     .min_w(px(0.))
-                    .h(px(64.))
                     .px_2p5()
                     .pt_1p5()
                     .child(state.input.clone()),

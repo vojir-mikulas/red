@@ -122,6 +122,12 @@ impl AppState {
                         // Prose composer: wrap long lines to the width instead of
                         // scrolling horizontally.
                         .soft_wrap(true)
+                        // Sized to what's been typed rather than to a fixed box:
+                        // roomy enough at rest to draft in, and it grows with a
+                        // longer prompt (wrapped rows count) before it starts
+                        // scrolling — without letting the composer eat the
+                        // transcript.
+                        .rows(4..=8)
                         .a11y_label(crate::i18n::tr!("assistant.agent_prompt", "Agent prompt"))
                         .placeholder(crate::i18n::tr!(
                             "assistant.message_claude_agent_for_commands",
