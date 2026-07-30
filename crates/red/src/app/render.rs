@@ -1103,12 +1103,18 @@ impl AppState {
     /// immediately on check so it applies to this close too.
     fn dont_ask_close_tab_checkbox(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme();
+        // Ticked means "stop asking", so the box reflects the *inverse* of the
+        // still-live confirm setting: the modal opens while confirm is on (box
+        // unticked); ticking calls `set_confirm_close_tab(false)`, which flips the
+        // setting and re-renders, so the tick now shows instead of the box
+        // staying blank with no feedback.
+        let checked = !self.settings.safety.confirm_close_tab;
         div()
             .flex()
             .items_center()
             .gap_2()
             .child(
-                Checkbox::new("close-tab-dont-ask", false)
+                Checkbox::new("close-tab-dont-ask", checked)
                     .mark(crate::icons::icon("check", px(12.), theme.on_accent))
                     .on_change(cx.listener(|this, checked: &bool, _, cx| {
                         this.set_confirm_close_tab(!checked, cx);
@@ -1133,7 +1139,10 @@ impl AppState {
         level: RiskLevel,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        Self::dont_ask_checkbox_el(id, level, cx.theme(), cx.entity().downgrade())
+        // Ticked = no longer confirms at `level`; the modal opens while it still
+        // does, so the box starts unticked and reflects the flip after a click.
+        let checked = !self.confirm_policy().requires(level);
+        Self::dont_ask_checkbox_el(id, level, checked, cx.theme(), cx.entity().downgrade())
     }
 
     /// The checkbox itself, over a [`gpui::WeakEntity`] rather than `&self` + a live
@@ -1144,6 +1153,7 @@ impl AppState {
     pub(crate) fn dont_ask_checkbox_el(
         id: &'static str,
         level: RiskLevel,
+        checked: bool,
         theme: &flint::Theme,
         view: gpui::WeakEntity<AppState>,
     ) -> gpui::AnyElement {
@@ -1152,7 +1162,7 @@ impl AppState {
             .items_center()
             .gap_2()
             .child(
-                Checkbox::new(id, false)
+                Checkbox::new(id, checked)
                     .mark(crate::icons::icon("check", px(12.), theme.on_accent))
                     // "Don't ask again" ticked means *stop* asking, hence the negation.
                     .on_change(move |checked: &bool, _, cx| {

@@ -951,6 +951,9 @@ impl AppState {
             AppState::dont_ask_checkbox_el(
                 "doc-delete-dont-ask",
                 red_core::sql::RiskLevel::Risky,
+                !self
+                    .confirm_policy()
+                    .requires(red_core::sql::RiskLevel::Risky),
                 theme,
                 view.clone(),
             )
