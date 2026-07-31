@@ -134,6 +134,8 @@ pub(in crate::ai) const READ_ONLY_TOOLS: &[&str] = &[
     "kv_key_schema",
     "kv_get_value",
     "kv_read_collection",
+    "kv_json_get",
+    "kv_json_shape",
     "kv_stream_groups",
     "kv_biggest_keys",
     "kv_analyze",
@@ -466,6 +468,8 @@ mod tests {
     use super::*;
 
     use crate::ai::doc::catalog::doc_tool_catalog;
+    use red_core::kv::KvModules;
+
     use crate::ai::kv::catalog::kv_tool_catalog;
     use crate::ai::sql::catalog::tool_catalog;
 
@@ -988,7 +992,7 @@ mod tests {
                 .any(|t| t.name == "relationship_map")
         );
         assert!(
-            kv_tool_catalog(&read)
+            kv_tool_catalog(&read, &KvModules::NONE)
                 .iter()
                 .any(|t| t.name == "kv_key_schema")
         );

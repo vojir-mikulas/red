@@ -758,6 +758,10 @@ impl AiTier {
                     | "kv_key_schema"
                     | "kv_get_value"
                     | "kv_read_collection"
+                    // RedisJSON reads: one path's value, and the paths+types
+                    // map that reads no values at all.
+                    | "kv_json_get"
+                    | "kv_json_shape"
                     | "kv_stream_groups"
                     | "kv_biggest_keys"
                     | "kv_analyze"
@@ -801,6 +805,7 @@ impl AiTier {
                         // unlike the DROP/TRUNCATE/ALTER that stay blocked.
                         | "create_index"
                         | "kv_set"
+                        | "kv_json_set"
                         | "kv_expire"
                         | "kv_delete"
                         | "kv_rename"

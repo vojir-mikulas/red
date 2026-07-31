@@ -8,7 +8,9 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use red_core::kv::{KeyTemplate, KvCollection, KvValue, RespValue};
+use red_core::kv::{
+    JsonDoc, JsonNode, JsonNodeView, KeyTemplate, KvCollection, KvValue, RespValue,
+};
 
 use super::super::sql::format::render_cell;
 use super::super::util::fmt_bytes;
@@ -201,8 +203,63 @@ pub(in crate::ai) fn fmt_kv_value(v: &KvValue) -> String {
             KvCollection::Loaded(entries) => format!("stream with {} entr(ies)", entries.len()),
             KvCollection::Large { len } => format!("stream with {len} entr(ies) (large)"),
         },
+        KvValue::Json(doc) => match doc {
+            JsonDoc::Loaded { text, bytes } => {
+                format!("JSON document ({}):\n{text}", fmt_bytes(*bytes))
+            }
+            // Say the size and show only the root level: a lazily-walked
+            // document is large by definition, and the model's way in is
+            // kv_json_get at a path, not a bigger dump.
+            JsonDoc::Lazy { bytes, root } => format!(
+                "JSON document ({}, too large to read whole; use kv_json_shape for its structure \
+                 and kv_json_get for a path):\n{}",
+                fmt_bytes(*bytes),
+                fmt_json_node(root),
+            ),
+        },
         KvValue::Unsupported(kt) => format!("(no value preview for type {})", kt.label()),
     }
+}
+
+/// One JSON node as an outline: a leaf's value, or a container's arity and the
+/// window of children that was actually read. Deliberately says how many
+/// children were *shown* against how many exist, so the model can tell an
+/// exhausted level from a windowed one.
+pub(in crate::ai) fn fmt_json_node(view: &JsonNodeView) -> String {
+    match view {
+        JsonNodeView::Scalar { kind, value } => format!("{}: {value}", kind.label()),
+        JsonNodeView::Container {
+            kind,
+            len,
+            offset,
+            children,
+        } => {
+            let mut out = format!("{} with {len} child(ren)", kind.label());
+            if *offset > 0 || (children.len() as u64) < *len {
+                out.push_str(&format!(
+                    ", showing {}..{}",
+                    offset,
+                    offset + children.len() as u64
+                ));
+            }
+            out.push_str(":\n");
+            for c in children {
+                out.push_str(&format!("  {}\n", fmt_json_child(c)));
+            }
+            out
+        }
+    }
+}
+
+/// One child row of a JSON outline: its name, its kind, and either its value or
+/// its size.
+fn fmt_json_child(node: &JsonNode) -> String {
+    let detail = match (&node.preview, node.len) {
+        (Some(v), _) => v.clone(),
+        (None, Some(n)) => format!("{} · {n}", node.kind.label()),
+        (None, None) => node.kind.label().to_string(),
+    };
+    format!("{} = {detail}", node.seg)
 }
 /// A RESP scalar as plain text (for CONFIG GET pairs).
 pub(super) fn resp_scalar(v: Option<&RespValue>) -> String {

@@ -17,9 +17,10 @@ use red_core::doc::{
     CollectionInfo, DbInfo, DocPlan, DocSchema, DocSeek, DocWrite, Document, IndexInfo,
 };
 use red_core::kv::{
-    ClientInfo, CollectionKind, KeyMeta, KvCollectionPage, KvEdit, KvScanPage, KvStreamActionReq,
-    KvStreamPage, KvType, KvValue, PendingEntry, RecycledKey, RespValue, ScanBudget, ScanCursor,
-    SlowlogEntry, StreamAction, StreamConsumer, StreamGroup,
+    ClientInfo, CollectionKind, JsonNodeView, JsonPath, KeyMeta, KvCollectionPage, KvEdit,
+    KvModules, KvScanPage, KvStreamActionReq, KvStreamPage, KvType, KvValue, PendingEntry,
+    RecycledKey, RespValue, ScanBudget, ScanCursor, SlowlogEntry, StreamAction, StreamConsumer,
+    StreamGroup,
 };
 use red_core::{
     ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, BatchMode, Column, ColumnMap,
@@ -400,6 +401,34 @@ pub enum Command {
         key: String,
         before: Option<String>,
         count: usize,
+    },
+    /// One node of a RedisJSON document, for the inspector's tree: expanding a
+    /// node and paging a large array are the same request. `offset`/`count`
+    /// window a container's children; a leaf ignores them. Replied with
+    /// `KvJsonNodeReady`, echoing `key` and `path` so the UI can place the
+    /// answer without holding a request table.
+    KvReadJsonNode {
+        epoch: Epoch,
+        key: String,
+        path: JsonPath,
+        offset: u64,
+        count: usize,
+    },
+    /// The serialized JSON at one path (`JSON.GET`), for "Copy value" and the
+    /// Raw view. Capped like a string value. Replied with `KvJsonTextReady`.
+    KvReadJsonText {
+        epoch: Epoch,
+        key: String,
+        path: JsonPath,
+    },
+    /// Which Redis Stack modules the session's server loaded, so the UI only
+    /// offers module-specific affordances (the JSON type filter, the JSON
+    /// new-key type) where they will work. A cheap sync accessor over
+    /// connect-time facts, not a server round trip. Replied with
+    /// `KvModulesReady`; failures are swallowed like `KvDbSize`, since the
+    /// fallback is simply offering less.
+    KvModules {
+        epoch: Epoch,
     },
     /// A stream's consumer groups (`XINFO GROUPS`), for the inspector's consumer-group
     /// management view. `epoch` scopes cancellation like the other inspector reads; the
@@ -1302,6 +1331,27 @@ pub enum Event {
         epoch: Epoch,
         key: String,
         page: KvStreamPage,
+    },
+    /// One node of a RedisJSON document, in response to `KvReadJsonNode`.
+    /// `view: None` means the path matched nothing (the node was deleted since
+    /// it was listed), which the tree shows rather than treating as an error.
+    KvJsonNodeReady {
+        epoch: Epoch,
+        key: String,
+        path: JsonPath,
+        view: Option<JsonNodeView>,
+    },
+    /// The serialized JSON at one path, in response to `KvReadJsonText`.
+    KvJsonTextReady {
+        epoch: Epoch,
+        key: String,
+        path: JsonPath,
+        text: Option<red_core::Value>,
+    },
+    /// The session server's loaded Stack modules, in response to `KvModules`.
+    KvModulesReady {
+        epoch: Epoch,
+        modules: KvModules,
     },
     /// A stream's consumer groups, in response to `KvStreamGroups`. `key`
     /// lets the UI drop a reply for a key the inspector has since moved off.

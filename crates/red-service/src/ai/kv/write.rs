@@ -16,12 +16,14 @@ use serde_json::Value as Json;
 use super::super::gate::WriteAssessment;
 use super::super::util::truncate_summary;
 use super::format::resp_arg;
+use super::json::kv_json_set_value;
 use super::set::{KV_SET_PROMPT_CHARS, kv_set_plan};
 
 /// The Redis mutating tools (KV backend): each rides the same per-call
 /// approval gate as a SQL write.
 pub(in crate::ai) const KV_WRITE_TOOLS: &[&str] = &[
     "kv_set",
+    "kv_json_set",
     "kv_expire",
     "kv_delete",
     "kv_rename",
@@ -194,6 +196,33 @@ pub(in crate::ai) fn assess_kv_write(name: &str, input: &Json) -> WriteAssessmen
             },
             Err(why) => WriteAssessment::Reject(why),
         },
+        "kv_json_set" => {
+            let Some(key) = s("key") else {
+                return WriteAssessment::Reject("kv_json_set needs `key`".into());
+            };
+            let Some(value) = kv_json_set_value(input) else {
+                return WriteAssessment::Reject("kv_json_set needs `value`".into());
+            };
+            if let Err(e) = red_core::kv::validate_json(&value) {
+                return WriteAssessment::Reject(format!("`value` is not valid JSON: {e}"));
+            }
+            let path = s("path").unwrap_or("$");
+            // The prompt says whether the whole document is being replaced.
+            // `JSON.SET key $` overwrites everything, including the parts of the
+            // document nobody read, which is a different risk from writing a leaf.
+            let scope = if path == "$" || path.is_empty() {
+                "\n\u{26a0} Path `$` replaces the WHOLE document, not just one field."
+            } else {
+                ""
+            };
+            WriteAssessment::NeedsApproval {
+                sql: format!(
+                    "JSON.SET {} {path} {}{scope}",
+                    resp_arg(key),
+                    truncate_summary(&value, KV_SET_PROMPT_CHARS)
+                ),
+            }
+        }
         "kv_copy_key" => match (s("from"), s("to")) {
             (Some(f), Some(t)) => {
                 let replace = input
@@ -311,6 +340,8 @@ pub(super) fn is_secret_config_param(param: &str) -> bool {
 mod tests {
     use super::*;
     use crate::ai::gate::{is_headless_tool, is_write_tool};
+    use red_core::kv::KvModules;
+
     use crate::ai::kv::catalog::kv_tool_catalog;
     use crate::ai::testutil::assess_write;
     use crate::ai::turn::kv_subagent_catalog;
@@ -352,13 +383,54 @@ mod tests {
         ));
     }
 
+    /// The approval prompt must show the exact payload that runs, and must say
+    /// when a write replaces the whole document rather than one field.
+    #[test]
+    fn kv_json_set_prompts_with_the_payload_and_flags_a_root_write() {
+        assert!(is_write_tool("kv_json_set"));
+        assert!(!AiTier::Read.allows_tool("kv_json_set"));
+        assert!(AiTier::Write.allows_tool("kv_json_set"));
+
+        let leaf = assess_kv_write(
+            "kv_json_set",
+            &json!({ "key": "cfg", "path": "$.status", "value": "ok" }),
+        );
+        let WriteAssessment::NeedsApproval { sql } = leaf else {
+            panic!("a scoped JSON write should prompt");
+        };
+        assert!(sql.contains("$.status"), "got {sql}");
+        // A bare string is written as a JSON string, and the prompt shows that.
+        assert!(sql.contains("\"ok\""), "got {sql}");
+        assert!(
+            !sql.contains('\u{26a0}'),
+            "a leaf write is not a whole-document one"
+        );
+
+        let WriteAssessment::NeedsApproval { sql } =
+            assess_kv_write("kv_json_set", &json!({ "key": "cfg", "value": { "a": 1 } }))
+        else {
+            panic!("a root JSON write should prompt");
+        };
+        assert!(sql.contains("WHOLE document"), "got {sql}");
+
+        // Malformed JSON is refused before the prompt, not at the server.
+        assert!(matches!(
+            assess_kv_write("kv_json_set", &json!({ "key": "cfg", "value": "{\"a\":}" })),
+            WriteAssessment::Reject(_)
+        ));
+        assert!(matches!(
+            assess_kv_write("kv_json_set", &json!({ "key": "cfg" })),
+            WriteAssessment::Reject(_)
+        ));
+    }
+
     #[test]
     fn kv_set_is_a_gated_write_at_write_tier_only() {
         assert!(is_write_tool("kv_set"));
         assert!(!AiTier::Read.allows_tool("kv_set"));
         assert!(AiTier::Write.allows_tool("kv_set"));
         let names = |p: AiPolicy| {
-            kv_tool_catalog(&p)
+            kv_tool_catalog(&p, &KvModules::NONE)
                 .into_iter()
                 .map(|t| t.name)
                 .collect::<Vec<_>>()
@@ -377,10 +449,13 @@ mod tests {
         };
         assert!(names(write_ro).iter().all(|n| n != "kv_set"));
         assert!(
-            kv_subagent_catalog(&AiPolicy {
-                tier: AiTier::Write,
-                ..AiPolicy::default()
-            })
+            kv_subagent_catalog(
+                &AiPolicy {
+                    tier: AiTier::Write,
+                    ..AiPolicy::default()
+                },
+                &KvModules::NONE,
+            )
             .iter()
             .all(|t| t.name != "kv_set")
         );

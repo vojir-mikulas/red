@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 use red_ai::{
     AiProvider, CancelToken, ContentBlock, Message, Role, StopReason, ToolDef, TurnRequest,
 };
+use red_core::kv::KvModules;
 use red_core::{ActivityKind, ActivityStatus, AiPolicy};
 use serde_json::{Value as Json, json};
 
@@ -833,7 +834,10 @@ async fn run_subagent(
     // The child runs the parent's backend, narrowed to reads (see the catalogs).
     let (tools, system) = match backend {
         AiBackend::Sql { .. } => (subagent_catalog(policy), subagent_system_prompt(task)),
-        AiBackend::Kv(_) => (kv_subagent_catalog(policy), kv_subagent_system_prompt(task)),
+        AiBackend::Kv(d) => (
+            kv_subagent_catalog(policy, &d.modules()),
+            kv_subagent_system_prompt(task),
+        ),
         AiBackend::Doc(_) => (
             doc_subagent_catalog(policy),
             doc_subagent_system_prompt(task),
@@ -1009,8 +1013,8 @@ fn subagent_system_prompt(task: &str) -> String {
 }
 /// The Redis subagent's tool subset: the parent's KV catalog, narrowed like
 /// [`subagent_catalog`].
-pub(in crate::ai) fn kv_subagent_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
-    narrow_to_subagent(kv_tool_catalog(policy))
+pub(in crate::ai) fn kv_subagent_catalog(policy: &AiPolicy, modules: &KvModules) -> Vec<ToolDef> {
+    narrow_to_subagent(kv_tool_catalog(policy, modules))
 }
 /// The Redis subagent's system prompt (the KV analogue of [`subagent_system_prompt`]).
 fn kv_subagent_system_prompt(task: &str) -> String {
@@ -1371,10 +1375,13 @@ mod tests {
 
         // The Redis subagent catalog is likewise read-only and non-recursive:
         // no KV writes, no spawn_subagent, but the KV read tools survive.
-        let kv: Vec<String> = kv_subagent_catalog(&AiPolicy {
-            tier: AiTier::Write,
-            ..AiPolicy::default()
-        })
+        let kv: Vec<String> = kv_subagent_catalog(
+            &AiPolicy {
+                tier: AiTier::Write,
+                ..AiPolicy::default()
+            },
+            &KvModules::NONE,
+        )
         .into_iter()
         .map(|t| t.name)
         .collect();

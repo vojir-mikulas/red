@@ -25,6 +25,7 @@ use catalog::{KV_BIGGEST_TOP, KV_BULK_MAX, KV_SAMPLE_MAX, KV_TEMPLATE_TOP};
 use format::{
     fmt_kv_value, kv_format_analysis, kv_format_templates, kv_info_summary, kv_ttl, resp_scalar,
 };
+use json::{kv_json_get, kv_json_set, kv_json_shape};
 use set::{kv_apply_set, kv_set_plan};
 use tools::{kv_collect_keys, kv_read_collection, kv_stream_groups};
 use write::{
@@ -34,6 +35,7 @@ use write::{
 
 pub(super) mod catalog;
 pub(super) mod format;
+pub(super) mod json;
 pub(super) mod set;
 pub(super) mod tools;
 pub(super) mod write;
@@ -182,6 +184,8 @@ pub(in crate::ai) async fn kv_run_tool(
             }
         }
         "kv_read_collection" => kv_read_collection(driver, input, limits).await,
+        "kv_json_get" => kv_json_get(driver, input, limits).await,
+        "kv_json_shape" => kv_json_shape(driver, input, limits).await,
         "kv_stream_groups" => kv_stream_groups(driver, input, limits).await,
         "kv_keyspace_notifications" => match driver.notify_config().await {
             Ok(flags) if flags.trim().is_empty() => (
@@ -350,6 +354,7 @@ pub(in crate::ai) async fn kv_run_tool(
             Ok(plan) => kv_apply_set(driver, &plan).await,
             Err(why) => (format!("error: {why}"), false),
         },
+        "kv_json_set" => kv_json_set(driver, input).await,
         "kv_expire" => {
             let seconds = input.get("seconds").and_then(Json::as_i64);
             let ttl = match seconds {

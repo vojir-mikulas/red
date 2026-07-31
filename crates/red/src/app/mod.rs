@@ -1775,6 +1775,19 @@ impl AppState {
             Event::KvValueReady { key, value, .. } => {
                 self.on_kv_value_ready(session, key, value, cx);
             }
+            Event::KvJsonNodeReady {
+                key, path, view, ..
+            } => {
+                self.on_kv_json_node_ready(session, key, path, view, cx);
+            }
+            Event::KvJsonTextReady {
+                key, path, text, ..
+            } => {
+                self.on_kv_json_text_ready(session, key, path, text, cx);
+            }
+            Event::KvModulesReady { epoch, modules } => {
+                self.on_kv_modules_ready(session, epoch, modules, cx);
+            }
             Event::KvValueError { key, message, .. } => {
                 self.on_kv_value_error(session, key, message, cx);
             }

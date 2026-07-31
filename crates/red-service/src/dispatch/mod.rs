@@ -1918,9 +1918,12 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         .scan_keys(
                             cursor,
                             pattern.as_deref(),
-                            // Map the typed filter to its `TYPE` label at the driver
-                            // seam; the wire carries the enum, not the string.
-                            type_filter.as_ref().map(red_core::kv::KvType::label),
+                            // Map the typed filter to its `TYPE` argument at the
+                            // driver seam; the wire carries the enum, not the
+                            // string. `wire_type`, not `label`: a module type
+                            // spells itself differently on the wire than it
+                            // reads in the UI (`ReJSON-RL` vs. `json`).
+                            type_filter.as_ref().map(red_core::kv::KvType::wire_type),
                             value_needle.as_deref(),
                             budget,
                             &abort,
@@ -2152,6 +2155,96 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
                     }
                 });
+            }
+
+            Command::KvReadJsonNode {
+                epoch,
+                key,
+                path,
+                offset,
+                count,
+            } => {
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
+                    continue;
+                };
+                // Its own slot, like `KvReadCollectionPage`: expanding a node
+                // must not abort the sibling read that populated the level it
+                // was expanded from, and vice versa.
+                let entry = state.inflight.entry(epoch).or_default();
+                let abort = entry.supersede(Slot::KvCollection);
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let result = driver.read_json_node(&key, &path, offset, count).await;
+                    if abort.is_aborted() {
+                        return;
+                    }
+                    match result {
+                        Ok(view) => emit(
+                            &events,
+                            session_id,
+                            Event::KvJsonNodeReady {
+                                epoch,
+                                key,
+                                path,
+                                view,
+                            },
+                        ),
+                        Err(RedError::Interrupted) => {}
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::KvValueError {
+                                epoch,
+                                key,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
+            }
+
+            Command::KvReadJsonText { epoch, key, path } => {
+                let Some(driver) = require_kv_driver(&sessions, session_id, &events) else {
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver.json_get(&key, &path).await {
+                        Ok(text) => emit(
+                            &events,
+                            session_id,
+                            Event::KvJsonTextReady {
+                                epoch,
+                                key,
+                                path,
+                                text,
+                            },
+                        ),
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
+            Command::KvModules { epoch } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    continue;
+                };
+                // Swallowed like `KvDbSize`: not knowing the module list simply
+                // means offering less, which is not worth a toast.
+                let Some(driver) = state.driver.as_kv() else {
+                    continue;
+                };
+                emit(
+                    &events,
+                    session_id,
+                    Event::KvModulesReady {
+                        epoch,
+                        modules: driver.modules(),
+                    },
+                );
             }
 
             Command::KvStreamGroups { epoch, key } => {
@@ -2619,6 +2712,12 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         }
                         KvEdit::StreamAdd { key, fields } => {
                             driver.stream_add(key, fields).await.map(|_| ())
+                        }
+                        KvEdit::JsonSet { key, path, value } => {
+                            driver.json_set(key, path, value).await
+                        }
+                        KvEdit::JsonDelete { key, path } => {
+                            driver.json_delete(key, path).await.map(|_| ())
                         }
                     };
                     match result {

@@ -646,7 +646,7 @@ impl AppState {
                         // Server-side type filter (`SCAN ... TYPE`): index 0 is
                         // "All types", 1..=6 the concrete types in menu order.
                         // Composes with both the MATCH/fuzzy filter above.
-                        let types = kv_filter_types();
+                        let types = kv_filter_types(&view_ref.modules);
                         let selected_ix = match &browse.type_filter {
                             None => 0,
                             Some(t) => types
@@ -657,6 +657,7 @@ impl AppState {
                         };
                         let toggle_view = view.clone();
                         let select_view = view.clone();
+                        let filter_modules = view_ref.modules.clone();
                         let mut select = Select::new("kv-type-filter")
                             .accent(false)
                             .option("All types");
@@ -672,9 +673,9 @@ impl AppState {
                                     .ok();
                             })
                             .on_select(move |ix, _, cx| {
-                                let choice = ix
-                                    .checked_sub(1)
-                                    .and_then(|i| kv_filter_types().into_iter().nth(i));
+                                let choice = ix.checked_sub(1).and_then(|i| {
+                                    kv_filter_types(&filter_modules).into_iter().nth(i)
+                                });
                                 select_view
                                     .update(cx, |this, cx| {
                                         this.kv_set_type_filter(session, choice, cx)
@@ -823,7 +824,8 @@ impl AppState {
         let view = cx.entity().downgrade();
 
         // Segmented type picker: choosing a type reshapes the fields below.
-        let types = kv_creatable_types();
+        let modules = active.kv_view.as_ref()?.modules.clone();
+        let types = kv_creatable_types(&modules);
         let selected_ix = types.iter().position(|t| *t == ck.kv_type).unwrap_or(0);
         let type_view = view.clone();
         let type_picker = types
@@ -833,7 +835,7 @@ impl AppState {
             })
             .selected(selected_ix)
             .on_select(move |ix, _, cx| {
-                let choice = kv_creatable_types()
+                let choice = kv_creatable_types(&modules)
                     .into_iter()
                     .nth(ix)
                     .unwrap_or(KvType::String);
@@ -2372,6 +2374,7 @@ impl AppState {
                     .into_any_element()
             }
             KvValue::Stream(_) => self.render_kv_stream(session, inspector, writable, theme, cx),
+            KvValue::Json(doc) => self.render_kv_json(session, inspector, doc, writable, theme, cx),
             KvValue::Unsupported(kind) => div()
                 .flex_1()
                 .flex()

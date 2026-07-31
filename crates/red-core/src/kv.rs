@@ -7,9 +7,24 @@ use std::time::Duration;
 
 use crate::Value;
 
+mod json;
+mod modules;
+
+pub use json::{
+    JSON_INLINE_STR_MAX, JSON_NODE_WINDOW, JSON_WHOLE_DOC_MAX, JsonDoc, JsonFetch, JsonKind,
+    JsonNode, JsonNodeView, JsonPath, JsonSeg, JsonSyntaxError, json_fetch_mode,
+    json_unwrap_singleton, validate_json,
+};
+pub use modules::{KvModule, KvModules};
+
+/// The wire name RedisJSON answers `TYPE` with, and the argument
+/// `SCAN ... TYPE` takes to filter for one. Never shown to a user: it is the
+/// module's internal spelling, while [`KvType::label`] is the word for a reader.
+const REJSON_WIRE_TYPE: &str = "ReJSON-RL";
+
 /// A key's Redis data type, from `TYPE`. `Other` covers types this build
 /// doesn't render a dedicated inspector for yet (bitmap, hyperloglog — both
-/// report as `string` so rarely land here; a future module type would).
+/// report as `string` so rarely land here; another module type would).
 /// Deliberately has no `None`/`none` variant: that reply means the key
 /// vanished between `SCAN` finding it and the metadata fetch reading it (a
 /// real race under the weak-consistency contract `SCAN` already has, see the
@@ -23,6 +38,10 @@ pub enum KvType {
     Set,
     ZSet,
     Stream,
+    /// A RedisJSON document. Its own variant rather than `Other` because RED
+    /// reads, renders and edits it; the module's wire spelling stays inside
+    /// [`KvType::wire_type`].
+    Json,
     Other(String),
 }
 
@@ -37,6 +56,7 @@ impl KvType {
             "set" => Some(KvType::Set),
             "zset" => Some(KvType::ZSet),
             "stream" => Some(KvType::Stream),
+            REJSON_WIRE_TYPE => Some(KvType::Json),
             "none" => None,
             other => Some(KvType::Other(other.to_string())),
         }
@@ -51,7 +71,20 @@ impl KvType {
             KvType::Set => "set",
             KvType::ZSet => "zset",
             KvType::Stream => "stream",
+            KvType::Json => "json",
             KvType::Other(s) => s,
+        }
+    }
+
+    /// The name this type answers `TYPE` with, i.e. the argument
+    /// `SCAN ... TYPE` filters on. Identical to [`label`](Self::label) for the
+    /// built-in types; a module type spells itself differently on the wire than
+    /// it reads in a UI, and that difference must never be resolved by
+    /// re-stringifying a label.
+    pub fn wire_type(&self) -> &str {
+        match self {
+            KvType::Json => REJSON_WIRE_TYPE,
+            other => other.label(),
         }
     }
 }
@@ -294,6 +327,11 @@ pub enum KvValue {
     /// [`KvDriver::read_stream_range`](crate) rather than this ever loading a
     /// huge stream whole.
     Stream(KvCollection<StreamEntry>),
+    /// A RedisJSON document. `Loaded` below [`JSON_WHOLE_DOC_MAX`] (one
+    /// `JSON.GET $`); `Lazy` carries only the root's shape and one window of its
+    /// children, with each subtree fetched on expand by path — a document can
+    /// reach hundreds of megabytes, and a preview must never pull one whole.
+    Json(JsonDoc),
     /// A type this build has no preview for yet. Distinct from `Ok(None)`
     /// (the key doesn't exist): the key is real, its value just isn't shown.
     Unsupported(KvType),
@@ -428,6 +466,22 @@ pub enum KvEdit {
         key: String,
         fields: Vec<(String, String)>,
     },
+    /// `JSON.SET key <path> <value>` — write one node of a RedisJSON document,
+    /// or the whole document at [`JsonPath::root`]. `value` is validated as JSON
+    /// before it leaves RED (see [`validate_json`]) so a typo fails with an
+    /// offset here rather than as `ERR expected value` at the server. Also how
+    /// the "New key" popover creates a JSON key.
+    JsonSet {
+        key: String,
+        path: JsonPath,
+        value: String,
+    },
+    /// `JSON.DEL key <path>` — remove one node. At [`JsonPath::root`] this
+    /// deletes the key itself, which is why it classifies as destructive.
+    JsonDelete {
+        key: String,
+        path: JsonPath,
+    },
 }
 
 /// One entry of the server's slow-command log (`SLOWLOG GET`), for the
@@ -544,6 +598,26 @@ pub enum RespValue {
 }
 
 impl RespValue {
+    /// The reply's text, for the scalar string shapes. `None` for a container,
+    /// an error, or a non-textual scalar — so a caller reading a named field out
+    /// of a flat map reply can't silently accept the wrong shape.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            RespValue::Simple(s) | RespValue::Bulk(s) => Some(s),
+            _ => None,
+        }
+    }
+
+    /// The reply's integer value, accepting both a RESP integer and the bulk
+    /// string an older server may answer with in the same position.
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            RespValue::Int(i) => Some(*i),
+            RespValue::Simple(s) | RespValue::Bulk(s) => s.parse().ok(),
+            _ => None,
+        }
+    }
+
     /// A rough resident-byte estimate of the reply tree: the string payloads plus
     /// a small per-node overhead. The console keeps replies for its scrollback, so
     /// a `LRANGE bigkey 0 -1` on a huge list would otherwise pin the whole thing;
@@ -618,6 +692,19 @@ const READ_COMMANDS: &[&str] = &[
     "LASTSAVE",
     "RANDOMKEY",
     "DUMP",
+    // RedisJSON reads. `JSON.DEBUG` is listed despite the bare `DEBUG` being
+    // destructive: it is a separate command whose only subcommands report a
+    // document's memory and depth.
+    "JSON.GET",
+    "JSON.MGET",
+    "JSON.TYPE",
+    "JSON.STRLEN",
+    "JSON.ARRLEN",
+    "JSON.OBJLEN",
+    "JSON.OBJKEYS",
+    "JSON.ARRINDEX",
+    "JSON.RESP",
+    "JSON.DEBUG",
 ];
 
 /// `(command, subcommand)` pairs whose *specific form* is a read, for commands
@@ -628,6 +715,7 @@ const READ_SUBCOMMANDS: &[(&str, &str)] = &[
     ("MEMORY", "STATS"),
     ("MEMORY", "DOCTOR"),
     ("MEMORY", "MALLOC-STATS"),
+    ("MODULE", "LIST"),
 ];
 
 /// Commands that are destructive purely by name (any invocation), gated behind
@@ -680,6 +768,13 @@ const DESTRUCTIVE_COMMANDS: &[&str] = &[
     "SETRANGE",
     "RESTORE",
     "COPY",
+    // RedisJSON removals. `JSON.DEL`/`JSON.FORGET` at path `$` delete the key
+    // outright, and `JSON.CLEAR`/`ARRPOP`/`ARRTRIM` discard data in place.
+    "JSON.DEL",
+    "JSON.FORGET",
+    "JSON.CLEAR",
+    "JSON.ARRPOP",
+    "JSON.ARRTRIM",
 ];
 
 /// `(command, subcommand)` pairs that are destructive only in a specific form,
@@ -707,6 +802,9 @@ const DESTRUCTIVE_SUBCOMMANDS: &[(&str, &str)] = &[
     ("CLUSTER", "FORGET"),
     ("CLUSTER", "SETSLOT"),
     ("XGROUP", "DESTROY"),
+    ("MODULE", "LOAD"),
+    ("MODULE", "LOADEX"),
+    ("MODULE", "UNLOAD"),
 ];
 
 /// Classify a raw console command line for the read-only gate and the
@@ -1254,6 +1352,60 @@ mod tests {
             .map(|t| t.pattern)
             .collect();
         assert_eq!(patterns, ["job:*", "job:*:log"]);
+    }
+
+    /// A module type reads as one word and filters as another; conflating the
+    /// two sends `TYPE json` to a server that only knows `TYPE ReJSON-RL`.
+    #[test]
+    fn json_type_reads_as_json_and_filters_as_the_wire_name() {
+        assert_eq!(KvType::parse("ReJSON-RL"), Some(KvType::Json));
+        assert_eq!(KvType::Json.label(), "json");
+        assert_eq!(KvType::Json.wire_type(), "ReJSON-RL");
+        // Every built-in type spells itself the same either way.
+        for t in [
+            KvType::String,
+            KvType::Hash,
+            KvType::List,
+            KvType::Set,
+            KvType::ZSet,
+            KvType::Stream,
+        ] {
+            assert_eq!(t.label(), t.wire_type());
+        }
+        // Another module type still passes through untouched.
+        assert_eq!(
+            KvType::parse("TSDB-TYPE"),
+            Some(KvType::Other("TSDB-TYPE".into()))
+        );
+    }
+
+    #[test]
+    fn json_commands_classify_as_reads_writes_and_deletes() {
+        assert_eq!(
+            classify_command(&["JSON.GET".into(), "k".into(), "$".into()]),
+            OpClass::Read
+        );
+        assert_eq!(
+            classify_command(&["json.type".into(), "k".into()]),
+            OpClass::Read
+        );
+        assert_eq!(
+            classify_command(&["JSON.SET".into(), "k".into(), "$".into(), "{}".into()]),
+            OpClass::Write
+        );
+        assert_eq!(
+            classify_command(&["JSON.DEL".into(), "k".into(), "$".into()]),
+            OpClass::Destructive
+        );
+        // Listing modules is introspection; loading one is not.
+        assert_eq!(
+            classify_command(&["MODULE".into(), "LIST".into()]),
+            OpClass::Read
+        );
+        assert_eq!(
+            classify_command(&["MODULE".into(), "UNLOAD".into(), "ReJSON".into()]),
+            OpClass::Destructive
+        );
     }
 
     #[test]

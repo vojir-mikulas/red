@@ -6,6 +6,7 @@
 //! it stopped.
 
 use red_ai::ToolDef;
+use red_core::kv::KvModules;
 use red_core::{AiPolicy, AiTier};
 use serde_json::json;
 
@@ -39,10 +40,15 @@ pub(super) const KV_PENDING_MAX: usize = 100;
 /// How many key templates `kv_key_schema` reports. A real keyspace has a handful
 /// of shapes; past this the rollup has stopped rolling anything up.
 pub(super) const KV_TEMPLATE_TOP: usize = 40;
-/// The Redis agent's read-only tool catalog, gated by tier via
-/// [`AiTier::allows_tool`] exactly like the SQL [`tool_catalog`](crate::ai::sql::catalog::tool_catalog). Redis writes
-/// aren't wired yet, so every tool here is read-only.
-pub(in crate::ai) fn kv_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
+/// The Redis agent's tool catalog, gated by tier via [`AiTier::allows_tool`]
+/// exactly like the SQL [`tool_catalog`](crate::ai::sql::catalog::tool_catalog),
+/// and by `modules` for the tools a plain Redis cannot answer.
+///
+/// Module gating is a separate, earlier filter than the tier gate: a `JSON.*`
+/// tool offered to a server without RedisJSON would spend a turn discovering
+/// "unknown command", which reads as RED being broken rather than the server
+/// lacking a module.
+pub(in crate::ai) fn kv_tool_catalog(policy: &AiPolicy, modules: &KvModules) -> Vec<ToolDef> {
     let all = [
         ToolDef {
             name: "kv_server_info".into(),
@@ -126,6 +132,38 @@ pub(in crate::ai) fn kv_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                     "before": { "type": "string", "description": "Stream: the previous page's next_before, to walk older (omit to start at the newest)." },
                     "from_tail": { "type": "boolean", "description": "List: read the tail rather than the head. Default false." },
                     "limit": { "type": "integer", "description": "Max elements to return." },
+                },
+                "required": ["key"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_json_shape".into(),
+            description: "Map a RedisJSON document's STRUCTURE: every path and its type, with no \
+                values. The JSON analogue of kv_key_schema, and the way to answer \"what is in \
+                these documents\" without reading any of them. Bounded in depth, fan-out and \
+                node count; it says when it stopped. Call this before kv_json_get so you fetch a \
+                path that exists."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "key": { "type": "string", "description": "The JSON key." } },
+                "required": ["key"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "kv_json_get".into(),
+            description: "Read the value at one JSONPath inside a RedisJSON document, e.g. \
+                `$.orders[3].total`. This is how you read a large document: it is never fetched \
+                whole, so navigate to the path you want rather than asking for the root. Capped \
+                like every other read."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "The JSON key." },
+                    "path": { "type": "string", "description": "JSONPath inside the document, e.g. `$.a.b`, `orders[3].id`, `$[\"key with spaces\"]`. Default `$` (the whole document)." },
                 },
                 "required": ["key"],
                 "additionalProperties": false,
@@ -299,6 +337,26 @@ pub(in crate::ai) fn kv_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "kv_json_set".into(),
+            description: "Write one node of a RedisJSON document (JSON.SET). Prefer a specific \
+                `path`: writing at `$` replaces the WHOLE document, including the parts you did \
+                not read, while a path scoped to one node leaves the rest alone. `value` is the \
+                JSON to write and is validated before it is sent. Requires the user's explicit \
+                approval, and the value is read back afterwards so the reply states what is \
+                actually there."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "key": { "type": "string", "description": "The JSON key (not a glob)." },
+                    "path": { "type": "string", "description": "JSONPath of the node to write, e.g. `$.status`. `$` replaces the whole document." },
+                    "value": { "description": "The JSON value to write." },
+                },
+                "required": ["key", "value"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
             name: "kv_expire".into(),
             description: "Set or remove a key's expiry (EXPIRE / PERSIST). Targets one `key`, or \
                 every key matching a `pattern` (bulk). Requires the user's explicit approval; a \
@@ -403,7 +461,10 @@ pub(in crate::ai) fn kv_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             }),
         },
     ];
-    gate_catalog(all, policy)
+    let offered = all
+        .into_iter()
+        .filter(|t| modules.json() || !t.name.starts_with("kv_json_"));
+    gate_catalog(offered, policy)
 }
 /// The Redis agent's system prompt (the KV analogue of [`system_prompt`](crate::ai::sql::catalog::system_prompt)): the
 /// same shape, but describing the `kv_*` tools and Redis idioms instead of SQL.
@@ -436,7 +497,10 @@ pub(in crate::ai) fn kv_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> Str
              appears as a card the user can open — use it when the user asks for a report), and \
              save_knowledge (draft this connection's knowledge file for the user to review), \
              search_query_history (the commands this user has actually run here) and \
-             kv_recent_keys (the keys they have been looking at). Ground every answer in the live \
+             kv_recent_keys (the keys they have been looking at). On a server with RedisJSON \
+             loaded you also have kv_json_shape (a document's paths and types, no values) and \
+             kv_json_get (the value at one JSONPath); a JSON document is never read whole, so map \
+             its shape first and then fetch the paths you need. Ground every answer in the live \
              server with these tools rather than guessing."
         }
         AiTier::Write => {
@@ -444,7 +508,9 @@ pub(in crate::ai) fn kv_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> Str
              kv_get_value, kv_biggest_keys, kv_analyze, kv_slowlog, kv_config_get, \
              generate_report, save_knowledge, search_query_history, kv_recent_keys) AND gated \
              tools: kv_set (write a key of any type — this is how you create or update \
-             data), kv_expire (set/remove a key's TTL), kv_delete (delete keys), kv_rename, \
+             data), kv_json_set (write one node of a RedisJSON document; prefer a specific path \
+             over `$`, which replaces the whole document), kv_expire (set/remove a key's TTL), \
+             kv_delete (delete keys), kv_rename, \
              kv_copy_key, kv_client_kill, kv_config_set, and kv_command (introspection verbs only). \
              Every one requires the user's explicit Allow on the exact operation; assume it may be \
              denied. Before a bulk kv_delete/kv_expire by pattern, scan first (kv_scan_keys) and \
@@ -485,11 +551,12 @@ mod tests {
     use super::*;
 
     use red_core::AiPolicy;
+    use red_core::kv::KvModules;
 
     #[test]
     fn kv_catalog_offers_writes_only_at_write_tier_and_not_read_only() {
         let names = |p: AiPolicy| {
-            kv_tool_catalog(&p)
+            kv_tool_catalog(&p, &KvModules::NONE)
                 .into_iter()
                 .map(|t| t.name)
                 .collect::<Vec<_>>()
@@ -513,5 +580,35 @@ mod tests {
         });
         assert!(write_ro.iter().all(|n| n != "kv_delete"));
         assert!(write_ro.iter().any(|n| n == "kv_scan_keys"));
+    }
+
+    /// The JSON tools are module-gated, a separate and earlier filter than the
+    /// tier gate: offering them to a plain Redis would spend a turn discovering
+    /// "unknown command".
+    #[test]
+    fn kv_catalog_offers_the_json_tools_only_where_the_module_is_loaded() {
+        let write = AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        };
+        let names = |modules: &KvModules| {
+            kv_tool_catalog(&write, modules)
+                .into_iter()
+                .map(|t| t.name)
+                .collect::<Vec<_>>()
+        };
+        let without = names(&KvModules::NONE);
+        assert!(without.iter().all(|n| !n.starts_with("kv_json_")));
+        // The rest of the catalog is unaffected by the module gate.
+        assert!(without.iter().any(|n| n == "kv_get_value"));
+
+        let with = names(&KvModules::NONE.with_json_probe(true));
+        for tool in ["kv_json_get", "kv_json_shape", "kv_json_set"] {
+            assert!(with.iter().any(|n| n == tool), "{tool} should be offered");
+        }
+        // Still tier-gated on top: the write tool is absent below Write tier.
+        let read = kv_tool_catalog(&AiPolicy::default(), &KvModules::NONE.with_json_probe(true));
+        assert!(read.iter().any(|t| t.name == "kv_json_get"));
+        assert!(read.iter().all(|t| t.name != "kv_json_set"));
     }
 }

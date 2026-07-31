@@ -15,9 +15,9 @@ use async_trait::async_trait;
 use futures_util::Stream;
 use red_core::Result;
 use red_core::kv::{
-    ClientInfo, CollectionKind, KeyMeta, KvCollectionPage, KvMessage, KvScanPage, KvStreamPage,
-    KvValue, PendingEntry, RespValue, ScanBudget, ScanCursor, SlowlogEntry, StreamConsumer,
-    StreamGroup, StringTtl,
+    ClientInfo, CollectionKind, JsonNodeView, JsonPath, KeyMeta, KvCollectionPage, KvMessage,
+    KvModules, KvScanPage, KvStreamPage, KvValue, PendingEntry, RespValue, ScanBudget, ScanCursor,
+    SlowlogEntry, StreamConsumer, StreamGroup, StringTtl,
 };
 
 use crate::AbortSignal;
@@ -50,6 +50,12 @@ pub enum KvTopology {
     Cluster,
 }
 
+/// The error an engine without a given capability reports, so every "this
+/// engine can't" default reads the same way to a caller.
+fn unsupported(what: &str) -> red_core::RedError {
+    red_core::RedError::Driver(format!("{what} is not supported by this engine"))
+}
+
 /// One open key-value session. The parallel seam to [`DatabaseDriver`](crate::DatabaseDriver)
 /// for engines that aren't SQL-shaped. Object-safe so the service can hold
 /// `Arc<dyn KvDriver>` and swap engines behind it, mirroring how
@@ -65,6 +71,20 @@ pub trait KvDriver: Send + Sync {
 
     /// The deployment topology detected at connect.
     fn topology(&self) -> KvTopology;
+
+    /// The Redis Stack modules this server loaded, read once at connect like
+    /// [`topology`](Self::topology). Gates module-specific *affordances* — the
+    /// type-filter entry, the new-key type, the agent's JSON tools — so RED
+    /// never offers a `JSON.*` command to a server that would answer "unknown
+    /// command". Reads are not gated on it: a key whose `TYPE` is already
+    /// `ReJSON-RL` proves the module is loaded regardless of what the probe
+    /// managed to learn. Returned by value like
+    /// [`server_version`](Self::server_version); the default is
+    /// [`KvModules::NONE`], which is also what a refused probe yields — never an
+    /// error.
+    fn modules(&self) -> KvModules {
+        KvModules::NONE
+    }
 
     /// Total key count in the selected logical database (`DBSIZE`). O(1) on the server;
     /// a header stat only — it counts the *whole* database, not a pattern-filtered
@@ -155,6 +175,51 @@ pub trait KvDriver: Send + Sync {
         before: Option<&str>,
         count: usize,
     ) -> Result<KvStreamPage>;
+
+    /// One node of a RedisJSON document, read at `path`: a leaf's serialized
+    /// value, or a container's arity plus the window of `count` children
+    /// starting at `offset`. This is the whole lazy walk — expanding a node in
+    /// the tree, and paging a large array root, are the same call.
+    ///
+    /// Never reads a subtree: a child's summary comes from `JSON.TYPE` plus the
+    /// O(1) length command for its kind, so opening the root of a 200 MB
+    /// document costs the same as opening the root of a small one. `Ok(None)`
+    /// when the key or the path is gone.
+    async fn read_json_node(
+        &self,
+        key: &str,
+        path: &JsonPath,
+        offset: u64,
+        count: usize,
+    ) -> Result<Option<JsonNodeView>> {
+        let _ = (key, path, offset, count);
+        Err(unsupported("reading JSON documents"))
+    }
+
+    /// The serialized JSON at `path` (`JSON.GET`), capped like a string value so
+    /// a "copy this node" on a huge subtree can't pull it whole into the
+    /// process. `Ok(None)` when the path matches nothing.
+    async fn json_get(&self, key: &str, path: &JsonPath) -> Result<Option<red_core::Value>> {
+        let _ = (key, path);
+        Err(unsupported("reading JSON documents"))
+    }
+
+    /// `JSON.SET key <path> <value>` — write one node, or the whole document at
+    /// [`JsonPath::root`]. `value` must already be valid JSON (callers validate
+    /// with [`validate_json`](red_core::kv::validate_json) so the failure names
+    /// an offset); the driver re-checks rather than trusting its caller. Refused
+    /// on a read-only connection.
+    async fn json_set(&self, key: &str, path: &JsonPath, value: &str) -> Result<()> {
+        let _ = (key, path, value);
+        Err(unsupported("writing JSON documents"))
+    }
+
+    /// `JSON.DEL key <path>`, returning the number of nodes removed. At the root
+    /// this deletes the key. Refused on a read-only connection.
+    async fn json_delete(&self, key: &str, path: &JsonPath) -> Result<u64> {
+        let _ = (key, path);
+        Err(unsupported("writing JSON documents"))
+    }
 
     /// A stream's consumer groups (`XINFO GROUPS <key>`), for the inspector's consumer-
     /// group management view. An empty vec means the stream has no groups yet; an error

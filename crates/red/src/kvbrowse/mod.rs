@@ -9,7 +9,7 @@
 //! needs, no windowing/eviction/margin machinery.
 
 use std::cell::RefCell;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -19,8 +19,8 @@ use gpui::{
     UniformListScrollHandle, WeakEntity, Window, div, prelude::*, px, relative,
 };
 use red_core::kv::{
-    KeyMeta, KvElement, KvType, KvValue, PendingEntry, ScanBudget, ScanCursor, StreamConsumer,
-    StreamEntry, StreamGroup,
+    JsonNodeView, JsonPath, KeyMeta, KvElement, KvModules, KvType, KvValue, PendingEntry,
+    ScanBudget, ScanCursor, StreamConsumer, StreamEntry, StreamGroup,
 };
 use red_service::{Command, SessionId};
 
@@ -28,6 +28,7 @@ use crate::app::{AppState, Phase, SplitWorkspace, TabWorkspace, WorkspaceTab};
 use crate::panes::{PaneId, PaneLayout};
 mod analysis;
 mod inspector;
+mod jsontree;
 mod render;
 mod tabs;
 use render::render_string_preview;
@@ -179,17 +180,23 @@ impl QueryMode {
 
 /// The concrete Redis types the browse type-filter dropdown offers, in menu
 /// order after the leading "All types" entry. Each maps to a `SCAN ... TYPE`
-/// argument via [`KvType::label`]. `Other` is deliberately absent — the
-/// dropdown is a fixed picker, not a reflection of what's in the keyspace.
-fn kv_filter_types() -> [KvType; 6] {
-    [
+/// argument via [`KvType::wire_type`]. `Other` is deliberately absent — the
+/// dropdown is a fixed picker, not a reflection of what's in the keyspace —
+/// while `Json` appears only when the server loaded RedisJSON, so the picker
+/// never offers a filter that would match nothing on a plain Redis.
+fn kv_filter_types(modules: &KvModules) -> Vec<KvType> {
+    let mut types = vec![
         KvType::String,
         KvType::Hash,
         KvType::List,
         KvType::Set,
         KvType::ZSet,
         KvType::Stream,
-    ]
+    ];
+    if modules.json() {
+        types.push(KvType::Json);
+    }
+    types
 }
 
 /// A client-side filter on a loaded key's remaining TTL (the browse toolbar's
@@ -552,17 +559,23 @@ pub(crate) struct CreateKeyState {
 }
 
 /// The key types the "New key" popover can create, in menu order. A Stream is
-/// created by its first `XADD` (see [`KvEdit::StreamAdd`](red_core::kv::KvEdit));
-/// `Other` (module types) still can't be created here.
-fn kv_creatable_types() -> [KvType; 6] {
-    [
+/// created by its first `XADD` (see [`KvEdit::StreamAdd`](red_core::kv::KvEdit))
+/// and a JSON document by its first `JSON.SET`; `Json` is offered only where the
+/// module is loaded, so a user on a plain Redis is never given a type the server
+/// would reject. `Other` (other module types) still can't be created here.
+fn kv_creatable_types(modules: &KvModules) -> Vec<KvType> {
+    let mut types = vec![
         KvType::String,
         KvType::Hash,
         KvType::List,
         KvType::Set,
         KvType::ZSet,
         KvType::Stream,
-    ]
+    ];
+    if modules.json() {
+        types.push(KvType::Json);
+    }
+    types
 }
 
 /// One entry in a connection's "recently viewed keys" list — browser-history
@@ -582,7 +595,10 @@ impl RecentKey {
     fn to_rec(&self) -> red_config::recent_keys::RecentKeyRec {
         red_config::recent_keys::RecentKeyRec {
             key: self.key.clone(),
-            kv_type: self.kv_type.label().to_string(),
+            // The wire name, not the label: `KvType::parse` reads what `TYPE`
+            // answers, so persisting a label would round-trip a module type back
+            // as `Other`.
+            kv_type: self.kv_type.wire_type().to_string(),
             ttl_secs: self.ttl.map(|d| d.as_secs()),
             viewed_unix: self.viewed_unix,
         }
@@ -659,6 +675,11 @@ pub(crate) struct RedisView {
     pub(crate) tab_seq: u64,
     /// `DBSIZE`, fetched once at connect.
     pub(crate) db_size: Option<u64>,
+    /// The server's loaded Stack modules, fetched once at connect. Gates the
+    /// module-specific affordances (the JSON type filter, the JSON new-key
+    /// type); [`KvModules::NONE`] until the reply lands, so RED offers less
+    /// before it knows rather than more.
+    pub(crate) modules: KvModules,
     /// Recently-viewed keys, newest-first (browser-history for the keyspace),
     /// shown in the History dock's Keys section.
     pub(crate) recent_keys: Vec<RecentKey>,
@@ -787,6 +808,7 @@ fn kv_read_command(kv_type: &KvType, key: &str) -> String {
         KvType::Set => format!("SMEMBERS {q}"),
         KvType::ZSet => format!("ZRANGE {q} 0 -1 WITHSCORES"),
         KvType::Stream => format!("XRANGE {q} - +"),
+        KvType::Json => format!("JSON.GET {q} $"),
         KvType::Other(_) => format!("TYPE {q}"),
     }
 }
@@ -901,6 +923,44 @@ pub(crate) struct KvInspector {
     /// Inline validation message for the expiry popover (a non-numeric input),
     /// shown instead of silently ignoring the value.
     pub(crate) ttl_error: Option<String>,
+
+    /// The RedisJSON tree's state. Only meaningful when `kv_type` is
+    /// [`KvType::Json`]; see [`JsonTreeState`].
+    pub(crate) json: JsonTreeState,
+}
+
+/// The RedisJSON inspector's state: which nodes have been read, which are open,
+/// and which one the actions apply to.
+///
+/// Nothing here holds a whole document. Each entry in `nodes` is one level's
+/// summary, fetched by path when the user opens it, so the resident cost tracks
+/// what has actually been looked at rather than the document's size. The `raw`
+/// text is the one exception and is capped like any other value.
+#[derive(Default)]
+pub(crate) struct JsonTreeState {
+    /// Every level read so far, by path. The root arrives with the value (or is
+    /// requested on first render for a whole-loaded document); each expand adds
+    /// one more.
+    pub(crate) nodes: HashMap<JsonPath, JsonNodeView>,
+    /// The paths currently open in the tree.
+    pub(crate) expanded: HashSet<JsonPath>,
+    /// Paths with a read in flight, so their row can say so rather than looking
+    /// like an empty container.
+    pub(crate) loading: HashSet<JsonPath>,
+    /// The node the breadcrumb names and the actions apply to; `None` = root.
+    pub(crate) selected: Option<JsonPath>,
+    /// Raw text instead of the tree. The default for a document small enough to
+    /// have been fetched whole (the text is already in hand), the tree
+    /// otherwise.
+    pub(crate) raw: bool,
+    /// The serialized JSON of the selected node, for the raw view. `None` while
+    /// a fetch is in flight.
+    pub(crate) raw_text: Option<red_core::Value>,
+    /// The path whose raw text is being edited, so a reply that lands for a
+    /// different path can't stomp the editor.
+    pub(crate) editing: Option<JsonPath>,
+    /// A validation or read failure, shown inline in the JSON body.
+    pub(crate) error: Option<String>,
 }
 
 /// Which collection-element edit popover the inspector is showing: adding or
@@ -1413,6 +1473,7 @@ impl RedisView {
             }],
             tab_seq: 1,
             db_size: None,
+            modules: KvModules::NONE,
             recent_keys: Vec::new(),
             layout: PaneLayout::new(),
             tab_menu: None,
@@ -1643,6 +1704,10 @@ impl AppState {
         browse.loading = true;
         let epoch = browse.epoch;
         self.service.send_to(session, Command::KvDbSize { epoch });
+        // Which Stack modules are loaded gates what the toolbar and the
+        // New-key modal may offer, so ask before the first render rather
+        // than after a user notices the JSON entry appear.
+        self.service.send_to(session, Command::KvModules { epoch });
         self.service.send_to(
             session,
             Command::KvFetchScan {
@@ -2969,6 +3034,9 @@ fn kv_type_color(kv_type: &KvType, theme: &Theme) -> gpui::Hsla {
         KvType::Set => theme.purple,
         KvType::ZSet => theme.yellow,
         KvType::Stream => theme.cyan,
+        // The one hue left in the palette that reads as a category rather than
+        // a state; every other accent is already spoken for by a built-in type.
+        KvType::Json => theme.accent,
         KvType::Other(_) => theme.text_muted,
     }
 }
@@ -2983,6 +3051,7 @@ fn kv_create_hint(kv_type: &KvType) -> &'static str {
         KvType::Set => "A set seeded with one member (SADD).",
         KvType::ZSet => "A sorted set seeded with one scored member (ZADD).",
         KvType::Stream => "A stream seeded with one entry's field → value (XADD).",
+        KvType::Json => "A RedisJSON document, written whole (JSON.SET at `$`).",
         KvType::Other(_) => "",
     }
 }

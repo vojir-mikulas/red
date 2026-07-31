@@ -24,6 +24,26 @@ use crate::app::{
 use super::*;
 
 impl AppState {
+    /// `Event::KvModulesReady`: which Stack modules the server loaded. Stored on
+    /// the view (connection-level, like `DBSIZE`) because it gates affordances
+    /// in every Browse tab, not just the one that asked.
+    pub(crate) fn on_kv_modules_ready(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: red_service::Epoch,
+        modules: red_core::kv::KvModules,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.conn_mut(session).and_then(|a| a.kv_view.as_mut()) else {
+            return;
+        };
+        if view.browse_by_scan_epoch_mut(epoch).is_none() {
+            return;
+        }
+        view.modules = modules;
+        cx.notify();
+    }
+
     pub(crate) fn on_kv_db_size(
         &mut self,
         session: Option<SessionId>,
@@ -209,6 +229,7 @@ impl AppState {
             value_loaded: false,
             value_error: None,
             ttl_error: None,
+            json: JsonTreeState::default(),
         });
         self.service
             .send_to(session, Command::KvReadValue { epoch, key });
@@ -479,6 +500,12 @@ impl AppState {
     }
 
     pub(crate) fn kv_cancel_editing_value(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        // One `value_editor` serves both the string body and a JSON node, so Esc
+        // has to cancel whichever one is actually open.
+        if self.kv_json_editing(session) {
+            self.kv_json_cancel_edit(session, cx);
+            return;
+        }
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
@@ -495,6 +522,12 @@ impl AppState {
     }
 
     pub(crate) fn kv_submit_value_edit(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        // See `kv_cancel_editing_value`: the editor is shared, so ⌘↵ routes to
+        // the body that owns it.
+        if self.kv_json_editing(session) {
+            self.kv_json_submit_edit(session, cx);
+            return;
+        }
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
@@ -1126,6 +1159,20 @@ impl AppState {
                     fields: vec![(field, value)],
                 }
             }
+            KvType::Json => {
+                // A new JSON key is its whole document at `$`, validated
+                // here so a typo names an offset rather than reaching the
+                // server as `ERR expected value`.
+                let value = value.trim().to_string();
+                if let Err(e) = red_core::kv::validate_json(&value) {
+                    return self.kv_set_create_error(session, format!("Not valid JSON: {e}"), cx);
+                }
+                KvEdit::JsonSet {
+                    key,
+                    path: JsonPath::root(),
+                    value,
+                }
+            }
             KvType::Other(_) => return,
         };
 
@@ -1170,6 +1217,9 @@ impl AppState {
         else {
             return;
         };
+        // A JSON write cannot be patched locally, so the arm below asks for a
+        // fresh read instead; the request is issued after the borrow ends.
+        let mut refetch = None;
         match edit {
             KvEdit::SetString { key, value, ttl } => {
                 if let Some(inspector) = &mut browse.inspector
@@ -1415,6 +1465,28 @@ impl AppState {
             // on it (see `kv_submit_create_key`), which fetches the entry fresh, so
             // there's no local buffer to patch.
             KvEdit::StreamAdd { .. } => {}
+            // A JSON write changes one node of a lazily-walked document, and
+            // nothing local can be patched honestly: the level that changed may
+            // not even be loaded, and a `$` write replaces everything. Drop the
+            // whole tree and re-read, so what the inspector shows is what the
+            // server holds rather than an optimistic guess at it.
+            KvEdit::JsonSet { key, .. } | KvEdit::JsonDelete { key, .. } => {
+                let epoch = browse.epoch;
+                if let Some(inspector) = &mut browse.inspector
+                    && inspector.key == key
+                {
+                    inspector.json = JsonTreeState::default();
+                    inspector.value = None;
+                    inspector.value_loaded = false;
+                    refetch = Some((epoch, key));
+                }
+            }
+        }
+        if let Some((epoch, key)) = refetch
+            && let Some(session) = session
+        {
+            self.service
+                .send_to(session, Command::KvReadValue { epoch, key });
         }
         // A `SetString` replaced the string body (and cleared the edit); refresh
         // the selectable preview so it shows the just-written value.
@@ -1555,6 +1627,9 @@ impl AppState {
         inspector.value = value.clone();
         inspector.value_loaded = true;
         inspector.value_error = None;
+        if let Some(KvValue::Json(doc)) = &inspector.value {
+            inspector.json = JsonTreeState::from_doc(doc);
+        }
         // Whether this is the initial capped read or a "Load full value" reply,
         // the string body is now settled — drop the loading state either way.
         inspector.loading_full_value = false;

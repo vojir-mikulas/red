@@ -7,6 +7,25 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- RedisJSON documents are now first-class. A `JSON.*` key used to appear in the
+  keyspace with an unreadable `ReJSON-RL` type and no value at all; it now reads
+  as `json`, filters as its own type in the browse toolbar, and opens in a
+  document tree you navigate rather than receive. That distinction is the point:
+  a small document is fetched whole, but a large one is walked a level at a
+  time, so opening a 200 MB document costs the same as opening a small one and
+  RED never pulls one into memory just to show you a preview. A big array pages
+  in place like a list. You can edit a single node - the safe default, since it
+  leaves the parts of the document you did not look at alone - or the whole
+  document from the Raw view, with the JSON validated before it is sent so a
+  typo fails in RED pointing at the character rather than as a bare error from
+  the server. "New key" can create a JSON document, node deletion rides the same
+  confirmation as every other destructive Redis action, and a read-only
+  connection refuses both. Everything module-specific is offered only where the
+  server actually has RedisJSON loaded, detected once when you connect. The
+  assistant learns the same two moves: it can map a document's shape (paths and
+  types, no values) and read any single path, so it can answer "what is in these
+  documents" without downloading any of them, and write one node with your
+  approval.
 - You can point the agent at things instead of describing them. Drag a table, a
   column, a schema or a query tab onto the assistant panel and it becomes a chip
   on your next message; right-click anything in the schema tree and pick "Ask AI

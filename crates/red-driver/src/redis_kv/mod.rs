@@ -7,9 +7,10 @@ use std::time::Duration;
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use red_core::kv::{
-    ClientInfo, CollectionKind, KeyMeta, KvCollection, KvCollectionPage, KvElement, KvMessage,
-    KvScanPage, KvStreamPage, KvType, KvValue, OpClass, PendingEntry, RespValue, ScanBudget,
-    ScanCursor, SlowlogEntry, StreamConsumer, StreamGroup, StringTtl,
+    ClientInfo, CollectionKind, JSON_NODE_WINDOW, JsonNodeView, JsonPath, KeyMeta, KvCollection,
+    KvCollectionPage, KvElement, KvMessage, KvModules, KvScanPage, KvStreamPage, KvType, KvValue,
+    OpClass, PendingEntry, RespValue, ScanBudget, ScanCursor, SlowlogEntry, StreamConsumer,
+    StreamGroup, StringTtl, validate_json,
 };
 use red_core::{RedError, Result, Value};
 use redis::aio::MultiplexedConnection;
@@ -17,6 +18,7 @@ use tokio::time::Instant;
 
 use crate::AbortSignal;
 
+mod json;
 mod parse;
 use crate::kv::{KvDriver, KvMonitorStream, KvSubscription, KvTopology};
 mod topology;
@@ -98,6 +100,8 @@ pub struct RedisDriver {
     cluster: Option<ClusterState>,
     version: String,
     topology: KvTopology,
+    /// Redis Stack modules seen at connect (see [`KvDriver::modules`]).
+    modules: KvModules,
     read_only: bool,
 }
 
@@ -149,12 +153,17 @@ impl RedisDriver {
         } else {
             None
         };
+        // Which Stack modules are loaded rides the same connect probe as the
+        // version and topology, for the same reason: it changes what RED may
+        // offer, and asking later would mean a round trip on the first render.
+        let modules = json::probe_modules(&mut conn).await;
         Ok(Self {
             client,
             conn,
             cluster,
             version,
             topology,
+            modules,
             read_only,
         })
     }
@@ -446,6 +455,10 @@ impl KvDriver for RedisDriver {
         self.topology
     }
 
+    fn modules(&self) -> KvModules {
+        self.modules.clone()
+    }
+
     async fn db_size(&self) -> Result<u64> {
         // `DBSIZE` is per-node, so a cluster's total is the sum across every
         // master (the seed connection alone would report only its own shard).
@@ -560,6 +573,12 @@ impl KvDriver for RedisDriver {
                         .await?;
                 Ok(Some(KvValue::Stream(KvCollection::Loaded(page.entries))))
             }
+            // Attempted whatever `modules()` learned: the `ReJSON-RL` reply
+            // above is itself proof the module is loaded, so a provider that
+            // refused every module probe still gets a readable document.
+            KvType::Json => Ok(json::read_json_doc(&mut conn, key)
+                .await?
+                .map(KvValue::Json)),
             KvType::Other(_) => Ok(Some(KvValue::Unsupported(kv_type))),
         }
     }
@@ -703,6 +722,56 @@ impl KvDriver for RedisDriver {
     ) -> Result<KvStreamPage> {
         let mut conn = self.route(key);
         fetch_stream_page(&mut conn, key, before, count).await
+    }
+
+    async fn read_json_node(
+        &self,
+        key: &str,
+        path: &JsonPath,
+        offset: u64,
+        count: usize,
+    ) -> Result<Option<JsonNodeView>> {
+        let mut conn = self.route(key);
+        json::read_node(&mut conn, key, path, offset, count.min(JSON_NODE_WINDOW)).await
+    }
+
+    async fn json_get(&self, key: &str, path: &JsonPath) -> Result<Option<Value>> {
+        let mut conn = self.route(key);
+        // Capped like a string value: "copy this node" on a multi-megabyte
+        // subtree must not pull it whole into the process, and a `Value::Capped`
+        // is the shape the inspector already knows how to say that with.
+        Ok(json::json_get_text(&mut conn, key, path)
+            .await?
+            .map(|text| cap_string_value(text.into_bytes())))
+    }
+
+    async fn json_set(&self, key: &str, path: &JsonPath, value: &str) -> Result<()> {
+        self.check_writable()?;
+        // Re-validated here, not only at the caller: this is the one place every
+        // JSON write funnels through, so the "malformed fails in RED with an
+        // offset, never at the server" promise is kept even for a path that
+        // skipped the UI's check.
+        validate_json(value).map_err(|e| RedError::Driver(e.to_string()))?;
+        let mut conn = self.route(key);
+        redis::cmd("JSON.SET")
+            .arg(key)
+            .arg(path.expr())
+            .arg(value)
+            .query_async::<()>(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))
+    }
+
+    async fn json_delete(&self, key: &str, path: &JsonPath) -> Result<u64> {
+        self.check_writable()?;
+        let mut conn = self.route(key);
+        let removed: i64 = redis::cmd("JSON.DEL")
+            .arg(key)
+            .arg(path.expr())
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        Ok(removed.max(0) as u64)
     }
 
     async fn stream_groups(&self, key: &str) -> Result<Vec<StreamGroup>> {
@@ -1320,6 +1389,8 @@ impl KvDriver for RedisDriver {
 
 #[cfg(test)]
 mod tests {
+    use red_core::kv::{JsonDoc, JsonKind, JsonSeg};
+
     use super::*;
 
     fn argv(parts: &[&str]) -> Vec<String> {
@@ -2009,6 +2080,204 @@ mod tests {
 
         let absent = driver.probe_key(&missing).await.unwrap();
         assert!(absent.is_none());
+    }
+
+    /// The RedisJSON tests need a server with the module (the standard image is
+    /// `redis/redis-stack-server:latest`). A plain Redis skips with a reason
+    /// rather than failing, the same way the SQL drivers skip without their
+    /// `RED_TEST_*_URL`.
+    macro_rules! json_driver_or_skip {
+        () => {{
+            let url = url_or_skip!();
+            let driver = RedisDriver::connect(&url, false).await.unwrap();
+            if !driver.modules().json() {
+                eprintln!(
+                    "SKIP {}: this server has no RedisJSON module (try \
+                     redis/redis-stack-server)",
+                    module_path!()
+                );
+                return;
+            }
+            driver
+        }};
+    }
+
+    #[tokio::test]
+    async fn json_key_reads_as_json_and_filters_by_the_wire_type() {
+        let driver = json_driver_or_skip!();
+        let key = tag("json_type");
+        driver
+            .json_set(&key, &JsonPath::root(), r#"{"a":1}"#)
+            .await
+            .unwrap();
+
+        let meta = driver.probe_key(&key).await.unwrap().unwrap();
+        assert_eq!(meta.kv_type, KvType::Json, "TYPE must map to KvType::Json");
+
+        // The scan's TYPE filter takes the wire name, not the label.
+        let page = driver
+            .scan_keys(
+                ScanCursor::START,
+                Some(&format!("{key}*")),
+                Some(KvType::Json.wire_type()),
+                None,
+                budget(),
+                &AbortSignal::new(),
+            )
+            .await
+            .unwrap();
+        assert!(page.keys.iter().any(|k| k.key == key));
+
+        driver.delete_keys(&[key]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn small_json_document_is_read_whole() {
+        let driver = json_driver_or_skip!();
+        let key = tag("json_small");
+        driver
+            .json_set(&key, &JsonPath::root(), r#"{"a":1,"b":[1,2,3]}"#)
+            .await
+            .unwrap();
+
+        match driver.read_value(&key).await.unwrap() {
+            Some(KvValue::Json(JsonDoc::Loaded { text, .. })) => {
+                assert!(text.contains("\"a\""), "got {text}");
+            }
+            other => panic!("expected a whole-loaded JSON document, got {other:?}"),
+        }
+        driver.delete_keys(&[key]).await.unwrap();
+    }
+
+    /// The load-bearing case: a document past the threshold reports its root's
+    /// shape without the contents ever crossing the wire.
+    #[tokio::test]
+    async fn large_json_document_is_walked_not_materialized() {
+        let driver = json_driver_or_skip!();
+        let key = tag("json_large");
+        // Comfortably past JSON_WHOLE_DOC_MAX (64 KiB).
+        let filler = "x".repeat(4096);
+        let items: Vec<String> = (0..40)
+            .map(|i| format!(r#"{{"i":{i},"pad":"{filler}"}}"#))
+            .collect();
+        let doc = format!(r#"{{"meta":{{"v":1}},"items":[{}]}}"#, items.join(","));
+        driver
+            .json_set(&key, &JsonPath::root(), &doc)
+            .await
+            .unwrap();
+
+        let Some(KvValue::Json(JsonDoc::Lazy { root, bytes })) =
+            driver.read_value(&key).await.unwrap()
+        else {
+            panic!(
+                "a {}-byte document should be walked, not loaded whole",
+                doc.len()
+            );
+        };
+        assert!(bytes > 0);
+        let JsonNodeView::Container { kind, children, .. } = root else {
+            panic!("the root is an object");
+        };
+        assert_eq!(kind, JsonKind::Object);
+        // The root level knows its children's shape without holding their bodies.
+        let items_node = children
+            .iter()
+            .find(|c| c.seg == JsonSeg::Member("items".into()))
+            .expect("the `items` member");
+        assert_eq!(items_node.kind, JsonKind::Array);
+        assert_eq!(items_node.len, Some(40));
+        assert!(items_node.preview.is_none(), "a container carries no body");
+
+        // Expanding pages the array a window at a time.
+        let items_path = JsonPath::root().member("items");
+        let Some(JsonNodeView::Container { len, children, .. }) = driver
+            .read_json_node(&key, &items_path, 0, 10)
+            .await
+            .unwrap()
+        else {
+            panic!("the items node is a container");
+        };
+        assert_eq!(len, 40);
+        assert_eq!(children.len(), 10, "the window is honoured");
+        assert_eq!(children[0].seg, JsonSeg::Index(0));
+
+        let second = driver
+            .read_json_node(&key, &items_path, 10, 10)
+            .await
+            .unwrap();
+        let Some(JsonNodeView::Container { children, .. }) = second else {
+            panic!("the second window is a container");
+        };
+        assert_eq!(children[0].seg, JsonSeg::Index(10));
+
+        driver.delete_keys(&[key]).await.unwrap();
+    }
+
+    /// Path quoting is where this breaks first, so exercise it against the real
+    /// parser rather than only the builder's unit tests.
+    #[tokio::test]
+    async fn json_set_writes_one_leaf_and_leaves_the_rest_alone() {
+        let driver = json_driver_or_skip!();
+        let key = tag("json_leaf");
+        driver
+            .json_set(
+                &key,
+                &JsonPath::root(),
+                r#"{"a":{"key with.dots":"old"},"keep":[1,2]}"#,
+            )
+            .await
+            .unwrap();
+
+        let leaf = JsonPath::root().member("a").member("key with.dots");
+        driver.json_set(&key, &leaf, r#""new""#).await.unwrap();
+        assert_eq!(
+            driver.json_get(&key, &leaf).await.unwrap(),
+            Some(Value::Text(r#""new""#.into()))
+        );
+        // The sibling the write did not name is untouched.
+        assert_eq!(
+            driver
+                .json_get(&key, &JsonPath::root().member("keep"))
+                .await
+                .unwrap(),
+            Some(Value::Text("[1,2]".into()))
+        );
+
+        // Deleting a node removes only that node.
+        assert_eq!(driver.json_delete(&key, &leaf).await.unwrap(), 1);
+        assert_eq!(driver.json_get(&key, &leaf).await.unwrap(), None);
+
+        driver.delete_keys(&[key]).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn json_writes_are_refused_on_a_read_only_connection() {
+        let url = url_or_skip!();
+        let probe = RedisDriver::connect(&url, false).await.unwrap();
+        if !probe.modules().json() {
+            eprintln!(
+                "SKIP {}: this server has no RedisJSON module",
+                module_path!()
+            );
+            return;
+        }
+        let ro = RedisDriver::connect(&url, true).await.unwrap();
+        let key = tag("json_ro");
+        assert!(ro.json_set(&key, &JsonPath::root(), "{}").await.is_err());
+        assert!(ro.json_delete(&key, &JsonPath::root()).await.is_err());
+    }
+
+    /// Malformed JSON fails in RED, naming the offset, rather than reaching the
+    /// server as a bare `ERR expected value`.
+    #[tokio::test]
+    async fn json_set_refuses_malformed_json_before_the_wire() {
+        let driver = json_driver_or_skip!();
+        let err = driver
+            .json_set(&tag("json_bad"), &JsonPath::root(), "{\"a\":}")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("offset"), "got {err}");
     }
 
     #[tokio::test]

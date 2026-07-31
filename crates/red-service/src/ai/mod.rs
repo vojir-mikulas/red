@@ -124,7 +124,7 @@ impl AiBackend {
     pub(crate) fn catalog(&self, policy: &AiPolicy) -> Vec<ToolDef> {
         match self {
             AiBackend::Sql { .. } => tool_catalog(policy),
-            AiBackend::Kv(_) => kv_tool_catalog(policy),
+            AiBackend::Kv(d) => kv_tool_catalog(policy, &d.modules()),
             AiBackend::Doc(_) => doc_tool_catalog(policy),
         }
     }
