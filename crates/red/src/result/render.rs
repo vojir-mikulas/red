@@ -1759,6 +1759,15 @@ impl AppState {
                         cx.notify();
                     },
                 )),
+            )
+            .item(
+                ContextMenuItem::new("export-xlsx", "Excel (.xlsx)").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.export_menu = None;
+                        this.export_result(ExportFormat::Xlsx, cx);
+                        cx.notify();
+                    },
+                )),
             );
         div()
             .absolute()

@@ -18,16 +18,16 @@ use red_core::doc::{
 };
 use red_core::kv::{
     ClientInfo, CollectionKind, JsonNodeView, JsonPath, KeyMeta, KvCollectionPage, KvEdit,
-    KvModules, KvScanPage, KvStreamActionReq, KvStreamPage, KvType, KvValue, PendingEntry,
-    RecycledKey, RespValue, ScanBudget, ScanCursor, SlowlogEntry, StreamAction, StreamConsumer,
-    StreamGroup,
+    KvExportFormat, KvExportOptions, KvExportScope, KvModules, KvScanPage, KvStreamActionReq,
+    KvStreamPage, KvType, KvValue, PendingEntry, RecycledKey, RespValue, ScanBudget, ScanCursor,
+    SlowlogEntry, StreamAction, StreamConsumer, StreamGroup,
 };
 use red_core::{
     ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, BatchMode, Column, ColumnMap,
-    ColumnMeta, ColumnStats, ConnectionConfig, CopyMode, EditOp, ExportFormat, FkEdge, FkJoin,
-    ImportFormat, KeySpec, KillMode, LookupRow, ObjectKind, ObjectMeta, PlanStep, QueryOptions,
-    QueryPlan, ResultFilter, RowWindow, SchemaMeta, ServerSession, SessionKey, SortDirection,
-    StatsFlags, TableDetail, TableRef, UpdateState, Value,
+    ColumnMeta, ColumnStats, ConnectionConfig, CopyMode, EditOp, ExportFormat, ExportShortfall,
+    FkEdge, FkJoin, ImportFormat, KeySpec, KillMode, LookupRow, ObjectKind, ObjectMeta, PlanStep,
+    QueryOptions, QueryPlan, ResultFilter, RowWindow, SchemaMeta, ServerSession, SessionKey,
+    SortDirection, StatsFlags, TableDetail, TableRef, UpdateState, Value,
 };
 
 /// Identifies one keep-alive backend session. Minted UI-side at connect start so
@@ -420,6 +420,37 @@ pub enum Command {
         epoch: Epoch,
         key: String,
         path: JsonPath,
+    },
+    /// Stream Redis keys to `path` in `format`, key by key. `scope` picks what to
+    /// walk; `options` carry the TTL / `DEL`-first switches. `id` identifies the
+    /// export so the standard `ExportProgress` / `ExportFinished` /
+    /// `ExportCancelled` events and a `CancelKvExport` route to it -- keys are
+    /// rows, so the toast, the progress and the cancel are the SQL export's,
+    /// not a parallel set. Runs off the dispatch loop under its own
+    /// `Slot::KvExport`, so a second export supersedes the first.
+    KvExport {
+        epoch: Epoch,
+        id: OpId,
+        path: PathBuf,
+        format: KvExportFormat,
+        scope: KvExportScope,
+        options: KvExportOptions,
+    },
+    /// Abort an in-flight `KvExport` by `id` (the toast's Cancel). The partial
+    /// file is removed, like `CancelExport`.
+    CancelKvExport {
+        id: OpId,
+    },
+    /// Restore a DUMP-format export (see `KvExport`) into this database, frame by
+    /// frame through `KvDriver::restore_key`. Its own command rather than an arm
+    /// of `KvImport` because the payloads are raw bytes and `KvImport` carries
+    /// text argv. `replace` overwrites an existing key; without it a collision
+    /// is counted as a failure and the rest still restore. Replied with
+    /// `KvImportDone`, so the import modal reports both kinds identically.
+    KvImportDump {
+        epoch: Epoch,
+        path: PathBuf,
+        replace: bool,
     },
     /// Which Redis Stack modules the session's server loaded, so the UI only
     /// offers module-specific affordances (the JSON type filter, the JSON
@@ -1758,11 +1789,14 @@ pub enum Event {
         rows: usize,
     },
     /// A streamed export finished: `rows` rows written to `path`. `id` selects the
-    /// export's toast.
+    /// export's toast. `shortfall` is `Some` when the file holds less than was
+    /// asked for (a format row limit, keys a format cannot carry), so the toast
+    /// can say so; silent truncation is the one thing an export must never do.
     ExportFinished {
         id: OpId,
         path: String,
         rows: usize,
+        shortfall: Option<ExportShortfall>,
     },
     /// An in-flight export was cancelled (its partial file removed). `id` selects
     /// the export's toast.

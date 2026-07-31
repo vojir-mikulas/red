@@ -39,8 +39,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use red_core::{
     Column, ColumnMeta, ColumnPredicate, ColumnValue, ConnectionConfig, DbKind, EditOp,
-    ExportFormat, FkEdge, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError,
-    Result, ResultPage, RowEditCaps, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
+    ExportFormat, ExportOutcome, FkEdge, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan,
+    RedError, Result, ResultPage, RowEditCaps, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use std::borrow::Cow;
 
@@ -1676,16 +1676,15 @@ impl DatabaseDriver for ClickhouseDriver {
         format: ExportFormat,
         cancel: Arc<AtomicBool>,
         progress: UnboundedSender<u64>,
-    ) -> Result<u64> {
+    ) -> Result<ExportOutcome> {
         let qid = new_query_id();
         let base = format!("SELECT * FROM ({}) AS _red", strip_trailing(sql));
         let (columns, types, mut resp, mut buf) = self.open_stream(&base, &qid).await?;
         let names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
         let file = File::create(path).map_err(driver_err)?;
-        let table = crate::format::sql_table_name(path);
         let mut writer =
-            ExportWriter::begin(BufWriter::new(file), format, names, table).map_err(driver_err)?;
+            ExportWriter::begin(BufWriter::new(file), format, names, path).map_err(driver_err)?;
         let mut throttle = ProgressThrottle::new(progress);
 
         // Bail on cancel: drop the writer, remove the partial file, report interruption.

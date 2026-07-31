@@ -14,8 +14,8 @@
 use std::time::Duration;
 
 use red_core::{
-    CmpOp, Column, ColumnPredicate, ColumnValue, EditOp, ExportFormat, KeySpec, ObjectKind,
-    QueryOptions, RedError, TableRef, Value,
+    CmpOp, Column, ColumnPredicate, ColumnValue, EditOp, ExportFormat, ExportOutcome, KeySpec,
+    ObjectKind, QueryOptions, RedError, TableRef, Value,
 };
 
 use crate::{AbortSignal, DEFAULT_DISPLAY_CELL_CAP, DatabaseDriver, PageCap};
@@ -582,10 +582,12 @@ pub(crate) async fn column_stats_summary(
     );
 }
 
-/// `export` streams to CSV and JSON without materializing the result: a field
-/// containing a comma is quoted, and a SQL NULL becomes JSON `null`. `select_sql`
-/// must yield two columns `id, name` = `(1, 'a,b'), (2, NULL)` ordered by `id`.
-/// `tag` makes the temp file names unique across concurrent callers.
+/// `export` streams to CSV, JSON and XLSX without materializing the result: a
+/// field containing a comma is quoted, a SQL NULL becomes JSON `null`, and the
+/// workbook is a real ZIP whose sheet types cells off the value, not the text.
+/// `select_sql` must yield two columns `id, name` = `(1, 'a,b'), (2, NULL)`
+/// ordered by `id`. `tag` makes the temp file names unique across concurrent
+/// callers.
 pub(crate) async fn exports_csv_and_json(driver: &dyn DatabaseDriver, select_sql: &str, tag: &str) {
     let dir = std::env::temp_dir();
     let csv_path = dir.join(format!("red_conf_{tag}.csv"));
@@ -606,7 +608,11 @@ pub(crate) async fn exports_csv_and_json(driver: &dyn DatabaseDriver, select_sql
         )
         .await
         .unwrap();
-    assert_eq!(rows, 2, "two data rows written");
+    assert_eq!(
+        rows,
+        ExportOutcome::complete(2),
+        "two data rows, nothing dropped"
+    );
     let csv = std::fs::read_to_string(&csv_path).unwrap();
     assert!(csv.starts_with("id,name\n"), "header row first: {csv}");
     assert!(csv.contains("\"a,b\""), "comma field is quoted: {csv}");
@@ -627,8 +633,34 @@ pub(crate) async fn exports_csv_and_json(driver: &dyn DatabaseDriver, select_sql
         "NULL becomes json null: {json}"
     );
 
+    // XLSX rides the same writer, so every driver produces the same workbook.
+    let xlsx_path = dir.join(format!("red_conf_{tag}.xlsx"));
+    let rows = driver
+        .export(
+            select_sql,
+            &xlsx_path,
+            ExportFormat::Xlsx,
+            no_cancel(),
+            drain(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        rows,
+        ExportOutcome::complete(2),
+        "two data rows in the sheet"
+    );
+    let book = std::fs::read(&xlsx_path).unwrap();
+    assert_eq!(&book[..2], b"PK", "a workbook is a ZIP");
+    // The sheet part is stored uncompressed, so its XML is findable verbatim.
+    let text = String::from_utf8_lossy(&book);
+    assert!(text.contains("<worksheet"), "the sheet part is present");
+    assert!(text.contains("<v>1</v>"), "an integer is a numeric cell");
+    assert!(text.contains("a,b"), "a comma needs no quoting in XML");
+
     std::fs::remove_file(&csv_path).ok();
     std::fs::remove_file(&json_path).ok();
+    std::fs::remove_file(&xlsx_path).ok();
 }
 
 /// The contains-filter ([`red_core::ResultFilter::Contains`]) narrows a result to

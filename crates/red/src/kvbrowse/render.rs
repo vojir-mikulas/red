@@ -970,6 +970,11 @@ impl AppState {
                     .disabled(!writable)
                     .on_click(cx.listener(move |this, _, _, cx| this.kv_open_import(session, cx))),
             )
+            .item(
+                // Not gated on `writable`: an export only reads.
+                ContextMenuItem::new("kv-act-export", "Export keys…")
+                    .on_click(cx.listener(move |this, _, _, cx| this.kv_open_export(session, cx))),
+            )
             .separator()
             .item(
                 ContextMenuItem::new("kv-act-expand", "Expand all")
@@ -1084,7 +1089,12 @@ impl AppState {
         let theme = cx.theme().clone();
         let view = cx.entity().downgrade();
 
-        let count = imp.commands.len();
+        let count = imp.payload.as_ref().map(ImportPayload::len).unwrap_or(0);
+        let unit = imp
+            .payload
+            .as_ref()
+            .map(ImportPayload::unit)
+            .unwrap_or("command");
         let can_import = count > 0 && !imp.running;
 
         let choose_view = view.clone();
@@ -1142,8 +1152,9 @@ impl AppState {
                     .text_color(theme.text)
                     .child(crate::i18n::tr!(
                         "kv.commands_ready",
-                        "{count} command(s) ready to run",
-                        count = count
+                        "{count} {unit}(s) ready to run",
+                        count = count,
+                        unit = unit,
                     )),
             )
         } else {
@@ -1154,8 +1165,9 @@ impl AppState {
             .text_size(theme.scale(11.))
             .text_color(theme.text_faint)
             .child(
-                "A text file of Redis commands, one per line (e.g. SET user:1 alice). \
-                 Blank lines and lines starting with # are ignored. Commands run in order.",
+                "A text file of Redis commands, one per line (e.g. SET user:1 alice), or a \
+                 .rdbdump file RED exported. Blank lines and lines starting with # are \
+                 ignored; commands run in order.",
             );
 
         // The destructive pre-scan's findings: the file runs end to end on one
@@ -1246,6 +1258,184 @@ impl AppState {
                 .on_close(move |_, cx| {
                     close_view
                         .update(cx, |this, cx| this.kv_cancel_import(session, cx))
+                        .ok();
+                })
+                .footer(footer)
+                .child(body)
+                .into_any_element(),
+        )
+    }
+
+    /// The "Export keys" modal: scope, format, options, then a save dialog.
+    ///
+    /// The format's caveat is on the dialog rather than in a tooltip: DUMP is
+    /// byte-exact but not cross-version, and finding that out from a `RESTORE`
+    /// error on another server is finding it out too late.
+    pub(crate) fn render_kv_export_modal(
+        &self,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        use crate::connect::labeled_field;
+        use crate::kvbrowse::kvexport::{KV_EXPORT_FORMATS, KvExportSwitch};
+
+        let Phase::Connected(active) = &self.phase else {
+            return None;
+        };
+        let session = active.session;
+        let export = active.kv_view.as_ref()?.export.as_ref()?;
+        let theme = cx.theme().clone();
+        let view = cx.entity().downgrade();
+
+        // Scope: one row per resolved scope, so what the label counts is what
+        // the export writes.
+        let scope_view = view.clone();
+        let scope_row = labeled_field("Scope", &theme).child(
+            export
+                .scopes
+                .iter()
+                .fold(Segmented::new("kv-export-scope"), |seg, (label, _)| {
+                    seg.segment(label.clone())
+                })
+                .selected(export.scope_ix)
+                .on_select(move |ix, _, cx| {
+                    scope_view
+                        .update(cx, |this, cx| this.kv_set_export_scope(session, ix, cx))
+                        .ok();
+                }),
+        );
+
+        let format_view = view.clone();
+        let format_ix = KV_EXPORT_FORMATS
+            .iter()
+            .position(|(f, _, _)| *f == export.format)
+            .unwrap_or(0);
+        let format_row = labeled_field("Format", &theme).child(
+            KV_EXPORT_FORMATS
+                .iter()
+                .fold(Segmented::new("kv-export-format"), |seg, (_, label, _)| {
+                    seg.segment(*label)
+                })
+                .selected(format_ix)
+                .on_select(move |ix, _, cx| {
+                    let Some((format, _, _)) = KV_EXPORT_FORMATS.get(ix) else {
+                        return;
+                    };
+                    let format = *format;
+                    format_view
+                        .update(cx, |this, cx| {
+                            this.kv_set_export_format(session, format, cx)
+                        })
+                        .ok();
+                }),
+        );
+        let format_hint = div()
+            .text_size(theme.scale(11.))
+            .text_color(if export.format == KvExportFormat::Dump {
+                theme.yellow
+            } else {
+                theme.text_faint
+            })
+            .child(
+                KV_EXPORT_FORMATS
+                    .iter()
+                    .find(|(f, _, _)| *f == export.format)
+                    .map(|(_, _, hint)| *hint)
+                    .unwrap_or_default(),
+            );
+
+        // Options apply to the Commands format only; the other two carry the
+        // expiry in their own shape and have nothing to DEL.
+        let commands = export.format == KvExportFormat::Commands;
+        let (ttl_view, del_view) = (view.clone(), view.clone());
+        let options = commands.then(|| {
+            div()
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(
+                    Checkbox::new("kv-export-ttls", export.options.ttls)
+                        .label("Include expiry times (absolute PEXPIREAT)")
+                        .on_change(move |_, _, cx| {
+                            ttl_view
+                                .update(cx, |this, cx| {
+                                    this.kv_toggle_export_option(session, KvExportSwitch::Ttls, cx)
+                                })
+                                .ok();
+                        }),
+                )
+                .child(
+                    Checkbox::new("kv-export-del", export.options.del_first)
+                        .label("DEL each key before writing it")
+                        .on_change(move |_, _, cx| {
+                            del_view
+                                .update(cx, |this, cx| {
+                                    this.kv_toggle_export_option(
+                                        session,
+                                        KvExportSwitch::DelFirst,
+                                        cx,
+                                    )
+                                })
+                                .ok();
+                        }),
+                )
+                .when(export.options.del_first, |d| {
+                    d.child(
+                        div()
+                            .text_size(theme.scale(11.))
+                            .text_color(theme.red)
+                            .child(
+                                "Importing this file will DELETE those keys on whichever \
+                                 server it is imported into.",
+                            ),
+                    )
+                })
+        });
+
+        let (save_view, cancel_view, close_view) = (view.clone(), view.clone(), view.clone());
+        let footer = div()
+            .flex()
+            .flex_1()
+            .justify_end()
+            .gap_2()
+            .child(
+                Button::new("kv-export-cancel", "Cancel")
+                    .variant(ButtonVariant::Secondary)
+                    .size(ButtonSize::Sm)
+                    .on_click(move |_, _, cx| {
+                        cancel_view
+                            .update(cx, |this, cx| this.kv_close_export(session, cx))
+                            .ok();
+                    }),
+            )
+            .child(
+                Button::new("kv-export-save", "Choose file…")
+                    .variant(ButtonVariant::Primary)
+                    .size(ButtonSize::Sm)
+                    .disabled(export.running || export.scopes.is_empty())
+                    .on_click(move |_, _, cx| {
+                        save_view
+                            .update(cx, |this, cx| this.kv_choose_export_path(session, cx))
+                            .ok();
+                    }),
+            );
+
+        let body = div()
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(scope_row)
+            .child(format_row)
+            .child(format_hint)
+            .children(options);
+
+        Some(
+            Modal::new("kv-export")
+                .title(crate::i18n::tr!("kv.export_keys", "Export keys"))
+                .width(px(520.))
+                .focus_handle(self.modal_focus.clone())
+                .on_close(move |_, cx| {
+                    close_view
+                        .update(cx, |this, cx| this.kv_close_export(session, cx))
                         .ok();
                 })
                 .footer(footer)

@@ -12,9 +12,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use async_trait::async_trait;
 use red_core::{
-    Column, ColumnMeta, ColumnPredicate, ColumnValue, DbKind, EditOp, ExportFormat, FkEdge, FkJoin,
-    ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError,
-    Result, ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
+    Column, ColumnMeta, ColumnPredicate, ColumnValue, DbKind, EditOp, ExportFormat, ExportOutcome,
+    FkEdge, FkJoin, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta, QueryOptions,
+    QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use rusqlite::types::ValueRef;
 use rusqlite::{Connection, ErrorCode, OpenFlags};
@@ -790,7 +790,7 @@ impl DatabaseDriver for SqliteDriver {
         format: ExportFormat,
         cancel: Arc<AtomicBool>,
         progress: UnboundedSender<u64>,
-    ) -> Result<u64> {
+    ) -> Result<ExportOutcome> {
         let db_path = self.path.clone();
         let read_only = self.read_only;
         let out_path = path.to_path_buf();
@@ -941,7 +941,7 @@ fn export_blocking(
     format: ExportFormat,
     cancel: &AtomicBool,
     progress: UnboundedSender<u64>,
-) -> Result<u64> {
+) -> Result<ExportOutcome> {
     let conn = SqliteDriver::open(path, read_only)?;
     let mut stmt = conn.prepare(sql).map_err(driver_err)?;
     let column_count = stmt.column_count();
@@ -954,8 +954,7 @@ fn export_blocking(
     let file = File::create(out_path).map_err(driver_err)?;
     let out = BufWriter::new(file);
     let mut rows_iter = stmt.query([]).map_err(driver_err)?;
-    let table = crate::format::sql_table_name(out_path);
-    let mut writer = ExportWriter::begin(out, format, names, table).map_err(driver_err)?;
+    let mut writer = ExportWriter::begin(out, format, names, out_path).map_err(driver_err)?;
     let mut throttle = ProgressThrottle::new(progress);
 
     // Bail on cancel: drop the writer, remove the partial file, and report
@@ -2064,7 +2063,7 @@ mod tests {
             .export(&counting_sql(5_000), &out, ExportFormat::Csv, cancel, tx)
             .await
             .unwrap();
-        assert_eq!(rows, 5_000);
+        assert_eq!(rows, ExportOutcome::complete(5_000));
         let mut updates = Vec::new();
         while let Ok(n) = rx.try_recv() {
             updates.push(n);

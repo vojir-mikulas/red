@@ -2223,6 +2223,7 @@ impl AppState {
             ExportFormat::Json => "red-export.json",
             ExportFormat::Html => "red-report.html",
             ExportFormat::Sql => "red-export.sql",
+            ExportFormat::Xlsx => "red-export.xlsx",
         };
         let dir = dirs::download_dir()
             .or_else(dirs::home_dir)
@@ -2321,22 +2322,30 @@ impl AppState {
         id: OpId,
         path: String,
         rows: usize,
+        shortfall: Option<red_core::ExportShortfall>,
         cx: &mut Context<Self>,
     ) {
         if let Some(nid) = self.export_notification_id(id) {
             self.dismiss(nid, cx);
         }
+        // An export that holds less than was asked for says so on the toast, and
+        // says it as a warning: a success toast over a truncated file is the one
+        // outcome a user must never be able to miss.
+        let variant = match &shortfall {
+            None => ToastVariant::Success,
+            Some(_) => ToastVariant::Warning,
+        };
         self.push_notification(
             Notification {
                 id: 0,
-                variant: ToastVariant::Success,
+                variant,
                 message: crate::i18n::tr!(
                     "notify.exported_rows",
                     "Exported {rows} row(s) to {path}",
                     rows = rows,
                     path = path,
                 ),
-                detail: None,
+                detail: shortfall.as_ref().map(|s| s.note().into()),
                 detail_label: None,
                 auto_dismiss: Some(TOAST_AUTO_DISMISS),
                 export: None,

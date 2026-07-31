@@ -7,9 +7,15 @@ use std::time::Duration;
 
 use crate::Value;
 
+mod export;
 mod json;
 mod modules;
 
+pub use export::{
+    KV_DUMP_MAGIC, KV_EXPORT_CHUNK, KvDumpEntry, KvExportFormat, KvExportOptions, KvExportScope,
+    b64_encode, command_line, commands_header, dump_frame, expire_line, is_lossy_text, json_binary,
+    json_string, quote_arg, read_dump_frame,
+};
 pub use json::{
     JSON_INLINE_STR_MAX, JSON_NODE_WINDOW, JSON_WHOLE_DOC_MAX, JsonDoc, JsonFetch, JsonKind,
     JsonNode, JsonNodeView, JsonPath, JsonSeg, JsonSyntaxError, json_fetch_mode,
@@ -841,6 +847,18 @@ pub fn classify_command(argv: &[String]) -> OpClass {
 /// unterminated quote) still returns the tokens parsed so far rather than
 /// failing outright, so the console can report "unterminated quote" as a
 /// normal command error instead of a special UI state.
+///
+/// Inside double quotes, `\xHH`, `\n`, `\r`, `\t`, `\b`, `\a`, `\\` and `\"`
+/// decode the way `redis-cli` writes them, which is what makes a Commands-format
+/// export round-trip: a value carrying a newline or a tab comes back byte for
+/// byte rather than as the two characters that spelled it. Any other escaped
+/// character is still taken literally.
+///
+/// Tokens accumulate as **bytes**, not characters, because `\xHH` names a byte:
+/// the two escapes `\xc3\xa9` have to rejoin into `é` rather than becoming two
+/// replacement characters. A token whose bytes are not valid UTF-8 decodes
+/// lossily, which is the limit the Commands export refuses to cross (it skips
+/// such keys and points at the DUMP format).
 pub fn tokenize_command(line: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut chars = line.chars().peekable();
@@ -851,7 +869,11 @@ pub fn tokenize_command(line: &str) -> Vec<String> {
         if chars.peek().is_none() {
             break;
         }
-        let mut tok = String::new();
+        let mut tok: Vec<u8> = Vec::new();
+        let push = |tok: &mut Vec<u8>, c: char| {
+            let mut buf = [0u8; 4];
+            tok.extend_from_slice(c.encode_utf8(&mut buf).as_bytes());
+        };
         match chars.peek() {
             Some('\'') => {
                 chars.next();
@@ -859,7 +881,7 @@ pub fn tokenize_command(line: &str) -> Vec<String> {
                     if c == '\'' {
                         break;
                     }
-                    tok.push(c);
+                    push(&mut tok, c);
                 }
             }
             Some('"') => {
@@ -867,25 +889,46 @@ pub fn tokenize_command(line: &str) -> Vec<String> {
                 while let Some(c) = chars.next() {
                     match c {
                         '"' => break,
-                        '\\' => {
-                            if let Some(next) = chars.next() {
-                                tok.push(next);
-                            }
-                        }
-                        other => tok.push(other),
+                        '\\' => match chars.next() {
+                            Some('n') => tok.push(b'\n'),
+                            Some('r') => tok.push(b'\r'),
+                            Some('t') => tok.push(b'\t'),
+                            Some('b') => tok.push(0x08),
+                            Some('a') => tok.push(0x07),
+                            Some('x') => match take_hex_byte(&mut chars) {
+                                Some(b) => tok.push(b),
+                                // Not two hex digits: `\x` was literal text.
+                                None => push(&mut tok, 'x'),
+                            },
+                            // `\\` and `\"` land here, as does any other escape:
+                            // the character itself, which is the old behaviour.
+                            Some(other) => push(&mut tok, other),
+                            None => break,
+                        },
+                        other => push(&mut tok, other),
                     }
                 }
             }
             _ => {
                 while matches!(chars.peek(), Some(c) if !c.is_whitespace()) {
                     #[allow(clippy::unwrap_used, reason = "peek() above proved a next char")]
-                    tok.push(chars.next().unwrap());
+                    push(&mut tok, chars.next().unwrap());
                 }
             }
         }
-        out.push(tok);
+        out.push(String::from_utf8_lossy(&tok).into_owned());
     }
     out
+}
+
+/// Consume exactly two hex digits as one byte, leaving the iterator untouched
+/// when they are not both there (so `"\xzz"` stays the literal text it was).
+fn take_hex_byte(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) -> Option<u8> {
+    let mut probe = chars.clone();
+    let hi = probe.next()?.to_digit(16)?;
+    let lo = probe.next()?.to_digit(16)?;
+    *chars = probe;
+    Some((hi * 16 + lo) as u8)
 }
 
 /// One Pub/Sub message delivered to a pattern subscription (`PSUBSCRIBE`).
@@ -1425,6 +1468,38 @@ mod tests {
             tokenize_command("SET foo 'hello world'"),
             vec!["SET", "foo", "hello world"]
         );
+    }
+
+    /// The decoding that makes a Commands-format export round-trip.
+    #[test]
+    fn tokenize_decodes_the_redis_cli_escapes() {
+        assert_eq!(
+            tokenize_command(r#"SET k "a\nb\tc\rd""#),
+            vec!["SET", "k", "a\nb\tc\rd"]
+        );
+        assert_eq!(
+            tokenize_command(r#"SET k "\x41\x42""#),
+            vec!["SET", "k", "AB"]
+        );
+        // A byte escape names a *byte*, so a multi-byte codepoint spelled as two
+        // escapes rejoins rather than becoming two replacement characters.
+        assert_eq!(
+            tokenize_command(r#"SET k "\xc3\xa9""#),
+            vec!["SET", "k", "é"]
+        );
+        assert_eq!(
+            tokenize_command(r#"SET k "\x00""#),
+            vec!["SET", "k", "\u{0}"]
+        );
+        assert_eq!(
+            tokenize_command(r#"SET k "\a\b""#),
+            vec!["SET", "k", "\u{7}\u{8}"]
+        );
+        // `\x` not followed by two hex digits stays the literal text it was.
+        assert_eq!(tokenize_command(r#"SET k "\xzz""#), vec!["SET", "k", "xzz"]);
+        assert_eq!(tokenize_command(r#"SET k "\x4""#), vec!["SET", "k", "x4"]);
+        // Single quotes are still literal: no escape processing at all.
+        assert_eq!(tokenize_command(r"SET k 'a\nb'"), vec!["SET", "k", r"a\nb"]);
     }
 
     #[test]

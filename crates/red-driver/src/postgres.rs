@@ -21,9 +21,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use async_trait::async_trait;
 use futures_util::StreamExt;
 use red_core::{
-    Column, ColumnMeta, ColumnPredicate, ColumnValue, DbKind, EditOp, ExportFormat, FkEdge, FkJoin,
-    ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError,
-    Result, ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
+    Column, ColumnMeta, ColumnPredicate, ColumnValue, DbKind, EditOp, ExportFormat, ExportOutcome,
+    FkEdge, FkJoin, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta, QueryOptions,
+    QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use std::fs::File;
 use std::io::BufWriter;
@@ -1850,7 +1850,7 @@ impl DatabaseDriver for PostgresDriver {
         format: ExportFormat,
         cancel: Arc<AtomicBool>,
         progress: UnboundedSender<u64>,
-    ) -> Result<u64> {
+    ) -> Result<ExportOutcome> {
         let sql = format!("SELECT * FROM ({}) AS _red", strip_trailing(sql));
         // Its own pooled connection, for the reason `open_cursor` documents: an
         // export streams for as long as the table is big, and on the shared client
@@ -1867,8 +1867,7 @@ impl DatabaseDriver for PostgresDriver {
 
         let file = File::create(path).map_err(driver_err)?;
         let out = BufWriter::new(file);
-        let table = crate::format::sql_table_name(path);
-        let mut writer = ExportWriter::begin(out, format, names, table).map_err(driver_err)?;
+        let mut writer = ExportWriter::begin(out, format, names, path).map_err(driver_err)?;
         let mut throttle = ProgressThrottle::new(progress);
 
         // Bail on cancel: drop the writer, remove the partial file, and report

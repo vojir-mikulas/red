@@ -85,8 +85,9 @@ fn export_format(input: &Json) -> Result<(red_core::ExportFormat, &'static str),
         "json" => Ok((red_core::ExportFormat::Json, "json")),
         "sql" => Ok((red_core::ExportFormat::Sql, "sql")),
         "html" => Ok((red_core::ExportFormat::Html, "html")),
+        "xlsx" => Ok((red_core::ExportFormat::Xlsx, "xlsx")),
         other => Err(format!(
-            "export format must be csv/json/sql/html, not `{other}`"
+            "export format must be csv/json/sql/html/xlsx, not `{other}`"
         )),
     }
 }
@@ -132,11 +133,19 @@ pub(in crate::ai) async fn export_result(
         )
         .await
     {
-        Ok(rows) => {
+        Ok(outcome) => {
+            let rows = outcome.rows;
             sink.announce(&path, Some(&format!("Export ({rows} rows)")));
+            // A shortfall is stated, never swallowed: the model must not report a
+            // complete export of a file that holds less than the result.
+            let note = outcome
+                .shortfall
+                .map(|s| format!(" Note: {}.", s.note()))
+                .unwrap_or_default();
             (
                 format!(
-                    "Wrote {rows} row(s) to {}. It is now a card in the chat the user can open.",
+                    "Wrote {rows} row(s) to {}. It is now a card in the chat the user can \
+                     open.{note}",
                     path.display()
                 ),
                 true,

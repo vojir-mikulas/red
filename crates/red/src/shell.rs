@@ -1358,6 +1358,14 @@ impl AppState {
                     }
                 })),
             )
+            .item(
+                // The common case the Actions-menu export is not: one key, to a
+                // file, to send to someone.
+                ContextMenuItem::new("kv-key-export", "Export key…").on_click(cx.listener({
+                    let key = key.clone();
+                    move |this, _, _, cx| this.kv_export_one_key(session, key.clone(), cx)
+                })),
+            )
             .separator()
             .item(
                 ContextMenuItem::new(

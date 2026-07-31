@@ -13,7 +13,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use red_core::{ExportFormat, Value};
+use red_core::{ExportFormat, ExportOutcome, ExportShortfall, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Strip surrounding whitespace and a single trailing `;` so a user statement can
@@ -81,12 +81,22 @@ impl ProgressThrottle {
 /// and the easy-to-drift framing lives in one place.
 pub(crate) struct ExportWriter<W: Write> {
     out: W,
-    format: ExportFormat,
+    /// The per-format framing state. An enum rather than an `ExportFormat` plus
+    /// a bag of optional fields, so "XLSX without a sheet" cannot be built.
+    framing: Framing,
     names: Vec<String>,
-    /// Target table name for [`ExportFormat::Sql`] `INSERT` statements; unused by
-    /// the other formats. Derived from the destination file stem by the driver.
-    table: String,
     written: u64,
+}
+
+/// What a format needs to carry between rows. Most carry nothing; SQL carries
+/// its target table, and XLSX carries the sheet being spooled.
+enum Framing {
+    Csv,
+    Json,
+    Html,
+    /// Target table name for the `INSERT` statements, from the destination stem.
+    Sql(String),
+    Xlsx(crate::xlsx::XlsxSheet),
 }
 
 impl<W: Write> ExportWriter<W> {
@@ -97,28 +107,35 @@ impl<W: Write> ExportWriter<W> {
         mut out: W,
         format: ExportFormat,
         names: Vec<String>,
-        table: String,
+        dest: &Path,
     ) -> io::Result<Self> {
-        match format {
+        let framing = match format {
             ExportFormat::Csv => {
                 writeln!(out, "{}", csv_record(names.iter().map(String::as_str)))?;
+                Framing::Csv
             }
-            ExportFormat::Json => write!(out, "[")?,
+            ExportFormat::Json => {
+                write!(out, "[")?;
+                Framing::Json
+            }
             ExportFormat::Html => {
                 // A streamed grid export carries no model-supplied title; the
                 // generate_report tool renders titled reports via `render_html_report`.
                 write!(out, "{}", html_head(None))?;
                 write!(out, "{}", html_thead(&names))?;
+                Framing::Html
             }
             // The INSERT stream needs no preamble; each row is a standalone
             // statement carrying the table name and column list.
-            ExportFormat::Sql => {}
-        }
+            ExportFormat::Sql => Framing::Sql(sql_table_name(dest)),
+            // Nothing reaches `out` until `finish`: the sheet spools to disk and
+            // the archive is assembled once every entry's size is known.
+            ExportFormat::Xlsx => Framing::Xlsx(crate::xlsx::XlsxSheet::begin(dest, &names)?),
+        };
         Ok(Self {
             out,
-            format,
+            framing,
             names,
-            table,
             written: 0,
         })
     }
@@ -126,8 +143,8 @@ impl<W: Write> ExportWriter<W> {
     /// Write one row (cells positionally aligned with the column names): CSV
     /// escaping for CSV, object framing + comma separation for JSON.
     pub(crate) fn write_row(&mut self, cells: &[Value]) -> io::Result<()> {
-        match self.format {
-            ExportFormat::Csv => {
+        match &mut self.framing {
+            Framing::Csv => {
                 let fields: Vec<String> = cells.iter().map(csv_cell).collect();
                 writeln!(
                     self.out,
@@ -135,7 +152,7 @@ impl<W: Write> ExportWriter<W> {
                     csv_record(fields.iter().map(String::as_str))
                 )?;
             }
-            ExportFormat::Json => {
+            Framing::Json => {
                 if self.written > 0 {
                     write!(self.out, ",")?;
                 }
@@ -150,15 +167,15 @@ impl<W: Write> ExportWriter<W> {
                 }
                 write!(self.out, "}}")?;
             }
-            ExportFormat::Html => {
+            Framing::Html => {
                 write!(self.out, "<tr>")?;
                 for value in cells {
                     write!(self.out, "<td>{}</td>", html_cell(value))?;
                 }
                 writeln!(self.out, "</tr>")?;
             }
-            ExportFormat::Sql => {
-                write!(self.out, "INSERT INTO {} (", sql_ident(&self.table))?;
+            Framing::Sql(table) => {
+                write!(self.out, "INSERT INTO {} (", sql_ident(table))?;
                 for (i, name) in self.names.iter().enumerate() {
                     if i > 0 {
                         write!(self.out, ", ")?;
@@ -174,21 +191,42 @@ impl<W: Write> ExportWriter<W> {
                 }
                 writeln!(self.out, ");")?;
             }
+            Framing::Xlsx(sheet) => {
+                sheet.write_row(cells)?;
+                // A row past Excel's limit is not written, so it is not counted:
+                // the reported total must be what the file actually holds.
+                if sheet.truncated() {
+                    return Ok(());
+                }
+            }
         }
         self.written += 1;
         Ok(())
     }
 
     /// Close the export: JSON gets its trailing `]`, HTML closes the table + a row-
-    /// count footer + the document; CSV needs no footer. Flush, return the count.
-    pub(crate) fn finish(mut self) -> io::Result<u64> {
-        match self.format {
-            ExportFormat::Json => write!(self.out, "\n]\n")?,
-            ExportFormat::Html => write!(self.out, "{}", html_foot(self.written))?,
-            ExportFormat::Csv | ExportFormat::Sql => {}
+    /// count footer + the document; CSV needs no footer. Flush, and report what was
+    /// written -- including a format limit that stopped it short.
+    pub(crate) fn finish(mut self) -> io::Result<ExportOutcome> {
+        let mut shortfall = None;
+        match self.framing {
+            Framing::Json => write!(self.out, "\n]\n")?,
+            Framing::Html => write!(self.out, "{}", html_foot(self.written))?,
+            Framing::Csv | Framing::Sql(_) => {}
+            // The archive is written here, in one pass, now that the sheet's
+            // checksum and length are known.
+            Framing::Xlsx(sheet) => {
+                if sheet.truncated() {
+                    shortfall = Some(ExportShortfall::RowLimit);
+                }
+                sheet.finish(&mut self.out)?;
+            }
         }
         self.out.flush()?;
-        Ok(self.written)
+        Ok(ExportOutcome {
+            rows: self.written,
+            shortfall,
+        })
     }
 
     /// Rows written so far; feeds the progress throttle.
@@ -436,15 +474,15 @@ mod tests {
             &mut buf,
             ExportFormat::Html,
             vec!["name".to_string(), "note".to_string()],
-            String::new(),
+            Path::new("report.html"),
         )
         .unwrap();
         w.write_row(&[Value::Text("<script>".into()), Value::Null])
             .unwrap();
         w.write_row(&[Value::Text("a & b".into()), Value::Integer(7)])
             .unwrap();
-        let rows = w.finish().unwrap();
-        assert_eq!(rows, 2);
+        let outcome = w.finish().unwrap();
+        assert_eq!(outcome, ExportOutcome::complete(2));
 
         let html = String::from_utf8(buf).unwrap();
         assert!(html.starts_with("<!doctype html>"));
@@ -503,14 +541,14 @@ mod tests {
             &mut buf,
             ExportFormat::Sql,
             vec!["id".to_string(), "name".to_string()],
-            "users".to_string(),
+            Path::new("users.sql"),
         )
         .unwrap();
         w.write_row(&[Value::Integer(1), Value::Text("O'Brien".into())])
             .unwrap();
         w.write_row(&[Value::Integer(2), Value::Null]).unwrap();
-        let rows = w.finish().unwrap();
-        assert_eq!(rows, 2);
+        let outcome = w.finish().unwrap();
+        assert_eq!(outcome, ExportOutcome::complete(2));
 
         let sql = String::from_utf8(buf).unwrap();
         assert_eq!(

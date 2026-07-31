@@ -19,8 +19,9 @@ use gpui::{
     UniformListScrollHandle, WeakEntity, Window, div, prelude::*, px, relative,
 };
 use red_core::kv::{
-    JsonNodeView, JsonPath, KeyMeta, KvElement, KvModules, KvType, KvValue, PendingEntry,
-    ScanBudget, ScanCursor, StreamConsumer, StreamEntry, StreamGroup,
+    JsonNodeView, JsonPath, KeyMeta, KvElement, KvExportFormat, KvExportOptions, KvExportScope,
+    KvModules, KvType, KvValue, PendingEntry, ScanBudget, ScanCursor, StreamConsumer, StreamEntry,
+    StreamGroup,
 };
 use red_service::{Command, SessionId};
 
@@ -29,6 +30,7 @@ use crate::panes::{PaneId, PaneLayout};
 mod analysis;
 mod inspector;
 mod jsontree;
+mod kvexport;
 mod render;
 mod tabs;
 use render::render_string_preview;
@@ -706,6 +708,8 @@ pub(crate) struct RedisView {
     /// The "Import keys" modal, when open (see [`AppState::kv_open_import`]).
     /// Connection-level (imports into the current DB), like `annotate`.
     pub(crate) import: Option<ImportState>,
+    /// The "Export keys" modal, when open. Connection-level like `import`.
+    pub(crate) export: Option<KvExportState>,
     /// Focus + highlighted choice for the blank-tab panel chooser, so it's
     /// keyboard-drivable (1–6 / arrows / Enter). One handle is enough: only the
     /// focused half's chooser binds it (see `render_kv_new_tab`).
@@ -741,11 +745,75 @@ pub(crate) enum KeyMenuEdit {
 /// file and its parsed commands, or a parse/read error to show inline. Commands
 /// are tokenized up front so the modal can show a count and the Import button
 /// stays disabled until there's something to run.
+/// The "Export keys" modal's state.
+///
+/// The scopes are stored **resolved**, built from what the browse tab actually
+/// held when the modal opened, rather than as a "which radio is on" flag the
+/// submit path re-derives. A background auto-refresh can change the visible rows
+/// while the modal is up, and a label promising "412 keys" must export the 412
+/// it named.
+pub(crate) struct KvExportState {
+    /// The scopes offered, in menu order, each with the label it shows.
+    pub(crate) scopes: Vec<(String, KvExportScope)>,
+    pub(crate) scope_ix: usize,
+    pub(crate) format: KvExportFormat,
+    pub(crate) options: KvExportOptions,
+    /// True while the export runs, so the modal shows progress instead of a
+    /// second Export click.
+    pub(crate) running: bool,
+}
+
+impl KvExportState {
+    /// The chosen scope, or the first one if the index somehow drifted.
+    pub(crate) fn scope(&self) -> KvExportScope {
+        self.scopes
+            .get(self.scope_ix)
+            .or_else(|| self.scopes.first())
+            .map(|(_, s)| s.clone())
+            .unwrap_or(KvExportScope::Database)
+    }
+}
+
+/// What the chosen import file turned out to be.
+///
+/// Detected from the file itself -- a DUMP export opens with its own magic --
+/// rather than asked of the user as a format radio. Picking the wrong import for
+/// a file is a mistake the format can rule out, and a binary payload fed to the
+/// command tokenizer produces noise rather than an error.
+pub(crate) enum ImportPayload {
+    /// Tokenized command lines, run through `KvDriver::command` in file order.
+    Commands(Vec<Vec<String>>),
+    /// A RED key dump, restored frame by frame through `restore_key`.
+    Dump {
+        path: std::path::PathBuf,
+        /// Frames counted at parse time, so the modal can say how many keys.
+        keys: usize,
+    },
+}
+
+impl ImportPayload {
+    /// How many keys or commands this file will run.
+    pub(crate) fn len(&self) -> usize {
+        match self {
+            ImportPayload::Commands(c) => c.len(),
+            ImportPayload::Dump { keys, .. } => *keys,
+        }
+    }
+
+    /// The noun the modal counts in, which differs between the two.
+    pub(crate) fn unit(&self) -> &'static str {
+        match self {
+            ImportPayload::Commands(_) => "command",
+            ImportPayload::Dump { .. } => "key",
+        }
+    }
+}
+
 pub(crate) struct ImportState {
     /// The chosen file's display path, or `None` before one is picked.
     pub(crate) path: Option<String>,
-    /// The tokenized commands to run (blank/`#`-comment lines dropped).
-    pub(crate) commands: Vec<Vec<String>>,
+    /// What the chosen file holds, once one has been read.
+    pub(crate) payload: Option<ImportPayload>,
     /// The destructive commands found in the file, rendered for the modal's
     /// warning block. The same `classify_command` pre-scan the Batch console
     /// runs: a "seed data" file whose 400th line is a `FLUSHALL` (or a
@@ -1482,6 +1550,7 @@ impl RedisView {
             actions_menu: None,
             auto_menu: None,
             import: None,
+            export: None,
             new_tab_focus: cx.focus_handle(),
             new_tab_sel: 0,
             recent_keys_collapsed: false,
@@ -2166,7 +2235,7 @@ impl AppState {
         {
             view.import = Some(ImportState {
                 path: None,
-                commands: Vec::new(),
+                payload: None,
                 destructive: Vec::new(),
                 error: None,
                 running: false,
@@ -2228,18 +2297,29 @@ impl AppState {
             let parsed = cx
                 .background_executor()
                 .spawn(async move {
-                    std::fs::read_to_string(&path)
-                        .map(|text| {
-                            let commands: Vec<Vec<String>> = text
-                                .lines()
-                                .map(str::trim)
-                                .filter(|l| !l.is_empty() && !l.starts_with('#'))
-                                .map(red_core::kv::tokenize_command)
-                                .filter(|argv| !argv.is_empty())
-                                .collect();
-                            (path.display().to_string(), commands)
-                        })
-                        .map_err(|e| e.to_string())
+                    let bytes = std::fs::read(&path).map_err(|e| e.to_string())?;
+                    let label = path.display().to_string();
+                    // A DUMP export names itself, so the right reader is chosen
+                    // from the file rather than from a radio the user must get
+                    // right.
+                    if bytes.starts_with(red_core::kv::KV_DUMP_MAGIC) {
+                        let mut at = red_core::kv::KV_DUMP_MAGIC.len();
+                        let mut keys = 0;
+                        while let Some((_, next)) = red_core::kv::read_dump_frame(&bytes, at) {
+                            keys += 1;
+                            at = next;
+                        }
+                        return Ok((label, ImportPayload::Dump { path, keys }));
+                    }
+                    let text = String::from_utf8_lossy(&bytes);
+                    let commands: Vec<Vec<String>> = text
+                        .lines()
+                        .map(str::trim)
+                        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+                        .map(red_core::kv::tokenize_command)
+                        .filter(|argv| !argv.is_empty())
+                        .collect();
+                    Ok::<_, String>((label, ImportPayload::Commands(commands)))
                 })
                 .await;
             this.update(cx, |this, cx| {
@@ -2249,29 +2329,33 @@ impl AppState {
                     .and_then(|v| v.import.as_mut())
                 {
                     match parsed {
-                        Ok((path, commands)) => {
-                            imp.error = commands
-                                .is_empty()
-                                .then(|| "No commands found in this file".to_string());
+                        Ok((path, payload)) => {
+                            imp.error = (payload.len() == 0)
+                                .then(|| format!("No {}s found in this file", payload.unit()));
                             imp.path = Some(path);
                             // The same destructive pre-scan the Batch console
                             // runs over identical `tokenize_command` output, so
                             // two files through the same tokenizer can't take
                             // two different safety paths.
-                            imp.destructive = commands
-                                .iter()
-                                .filter(|argv| {
-                                    red_core::kv::classify_command(argv)
-                                        == red_core::kv::OpClass::Destructive
-                                })
-                                .map(|argv| argv.join(" "))
-                                .collect();
-                            imp.commands = commands;
+                            imp.destructive = match &payload {
+                                ImportPayload::Commands(commands) => commands
+                                    .iter()
+                                    .filter(|argv| {
+                                        red_core::kv::classify_command(argv)
+                                            == red_core::kv::OpClass::Destructive
+                                    })
+                                    .map(|argv| argv.join(" "))
+                                    .collect(),
+                                // A dump restores values; it runs no commands the
+                                // classifier could grade, and it never deletes.
+                                ImportPayload::Dump { .. } => Vec::new(),
+                            };
+                            imp.payload = Some(payload);
                         }
                         Err(e) => {
                             imp.error = Some(format!("Couldn't read the file: {e}"));
                             imp.path = None;
-                            imp.commands.clear();
+                            imp.payload = None;
                             imp.destructive.clear();
                         }
                     }
@@ -2299,13 +2383,28 @@ impl AppState {
         let Some(imp) = view.import.as_mut() else {
             return;
         };
-        if imp.running || imp.commands.is_empty() {
+        let Some(payload) = imp.payload.as_ref().filter(|p| p.len() > 0) else {
+            return;
+        };
+        if imp.running {
             return;
         }
+        let command = match payload {
+            ImportPayload::Commands(commands) => Command::KvImport {
+                epoch,
+                commands: commands.clone(),
+            },
+            // `replace` on: the file is a snapshot of these exact keys, so a
+            // restore that refused every key already present would be useless
+            // for the case the format exists to serve (copy A onto B).
+            ImportPayload::Dump { path, .. } => Command::KvImportDump {
+                epoch,
+                path: path.clone(),
+                replace: true,
+            },
+        };
         imp.running = true;
-        let commands = imp.commands.clone();
-        self.service
-            .send_to(session, Command::KvImport { epoch, commands });
+        self.service.send_to(session, command);
         cx.notify();
     }
 

@@ -7,6 +7,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Any query result can now be exported as an Excel workbook. It streams like
+  every other export, so a result too large to hold in memory is still too large
+  to hold in memory, and it stops at Excel's 1,048,576-row limit with the toast
+  saying so rather than quietly dropping the rest. The care is in the cells: a
+  number is a number and a numeric-looking *string* stays a string, so an account
+  number keeps its leading zero and a long id keeps its last digits instead of
+  being rounded off by a spreadsheet. Nulls are empty cells, not the word "NULL",
+  and a stray control character in a text column is escaped rather than producing
+  a file that opens as "unreadable content". Nothing is compressed, so the file
+  is larger than the CSV of the same data. The assistant can write one too.
+- Redis can finally export keys, not just import them. "Export keys…" sits under
+  the browse Actions menu and "Export key…" on any key's right-click, with a
+  choice of scope (the keys shown, everything matching the current filter, or the
+  whole database) and three formats. Commands (`.redis`) is the default and the
+  exact inverse of the import that already shipped - readable, version-agnostic,
+  and re-importable in one click; JSON is for feeding another tool or attaching
+  to a ticket; DUMP (`.rdbdump`) is byte-exact and the only one that carries
+  binary values, with its version caveat on the dialog rather than buried. Every
+  format streams: a million-element set is written as repeated commands and never
+  assembled, and Cancel leaves no partial file. Expiry times are written as
+  absolute deadlines, so importing an hour later does not silently extend every
+  TTL. A value the text formats genuinely cannot carry is skipped and *reported*,
+  pointing you at the format that would carry it, rather than being written
+  mangled - and importing a file RED exported now reconstructs values containing
+  newlines, tabs and other escapes byte for byte. RED recognises a `.rdbdump`
+  file on its own, so there is no import format to pick wrong.
 - RedisJSON documents are now first-class. A `JSON.*` key used to appear in the
   keyspace with an unreadable `ReJSON-RL` type and no value at all; it now reads
   as `json`, filters as its own type in the browse toolbar, and opens in a

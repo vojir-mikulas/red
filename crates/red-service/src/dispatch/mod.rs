@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedSender;
-use red_core::kv::{KvEdit, RecycledKey, RespValue};
+use red_core::kv::{KV_DUMP_MAGIC, KvEdit, RecycledKey, RespValue, read_dump_frame};
 use red_core::{
     BatchMode, Column, ColumnMeta, KeyKind, KeySpec, QueryOptions, RedError, ResultFilter, Value,
     coerce_edit_value,
@@ -24,6 +24,7 @@ use tokio::sync::mpsc::UnboundedReceiver as CmdReceiver;
 use crate::{Command, Envelope, Event, OpId, RunFetch, SessionId, SqlReview};
 
 mod connect;
+mod kvexport;
 mod paging;
 mod schema_cmds;
 mod session;
@@ -2449,6 +2450,191 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
+            Command::KvExport {
+                epoch,
+                id,
+                path,
+                format,
+                scope,
+                options,
+            } => {
+                let Some(sid) = session_id else { continue };
+                let Some((state, driver)) =
+                    require_kv_driver_mut(&mut sessions, session_id, &events)
+                else {
+                    continue;
+                };
+                // Register the cancel flag before the task starts, so a fast
+                // `CancelKvExport` can't race ahead of it (see `Command::Export`).
+                let cancel = Arc::new(AtomicBool::new(false));
+                lock(&state.exports).insert(id, cancel.clone());
+                // Its own slot: a sibling browse scan on the same epoch must not
+                // abort an export halfway through a keyspace.
+                let entry = state.inflight.entry(epoch).or_default();
+                entry.supersede(Slot::KvExport);
+
+                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                {
+                    let events = events.clone();
+                    tokio::spawn(async move {
+                        while let Some(rows) = progress_rx.recv().await {
+                            emit(
+                                &events,
+                                session_id,
+                                Event::ExportProgress {
+                                    id,
+                                    rows: rows as usize,
+                                },
+                            );
+                        }
+                    });
+                }
+                // The header names what the file came from. The session knows
+                // its engine and server; it does not know the connection's
+                // display name, and inventing one here would be a second source
+                // of truth for something the UI already shows.
+                let source = format!(
+                    "Redis {} ({:?})",
+                    driver.server_version(),
+                    driver.topology()
+                );
+                let exports = state.exports.clone();
+                let events = events.clone();
+                // Pin against idle eviction: a whole-database export runs for
+                // minutes with no commands, and an eviction would flip the cancel
+                // flag and toast "cancelled" out of nowhere.
+                let pin = PinGuard::new(state.busy.clone());
+                let _ = sid;
+                tokio::spawn(async move {
+                    let _pin = pin;
+                    let path_str = path.to_string_lossy().into_owned();
+                    let req = kvexport::KvExportRequest {
+                        format,
+                        scope,
+                        options,
+                        source,
+                        taken_at: export_stamp(),
+                    };
+                    let result =
+                        kvexport::run_kv_export(&driver, &path, req, &cancel, progress_tx).await;
+                    lock(&exports).remove(&id);
+                    match result {
+                        Ok(outcome) => emit(
+                            &events,
+                            session_id,
+                            Event::ExportFinished {
+                                id,
+                                path: path_str,
+                                rows: outcome.rows as usize,
+                                shortfall: outcome.shortfall,
+                            },
+                        ),
+                        Err(RedError::Interrupted) => {
+                            emit(&events, session_id, Event::ExportCancelled { id })
+                        }
+                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                    }
+                });
+            }
+
+            Command::CancelKvExport { id } => {
+                let Some(sid) = session_id else { continue };
+                if let Some(state) = sessions.get(&sid)
+                    && let Some(cancel) = lock(&state.exports).get(&id)
+                {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+
+            Command::KvImportDump {
+                epoch,
+                path,
+                replace,
+            } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                if state.read_only {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("this connection is read-only".into()),
+                    );
+                    continue;
+                }
+                let Some(driver) = state.driver.as_kv().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a Redis connection".into()),
+                    );
+                    continue;
+                };
+                // Shares `Slot::KvImport` with the command import: both are "the
+                // import modal is running", and only one can be.
+                let entry = state.inflight.entry(epoch).or_default();
+                let abort = entry.supersede(Slot::KvImport);
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let bytes = match std::fs::read(&path) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            emit(&events, session_id, Event::Error(e.to_string()));
+                            return;
+                        }
+                    };
+                    if !bytes.starts_with(KV_DUMP_MAGIC) {
+                        emit(
+                            &events,
+                            session_id,
+                            Event::Error(
+                                "that file is not a RED key dump; pick the Commands or JSON                                  import for a text export"
+                                    .into(),
+                            ),
+                        );
+                        return;
+                    }
+                    let (mut ok, mut failed) = (0usize, 0usize);
+                    let mut first_error = None;
+                    let mut aborted = false;
+                    let mut at = KV_DUMP_MAGIC.len();
+                    while let Some((entry, next)) = read_dump_frame(&bytes, at) {
+                        if abort.is_aborted() {
+                            aborted = true;
+                            break;
+                        }
+                        at = next;
+                        let ttl = (entry.ttl_ms > 0)
+                            .then(|| std::time::Duration::from_millis(entry.ttl_ms));
+                        match driver
+                            .restore_key(&entry.key, ttl, &entry.payload, replace)
+                            .await
+                        {
+                            Ok(()) => ok += 1,
+                            Err(e) => {
+                                failed += 1;
+                                if first_error.is_none() {
+                                    first_error = Some(format!("{}: {e}", entry.key));
+                                }
+                            }
+                        }
+                    }
+                    emit(
+                        &events,
+                        session_id,
+                        Event::KvImportDone {
+                            epoch,
+                            ok,
+                            failed,
+                            first_error,
+                            aborted,
+                        },
+                    );
+                });
+            }
+
             Command::KvImport { epoch, commands } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get_mut(&id) else {
@@ -4433,13 +4619,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         .await;
                     lock(&exports).remove(&id);
                     match result {
-                        Ok(rows) => emit(
+                        Ok(outcome) => emit(
                             &events,
                             session_id,
                             Event::ExportFinished {
                                 id,
                                 path: path_str,
-                                rows: rows as usize,
+                                rows: outcome.rows as usize,
+                                shortfall: outcome.shortfall,
                             },
                         ),
                         Err(RedError::Interrupted) => {
@@ -5120,6 +5307,35 @@ impl StreamRate {
             None
         }
     }
+}
+
+/// A human-readable UTC stamp for a Redis export's header comment.
+///
+/// Hand-rolled from the Unix epoch rather than pulling in a date crate: the
+/// header wants one legible line, and the civil-date arithmetic for that is a
+/// dozen lines (the same call `decode.rs` makes for its decoders).
+fn export_stamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let (days, rem) = (secs.div_euclid(86_400), secs.rem_euclid(86_400));
+    // Days since the epoch to a civil date (Howard Hinnant's `civil_from_days`).
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    let year = yoe + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02} {:02}:{:02}:{:02} UTC",
+        rem / 3600,
+        (rem % 3600) / 60,
+        rem % 60
+    )
 }
 
 pub(crate) mod jobs;

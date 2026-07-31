@@ -166,6 +166,10 @@ pub(crate) enum Slot {
     /// blocking modal made that rare rather than routine. The `Slot` enum exists
     /// precisely to keep sibling operations from cancelling each other.
     KvImport,
+    /// A running `KvExport` ("Export keys…"). Its own slot for the same reason
+    /// as [`Slot::KvImport`]: a sibling browse scan on the same epoch must not
+    /// abort an export halfway through a keyspace.
+    KvExport,
     /// The latest `KvReadCollectionPage` (the inspector's big-collection
     /// sub-grid). Kept apart from [`Slot::KvValue`] so a sibling value read
     /// (e.g. re-selecting the key) can't abort an in-progress page scan and

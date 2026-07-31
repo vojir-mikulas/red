@@ -14,9 +14,9 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use red_core::{
     BASE_ALIAS, CmpOp, Column, ColumnMeta, ColumnPredicate, ColumnStats, ColumnValue, DbKind,
-    EditOp, ExportFormat, FkEdge, FkJoin, KeySpec, QueryOptions, QueryPlan, RedError, Result,
-    ResultPage, RowEditCaps, RowWindow, SchemaMeta, SortDirection, StatsFlags, TableDetail,
-    TableRef, Value,
+    EditOp, ExportFormat, ExportOutcome, FkEdge, FkJoin, KeySpec, QueryOptions, QueryPlan,
+    RedError, Result, ResultPage, RowEditCaps, RowWindow, SchemaMeta, SortDirection, StatsFlags,
+    TableDetail, TableRef, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -34,6 +34,7 @@ mod plan;
 mod postgres;
 mod redis_kv;
 mod sqlite;
+mod xlsx;
 pub use clickhouse::ClickhouseDriver;
 pub use doc::DocDriver;
 pub use format::html_escape;
@@ -1730,7 +1731,8 @@ pub trait DatabaseDriver: Send + Sync {
     async fn explain(&self, sql: &str, analyze: bool) -> Result<QueryPlan>;
 
     /// Stream `sql`'s result straight to `path` in `format`, row-by-row, never
-    /// materializing the whole result. Returns the number of data rows written.
+    /// materializing the whole result. Returns what was written, including
+    /// whether the format's own limits stopped it short of the result.
     ///
     /// `cancel` is checked per row: when it flips true the export bails early,
     /// removes the partial file, and returns [`RedError::Interrupted`]. `progress`
@@ -1743,7 +1745,7 @@ pub trait DatabaseDriver: Send + Sync {
         format: ExportFormat,
         cancel: Arc<AtomicBool>,
         progress: UnboundedSender<u64>,
-    ) -> Result<u64>;
+    ) -> Result<ExportOutcome>;
 
     /// Whether this engine can hold a multi-statement transaction open across
     /// several calls and then commit or roll it back.

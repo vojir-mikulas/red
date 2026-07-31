@@ -2098,7 +2098,12 @@ impl AppState {
                 }
             }
             Event::ExportProgress { id, rows } => self.on_export_progress(id, rows, cx),
-            Event::ExportFinished { id, path, rows } => self.on_export_finished(id, path, rows, cx),
+            Event::ExportFinished {
+                id,
+                path,
+                rows,
+                shortfall,
+            } => self.on_export_finished(id, path, rows, shortfall, cx),
             Event::ExportCancelled { id } => self.on_export_cancelled(id, cx),
 
             // --- data import (Track: data import) ---

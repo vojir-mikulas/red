@@ -302,8 +302,8 @@ pub(in crate::ai) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                 "sql": { "type": "string", "description": "A single SELECT/WITH query whose full result is written." },
                 "format": {
                     "type": "string",
-                    "enum": ["csv", "json", "sql", "html"],
-                    "description": "Output format (default \"csv\").",
+                    "enum": ["csv", "json", "sql", "html", "xlsx"],
+                    "description": "Output format (default \"csv\"). \"xlsx\" is an Excel workbook, for a user who will open it in a spreadsheet.",
                 },
                 "name": { "type": "string", "description": "A short name for the file, e.g. \"monthly-revenue\"." },
             }),

@@ -28,9 +28,9 @@ use mysql_async::{
     Column as MyColumn, Error as MyError, Opts, OptsBuilder, Pool, Row, Value as MyValue,
 };
 use red_core::{
-    Column, ColumnMeta, ColumnPredicate, ColumnValue, DbKind, EditOp, ExportFormat, FkEdge, FkJoin,
-    ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta, QueryOptions, QueryPlan, RedError,
-    Result, ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
+    Column, ColumnMeta, ColumnPredicate, ColumnValue, DbKind, EditOp, ExportFormat, ExportOutcome,
+    FkEdge, FkJoin, ForeignKeyMeta, IndexMeta, KeySpec, ObjectKind, ObjectMeta, QueryOptions,
+    QueryPlan, RedError, Result, ResultPage, RowWindow, SchemaMeta, TableDetail, TableRef, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::{Mutex, mpsc};
@@ -1448,7 +1448,7 @@ impl DatabaseDriver for MysqlDriver {
         format: ExportFormat,
         cancel: Arc<AtomicBool>,
         progress: UnboundedSender<u64>,
-    ) -> Result<u64> {
+    ) -> Result<ExportOutcome> {
         let sql = format!("SELECT * FROM ({}) AS _red", strip_trailing(sql));
         let mut conn = self.conn().await?;
         let stmt = conn.prep(&sql).await.map_err(map_my_err)?;
@@ -1461,8 +1461,7 @@ impl DatabaseDriver for MysqlDriver {
 
         let file = File::create(path).map_err(driver_err)?;
         let out = BufWriter::new(file);
-        let table = crate::format::sql_table_name(path);
-        let mut writer = ExportWriter::begin(out, format, names, table).map_err(driver_err)?;
+        let mut writer = ExportWriter::begin(out, format, names, path).map_err(driver_err)?;
         let mut throttle = ProgressThrottle::new(progress);
 
         // Bail on cancel: drop the writer, remove the partial file, and report

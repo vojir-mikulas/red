@@ -2800,6 +2800,62 @@ pub enum ExportFormat {
     /// row. The table name is derived from the destination file stem; identifiers
     /// and string literals use portable ANSI quoting (double / single quotes).
     Sql,
+    /// An Excel workbook (`.xlsx`): one sheet, inline strings, no styles. Written
+    /// as a ZIP of uncompressed parts with the sheet spooled to disk, so a large
+    /// result never lands in memory. The file is bigger than the CSV of the same
+    /// data (nothing is compressed) and stops at Excel's 1,048,576-row limit,
+    /// reporting the truncation rather than dropping rows silently.
+    Xlsx,
+}
+
+/// What a finished export actually wrote.
+///
+/// Its reason for existing is [`shortfall`](Self::shortfall): an export that
+/// could not hold the whole result must say so. Returning a bare row count would
+/// make truncation indistinguishable from a result that happened to be that
+/// size, which is the one behaviour an export must never have.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExportOutcome {
+    /// Data rows (or keys) actually written to the file.
+    pub rows: u64,
+    /// `None` when the file holds everything that was asked for.
+    pub shortfall: Option<ExportShortfall>,
+}
+
+impl ExportOutcome {
+    /// A complete export of `rows` rows.
+    pub fn complete(rows: u64) -> ExportOutcome {
+        ExportOutcome {
+            rows,
+            shortfall: None,
+        }
+    }
+}
+
+/// Why an export holds less than was asked of it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ExportShortfall {
+    /// The format's own limit stopped it short: XLSX's 1,048,576-row sheet. The
+    /// source has more rows than the file holds.
+    RowLimit,
+    /// Keys the chosen format cannot represent were left out (a Redis Commands
+    /// export of a binary value, which only the DUMP format round-trips).
+    SkippedKeys(u64),
+}
+
+impl ExportShortfall {
+    /// The sentence the export toast appends, so every surface words the same
+    /// shortfall identically.
+    pub fn note(&self) -> String {
+        match self {
+            ExportShortfall::RowLimit => {
+                "stopped at Excel's sheet limit; the result has more rows".to_string()
+            }
+            ExportShortfall::SkippedKeys(n) => format!(
+                "{n} key(s) skipped: their values are binary and this format cannot carry them.                  Use the DUMP format for those."
+            ),
+        }
+    }
 }
 
 /// A streamed-import source format, the read-side mirror of [`ExportFormat`]. The
