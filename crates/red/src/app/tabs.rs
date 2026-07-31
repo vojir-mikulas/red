@@ -49,9 +49,9 @@ impl AppState {
 
     /// Drop the drop indicator (cursor left the tab strip mid-drag). Notifies
     /// only when something was showing.
-    pub(crate) fn clear_tab_drop_target(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn clear_tab_drop_target(&mut self, pane: PaneId, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase
-            && active.clear_drop_gap()
+            && active.clear_drop_gap(pane)
         {
             cx.notify();
         }

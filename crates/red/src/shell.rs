@@ -854,7 +854,7 @@ impl AppState {
             },
             move |this, from, cx| this.kv_drop_tab(session, from, pane, cx),
             move |this, slot, cx| this.kv_set_tab_drop_target(session, pane, slot, cx),
-            move |this, cx| this.kv_clear_tab_drop_target(session, cx),
+            move |this, cx| this.kv_clear_tab_drop_target(session, pane, cx),
         )
         .tabs(tabs)
         .gap(v.layout.gap_in(pane))

@@ -64,6 +64,7 @@ pub(crate) fn cmd_mcp(args: McpArgs) -> u8 {
             statement_timeout_ms: settings.ai.limits.statement_timeout_ms,
             max_result_bytes: settings.ai.limits.max_result_bytes,
             max_tool_calls: settings.ai.limits.max_tool_calls,
+            max_output_tokens: settings.ai.limits.max_output_tokens,
         },
     }));
     if let Err(code) = connect(&svc, &mut events, config) {

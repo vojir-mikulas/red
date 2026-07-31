@@ -1014,6 +1014,8 @@ pub struct AiLimitsSettings {
     pub max_result_bytes: usize,
     /// Cap on tool calls per conversation, bounding a runaway loop. `0` disables.
     pub max_tool_calls: usize,
+    /// Ceiling on the tokens one model reply may generate.
+    pub max_output_tokens: u32,
 }
 
 impl Default for AiLimitsSettings {
@@ -1026,6 +1028,7 @@ impl Default for AiLimitsSettings {
             statement_timeout_ms: d.statement_timeout_ms,
             max_result_bytes: d.max_result_bytes,
             max_tool_calls: d.max_tool_calls,
+            max_output_tokens: d.max_output_tokens,
         }
     }
 }

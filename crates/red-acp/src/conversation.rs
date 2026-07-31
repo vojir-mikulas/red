@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 
 use agent_client_protocol::schema::{
     AuthenticateRequest, CancelNotification, ClientCapabilities, ContentBlock,
-    FileSystemCapabilities, HttpHeader, Implementation, InitializeRequest, McpServer,
+    FileSystemCapabilities, HttpHeader, ImageContent, Implementation, InitializeRequest, McpServer,
     McpServerHttp, NewSessionRequest, PermissionOption, PermissionOptionId, PermissionOptionKind,
     PlanEntry, PlanEntryStatus, PromptRequest, ProtocolVersion, RequestPermissionOutcome,
     RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
@@ -29,7 +29,7 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::types::{
     AcpCommand, AcpConfig, AcpConfigCategory, AcpConfigChoice, AcpConfigOption, AcpDelta, AcpError,
-    AcpPermission, AcpStop, AcpTurnResult, AcpUsage, McpGrounding,
+    AcpPermission, AcpPromptBlock, AcpStop, AcpTurnResult, AcpUsage, McpGrounding,
 };
 
 /// The active turn's delta sink, swapped in before each prompt and cleared after.
@@ -50,7 +50,15 @@ type UsageCell = Arc<Mutex<AcpUsage>>;
 /// A reply channel for one completed (or failed) turn.
 type TurnReply = oneshot::Sender<Result<AcpTurnResult, AcpError>>;
 /// A take-once readiness signal fired when the session is up (or fails to start).
-type ReadyCell = Arc<Mutex<Option<oneshot::Sender<Result<(), AcpError>>>>>;
+/// Carries what the agent said it can take in a prompt, so the caller knows
+/// before it sends whether an image will land or has to degrade to a note.
+type ReadyCell = Arc<Mutex<Option<oneshot::Sender<Result<AcpPromptCaps, AcpError>>>>>;
+
+/// What an agent accepts in a prompt beyond text (which every agent must take).
+#[derive(Debug, Clone, Copy, Default)]
+struct AcpPromptCaps {
+    images: bool,
+}
 
 /// A reply channel for a `session/set_config_option` request: the refreshed option
 /// set on success.
@@ -59,7 +67,7 @@ type ConfigReply = oneshot::Sender<Result<Vec<AcpConfigOption>, AcpError>>;
 /// A command sent into the live connection.
 enum Cmd {
     Prompt {
-        text: String,
+        blocks: Vec<AcpPromptBlock>,
         sink: mpsc::UnboundedSender<AcpDelta>,
         done: TurnReply,
     },
@@ -79,6 +87,10 @@ enum Cmd {
 #[derive(Clone)]
 pub struct AcpConversation {
     cmd_tx: mpsc::UnboundedSender<Cmd>,
+    /// Whether this agent advertised image support at `initialize`. Sending an
+    /// image to an agent that did not would fail the turn, so the caller checks
+    /// and degrades instead.
+    supports_images: bool,
 }
 
 impl AcpConversation {
@@ -90,22 +102,32 @@ impl AcpConversation {
         let (ready_tx, ready_rx) = oneshot::channel();
         tokio::spawn(run_connection(config, cmd_rx, ready_tx));
         match ready_rx.await {
-            Ok(result) => result.map(|()| Self { cmd_tx }),
+            Ok(result) => result.map(|caps| Self {
+                cmd_tx,
+                supports_images: caps.images,
+            }),
             // The task ended before signalling readiness; treat as a spawn failure.
             Err(_) => Err(AcpError::Closed),
         }
+    }
+
+    /// Whether this agent takes [`AcpPromptBlock::Image`] blocks. A caller with an
+    /// image and a `false` here degrades to a text note rather than sending
+    /// something the agent will reject.
+    pub fn supports_images(&self) -> bool {
+        self.supports_images
     }
 
     /// Send one prompt. Streamed deltas arrive on `sink`; the returned receiver
     /// resolves with the turn's result (usage + stop reason) or an error.
     pub fn prompt(
         &self,
-        text: String,
+        blocks: Vec<AcpPromptBlock>,
         sink: mpsc::UnboundedSender<AcpDelta>,
     ) -> oneshot::Receiver<Result<AcpTurnResult, AcpError>> {
         let (done, done_rx) = oneshot::channel();
         if let Err(mpsc::error::SendError(Cmd::Prompt { done, .. })) =
-            self.cmd_tx.send(Cmd::Prompt { text, sink, done })
+            self.cmd_tx.send(Cmd::Prompt { blocks, sink, done })
         {
             let _ = done.send(Err(AcpError::Closed));
         }
@@ -157,7 +179,7 @@ impl AcpConversation {
 async fn run_connection(
     config: AcpConfig,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
-    ready_tx: oneshot::Sender<Result<(), AcpError>>,
+    ready_tx: oneshot::Sender<Result<AcpPromptCaps, AcpError>>,
 ) {
     let agent = match AcpAgent::from_str(&config.command) {
         Ok(agent) => agent,
@@ -222,8 +244,8 @@ async fn run_connection(
         )
         .connect_with(agent, move |conn: ConnectionTo<Agent>| async move {
             let session_id = match start_session(&conn, &cwd, mcp.as_ref()).await {
-                Ok((id, options)) => {
-                    signal(&ready_closure, Ok(()));
+                Ok((id, options, caps)) => {
+                    signal(&ready_closure, Ok(caps));
                     // Ship the session's initial config selectors (model / reasoning),
                     // advertised in the `session/new` response.
                     if let Some(tx) = &config_initial
@@ -262,7 +284,7 @@ async fn start_session(
     conn: &ConnectionTo<Agent>,
     cwd: &std::path::Path,
     mcp: Option<&McpGrounding>,
-) -> Result<(SessionId, Vec<AcpConfigOption>), agent_client_protocol::Error> {
+) -> Result<(SessionId, Vec<AcpConfigOption>, AcpPromptCaps), agent_client_protocol::Error> {
     let init = conn
         .send_request(
             InitializeRequest::new(ProtocolVersion::V1)
@@ -299,7 +321,22 @@ async fn start_session(
         config_options = options.len(),
         "acp: session opened (initial config options)"
     );
-    Ok((session.session_id, options))
+    // ACP obliges every agent to take text; anything else is opt-in, and the
+    // agent says so once, here.
+    let caps = AcpPromptCaps {
+        images: init.agent_capabilities.prompt_capabilities.image,
+    };
+    Ok((session.session_id, options, caps))
+}
+
+/// One RED prompt block as ACP's own content block.
+fn to_wire(block: AcpPromptBlock) -> ContentBlock {
+    match block {
+        AcpPromptBlock::Text(text) => ContentBlock::Text(TextContent::new(text)),
+        AcpPromptBlock::Image { data, media_type } => {
+            ContentBlock::Image(ImageContent::new(data, media_type))
+        }
+    }
 }
 
 /// A static name for a session update variant, for diagnostic logging.
@@ -328,8 +365,8 @@ async fn run_turns(
     usage_cell: &UsageCell,
 ) {
     while let Some(cmd) = cmd_rx.recv().await {
-        let (text, sink, done) = match cmd {
-            Cmd::Prompt { text, sink, done } => (text, sink, done),
+        let (blocks, sink, done) = match cmd {
+            Cmd::Prompt { blocks, sink, done } => (blocks, sink, done),
             // A Cancel with no active turn; nothing to do.
             Cmd::Cancel => continue,
             // Config changes (model / reasoning) happen between turns: issue the
@@ -367,7 +404,7 @@ async fn run_turns(
         let prompt = conn
             .send_request(PromptRequest::new(
                 session_id.clone(),
-                vec![ContentBlock::Text(TextContent::new(text))],
+                blocks.into_iter().map(to_wire).collect::<Vec<_>>(),
             ))
             .block_task();
         tokio::pin!(prompt);
@@ -841,7 +878,7 @@ fn map_stop(stop: StopReason) -> AcpStop {
 /// Fire the take-once readiness signal. Returns `true` if this call delivered the
 /// result (the signal was still pending: startup hadn't completed), `false` if
 /// readiness had already fired (so this is a later teardown).
-fn signal(ready: &ReadyCell, result: Result<(), AcpError>) -> bool {
+fn signal(ready: &ReadyCell, result: Result<AcpPromptCaps, AcpError>) -> bool {
     match lock(ready).take() {
         Some(tx) => {
             let _ = tx.send(result);

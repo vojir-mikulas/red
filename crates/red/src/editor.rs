@@ -770,7 +770,7 @@ impl AppState {
             },
             move |this, from, cx| this.drop_tab(from, pane, cx),
             move |this, slot, cx| this.set_tab_drop_target(pane, slot, cx),
-            |this, cx| this.clear_tab_drop_target(cx),
+            move |this, cx| this.clear_tab_drop_target(pane, cx),
         )
         .tabs(tabs)
         .gap(active.layout.gap_in(pane))

@@ -859,7 +859,7 @@ impl ResultGrid {
     /// The import target this browse represents, `(table, its columns)`, or `None`
     /// when the result isn't a single-table browse (editor SQL / a join). Drives the
     /// toolbar "Import…" affordance and the name-based column mapping.
-    pub(in crate::result) fn import_target(&self) -> Option<(TableRef, Vec<ResultColumn>)> {
+    pub(crate) fn import_target(&self) -> Option<(TableRef, Vec<ResultColumn>)> {
         let (schema, name) = self.table.clone()?;
         Some((
             TableRef {
@@ -1240,6 +1240,20 @@ impl ResultGrid {
     /// re-fetched in full first ([`CopyPlan::Refetch`]). `None` when the selection
     /// is empty or covers only the gutter. `gutter` is the data-column table offset
     /// (`1` with the row-number gutter shown, else `0`).
+    /// The current selection as a small text table, for handing to the agent as
+    /// a reference.
+    ///
+    /// Only the already-resident form: a selection whose cells are display-clipped
+    /// or off-window would need the same backend re-fetch a copy does, and a
+    /// reference is worth exactly as much as it is cheap. `None` then, and the
+    /// chip resolves to nothing rather than to half the rows.
+    pub(crate) fn selection_text(&self, gutter: usize) -> Option<String> {
+        match self.copy_plan(gutter)? {
+            CopyPlan::Ready(text) if !text.trim().is_empty() => Some(text),
+            _ => None,
+        }
+    }
+
     fn copy_plan(&self, gutter: usize) -> Option<CopyPlan> {
         let (r0, c0, r1, c1) = self.selection?.bounds();
         let ncol = self.columns.len();
@@ -2466,7 +2480,7 @@ impl AppState {
 
     /// File chosen: infer the format from its extension, stash the pending peek, and
     /// ask the backend for the file's source column names.
-    fn begin_import_peek(
+    pub(crate) fn begin_import_peek(
         &mut self,
         path: PathBuf,
         target: TableRef,

@@ -440,8 +440,9 @@ impl AppState {
         };
 
         // A bordered, rounded composer card (Zed-style), stacked top to bottom:
-        // the multiline input, a settings row of equal-width selector slots, and a
-        // status row carrying the usage ring, the agent's switches, and send/stop.
+        // the attachment chips, the multiline input, a settings row of equal-width
+        // selector slots, and a status row carrying the usage ring, the agent's
+        // switches, and send/stop.
         let composer = div()
             .flex_shrink_0()
             .m_2()
@@ -451,6 +452,7 @@ impl AppState {
             .border_1()
             .border_color(theme.border)
             .bg(theme.bg_input)
+            .children(self.render_attachment_chips(chat, &theme, cx))
             // No height here: the editor is built with `.rows(4..=8)`, so it sizes
             // itself to the draft and the card grows with it.
             .child(
@@ -478,6 +480,7 @@ impl AppState {
                             .items_center()
                             .gap_2()
                             .min_w(px(0.))
+                            .child(self.render_attach_button(&theme, cx))
                             .child(render_usage(chat.last_usage.as_ref(), &theme))
                             .children(self.render_knowledge_chip(&theme, cx)),
                     )
@@ -498,13 +501,82 @@ impl AppState {
                     ),
             );
 
+        // The drop target is the whole panel, not the text box: a target the size
+        // of a line is a target people miss.
+        //
+        // The highlight is an **overlay**, not a border on the panel itself.
+        // Turning the panel's own border on and off changes its box, which
+        // reflows the transcript and the composer under the cursor mid-drag —
+        // exactly when the user needs the layout to hold still.
+        let dropping = state.drop_active;
         let view = div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(theme.bg_panel_2)
             .border_l_1()
             .border_color(theme.border)
+            .on_drag_move::<gpui::ExternalPaths>(cx.listener(
+                |this, e: &gpui::DragMoveEvent<gpui::ExternalPaths>, _, cx| {
+                    // GPUI fires this for every element under the drag, so gate on
+                    // the cursor actually being over the panel; without it the
+                    // highlight sticks after the drag leaves.
+                    let (b, p) = (e.bounds, e.event.position);
+                    let inside = p.x >= b.origin.x
+                        && p.x < b.origin.x + b.size.width
+                        && p.y >= b.origin.y
+                        && p.y < b.origin.y + b.size.height;
+                    this.set_assistant_drop_active(inside, cx);
+                },
+            ))
+            .on_drop::<gpui::ExternalPaths>(cx.listener(
+                |this, paths: &gpui::ExternalPaths, _, cx| {
+                    this.set_assistant_drop_active(false, cx);
+                    this.attach_paths(paths.paths().to_vec(), cx);
+                },
+            ))
+            // The same target takes in-app references. From the user's side it is
+            // one mechanism -- "drop things here" -- which is the right mental
+            // model even though the two payloads land in different places.
+            .on_drag_move::<super::refs::ContextRef>(cx.listener(
+                |this, e: &gpui::DragMoveEvent<super::refs::ContextRef>, _, cx| {
+                    let (b, p) = (e.bounds, e.event.position);
+                    let inside = p.x >= b.origin.x
+                        && p.x < b.origin.x + b.size.width
+                        && p.y >= b.origin.y
+                        && p.y < b.origin.y + b.size.height;
+                    this.set_assistant_drop_active(inside, cx);
+                },
+            ))
+            .on_drop::<super::refs::ContextRef>(cx.listener(
+                |this, reference: &super::refs::ContextRef, _, cx| {
+                    this.set_assistant_drop_active(false, cx);
+                    this.add_reference(reference.clone(), cx);
+                },
+            ))
+            // A tab already drags for reordering, and an element carries one
+            // payload — so the panel reads that payload instead of the tab strip
+            // growing a second one.
+            .on_drag_move::<crate::editor::TabDrag>(cx.listener(
+                |this, e: &gpui::DragMoveEvent<crate::editor::TabDrag>, _, cx| {
+                    let (b, p) = (e.bounds, e.event.position);
+                    let inside = p.x >= b.origin.x
+                        && p.x < b.origin.x + b.size.width
+                        && p.y >= b.origin.y
+                        && p.y < b.origin.y + b.size.height;
+                    this.set_assistant_drop_active(inside, cx);
+                },
+            ))
+            .on_drop::<crate::editor::TabDrag>(cx.listener(
+                |this, drag: &crate::editor::TabDrag, _, cx| {
+                    // Dropping a tab here references it; it must not also be read
+                    // as a reorder by whatever sits underneath.
+                    cx.stop_propagation();
+                    this.set_assistant_drop_active(false, cx);
+                    this.reference_tab(drag.0, cx);
+                },
+            ))
             .child(header)
             .child(body)
             .when_some(chat.pending_permission.as_ref(), |col, pending| {
@@ -517,8 +589,176 @@ impl AppState {
                 col.child(chips)
             })
             .child(composer)
+            // Last child so it sits over the panel, and deliberately
+            // non-interactive (no id, no handlers) so it never eats the drop it
+            // is advertising.
+            .when(dropping, |v| {
+                v.child(
+                    div()
+                        .absolute()
+                        .inset_0()
+                        .border_1()
+                        .border_dashed()
+                        .border_color(theme.accent.opacity(0.55))
+                        .bg(theme.accent.opacity(0.04)),
+                )
+            })
             .into_any_element();
         self.with_agent_menu(view, cx)
+    }
+
+    /// The composer's `+` button: the discoverable half of attaching a file (the
+    /// other is dropping one on the panel, which nobody finds by looking).
+    fn render_attach_button(&self, theme: &flint::Theme, cx: &mut Context<Self>) -> AnyElement {
+        div()
+            .id("assistant-attach")
+            .size(theme.scale(COMPOSER_CONTROL))
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded(px(6.))
+            .border_1()
+            .border_color(theme.border)
+            .cursor_pointer()
+            .tooltip(flint::Tooltip::text(
+                "Attach a file (or drop one on this panel)",
+            ))
+            .hover(|s| s.border_color(theme.border_strong))
+            .child(crate::icons::icon(
+                "plus",
+                theme.scale(13.),
+                theme.text_muted,
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.pick_attachments(cx)))
+            .into_any_element()
+    }
+
+    /// The staged-attachment row above the composer input, plus whatever the last
+    /// refusal was. Absent when there is nothing to show, so the composer keeps
+    /// its shape.
+    fn render_attachment_chips(
+        &self,
+        chat: &ChatSession,
+        theme: &flint::Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if chat.attachments.is_empty() && chat.references.is_empty() && chat.attach_error.is_none()
+        {
+            return None;
+        }
+        let mut row = div().flex().flex_wrap().gap_1p5();
+        // References share the row with attachments: from the user's side both
+        // are "things I put on this message", distinguished by their icon.
+        for (i, reference) in chat.references.iter().enumerate() {
+            row = row.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1p5()
+                    .py(px(2.))
+                    .rounded(px(4.))
+                    .bg(theme.bg_panel)
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_size(theme.scale(10.5))
+                    .text_color(theme.text_muted)
+                    .child(crate::icons::icon(
+                        reference.icon(),
+                        theme.scale(11.),
+                        theme.accent,
+                    ))
+                    .child(SharedString::from(reference.label()))
+                    .child(
+                        div()
+                            .id(("assistant-reference-remove", i))
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme.red))
+                            .child(crate::icons::icon("x", theme.scale(11.), theme.text_faint))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_reference(i, cx);
+                            })),
+                    ),
+            );
+        }
+        for (i, attachment) in chat.attachments.iter().enumerate() {
+            row = row.child(
+                div()
+                    .id(("assistant-attachment-chip", i))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1p5()
+                    .py(px(2.))
+                    .rounded(px(4.))
+                    .bg(theme.bg_panel)
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_size(theme.scale(10.5))
+                    .text_color(theme.text_muted)
+                    // "Is that the right screenshot?" is a question only the
+                    // picture answers; a generated filename never does.
+                    .when_some(image_preview(attachment), |chip, preview| {
+                        chip.tooltip(preview)
+                    })
+                    .child(crate::icons::icon(
+                        attachment.kind.icon(),
+                        theme.scale(11.),
+                        theme.text_faint,
+                    ))
+                    .child(SharedString::from(attachment.name.clone()))
+                    .child(div().text_color(theme.text_faint).child(SharedString::from(
+                        super::attach::human_bytes(attachment.bytes),
+                    )))
+                    // Tabular data is usually better asked *about* than read, so
+                    // the doorway into the import pipeline sits on the chip.
+                    .when(attachment.is_importable(), |chip| {
+                        chip.child(
+                            div()
+                                .id(("assistant-attachment-import", i))
+                                .cursor_pointer()
+                                .text_color(theme.text_faint)
+                                .tooltip(flint::Tooltip::text(
+                                    "Import into the open table instead of sending it",
+                                ))
+                                .hover(|s| s.text_color(theme.accent))
+                                .child("import")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.import_attachment(i, cx);
+                                })),
+                        )
+                    })
+                    .child(
+                        div()
+                            .id(("assistant-attachment-remove", i))
+                            .cursor_pointer()
+                            .hover(|s| s.text_color(theme.red))
+                            .child(crate::icons::icon("x", theme.scale(11.), theme.text_faint))
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.remove_attachment(i, cx);
+                            })),
+                    ),
+            );
+        }
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .px_2p5()
+                .pt_2()
+                .child(row)
+                .when_some(chat.attach_error.clone(), |col, why| {
+                    col.child(
+                        div()
+                            .text_size(theme.scale(10.5))
+                            .text_color(theme.red)
+                            .child(why),
+                    )
+                })
+                .into_any_element(),
+        )
     }
 
     /// The composer's "knowledge: 1.2 KB" chip, beside the usage ring. Shown only
@@ -1805,6 +2045,45 @@ impl AppState {
         }
         let mut bubble = div().flex().flex_col().gap_1().child(label_row);
 
+        // What the user attached, above their words: it is what the sentence is
+        // about. Metadata only, because that is all the transcript stores.
+        if !msg.attachments.is_empty() {
+            let mut chips = div().flex().flex_wrap().gap_1p5();
+            for (ai, attachment) in msg.attachments.iter().enumerate() {
+                chips = chips.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "ai-attachment-{}-{ai}",
+                            bubble_key(index)
+                        )))
+                        .flex()
+                        .items_center()
+                        .gap_1()
+                        .px_1p5()
+                        .py(px(2.))
+                        .rounded(px(4.))
+                        .bg(theme.bg_panel)
+                        .border_1()
+                        .border_color(theme.border)
+                        .text_size(theme.scale(10.5))
+                        .text_color(theme.text_muted)
+                        .when_some(stored_image_preview(attachment), |chip, preview| {
+                            chip.tooltip(preview)
+                        })
+                        .child(crate::icons::icon(
+                            stored_attachment_icon(&attachment.kind),
+                            theme.scale(11.),
+                            theme.text_faint,
+                        ))
+                        .child(SharedString::from(attachment.name.clone()))
+                        .child(div().text_color(theme.text_faint).child(SharedString::from(
+                            super::attach::human_bytes(attachment.bytes),
+                        ))),
+                );
+            }
+            bubble = bubble.child(chips);
+        }
+
         // The agent's plan checklist (assistant only), at the top of the turn so the
         // intended steps are visible and tick off as it works.
         if msg.role == ChatRole::Assistant && !msg.plan.is_empty() {
@@ -1839,7 +2118,18 @@ impl AppState {
                 .as_ref()
                 .map(|s| &s.subagent_collapse)
                 .unwrap_or(&empty);
-            bubble = bubble.child(render_activity(&msg.activity, collapse, theme, 0, cx));
+            let highlighted = self
+                .assistant
+                .as_ref()
+                .and_then(|s| s.highlighted_source.as_ref());
+            bubble = bubble.child(render_activity(
+                &msg.activity,
+                collapse,
+                highlighted,
+                theme,
+                0,
+                cx,
+            ));
         }
         // Sources sit *above* the answer, where a reader meets them before the
         // number rather than after having already believed it.
@@ -2066,18 +2356,17 @@ fn activity_glyph(
 fn render_activity(
     nodes: &[red_core::ActivityNode],
     collapse: &HashMap<SharedString, bool>,
+    // Which node a Sources chip is currently pointing at.
+    //
+    // Passed down rather than fetched here. This runs during `render`, which
+    // holds `AppState` leased, so reaching back through the entity's own handle
+    // for it aborted the process the moment any turn produced a timeline -- see
+    // the `lease_guard_tests` note in `connect.rs`.
+    highlighted: Option<&red_core::ActivityId>,
     theme: &flint::Theme,
     depth: usize,
     cx: &mut Context<AppState>,
 ) -> AnyElement {
-    // Which node a Sources chip is currently pointing at, read once for the whole
-    // list rather than per row.
-    let highlighted = cx
-        .entity()
-        .read(cx)
-        .assistant
-        .as_ref()
-        .and_then(|s| s.highlighted_source.clone());
     let mut col = div().flex().flex_col().gap(px(2.));
     for node in nodes {
         if let red_core::ActivityKind::Subagent { task } = &node.kind {
@@ -2085,7 +2374,15 @@ fn render_activity(
             // delegated children (direct-provider path) or its live streamed progress
             // (the ACP path), so it reads as a distinct unit of work, never an empty
             // box. Parallel subagents are siblings here (see the ACP relay).
-            col = col.child(render_subagent_card(node, task, collapse, theme, depth, cx));
+            col = col.child(render_subagent_card(
+                node,
+                task,
+                collapse,
+                highlighted,
+                theme,
+                depth,
+                cx,
+            ));
             continue;
         }
         if matches!(node.kind, red_core::ActivityKind::Report { .. }) {
@@ -2094,16 +2391,12 @@ fn render_activity(
             // the tool calls. Skip them here.
             continue;
         }
-        col = col.child(render_activity_row(
-            node,
-            theme,
-            depth,
-            highlighted.as_ref(),
-        ));
+        col = col.child(render_activity_row(node, theme, depth, highlighted));
         if !node.children.is_empty() {
             col = col.child(render_activity(
                 &node.children,
                 collapse,
+                highlighted,
                 theme,
                 depth + 1,
                 cx,
@@ -2150,6 +2443,8 @@ fn render_subagent_card(
     node: &red_core::ActivityNode,
     task: &str,
     collapse: &HashMap<SharedString, bool>,
+    // Threaded through for the nested tool calls; see `render_activity`.
+    highlighted: Option<&red_core::ActivityId>,
     theme: &flint::Theme,
     depth: usize,
     cx: &mut Context<AppState>,
@@ -2259,7 +2554,14 @@ fn render_subagent_card(
     if !collapsed {
         // The delegate's own tool calls (direct path), nested inside the card.
         if !node.children.is_empty() {
-            card = card.child(render_activity(&node.children, collapse, theme, 0, cx));
+            card = card.child(render_activity(
+                &node.children,
+                collapse,
+                highlighted,
+                theme,
+                0,
+                cx,
+            ));
         }
         // Its current progress / result line (the ACP path's ongoing-work signal),
         // or a "Working…" hint while running before the first line arrives.
@@ -2383,6 +2685,13 @@ fn render_activity_row(
         // Reports render as a card in `render_activity`; this is only a defensive
         // fallback so the match stays exhaustive.
         red_core::ActivityKind::Report { title, .. } => ("Report".to_string(), title.clone()),
+        red_core::ActivityKind::Compacted { dropped } => (
+            "Context compacted".to_string(),
+            Some(format!(
+                "{dropped} earlier tool result{} dropped to stay inside the context window",
+                if *dropped == 1 { "" } else { "s" }
+            )),
+        ),
     };
 
     // A Sources chip points here: ring the row so the answer's `[3]` and the call
@@ -2493,33 +2802,125 @@ fn stream_caret(theme: &flint::Theme, reduce_motion: bool) -> AnyElement {
     .into_any_element()
 }
 
-/// How full the context window is, as a 0..=1 fraction, when the backend reported
-/// both the tokens in context and the window they sit in. `None` whenever the
-/// share can't be computed — the API-key path reports per-turn tokens with no
-/// window, so there is no "how full" to draw.
+/// The hover preview for a staged attachment, or `None` when it is not an image
+/// (there is nothing to look at) or the file has gone (a preview of a missing
+/// file is a broken box, which is worse than no preview).
+fn image_preview(
+    attachment: &super::attach::Attachment,
+) -> Option<impl Fn(&mut gpui::Window, &mut gpui::App) -> gpui::AnyView + 'static + use<>> {
+    (attachment.kind == super::attach::AttachmentKind::Image && attachment.path.exists())
+        .then(|| preview_builder(attachment.path.clone(), attachment.name.clone()))
+}
+
+/// The same, for an attachment a saved chat remembers. Its path can be stale --
+/// the file may have been moved or deleted since -- which is exactly why the
+/// existence check is not optional.
+fn stored_image_preview(
+    attachment: &crate::conversations::StoredAttachment,
+) -> Option<impl Fn(&mut gpui::Window, &mut gpui::App) -> gpui::AnyView + 'static + use<>> {
+    let path = std::path::PathBuf::from(&attachment.path);
+    (attachment.kind == "image" && !attachment.path.is_empty() && path.exists())
+        .then(|| preview_builder(path, attachment.name.clone()))
+}
+
+fn preview_builder(
+    path: std::path::PathBuf,
+    name: String,
+) -> impl Fn(&mut gpui::Window, &mut gpui::App) -> gpui::AnyView + 'static {
+    let name = SharedString::from(name);
+    move |_window, cx| {
+        let (path, name) = (path.clone(), name.clone());
+        cx.new(|_| ImagePreview { path, name }).into()
+    }
+}
+
+/// A hover preview of an attached image: the picture itself, bounded, above its
+/// filename.
+///
+/// Worth its own view rather than a text tooltip, because "is that the right
+/// screenshot?" is a question only the picture answers, and the filename a
+/// screenshot tool generates never does.
+struct ImagePreview {
+    path: std::path::PathBuf,
+    name: SharedString,
+}
+
+impl gpui::Render for ImagePreview {
+    fn render(&mut self, _: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme().clone();
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_1()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.border_strong)
+            .bg(theme.bg_elevated)
+            .child(
+                // Bounded so a 4K screenshot does not become a 4K tooltip; the
+                // aspect ratio is the image's own.
+                gpui::img(self.path.clone())
+                    .max_w(px(280.))
+                    .max_h(px(280.))
+                    .rounded(px(3.)),
+            )
+            .child(
+                div()
+                    .text_size(theme.scale(10.5))
+                    .text_color(theme.text_muted)
+                    .child(self.name.clone()),
+            )
+    }
+}
+
+/// The chip icon for a persisted attachment's kind string. Falls back to the
+/// generic file glyph, so a chat saved by a future version that knows more kinds
+/// still renders.
+fn stored_attachment_icon(kind: &str) -> &'static str {
+    match kind {
+        "image" => "image",
+        "text" => "file-text",
+        _ => "file",
+    }
+}
+
+/// How full the context window is, as a 0..=1 fraction, when both the tokens in
+/// context and the window they sit in are known. `None` when the model is one
+/// neither backend could size — better a bare token count than a percentage of a
+/// guess.
 fn context_fraction(usage: &red_service::AiUsage) -> Option<f32> {
     (usage.context_tokens > 0)
-        .then(|| (usage.input_tokens as f32 / usage.context_tokens as f32).clamp(0., 1.))
+        .then(|| (usage.context_used_tokens as f32 / usage.context_tokens as f32).clamp(0., 1.))
 }
 
 /// The full accounting, as the ring's hover tooltip: the context share, the token
 /// breakdown, and the running session cost. This is the detail the composer's
 /// footer used to spend a whole strip on; the ring carries it now. One line, since
 /// the tooltip is a single text run.
+///
+/// The token figures are the conversation's totals, not the last exchange's: the
+/// number worth looking at is what this chat has cost so far.
 fn usage_tooltip(usage: &red_service::AiUsage) -> String {
     let mut parts: Vec<String> = Vec::new();
     match context_fraction(usage) {
         Some(f) => parts.push(format!(
             "Context {} of {} ({:.0}%)",
-            compact_count(usage.input_tokens),
+            compact_count(usage.context_used_tokens),
             compact_count(usage.context_tokens),
             f * 100.
         )),
-        // No window reported (API-key path): the raw per-turn counts are all there is.
-        None if usage.input_tokens > 0 => {
-            parts.push(format!("{} in", compact_count(usage.input_tokens)));
+        // Window unknown: the counts are all there is to say.
+        None if usage.context_used_tokens > 0 => {
+            parts.push(format!(
+                "{} in context",
+                compact_count(usage.context_used_tokens)
+            ));
         }
         None => {}
+    }
+    if usage.input_tokens > 0 {
+        parts.push(format!("{} in", compact_count(usage.input_tokens)));
     }
     if usage.output_tokens > 0 {
         parts.push(format!("{} out", compact_count(usage.output_tokens)));
@@ -2550,18 +2951,20 @@ fn usage_tooltip(usage: &red_service::AiUsage) -> String {
 /// doesn't jump the moment the first turn finishes.
 fn render_usage(usage: Option<&red_service::AiUsage>, theme: &flint::Theme) -> AnyElement {
     let fraction = usage.and_then(context_fraction);
-    // Amber past three quarters, red past nine tenths: the point where trimming
-    // the conversation stops being optional.
+    // Amber past three fifths, red past nine tenths. Amber is deliberately early:
+    // it is the hint that the chat is filling up while there is still room to
+    // finish the thought, not the warning that it is too late. Red is where
+    // starting a new chat stops being optional.
     let color = match fraction {
         Some(f) if f >= 0.9 => theme.red,
-        Some(f) if f >= 0.75 => theme.yellow,
+        Some(f) if f >= 0.6 => theme.yellow,
         Some(_) => theme.accent,
         None => theme.text_faint,
     };
     let label = match (fraction, usage) {
         (Some(f), _) => format!("{:.0}%", f * 100.),
-        // No window reported (API-key path): fall back to the raw token count.
-        (None, Some(u)) if u.input_tokens > 0 => compact_count(u.input_tokens),
+        // Window unknown: fall back to the raw count of what's in context.
+        (None, Some(u)) if u.context_used_tokens > 0 => compact_count(u.context_used_tokens),
         _ => "—".to_string(),
     };
     div()
@@ -2914,48 +3317,70 @@ mod tests {
     fn context_fraction_needs_a_reported_window() {
         // The subscription path reports both, so the ring can fill.
         let acp = red_service::AiUsage {
-            input_tokens: 50_000,
+            context_used_tokens: 50_000,
             context_tokens: 200_000,
             ..Default::default()
         };
         assert_eq!(context_fraction(&acp), Some(0.25));
         // Over-full clamps rather than overdrawing the ring.
         let full = red_service::AiUsage {
-            input_tokens: 300_000,
+            context_used_tokens: 300_000,
             context_tokens: 200_000,
             ..Default::default()
         };
         assert_eq!(context_fraction(&full), Some(1.0));
-        // The API-key path reports tokens with no window: nothing to fill.
-        let api_key = red_service::AiUsage {
+        // An unrecognized model sizes no window, so there is nothing to fill —
+        // and the spend so far must not be mistaken for one.
+        let unknown_model = red_service::AiUsage {
             input_tokens: 4_000,
             output_tokens: 900,
+            context_used_tokens: 3_100,
             ..Default::default()
         };
-        assert_eq!(context_fraction(&api_key), None);
+        assert_eq!(context_fraction(&unknown_model), None);
         assert_eq!(context_fraction(&red_service::AiUsage::default()), None);
     }
 
     #[test]
     fn usage_tooltip_carries_the_detail_the_ring_drops() {
+        // The API-key path now sizes the window from the model, and the token
+        // figures are the conversation's totals rather than the last turn's.
+        let api_key = red_service::AiUsage {
+            input_tokens: 12_000,
+            output_tokens: 3_400,
+            cache_read_input_tokens: 88_000,
+            context_used_tokens: 30_800,
+            context_tokens: 200_000,
+            cost_usd: None,
+        };
+        assert_eq!(
+            usage_tooltip(&api_key),
+            "Context 30.8k of 200.0k (15%) · 12.0k in · 3.4k out · 88.0k cached"
+        );
+        // The subscription path reports a session cost alongside.
         let acp = red_service::AiUsage {
             input_tokens: 30_800,
+            context_used_tokens: 30_800,
             context_tokens: 200_000,
             cost_usd: Some(0.1647),
             ..Default::default()
         };
         assert_eq!(
             usage_tooltip(&acp),
-            "Context 30.8k of 200.0k (15%) · $0.1647 this session"
+            "Context 30.8k of 200.0k (15%) · 30.8k in · $0.1647 this session"
         );
-        // No window: fall back to the raw per-turn counts.
-        let api_key = red_service::AiUsage {
+        // No window: fall back to what is known.
+        let unknown_model = red_service::AiUsage {
             input_tokens: 4_000,
             output_tokens: 900,
             cache_read_input_tokens: 2_000,
+            context_used_tokens: 5_100,
             ..Default::default()
         };
-        assert_eq!(usage_tooltip(&api_key), "4.0k in · 900 out · 2.0k cached");
+        assert_eq!(
+            usage_tooltip(&unknown_model),
+            "5.1k in context · 4.0k in · 900 out · 2.0k cached"
+        );
         // Nothing reported reads as such rather than as an empty tooltip.
         assert_eq!(
             usage_tooltip(&red_service::AiUsage::default()),

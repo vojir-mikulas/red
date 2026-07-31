@@ -968,6 +968,14 @@ pub enum Command {
         conversation_id: ConversationId,
         agent: String,
         message: String,
+        /// Files the user attached, already read, classified and size-checked by
+        /// the UI. Empty for an ordinary text turn.
+        ///
+        /// Shipped as bytes rather than as paths on purpose: the UI owns
+        /// filesystem access for user content, so the service never opens a file
+        /// on the model's behalf and a path the model produced can never become
+        /// a read.
+        attachments: Vec<TurnAttachment>,
         context: AiContext,
         /// Run this turn's writes inside one uncommitted transaction the user
         /// reviews at the end, instead of approving each statement as it comes.
@@ -2088,8 +2096,14 @@ pub struct AiContext {
     pub editor_sql: Option<String>,
     /// The last query/result error shown, if any ("Explain this error").
     pub last_error: Option<String>,
-    /// A textual snapshot of the selected rows, if any.
-    pub selection: Option<String>,
+    /// Objects the user dragged into the composer (or picked from a context
+    /// menu) for this turn: the *explicit* channel, as opposed to `current_tab` /
+    /// `editor_sql`, which say what happens to be on screen.
+    ///
+    /// Resolved service-side with the same formatters the tools use and folded
+    /// into the user message, since what is pointed at is per-turn and volatile
+    /// — it must not land in the cached system prefix.
+    pub references: Vec<ContextRefSpec>,
     /// A rendered digest of an earlier, persisted conversation, set only on
     /// the first turn after a saved chat is reopened. The backend starts a fresh
     /// session (the agent/history isn't restored), so this folds the prior exchange
@@ -2285,6 +2299,72 @@ pub enum AiConfigCategory {
     Other,
 }
 
+/// One thing the user pointed the agent at for this turn, in the form that
+/// crosses the channel.
+///
+/// The split between the arms is where each one can be answered: a table is
+/// resolved **service-side**, through the same formatter `describe_table` uses,
+/// so a reference and a tool call describe an object identically. Anything that
+/// is really "text the UI already has" — a tab's SQL, a grid selection — arrives
+/// as text, because re-deriving it on the service would mean teaching it about
+/// UI state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ContextRefSpec {
+    /// A table or view, by qualified name.
+    Table { schema: String, name: String },
+    /// One column of a table.
+    Column {
+        schema: String,
+        table: String,
+        name: String,
+    },
+    /// A namespace, resolved to its object list.
+    Schema { name: String },
+    /// SQL the UI already had, under a label the user would recognise: an editor
+    /// tab, a history entry, a saved query.
+    Sql { label: String, sql: String },
+    /// Rows the UI already rendered, as a small text table.
+    Rows { label: String, text: String },
+}
+
+/// One file the user attached to a turn, resolved to bytes.
+///
+/// Already classified and size-checked when it gets here: the picker and the drop
+/// handler refuse an unsupported type or an oversized file up front, so a refusal
+/// is something the user reads in the composer rather than a 400 they wait for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TurnAttachment {
+    /// The file's display name, for the model and the audit log. Never the path:
+    /// where the file sat on disk is not the model's business.
+    pub name: String,
+    /// The IANA media type the UI's classification settled on.
+    pub media_type: String,
+    pub body: AttachmentBody,
+}
+
+/// An attachment's content. Text rides verbatim; anything binary rides as bytes
+/// and is base64-encoded once, at the provider seam.
+#[derive(Debug, Clone, PartialEq)]
+pub enum AttachmentBody {
+    Text(String),
+    Bytes(Vec<u8>),
+}
+
+impl TurnAttachment {
+    /// The attachment's size in bytes, however it is carried.
+    pub fn len(&self) -> usize {
+        match &self.body {
+            AttachmentBody::Text(t) => t.len(),
+            AttachmentBody::Bytes(b) => b.len(),
+        }
+    }
+
+    /// Whether the file was empty.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// Token accounting for one assistant turn (the `AiTurnFinished` payload). The
 /// subscription (ACP) path reports cumulative session figures and, when the agent
 /// provides it, a running `cost_usd`; the API-key path reports per-turn tokens and
@@ -2294,10 +2374,16 @@ pub struct AiUsage {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cache_read_input_tokens: u64,
-    /// The agent's total context window, when it reports one (subscription path).
-    /// With `input_tokens` carrying the tokens *currently in context*, the pair is
-    /// a "how full is the context" gauge; `0` means the backend didn't say, and
-    /// the panel falls back to a bare token count.
+    /// How many tokens the conversation occupies in the model's window as of the
+    /// last request. Paired with `context_tokens` this is the "how full" gauge,
+    /// and it is deliberately *not* `input_tokens`: that is what the chat has
+    /// been billed for and only grows, whereas this can fall when the history is
+    /// compacted.
+    pub context_used_tokens: u64,
+    /// The model's total context window, when it is known: reported by the agent
+    /// on the subscription path, looked up from the model id on the API-key path.
+    /// `0` means we don't know, and the panel shows a bare token count rather
+    /// than a percentage it would have had to guess at.
     pub context_tokens: u64,
     /// Running session cost in USD, when the backend reports it (subscription
     /// path). `None` on the API-key path, which prices nothing.

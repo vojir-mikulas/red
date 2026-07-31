@@ -391,6 +391,20 @@ settings-ai-limits-max_tool_calls-seg-500 = [500]
 
 settings-ai-limits-max_tool_calls-seg-off = [Öff]
 
+settings-ai-limits-max_output_tokens =
+    .label = [Máx réply léñgth]
+    .help = [Çéílíñg öñ thé tökéñs öñé réply máy géñéráté. Á réply thát híts ít ís çöñtíñúéd áútömátíçálly, bút á löñg répört ís çhéápér tö gét íñ öñé páss.]
+
+settings-ai-limits-max_output_tokens-seg-4k = [4K]
+
+settings-ai-limits-max_output_tokens-seg-8k = [8K]
+
+settings-ai-limits-max_output_tokens-seg-16k = [16K]
+
+settings-ai-limits-max_output_tokens-seg-32k = [32K]
+
+settings-ai-limits-max_output_tokens-seg-64k = [64K]
+
 settings-group-safety = [Sáféty]
 
 settings-ai-preview_writes =

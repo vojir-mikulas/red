@@ -142,7 +142,12 @@ pub(crate) fn aim(
         && p.y >= bounds.origin.y
         && p.y < bounds.origin.y + bounds.size.height;
     if !inside {
-        return false;
+        // *Release* it rather than merely declining to re-claim it. Nothing else
+        // clears this: the cursor may now be somewhere with no pane under it at
+        // all — the assistant panel, the sidebar, the status bar — where no aim
+        // call will ever run, and a stale highlight would sit there offering a
+        // split the drop is not going to perform.
+        return layout.clear_drop_target_of(pane);
     }
     if f32::from(p.y - bounds.origin.y) < limits.strip_h {
         return layout.clear_drop_target();
@@ -290,7 +295,7 @@ mod tests {
     }
 
     #[test]
-    fn a_drag_outside_a_pane_leaves_its_zone_alone() {
+    fn a_drag_outside_a_pane_with_nothing_showing_is_a_no_op() {
         let mut layout = PaneLayout::new();
         let pane = layout.focus();
         let b = bounds(800., 600.);
@@ -370,5 +375,112 @@ mod tests {
     fn a_zero_sized_pane_does_not_divide_by_zero() {
         let b = bounds(0., 0.);
         assert_eq!(at(b, 0., 0.), DropZone::Center);
+    }
+
+    /// Leaving a pane must *release* the highlight, not merely decline to
+    /// re-claim it. The cursor can end up somewhere no pane covers at all — the
+    /// assistant panel, the sidebar — where no further `aim` runs, and a
+    /// highlight left behind offers a split the drop will not perform.
+    #[test]
+    fn leaving_a_pane_releases_its_highlight() {
+        let mut layout = crate::panes::state::PaneLayout::new();
+        let pane = layout.focus();
+        let b = bounds(400., 300.);
+        let limits = PaneLimits {
+            min_w: 100.,
+            min_h: 100.,
+            strip_h: 30.,
+        };
+        let dragged = DraggedTab {
+            from: pane,
+            alone: false,
+        };
+
+        // Over the pane body: a zone is claimed.
+        aim(
+            &mut layout,
+            pane,
+            b,
+            point(px(120.), px(200.)),
+            limits,
+            dragged,
+        );
+        assert!(layout.drop_target().is_some());
+
+        // Off the pane entirely (to the right, where the assistant panel sits).
+        assert!(
+            aim(
+                &mut layout,
+                pane,
+                b,
+                point(px(900.), px(200.)),
+                limits,
+                dragged
+            ),
+            "the release is a real change, so the caller repaints"
+        );
+        assert!(layout.drop_target().is_none());
+    }
+
+    /// ...but only its *own* highlight. Every pane gets every drag-move, so an
+    /// unconditional clear would have the pane the cursor just left wipe the one
+    /// it just entered, depending on dispatch order.
+    #[test]
+    fn leaving_one_pane_does_not_wipe_another_panes_claim() {
+        let mut layout = crate::panes::state::PaneLayout::new();
+        let left = layout.focus();
+        let right = layout
+            .insert(left, DropZone::Right)
+            .expect("an edge zone splits");
+        let b = bounds(400., 300.);
+        let limits = PaneLimits {
+            min_w: 100.,
+            min_h: 100.,
+            strip_h: 30.,
+        };
+        let dragged = DraggedTab {
+            from: left,
+            alone: false,
+        };
+
+        // The right pane owns the highlight...
+        aim(
+            &mut layout,
+            right,
+            b,
+            point(px(120.), px(200.)),
+            limits,
+            dragged,
+        );
+        assert_eq!(layout.drop_target().map(|t| t.pane), Some(right));
+
+        // ...and the left pane's "I am not under the cursor" must not take it.
+        assert!(!aim(
+            &mut layout,
+            left,
+            b,
+            point(px(900.), px(200.)),
+            limits,
+            dragged
+        ));
+        assert_eq!(layout.drop_target().map(|t| t.pane), Some(right));
+    }
+
+    /// The same ownership rule for the strip's insertion bar, which is why it is
+    /// now safe to clear on a horizontal exit: a drag crossing to the strip next
+    /// door cannot un-claim what that strip just claimed.
+    #[test]
+    fn clearing_a_strip_gap_is_scoped_to_its_own_pane() {
+        let mut layout = PaneLayout::new();
+        let left = layout.focus();
+        let right = layout
+            .insert(left, DropZone::Right)
+            .expect("an edge zone splits");
+
+        layout.set_gap(right, 2);
+        assert!(!layout.clear_gap_of(left), "not the left strip's to clear");
+        assert_eq!(layout.gap_in(right), Some(2));
+        assert!(layout.clear_gap_of(right));
+        assert_eq!(layout.gap_in(right), None);
     }
 }

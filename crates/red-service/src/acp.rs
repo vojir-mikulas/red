@@ -359,6 +359,7 @@ pub(crate) async fn run_turn(
     conversation_id: ConversationId,
     policy: AiPolicy,
     user_message: String,
+    attachments: Vec<crate::protocol::TurnAttachment>,
     context: AiContext,
 ) {
     // Ensure the conversation exists, and learn whether this is its first turn.
@@ -394,14 +395,15 @@ pub(crate) async fn run_turn(
 
     // Fold grounding into the prompt text: the full instruction once (ACP has no
     // system role), then just the volatile per-turn context on follow-ups.
+    let references = crate::ai::resolve_references(&backend, &context.references, &policy).await;
     let text = if first_turn {
         format!(
             "{}\n\n{}",
             backend.system_prompt(&context, &policy),
-            user_turn(&user_message, &context)
+            user_turn(&user_message, &context, references.as_deref())
         )
     } else {
-        user_turn(&user_message, &context)
+        user_turn(&user_message, &context, references.as_deref())
     };
 
     // Relay streamed deltas onto the existing event vocabulary as they arrive.
@@ -446,7 +448,12 @@ pub(crate) async fn run_turn(
         })
     };
 
-    let outcome = agent.prompt(text, sink_tx).await;
+    let outcome = agent
+        .prompt(
+            crate::ai::acp_blocks(text, &attachments, agent.supports_images()),
+            sink_tx,
+        )
+        .await;
     // The sink closes when the turn ends (the agent drops it), so the relay drains.
     let _ = relay.await;
     // Clear the in-flight guard and reset the idle clock now the turn is done, so
@@ -557,7 +564,7 @@ pub(crate) async fn one_shot(
         .await
         .map_err(|e| e.to_string())?;
     let (tx, mut rx) = mpsc::unbounded_channel::<AcpDelta>();
-    let done = agent.prompt(prompt, tx);
+    let done = agent.prompt(vec![red_acp::AcpPromptBlock::Text(prompt)], tx);
     // Text arrives as deltas; the turn result carries only usage and stop reason,
     // so accumulate as we go. Thinking chunks are dropped: the dialog wants the
     // answer, not the reasoning.
@@ -990,6 +997,7 @@ fn map_usage(usage: &red_acp::AcpUsage) -> AiUsage {
         input_tokens: usage.used_tokens,
         output_tokens: 0,
         cache_read_input_tokens: 0,
+        context_used_tokens: usage.used_tokens,
         context_tokens: usage.context_tokens,
         cost_usd: usage.cost_usd,
     }

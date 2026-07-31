@@ -546,6 +546,29 @@ pub(crate) fn object_icon(kind: ObjectKind, cx: &App) -> (&'static str, gpui::Hs
 }
 
 /// Build the content right of the chevron for one tree row.
+/// The agent reference a tree node stands for, or `None` for a row that names no
+/// object (an object-kind folder is a UI grouping, not a database object).
+pub(crate) fn context_ref_for(node: &NodeId) -> Option<crate::assistant::refs::ContextRef> {
+    use crate::assistant::refs::ContextRef;
+    match node {
+        NodeId::Schema(name) => Some(ContextRef::Schema { name: name.clone() }),
+        NodeId::Object { schema, name } => Some(ContextRef::Table {
+            schema: schema.clone(),
+            name: name.clone(),
+        }),
+        NodeId::Column {
+            schema,
+            table,
+            name,
+        } => Some(ContextRef::Column {
+            schema: schema.clone(),
+            table: table.clone(),
+            name: name.clone(),
+        }),
+        NodeId::Group { .. } => None,
+    }
+}
+
 fn render_node(row: &VisibleRow, cx: &App) -> gpui::AnyElement {
     let theme = cx.theme();
     let (text, muted, faint) = (theme.text, theme.text_muted, theme.text_faint);
@@ -761,7 +784,29 @@ impl AppState {
                 crate::icons::icon(name, cx.theme().scale(12.), cx.theme().text_faint)
                     .into_any_element()
             })
-            .render_row(move |ix, _window, cx| render_node(&rows_render[ix], cx))
+            // Every row that names something the agent can be pointed at is a
+            // drag source. The payload renders as the chip it will become, so
+            // what is under the cursor is already the answer.
+            .render_row(move |ix, _window, cx| {
+                let row = &rows_render[ix];
+                let body = render_node(row, cx);
+                match row.node.as_ref().and_then(context_ref_for) {
+                    Some(reference) => gpui::div()
+                        .id(("schema-row-drag", ix))
+                        .flex()
+                        .flex_1()
+                        .min_w(gpui::px(0.))
+                        .on_drag(reference, |r, _offset, _window, cx| {
+                            cx.new({
+                                let r = r.clone();
+                                move |_| r
+                            })
+                        })
+                        .child(body)
+                        .into_any_element(),
+                    None => body,
+                }
+            })
             .on_toggle(move |ix, _window, cx| {
                 if let Some(node) = rows_toggle[ix].node.clone() {
                     tv.update(cx, |this, cx| this.schema_toggle(node, cx)).ok();
@@ -801,9 +846,7 @@ impl AppState {
             // Right-click opens the node's action menu. A column row has no
             // actions of its own, so it falls through and opens nothing.
             .on_secondary(move |ix, pos, _window, cx| {
-                if let Some(node) = rows_secondary[ix].node.clone()
-                    && !matches!(node, NodeId::Column { .. })
-                {
+                if let Some(node) = rows_secondary[ix].node.clone() {
                     cv.update(cx, |this, cx| this.schema_open_menu(node, pos, cx))
                         .ok();
                 }
@@ -859,6 +902,21 @@ impl AppState {
         let pos = menu.pos;
         let caps = active.config.kind.namespace_caps();
         let mut items = ContextMenu::new("schema-context-menu");
+
+        // First, and for every kind of object, because a menu item is discovered
+        // by everyone whereas a drag is discovered by the people who try it.
+        if let Some(reference) = context_ref_for(&menu.node) {
+            items = items
+                .item(
+                    ContextMenuItem::new("schema-ask-ai", "Ask AI about this").on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.schema_close_menu(cx);
+                            this.add_reference(reference.clone(), cx);
+                        }),
+                    ),
+                )
+                .separator();
+        }
 
         match &menu.node {
             NodeId::Schema(name) => {

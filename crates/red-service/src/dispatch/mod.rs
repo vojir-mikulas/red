@@ -741,6 +741,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 conversation_id,
                 agent,
                 message,
+                attachments,
                 context,
                 sandbox,
             } => {
@@ -868,6 +869,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             ai_show_thinking,
                             effective,
                             message,
+                            attachments,
                             context,
                             sandbox_mode,
                             cancel,
@@ -895,6 +897,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             conversation_id,
                             effective,
                             message,
+                            attachments,
                             context,
                         ));
                     }
@@ -3807,6 +3810,9 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 // loop, no way to read a row or take an action.
                                 tools: &[],
                                 messages: &messages,
+                                // One short completion over a fixed prompt has no
+                                // history to keep inside a window.
+                                context: red_ai::ContextManagement::default(),
                             };
                             // The receiver is held, not dropped: deltas are
                             // irrelevant here, but a dead channel would surface as

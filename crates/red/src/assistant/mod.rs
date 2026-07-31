@@ -22,6 +22,8 @@
 //! history/persistence); `render` holds the views; `text` holds the pure domain
 //! helpers and their unit tests.
 
+pub(crate) mod attach;
+pub(crate) mod refs;
 mod render;
 mod state;
 mod text;
@@ -71,6 +73,10 @@ pub(crate) struct ChatMessage {
     pub(crate) role: ChatRole,
     pub(crate) text: String,
     pub(crate) thinking: String,
+    /// What the user attached to this turn, for the transcript's chips. Persisted
+    /// as metadata only — a reopened chat says "report.pdf (2.1 MB)" rather than
+    /// carrying the megabytes the user already has on disk.
+    pub(crate) attachments: Vec<crate::conversations::StoredAttachment>,
     /// The turn's activity timeline (assistant only): tool calls, subagents, and
     /// proposed writes, in call order, each resolved by id as updates stream. Drawn
     /// inline above the answer text and persisted with the conversation so a
@@ -116,6 +122,7 @@ impl ChatMessage {
             role,
             text,
             thinking,
+            attachments: Vec::new(),
             activity: Vec::new(),
             plan: Vec::new(),
             cache: RefCell::new(MessageCache::default()),
@@ -279,6 +286,18 @@ pub(crate) struct ChatSession {
     /// "draft" keeps its text when you leave it and come back. Empty once the chat
     /// has sent a turn; the composer mirrors it while the draft is active.
     pub(crate) draft: String,
+    /// Files staged for the next turn, cleared when it is sent. Lives on the chat
+    /// rather than the panel so switching chats keeps each one's attachments with
+    /// its draft — the same reason `draft` is here.
+    pub(crate) attachments: Vec<attach::Attachment>,
+    /// Why the last attempt to attach something was refused, shown under the chip
+    /// row until the next attempt. A refusal the user never sees is a file that
+    /// mysteriously did not appear.
+    pub(crate) attach_error: Option<SharedString>,
+    /// Things in the app the user pointed at for the next turn: a table, a
+    /// column, a tab. Rides with `draft` and `attachments` for the same reason —
+    /// they are all part of the message being composed.
+    pub(crate) references: Vec<refs::ContextRef>,
     /// Characters of the streaming assistant bubble currently revealed. The model's
     /// text arrives in uneven network bursts; a steady reveal ticker walks this up
     /// to the received length so the answer types out smoothly (ChatGPT-style)
@@ -325,6 +344,9 @@ impl ChatSession {
             title: None,
             file_stem: None,
             created_unix: None,
+            attachments: Vec::new(),
+            attach_error: None,
+            references: Vec::new(),
             pending_seed: None,
             draft: String::new(),
             revealed: 0,
@@ -452,6 +474,10 @@ pub(crate) struct AssistantState {
     /// Whether the history sidebar (open chats + saved conversations) is shown in
     /// place of the active transcript.
     pub(crate) show_list: bool,
+    /// Whether a file drag is currently over the panel, which draws the drop
+    /// highlight. Panel-wide rather than per-chat: it is about the pointer, not
+    /// about a conversation.
+    pub(crate) drop_active: bool,
     /// An in-progress inline title rename, if any.
     pub(crate) renaming: Option<Rename>,
     /// The active chat's slash commands, mirrored here so the composer's completion

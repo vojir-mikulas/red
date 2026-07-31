@@ -11,10 +11,11 @@ use serde_json::{Value as Json, json};
 use tokio::sync::mpsc::UnboundedSender;
 
 use crate::types::{
-    AiError, ContentBlock, Delta, Message, Result, Role, StopReason, TurnOutcome, TurnRequest,
-    Usage,
+    AiError, ContentBlock, Delta, DocumentSource, Message, Result, Role, StopReason, TurnOutcome,
+    TurnRequest, Usage,
 };
-use crate::{AiProvider, CancelToken};
+use crate::{AiProvider, CancelToken, ProviderCapabilities};
+use crate::{COMPACTION_BETA, CONTEXT_EDITING_BETA};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 const DEFAULT_BASE_URL: &str = "https://api.anthropic.com";
@@ -119,8 +120,43 @@ impl AnthropicProvider {
             body["tools"] = Json::Array(tools);
         }
 
+        if let Some(edits) = context_edits(req) {
+            body["context_management"] = json!({ "edits": edits });
+        }
+
         body
     }
+}
+
+/// The `context_management.edits` list for `req`, or `None` when the caller asked
+/// for nothing.
+///
+/// Order is the contract, not a detail: the API applies the strategies in the
+/// order given, and clearing a tool result the model already summarized is
+/// lossless where summarizing the conversation is not.
+fn context_edits(req: &TurnRequest<'_>) -> Option<Vec<Json>> {
+    let mut edits = Vec::new();
+    if req.context.clear_tool_results {
+        edits.push(json!({ "type": "clear_tool_uses_20250919" }));
+    }
+    if req.context.compact {
+        edits.push(json!({ "type": "compact_20260112" }));
+    }
+    (!edits.is_empty()).then_some(edits)
+}
+
+/// The `anthropic-beta` header value opting into whatever `req.context` asked
+/// for, or `None` when it asked for nothing. Both strategies are betas, and each
+/// carries its own flag.
+fn beta_header(req: &TurnRequest<'_>) -> Option<String> {
+    let mut betas: Vec<&str> = Vec::new();
+    if req.context.clear_tool_results {
+        betas.push(CONTEXT_EDITING_BETA);
+    }
+    if req.context.compact {
+        betas.push(COMPACTION_BETA);
+    }
+    (!betas.is_empty()).then(|| betas.join(","))
 }
 
 #[async_trait]
@@ -139,12 +175,16 @@ impl AiProvider for AnthropicProvider {
         }
 
         let body = self.build_body(req);
-        let resp = self
+        let mut request = self
             .client
             .post(format!("{}/v1/messages", self.base_url))
             .header("x-api-key", &self.api_key)
             .header("anthropic-version", ANTHROPIC_VERSION)
-            .header("content-type", "application/json")
+            .header("content-type", "application/json");
+        if let Some(betas) = beta_header(req) {
+            request = request.header("anthropic-beta", betas);
+        }
+        let resp = request
             .json(&body)
             .send()
             .await
@@ -204,6 +244,14 @@ impl AiProvider for AnthropicProvider {
 
         acc.finish()
     }
+
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities {
+            // Both strategies are Messages API betas, reached by adding a header
+            // to the request we already build (see `beta_header`).
+            context_management: true,
+        }
+    }
 }
 
 /// Accumulates streamed SSE events into a single assistant message.
@@ -235,6 +283,7 @@ enum PartialBlock {
         name: String,
         json: String,
     },
+    Compaction(String),
 }
 
 /// Upper bound on distinct SSE content-block indices we'll materialize. A real
@@ -261,6 +310,16 @@ impl TurnAccumulator {
                     },
                     Some("redacted_thinking") => PartialBlock::RedactedThinking(
                         cb.and_then(|c| c.get("data"))
+                            .and_then(Json::as_str)
+                            .unwrap_or_default()
+                            .to_string(),
+                    ),
+                    // The provider's summary of context it folded away. Seeded
+                    // from the opening frame (which is where it arrives) and
+                    // still open to text deltas below, because what matters is
+                    // that whatever the wire sends comes back byte-identical.
+                    Some("compaction") => PartialBlock::Compaction(
+                        cb.and_then(|c| c.get("content"))
                             .and_then(Json::as_str)
                             .unwrap_or_default()
                             .to_string(),
@@ -311,13 +370,17 @@ impl TurnAccumulator {
                     return;
                 };
                 match dtype {
-                    Some("text_delta") => {
-                        if let (PartialBlock::Text(s), Some(t)) = (block, text_field(delta, "text"))
-                        {
+                    Some("text_delta") => match (block, text_field(delta, "text")) {
+                        (PartialBlock::Text(s), Some(t)) => {
                             s.push_str(t);
                             let _ = tx.send(Delta::Text(t.to_string()));
                         }
-                    }
+                        // A compaction summary is the provider talking to itself
+                        // about context we no longer send; accumulate it so it
+                        // round-trips, but never stream it into the answer.
+                        (PartialBlock::Compaction(s), Some(t)) => s.push_str(t),
+                        _ => {}
+                    },
                     Some("thinking_delta") => {
                         if let (PartialBlock::Thinking { text, .. }, Some(t)) =
                             (block, text_field(delta, "thinking"))
@@ -403,6 +466,7 @@ impl TurnAccumulator {
                 PartialBlock::RedactedThinking(data) => {
                     Some(ContentBlock::RedactedThinking { data })
                 }
+                PartialBlock::Compaction(content) => Some(ContentBlock::Compaction { content }),
                 PartialBlock::ToolUse { id, name, json } => {
                     // A stream cut mid-`input_json_delta` leaves unparseable JSON.
                     // Silently substituting `{}` turned truncated arguments into a
@@ -500,6 +564,35 @@ fn block_to_wire(block: &ContentBlock) -> Json {
             "content": content,
             "is_error": is_error,
         }),
+        // Verbatim, always: the provider matches this block against the history
+        // it summarized, so an edited or re-wrapped one no longer stands for
+        // anything.
+        ContentBlock::Compaction { content } => {
+            json!({ "type": "compaction", "content": content })
+        }
+        ContentBlock::Image { media_type, data } => json!({
+            "type": "image",
+            "source": { "type": "base64", "media_type": media_type, "data": data },
+        }),
+        ContentBlock::Document { source, title } => {
+            let source = match source {
+                DocumentSource::Pdf { data } => json!({
+                    "type": "base64",
+                    "media_type": "application/pdf",
+                    "data": data,
+                }),
+                DocumentSource::Text { data } => json!({
+                    "type": "text",
+                    "media_type": "text/plain",
+                    "data": data,
+                }),
+            };
+            let mut block = json!({ "type": "document", "source": source });
+            if let Some(title) = title {
+                block["title"] = json!(title);
+            }
+            block
+        }
     }
 }
 
@@ -528,6 +621,7 @@ mod tests {
             system: "You are a SQL analyst.",
             tools,
             messages,
+            context: crate::ContextManagement::default(),
         }
     }
 
@@ -650,6 +744,81 @@ mod tests {
             acc.handle_event(&e, &tx);
         }
         assert!(acc.finish().is_ok());
+    }
+
+    /// Nothing asked for, nothing sent: the ordinary turn must not carry a beta
+    /// header or a `context_management` body, or every request opts into a beta
+    /// it never wanted.
+    #[test]
+    fn context_management_is_absent_unless_asked_for() {
+        let p = AnthropicProvider::new("k");
+        let (tools, messages) = req_parts();
+        let request = req(&tools, &messages);
+        assert!(p.build_body(&request).get("context_management").is_none());
+        assert_eq!(beta_header(&request), None);
+    }
+
+    /// Clearing tool results is lossless and summarizing is not, so the API is
+    /// asked for them in that order — and each carries its own beta flag.
+    #[test]
+    fn context_management_orders_clearing_before_compaction() {
+        let p = AnthropicProvider::new("k");
+        let (tools, messages) = req_parts();
+        let request = TurnRequest {
+            context: crate::ContextManagement {
+                clear_tool_results: true,
+                compact: true,
+            },
+            ..req(&tools, &messages)
+        };
+        let body = p.build_body(&request);
+        let edits = body["context_management"]["edits"].as_array().unwrap();
+        assert_eq!(edits[0]["type"], "clear_tool_uses_20250919");
+        assert_eq!(edits[1]["type"], "compact_20260112");
+        assert_eq!(edits.len(), 2);
+        assert_eq!(
+            beta_header(&request).as_deref(),
+            Some("context-management-2025-06-27,compact-2026-01-12")
+        );
+    }
+
+    /// A compaction block stands for the history it replaced, so it has to come
+    /// back byte-identical — the same property the thinking blocks rely on.
+    /// Asserted end to end: off the wire, through the accumulator, back to wire.
+    #[test]
+    fn a_compaction_block_round_trips_unchanged() {
+        let summary = "The user asked about orders; 14 columns, 3 indexes.";
+        for events in [
+            // Whole in the opening frame...
+            vec![
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"compaction","content":summary}}),
+            ],
+            // ...or streamed in as deltas.
+            vec![
+                json!({"type":"content_block_start","index":0,"content_block":{"type":"compaction"}}),
+                json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":summary}}),
+            ],
+        ] {
+            let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+            let mut acc = TurnAccumulator::default();
+            for e in events.into_iter().chain([json!({"type":"message_stop"})]) {
+                acc.handle_event(&e, &tx);
+            }
+            let outcome = acc.finish().unwrap();
+            match &outcome.message.content[0] {
+                ContentBlock::Compaction { content } => assert_eq!(content, summary),
+                other => panic!("expected a compaction block, got {other:?}"),
+            }
+            assert_eq!(
+                block_to_wire(&outcome.message.content[0]),
+                json!({ "type": "compaction", "content": summary }),
+            );
+            // And it is never mistaken for the answer.
+            assert!(
+                rx.try_recv().is_err(),
+                "a compaction summary must not stream into the visible reply"
+            );
+        }
     }
 
     #[test]

@@ -1495,6 +1495,18 @@ impl AppState {
                         this.copy_result_selection(cx);
                         cx.notify();
                     })),
+            )
+            // Point the agent at what is selected instead of describing it. Row
+            // data, so the tier ladder gates it — `add_reference` says so rather
+            // than accepting a chip that would resolve to nothing.
+            .item(
+                ContextMenuItem::new("cell-ask-ai", "Ask AI about these rows").on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.cell_menu = None;
+                        this.reference_selected_rows(cx);
+                        cx.notify();
+                    }),
+                ),
             );
         // "Filter by": narrow the result to the focused cell's value
         // without writing SQL. Each item builds a `ResultFilter::Cmp` term, which

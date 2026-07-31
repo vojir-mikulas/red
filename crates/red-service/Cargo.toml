@@ -30,6 +30,9 @@ bytes.workspace = true
 uuid.workspace = true
 # Resolve the user config dir for the AI write-audit log .
 dirs.workspace = true
+# Encodes an attached image / PDF for the Messages API. Already in the tree via
+# the connection importers, so it adds no new supply-chain surface.
+base64.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt", "sync", "macros", "time", "net", "io-util"] }

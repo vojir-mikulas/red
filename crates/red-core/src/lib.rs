@@ -863,6 +863,14 @@ pub struct AiLimits {
     /// Cap on tool calls per conversation, bounding a runaway agent loop. `0`
     /// disables the cap.
     pub max_tool_calls: usize,
+    /// Ceiling on the tokens one model reply may generate. Unlike the other
+    /// guards this one is a *budget*, not a safety rail: too low and a long
+    /// answer or a generated report is cut off mid-sentence.
+    ///
+    /// Current models allow far more than the default, but output tokens are the
+    /// expensive ones, so the default is roomy rather than maximal and the
+    /// ceiling is the user's to raise.
+    pub max_output_tokens: u32,
 }
 
 impl Default for AiLimits {
@@ -872,6 +880,7 @@ impl Default for AiLimits {
             statement_timeout_ms: 15_000,
             max_result_bytes: 256 * 1024,
             max_tool_calls: 100,
+            max_output_tokens: 16_384,
         }
     }
 }
@@ -997,6 +1006,13 @@ pub enum ActivityKind {
         #[cfg_attr(feature = "serde", serde(default))]
         title: Option<String>,
     },
+    /// `dropped` earlier tool results were replaced with a one-line stub to keep
+    /// the conversation inside the model's context window.
+    ///
+    /// Shown rather than done quietly: silent context loss is how an agent starts
+    /// contradicting itself with no visible cause, and this node persists with the
+    /// conversation so a later reader can see where the detail went.
+    Compacted { dropped: usize },
 }
 
 /// The lifecycle of an [`ActivityNode`]. Drives the status glyph and whether a

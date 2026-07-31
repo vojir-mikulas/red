@@ -288,6 +288,21 @@ impl PaneLayout {
         self.drop.take().is_some()
     }
 
+    /// Release the highlight, but only if `pane` is the one holding it.
+    ///
+    /// The ownership check is what makes this safe to call from every pane on
+    /// every mouse move: GPUI dispatches a drag-move to *all* of them, so an
+    /// unconditional clear would have each pane wipe whichever neighbour had
+    /// legitimately claimed the cursor, and the highlight would flicker or
+    /// vanish depending on dispatch order.
+    pub(crate) fn clear_drop_target_of(&mut self, pane: PaneId) -> bool {
+        if self.drop.is_some_and(|t| t.pane == pane) {
+            self.drop = None;
+            return true;
+        }
+        false
+    }
+
     /// The strip insertion gap, if the drag is over `pane`'s strip.
     pub(crate) fn gap_in(&self, pane: PaneId) -> Option<usize> {
         self.gap.filter(|(p, _)| *p == pane).map(|(_, g)| g)
@@ -304,8 +319,18 @@ impl PaneLayout {
         false
     }
 
-    pub(crate) fn clear_gap(&mut self) -> bool {
-        self.gap.take().is_some()
+    /// Release the strip insertion bar, but only if `pane`'s strip is showing it.
+    ///
+    /// Same ownership check as [`Self::clear_drop_target_of`], and for the same
+    /// reason: with strips side by side, a drag crossing from one to the next
+    /// makes both fire on the same move, and an unconditional clear would race
+    /// the neighbour's legitimate claim.
+    pub(crate) fn clear_gap_of(&mut self, pane: PaneId) -> bool {
+        if self.gap.is_some_and(|(p, _)| p == pane) {
+            self.gap = None;
+            return true;
+        }
+        false
     }
 
     /// Drop all transient drag feedback (the drag ended, one way or another).

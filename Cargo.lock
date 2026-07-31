@@ -6928,6 +6928,7 @@ name = "red-service"
 version = "0.20.0"
 dependencies = [
  "async-trait",
+ "base64 0.22.1",
  "bytes",
  "dirs 5.0.1",
  "futures",

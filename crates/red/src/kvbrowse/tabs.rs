@@ -403,11 +403,16 @@ impl AppState {
         }
     }
 
-    pub(crate) fn kv_clear_tab_drop_target(&mut self, session: SessionId, cx: &mut Context<Self>) {
+    pub(crate) fn kv_clear_tab_drop_target(
+        &mut self,
+        session: SessionId,
+        pane: PaneId,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.kv_view.as_mut())
-            && view.clear_drop_gap()
+            && view.clear_drop_gap(pane)
         {
             cx.notify();
         }

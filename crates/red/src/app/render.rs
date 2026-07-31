@@ -344,14 +344,19 @@ impl Render for AppState {
         // pulls focus back inside if Tab would carry it to the backdrop. Registered
         // once when a modal opens (the modal's panel is a descendant of
         // `modal_focus`), and dropped (unsubscribing) when it closes.
+        // Mirrored for the trap below, which cannot ask `self`: it fires from
+        // gpui's focus dispatch, which can run while this entity is leased for
+        // *this* render, and reading it back through its own handle there aborts
+        // the process rather than returning an error.
+        self.modal_open.set(self.any_modal_open());
         if self.any_modal_open() {
             if self.modal_focus_trap.is_none() {
                 let handle = self.modal_focus.clone();
-                let weak = cx.entity().downgrade();
+                let modal_open = self.modal_open.clone();
                 let sub = window.on_focus_out(&handle.clone(), cx, move |_event, window, cx| {
                     // Re-enter only while a modal is genuinely still open (not mid-
                     // close) and focus actually left the modal subtree.
-                    let open = weak.upgrade().is_some_and(|e| e.read(cx).any_modal_open());
+                    let open = modal_open.get();
                     if open && !handle.contains_focused(window, cx) {
                         // Bounce focus back to the modal root (the scrim, ancestor
                         // of every modal control). The next Tab then walks *into*

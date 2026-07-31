@@ -324,3 +324,10 @@ max_result_bytes = 262144
 
 # Cumulative tool-call budget per conversation, bounding a runaway loop. 0 off.
 max_tool_calls = 100
+
+# Ceiling on the tokens one model reply may generate. A reply that hits the
+# ceiling is continued automatically (up to three times) rather than failing, but
+# a long answer or a generated report is cheaper to get in a single pass. Current
+# Claude models allow up to 128000 here; the default is roomy rather than maximal
+# because output tokens are the expensive ones.
+max_output_tokens = 16384

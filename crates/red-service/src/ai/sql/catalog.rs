@@ -538,7 +538,7 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
 /// Fold the volatile, per-turn context (editor SQL, last error, selection) into
 /// the user's message so the stable system prompt stays prompt-cacheable. Shared
 /// with the ACP path for the same per-turn grounding.
-pub(crate) fn user_turn(message: &str, ctx: &AiContext) -> String {
+pub(crate) fn user_turn(message: &str, ctx: &AiContext, references: Option<&str>) -> String {
     let mut s = String::new();
     // Cursors legitimately outlive the turn that opened them ("keep going" is a
     // real follow-up), but never *silently*: told nothing, a model either forgets
@@ -559,6 +559,13 @@ pub(crate) fn user_turn(message: &str, ctx: &AiContext) -> String {
         s.push_str(prior.trim());
         s.push_str("\n\n---\n\n");
     }
+    // What the user *pointed at*, ahead of what happens to be on screen and of
+    // their own words: it is the thing the sentence is about, and the ordering is
+    // the contract a golden test pins.
+    if let Some(refs) = references.filter(|r| !r.trim().is_empty()) {
+        s.push_str(refs.trim_end());
+        s.push_str("\n\n");
+    }
     if let Some(tab) = ctx.current_tab.as_deref().filter(|s| !s.trim().is_empty()) {
         s.push_str("The user is currently viewing tab ");
         s.push_str(tab.trim());
@@ -574,11 +581,6 @@ pub(crate) fn user_turn(message: &str, ctx: &AiContext) -> String {
     if let Some(err) = ctx.last_error.as_deref().filter(|s| !s.trim().is_empty()) {
         s.push_str("Last error shown:\n");
         s.push_str(err.trim());
-        s.push_str("\n\n");
-    }
-    if let Some(sel) = ctx.selection.as_deref().filter(|s| !s.trim().is_empty()) {
-        s.push_str("Selected rows:\n");
-        s.push_str(sel.trim());
         s.push_str("\n\n");
     }
     s.push_str(message);
@@ -736,7 +738,7 @@ mod tests {
         );
         // And it never leaks into the volatile per-turn message, which sits after
         // the last cache breakpoint and would be re-read on every single turn.
-        assert!(!user_turn("how many orders?", &ctx).contains("`void` orders"));
+        assert!(!user_turn("how many orders?", &ctx, None).contains("`void` orders"));
     }
 
     #[test]
@@ -745,14 +747,41 @@ mod tests {
             prior_transcript: Some("You: hi\n\nAssistant: hello".into()),
             ..Default::default()
         };
-        let turn = user_turn("and now?", &ctx);
+        let turn = user_turn("and now?", &ctx, None);
         assert!(turn.contains("Earlier in this conversation"));
         assert!(turn.contains("Assistant: hello"));
         // The actual message still comes last.
         assert!(turn.trim_end().ends_with("and now?"));
         // No prior transcript → no preamble.
-        let plain = user_turn("hi", &AiContext::default());
+        let plain = user_turn("hi", &AiContext::default(), None);
         assert!(!plain.contains("Earlier in this conversation"));
         assert_eq!(plain, "hi");
+    }
+
+    /// Where a reference block sits is the contract, so it is pinned as a golden
+    /// string: after the seeded prior transcript (which is history), before what
+    /// is merely on screen, and always before the user's own words.
+    #[test]
+    fn references_sit_between_the_transcript_seed_and_the_message() {
+        let ctx = AiContext {
+            prior_transcript: Some("You: hi".into()),
+            current_tab: Some("\"revenue\"".into()),
+            ..Default::default()
+        };
+        let turn = user_turn(
+            "which column is the amount?",
+            &ctx,
+            Some("Referenced by the user:\n\n# Table public.orders\n"),
+        );
+        assert_eq!(
+            turn,
+            "Earlier in this conversation (for context):\nYou: hi\n\n---\n\n\
+             Referenced by the user:\n\n# Table public.orders\n\n\
+             The user is currently viewing tab \"revenue\". When they say \
+             \"this\"/\"the current tab/query/result\", they mean this.\n\n\
+             which column is the amount?"
+        );
+        // Nothing pointed at, nothing said.
+        assert!(!user_turn("hi", &AiContext::default(), Some("   ")).contains("Referenced"));
     }
 }

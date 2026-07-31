@@ -11,8 +11,11 @@
 //! it learned, [`grounding`] retrieves what the user has already run, and
 //! [`preview`] counts what a proposed write would touch before the user answers,
 //! [`shape`] catches a read query that answers a different question than it
-//! looks like it asks, and [`cursors`] holds the live windowed reads that let the
-//! agent page a large result instead of truncating it.
+//! looks like it asks, [`cursors`] holds the live windowed reads that let the
+//! agent page a large result instead of truncating it, [`attach`] turns the
+//! files a user dropped on the composer into blocks the model reads, and
+//! [`refs`] resolves whatever the user pointed at into the text that describes
+//! it.
 //! Below it, one subtree per driver seam -- [`sql`], [`kv`],
 //! [`doc`] -- each laid out the same way: `catalog` declares the tools and the
 //! system prompt that introduces them, the subtree's own `mod` holds the
@@ -35,6 +38,7 @@ use serde_json::Value as Json;
 
 use crate::protocol::AiContext;
 
+mod attach;
 mod cursors;
 mod doc;
 mod export;
@@ -43,6 +47,7 @@ mod grounding;
 mod knowledge;
 mod kv;
 mod preview;
+mod refs;
 mod report;
 mod shape;
 mod sql;
@@ -53,7 +58,9 @@ mod util;
 #[cfg(test)]
 mod testutil;
 
+pub(crate) use attach::acp_blocks;
 pub(crate) use gate::{is_headless_tool, is_write_tool};
+pub(crate) use refs::resolve as resolve_references;
 pub(crate) use sql::user_turn;
 pub(crate) use state::SandboxSlot;
 pub(crate) use state::{AiState, ReportSink};

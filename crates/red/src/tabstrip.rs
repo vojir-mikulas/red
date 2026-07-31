@@ -359,16 +359,20 @@ impl AppState {
             .items_stretch()
             .overflow_x_scroll()
             .track_scroll(&scroll)
-            // Clear the gap indicator when the drag leaves the strip *vertically*
-            // (down into the pane body, where the drop-zone overlay takes over).
-            // Horizontal exit is deliberately ignored: with strips side by side, a
-            // drag crossing to the next one stays at the same Y, and clearing on
-            // horizontal exit would race that strip's gap.
+            // Clear the gap indicator once the drag leaves this strip, in either
+            // axis. The clear is scoped to this pane's strip, so a drag crossing
+            // to a neighbouring strip (same Y, so a horizontal exit) cannot wipe
+            // the gap that strip just claimed — which is what made the horizontal
+            // case unsafe to handle before, and why it used to be left showing
+            // when the drag went somewhere that is not a strip at all.
             .on_drag_move::<TabDrag>(cx.listener(
                 move |this, e: &gpui::DragMoveEvent<TabDrag>, _, cx| {
-                    let b = e.bounds;
-                    let p = e.event.position;
-                    if p.y < b.origin.y || p.y >= b.origin.y + b.size.height {
+                    let (b, p) = (e.bounds, e.event.position);
+                    let inside = p.x >= b.origin.x
+                        && p.x < b.origin.x + b.size.width
+                        && p.y >= b.origin.y
+                        && p.y < b.origin.y + b.size.height;
+                    if !inside {
                         on_gap_clear(this, cx);
                     }
                 },

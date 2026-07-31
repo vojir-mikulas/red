@@ -20,14 +20,60 @@ mod types;
 
 pub use anthropic::{AnthropicProvider, is_safe_base_url};
 pub use types::{
-    AiError, ContentBlock, Delta, Message, Result, Role, StopReason, ToolDef, TurnOutcome,
-    TurnRequest, Usage,
+    AiError, ContentBlock, ContextManagement, Delta, DocumentSource, Message, Result, Role,
+    StopReason, ToolDef, TurnOutcome, TurnRequest, Usage,
 };
+
+/// Beta opt-in for context editing (`clear_tool_uses_20250919`).
+const CONTEXT_EDITING_BETA: &str = "context-management-2025-06-27";
+/// Beta opt-in for server-side compaction (`compact_20260112`).
+const COMPACTION_BETA: &str = "compact-2026-01-12";
 
 /// Default deep-reasoning model.
 pub const MODEL_OPUS: &str = "claude-opus-4-8";
 /// Cheap / fast lane.
 pub const MODEL_HAIKU: &str = "claude-haiku-4-5";
+
+/// The context window `model` gives you, when we know it.
+///
+/// Spelled out rather than inferred from a prefix, because the families are not
+/// uniform: `claude-opus-4-6` carries a million tokens and `claude-opus-4-5`
+/// carries two hundred thousand, so a prefix rule would be confidently wrong.
+/// An unrecognized model -- a newer release, a proxied endpoint, a local server
+/// behind an Anthropic-compatible wire -- returns `None`, and the panel then
+/// shows what it counted instead of a percentage it made up.
+pub fn context_window(model: &str) -> Option<u64> {
+    const MILLION: u64 = 1_000_000;
+    const TWO_HUNDRED_K: u64 = 200_000;
+    match model {
+        "claude-fable-5" | "claude-mythos-5" | "claude-opus-5" | "claude-opus-4-8"
+        | "claude-opus-4-7" | "claude-opus-4-6" | "claude-sonnet-5" | "claude-sonnet-4-6" => {
+            Some(MILLION)
+        }
+        "claude-haiku-4-5" | "claude-opus-4-5" | "claude-sonnet-4-5" => Some(TWO_HUNDRED_K),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An unknown model must size no window: a wrong percentage is worse than
+    /// none, and the panel already renders "we don't know" honestly.
+    #[test]
+    fn an_unknown_model_sizes_no_window() {
+        assert_eq!(context_window("llama-3-70b"), None);
+        assert_eq!(context_window(""), None);
+        assert_eq!(context_window("claude-opus-4-9"), None);
+        // The families are not uniform, which is why this is a table and not a
+        // prefix match.
+        assert_eq!(context_window("claude-opus-4-6"), Some(1_000_000));
+        assert_eq!(context_window("claude-opus-4-5"), Some(200_000));
+        assert!(context_window(MODEL_OPUS).is_some());
+        assert!(context_window(MODEL_HAIKU).is_some());
+    }
+}
 
 /// A cloneable cancel flag the service flips when the user stops a turn.
 ///
@@ -77,6 +123,17 @@ impl CancelToken {
     }
 }
 
+/// What a backend can do beyond streaming a plain turn. Every field defaults to
+/// the conservative answer, so a provider that says nothing gets the behaviour
+/// that is safe everywhere and the caller falls back to doing the work itself.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ProviderCapabilities {
+    /// The backend will keep a long conversation inside its own context window
+    /// when asked (see [`ContextManagement`]). When `false` the caller has to
+    /// trim the history before it overflows.
+    pub context_management: bool,
+}
+
 /// One language-model backend. `stream_turn` runs exactly **one** turn: it streams
 /// incremental text / thinking over `tx` as tokens arrive and returns the fully
 /// assembled assistant message plus why it stopped. The caller inspects
@@ -90,4 +147,10 @@ pub trait AiProvider: Send + Sync {
         tx: &UnboundedSender<Delta>,
         cancel: &CancelToken,
     ) -> Result<TurnOutcome>;
+
+    /// What this backend supports beyond a plain turn. Defaults to "nothing
+    /// extra", which is what a new provider should get for free.
+    fn capabilities(&self) -> ProviderCapabilities {
+        ProviderCapabilities::default()
+    }
 }

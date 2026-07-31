@@ -99,6 +99,24 @@ pub struct AcpUsage {
     pub cost_usd: Option<f64>,
 }
 
+/// One block of a prompt RED sends to an ACP agent.
+///
+/// Deliberately narrower than ACP's own content-block union: RED only ever sends
+/// what it has, and an agent is only obliged to accept text. An image is sent
+/// only to an agent that advertised
+/// [`AcpConversation::supports_images`](crate::AcpConversation::supports_images);
+/// the caller degrades to a text note otherwise, because a silently dropped
+/// screenshot is worse than a refused one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcpPromptBlock {
+    Text(String),
+    /// Base64-encoded (no newlines) with its IANA media type.
+    Image {
+        data: String,
+        media_type: String,
+    },
+}
+
 /// Why an ACP turn ended (mapped from the agent's `StopReason`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AcpStop {

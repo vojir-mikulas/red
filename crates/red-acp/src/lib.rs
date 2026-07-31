@@ -17,5 +17,6 @@ pub use auth::{AuthStatus, LoginEvent, auth_status, logout, run_login};
 pub use conversation::AcpConversation;
 pub use types::{
     AcpCommand, AcpConfig, AcpConfigCategory, AcpConfigChoice, AcpConfigOption, AcpDelta, AcpError,
-    AcpPermission, AcpStop, AcpTurnResult, AcpUsage, DEFAULT_AGENT_COMMAND, McpGrounding,
+    AcpPermission, AcpPromptBlock, AcpStop, AcpTurnResult, AcpUsage, DEFAULT_AGENT_COMMAND,
+    McpGrounding,
 };

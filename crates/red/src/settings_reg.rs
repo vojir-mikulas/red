@@ -976,6 +976,30 @@ static DEFS: &[SettingDef] = &[
         }),
     },
     SettingDef {
+        key: "ai.limits.max_output_tokens",
+        tab: SettingsTab::Ai,
+        group: "Read-tier resource guards",
+        en_label: "Max reply length",
+        en_help: "Ceiling on the tokens one reply may generate. A reply that hits it is continued \
+               automatically, but a long report is cheaper to get in one pass.",
+        applies: Applies::All,
+        control: Control::Segments(&[
+            seg("4K", int(4_096)),
+            seg("8K", int(8_192)),
+            seg("16K", int(16_384)),
+            seg("32K", int(32_768)),
+            seg("64K", int(65_536)),
+        ]),
+        get: |s| Value::Int(s.ai.limits.max_output_tokens as i64),
+        set: |s, v| s.ai.limits.max_output_tokens = v.as_int().clamp(1, i64::from(u32::MAX)) as u32,
+        warn: Some(|s| {
+            (s.ai.limits.max_output_tokens > 32_768).then_some(
+                "Above the safe default: output tokens are the expensive ones, so a runaway \
+                 answer gets expensive fast.",
+            )
+        }),
+    },
+    SettingDef {
         key: "ai.preview_writes",
         tab: SettingsTab::Ai,
         group: "Safety",

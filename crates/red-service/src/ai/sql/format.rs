@@ -41,7 +41,7 @@ pub(super) fn fk_side(
         many => format!("{table}.({})", many.join(", ")),
     }
 }
-pub(super) fn format_schema(schemas: &[red_core::SchemaMeta]) -> String {
+pub(in crate::ai) fn format_schema(schemas: &[red_core::SchemaMeta]) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     for sch in schemas {
@@ -55,7 +55,11 @@ pub(super) fn format_schema(schemas: &[red_core::SchemaMeta]) -> String {
     }
     out
 }
-pub(super) fn format_table_detail(schema: &str, table: &str, d: &red_core::TableDetail) -> String {
+pub(in crate::ai) fn format_table_detail(
+    schema: &str,
+    table: &str,
+    d: &red_core::TableDetail,
+) -> String {
     use std::fmt::Write;
     let mut out = String::new();
     let _ = writeln!(out, "{schema}.{table}");

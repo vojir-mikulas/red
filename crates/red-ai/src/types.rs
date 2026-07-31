@@ -54,6 +54,39 @@ pub enum ContentBlock {
         #[serde(default)]
         is_error: bool,
     },
+    /// An image the user attached. `data` is base64 with **no newlines** — a
+    /// wrapping encoder produces a 400 — and `media_type` is one of the four
+    /// formats the API accepts (`image/jpeg`, `image/png`, `image/gif`,
+    /// `image/webp`); anything else is refused before it gets here.
+    Image { media_type: String, data: String },
+    /// A document the user attached: a PDF, or textual content the model should
+    /// treat as a file rather than as prose. Ordered *before* the text block in
+    /// the message it belongs to, which is what the API expects.
+    Document {
+        source: DocumentSource,
+        /// The file's display name, so the model can refer to it by name.
+        title: Option<String>,
+    },
+    /// The provider's own summary of earlier context it folded away, produced
+    /// when the conversation neared the window (see [`ContextManagement`]).
+    ///
+    /// Echoed back **unchanged** on every later turn, the same discipline
+    /// `Thinking` follows and for the same reason: the provider replaces the
+    /// summarized history with this block when it assembles the next prompt, so
+    /// a block that is dropped or edited loses the conversation it stands for.
+    Compaction { content: String },
+}
+
+/// Where a [`ContentBlock::Document`]'s content comes from. Two arms because the
+/// wire shape differs: a PDF is base64 under a binary media type, text is sent
+/// verbatim.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum DocumentSource {
+    /// A PDF, base64-encoded with **no newlines**.
+    Pdf { data: String },
+    /// Textual content, verbatim.
+    Text { data: String },
 }
 
 /// One conversation message.
@@ -69,6 +102,34 @@ impl Message {
             role: Role::User,
             content: vec![ContentBlock::Text { text: text.into() }],
         }
+    }
+}
+
+/// What the provider may do to keep a long conversation inside the context
+/// window, asked for per turn and honoured only where
+/// [`ProviderCapabilities::context_management`](crate::ProviderCapabilities)
+/// says so.
+///
+/// The two are ordered by what they cost the transcript: clearing a tool result
+/// the model already summarized loses nothing, so it is tried first;
+/// summarizing the conversation loses detail and is the fallback when clearing
+/// is not enough. Both act on the prompt the *provider* assembles, so the
+/// caller keeps sending its full history either way.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ContextManagement {
+    /// Drop tool results from earlier steps once the conversation grows. Right
+    /// for a database agent: a large result the model already drew a conclusion
+    /// from is dead weight, and the conclusion is still in the transcript.
+    pub clear_tool_results: bool,
+    /// Summarize earlier context as the window fills. The summary comes back as
+    /// a [`ContentBlock::Compaction`] that must round-trip unchanged.
+    pub compact: bool,
+}
+
+impl ContextManagement {
+    /// Nothing asked for: the caller keeps the history inside the window itself.
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
     }
 }
 
@@ -89,6 +150,9 @@ pub struct TurnRequest<'a> {
     pub system: &'a str,
     pub tools: &'a [ToolDef],
     pub messages: &'a [Message],
+    /// What the provider may do to keep this conversation inside its context
+    /// window. Ignored by a provider that reports no support for it.
+    pub context: ContextManagement,
 }
 
 /// A streamed increment of the current turn, pushed over the provider's channel

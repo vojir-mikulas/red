@@ -391,6 +391,20 @@ settings-ai-limits-max_tool_calls-seg-500 = 500
 
 settings-ai-limits-max_tool_calls-seg-off = Off
 
+settings-ai-limits-max_output_tokens =
+    .label = Max reply length
+    .help = Ceiling on the tokens one reply may generate. A reply that hits it is continued automatically, but a long report is cheaper to get in one pass.
+
+settings-ai-limits-max_output_tokens-seg-4k = 4K
+
+settings-ai-limits-max_output_tokens-seg-8k = 8K
+
+settings-ai-limits-max_output_tokens-seg-16k = 16K
+
+settings-ai-limits-max_output_tokens-seg-32k = 32K
+
+settings-ai-limits-max_output_tokens-seg-64k = 64K
+
 settings-group-safety = Safety
 
 settings-ai-preview_writes =

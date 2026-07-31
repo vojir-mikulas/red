@@ -37,6 +37,27 @@ pub(crate) struct StoredMessage {
     /// The turn's plan checklist, if the agent published one. Defaulted for old files.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub plan: Vec<red_core::PlanStep>,
+    /// Files the user attached to this turn, by name and size.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<StoredAttachment>,
+}
+
+/// One attachment as the transcript remembers it: what it was called and how big
+/// it was, never its contents.
+///
+/// Storing the bytes would balloon the config directory with data the user
+/// already has on disk, and a chat file is something they may well read in an
+/// editor. `path` is kept so a reopened chat can offer to attach it again, and is
+/// simply stale if the file has moved.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct StoredAttachment {
+    pub name: String,
+    pub bytes: u64,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub path: String,
+    /// `"text"`, `"image"` or `"pdf"`, for the chip's icon.
+    #[serde(default)]
+    pub kind: String,
 }
 
 /// A saved conversation: its transcript, a display title, the provider binding it
@@ -271,5 +292,28 @@ mod tests {
         assert_eq!(back.provider, "subscription");
         assert_eq!(back.messages.len(), 2);
         assert_eq!(back.messages[1].thinking, "counting");
+    }
+
+    /// A saved chat remembers *that* a file was attached, never the file. Storing
+    /// the bytes would balloon the config directory with data the user already
+    /// has on disk, in a file they may well open in an editor.
+    #[test]
+    fn an_attachment_is_persisted_as_metadata_only() {
+        let stored = StoredAttachment {
+            name: "report.pdf".into(),
+            bytes: 2_200_000,
+            path: "/home/a/report.pdf".into(),
+            kind: "pdf".into(),
+        };
+        let json = serde_json::to_string(&stored).unwrap();
+        assert_eq!(
+            json,
+            r#"{"name":"report.pdf","bytes":2200000,"path":"/home/a/report.pdf","kind":"pdf"}"#
+        );
+
+        // And a chat saved before attachments existed still loads.
+        let old = r#"{"role":"user","text":"hi","thinking":""}"#;
+        let back: StoredMessage = serde_json::from_str(old).unwrap();
+        assert!(back.attachments.is_empty());
     }
 }

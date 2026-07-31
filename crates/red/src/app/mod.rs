@@ -405,6 +405,14 @@ pub struct AppState {
     /// pulls focus back inside if Tab would carry it to the backdrop (the focus
     /// trap). Dropped (unsubscribing) when the modal closes.
     pub(crate) modal_focus_trap: Option<gpui::Subscription>,
+    /// Whether a modal is open, mirrored into a cell the focus trap can read.
+    ///
+    /// The trap needs to know, and it cannot ask: it fires from gpui's focus
+    /// dispatch, which can run while `AppState` is leased for a render, and
+    /// reading the entity back through its own handle there aborts the process
+    /// (see the `lease_guard_tests` note in `connect.rs`). A cell the render
+    /// writes and the callback reads carries the same answer without the read.
+    pub(crate) modal_open: std::rc::Rc<std::cell::Cell<bool>>,
     /// The command palette overlay, when open, plus the `id → Cmd` map for the
     /// commands it's currently showing (so an activation routes to the right one).
     /// The open command palette / prompt, paired with the `Subscription` to its
@@ -613,6 +621,7 @@ pub(crate) fn ai_config(settings: &Settings) -> red_service::AiConfig {
             statement_timeout_ms: settings.ai.limits.statement_timeout_ms,
             max_result_bytes: settings.ai.limits.max_result_bytes,
             max_tool_calls: settings.ai.limits.max_tool_calls,
+            max_output_tokens: settings.ai.limits.max_output_tokens,
         },
     }
 }
@@ -1289,6 +1298,7 @@ impl AppState {
             modal_focus: cx.focus_handle(),
             focus_modal: false,
             modal_focus_trap: None,
+            modal_open: std::rc::Rc::new(std::cell::Cell::new(false)),
             palette: None,
             palette_cmds: Vec::new(),
             palette_prompt: PromptKind::GoToRow,

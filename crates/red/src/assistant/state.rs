@@ -202,6 +202,7 @@ impl AppState {
                 chats: vec![ChatSession::new(conversation_id, provider)],
                 active: 0,
                 show_list: false,
+                drop_active: false,
                 renaming: None,
                 completion_commands,
                 open_config: None,
@@ -408,12 +409,19 @@ impl AppState {
         // Read the chat's mode while recording the turn, so the command carries what
         // this conversation was created with rather than a global default.
         let mut sandbox_mode = false;
+        // Taken off the chat as the turn is recorded: staged files belong to the
+        // draft, and the draft is what is being sent.
+        let mut staged: Vec<super::attach::Attachment> = Vec::new();
+        let mut pointed_at: Vec<super::refs::ContextRef> = Vec::new();
         let sent = self
             .with_chat_mut(conversation_id, |chat| {
                 if chat.streaming {
                     return false;
                 }
                 sandbox_mode = chat.sandbox;
+                staged = std::mem::take(&mut chat.attachments);
+                chat.attach_error = None;
+                pointed_at = std::mem::take(&mut chat.references);
                 // A reopened chat seeds its prior transcript into this one turn so
                 // the model resumes coherently despite a fresh session.
                 context.prior_transcript = chat.pending_seed.take();
@@ -421,11 +429,9 @@ impl AppState {
                 if chat.title.is_none() {
                     chat.title = Some(derive_title(&message));
                 }
-                chat.messages.push(ChatMessage::new(
-                    ChatRole::User,
-                    message.clone(),
-                    String::new(),
-                ));
+                let mut turn = ChatMessage::new(ChatRole::User, message.clone(), String::new());
+                turn.attachments = staged.iter().map(stored_attachment).collect();
+                chat.messages.push(turn);
                 chat.error = None;
                 chat.status = None;
                 chat.streaming = true;
@@ -441,19 +447,285 @@ impl AppState {
         if !sent {
             return;
         }
-        self.service.send_to(
-            session,
-            red_service::Command::AiTurn {
-                sandbox: sandbox_mode,
-                conversation_id,
-                agent,
-                message,
-                context,
-            },
-        );
+        // Resolved here rather than at drop time: a tab's SQL can change between
+        // the two, and what the model should get is what is there now.
+        context.references = self.resolve_references(&pointed_at, cx);
+        let command = move |attachments| red_service::Command::AiTurn {
+            sandbox: sandbox_mode,
+            conversation_id,
+            agent,
+            message,
+            attachments,
+            context,
+        };
+        if staged.is_empty() {
+            self.service.send_to(session, command(Vec::new()));
+        } else {
+            // Reading a 20 MB PDF on the UI thread would drop frames, so the turn
+            // is sent once the bytes land. The user message is already on screen
+            // and the chat already reads as streaming, which is honest: the turn
+            // *has* started, it is just waiting on a disk read.
+            cx.spawn(
+                async move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                    let read = cx
+                        .background_executor()
+                        .spawn(async move { super::attach::read_all(&staged) })
+                        .await;
+                    let _ = this.update(cx, |this, cx| match read {
+                        Ok(attachments) => this.service.send_to(session, command(attachments)),
+                        // Nothing was sent, so nothing will come back to settle the
+                        // turn: settle it here, with the reason.
+                        Err(why) => {
+                            this.with_chat_mut(conversation_id, |chat| {
+                                chat.streaming = false;
+                                chat.error = Some(why.into());
+                            });
+                            cx.notify();
+                        }
+                    });
+                },
+            )
+            .detach();
+        }
         // Make the just-recorded user turn selectable right away (its text is final).
         self.build_chat_selectables(conversation_id, cx);
         cx.notify();
+    }
+
+    /// Stage `paths` on the active chat, refusing what cannot be sent.
+    ///
+    /// The one entry point for both the picker and an OS drop, which is also the
+    /// security boundary: a path only ever arrives from the user, never from the
+    /// model.
+    pub(crate) fn attach_paths(&mut self, paths: Vec<std::path::PathBuf>, cx: &mut Context<Self>) {
+        let Some(conversation_id) = self.assistant.as_ref().map(|s| s.active().conversation_id)
+        else {
+            return;
+        };
+        let mut refused: Vec<String> = Vec::new();
+        self.with_chat_mut(conversation_id, |chat| {
+            for path in paths {
+                if chat.attachments.len() >= super::attach::MAX_ATTACHMENTS {
+                    refused.push(format!(
+                        "A turn can carry {} files; the rest were not attached.",
+                        super::attach::MAX_ATTACHMENTS
+                    ));
+                    break;
+                }
+                match super::attach::classify(&path) {
+                    // Attaching the same file twice is a slip, not a request for
+                    // two copies of it in the prompt.
+                    Ok(a) if chat.attachments.iter().any(|x| x.path == a.path) => {}
+                    Ok(a) => chat.attachments.push(a),
+                    Err(why) => refused.push(why),
+                }
+            }
+            chat.attach_error = (!refused.is_empty()).then(|| refused.join(" ").into());
+        });
+        cx.notify();
+    }
+
+    /// Remove one staged attachment from the active chat (the chip's ✕).
+    pub(crate) fn remove_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(conversation_id) = self.assistant.as_ref().map(|s| s.active().conversation_id)
+        else {
+            return;
+        };
+        self.with_chat_mut(conversation_id, |chat| {
+            if index < chat.attachments.len() {
+                chat.attachments.remove(index);
+            }
+            chat.attach_error = None;
+        });
+        cx.notify();
+    }
+
+    /// Hand a staged CSV/JSON attachment to RED's own import pipeline instead of
+    /// to the model.
+    ///
+    /// The better answer for tabular data past a certain size is a table the
+    /// agent can query, so this is a doorway into a workflow RED already has
+    /// rather than an AI feature. The mapping and the confirm are the existing
+    /// ones; only the file's origin differs.
+    pub(crate) fn import_attachment(&mut self, index: usize, cx: &mut Context<Self>) {
+        let path = self
+            .assistant
+            .as_ref()
+            .and_then(|s| s.active().attachments.get(index))
+            .map(|a| a.path.clone());
+        let Some(path) = path else { return };
+        // The pipeline maps a file's columns onto a table's, so it needs a table:
+        // the one the user is looking at.
+        let target = match &self.phase {
+            crate::app::Phase::Connected(a) => a.active_result().and_then(|g| g.import_target()),
+            _ => None,
+        };
+        let Some((target, columns)) = target else {
+            self.notify(
+                flint::ToastVariant::Info,
+                "Open the table you want to import into, then try again",
+                cx,
+            );
+            return;
+        };
+        self.begin_import_peek(path, target, columns);
+    }
+
+    /// Turn the chips into the wire form, resolving the ones that name live UI
+    /// against what is on screen **now**.
+    ///
+    /// A tab whose SQL changed since it was dropped sends the current SQL; a tab
+    /// that has since been closed drops out rather than sending a stale copy of
+    /// something the user can no longer see.
+    fn resolve_references(
+        &self,
+        refs: &[super::refs::ContextRef],
+        cx: &Context<Self>,
+    ) -> Vec<red_service::ContextRefSpec> {
+        use super::refs::ContextRef;
+        let gutter = self.gutter();
+        let crate::app::Phase::Connected(active) = &self.phase else {
+            // Structure references still make sense to a service that has a
+            // session; the tab-bound ones cannot resolve without one.
+            return refs.iter().filter_map(ContextRef::static_spec).collect();
+        };
+        refs.iter()
+            .filter_map(|r| match r {
+                other if other.static_spec().is_some() => other.static_spec(),
+                ContextRef::Tab { index, .. } => {
+                    let tab = active.tabs.get(*index)?;
+                    let sql = tab.editor.read(cx).content().to_string();
+                    (!sql.trim().is_empty()).then(|| red_service::ContextRefSpec::Sql {
+                        label: format!("Tab \"{}\"", tab.title),
+                        sql,
+                    })
+                }
+                ContextRef::Rows { index } => {
+                    let tab = active.tabs.get(*index)?;
+                    let text = tab.result.as_ref()?.selection_text(gutter)?;
+                    Some(red_service::ContextRefSpec::Rows {
+                        label: format!("Selected rows in \"{}\"", tab.title),
+                        text,
+                    })
+                }
+                // Every arm above is either static or handled; a `_` here would
+                // silently swallow a reference kind added later.
+                ContextRef::Table { .. }
+                | ContextRef::Column { .. }
+                | ContextRef::Schema { .. } => None,
+            })
+            .collect()
+    }
+
+    /// Point the agent at the tab at `index`, naming the chip after it.
+    pub(crate) fn reference_tab(&mut self, index: usize, cx: &mut Context<Self>) {
+        let title = match &self.phase {
+            crate::app::Phase::Connected(a) => a.tabs.get(index).map(|t| t.title.clone()),
+            _ => None,
+        };
+        let Some(title) = title else { return };
+        self.add_reference(super::refs::ContextRef::Tab { index, title }, cx);
+    }
+
+    /// Point the agent at whatever is selected in the active result grid (the
+    /// grid's "Ask AI about these rows").
+    pub(crate) fn reference_selected_rows(&mut self, cx: &mut Context<Self>) {
+        let index = match &self.phase {
+            crate::app::Phase::Connected(a) => {
+                use crate::app::TabWorkspace as _;
+                a.focused_tab_index()
+            }
+            _ => None,
+        };
+        let Some(index) = index else { return };
+        self.add_reference(super::refs::ContextRef::Rows { index }, cx);
+    }
+
+    /// Stage a reference on the active chat (a drop, or "Ask AI about this").
+    ///
+    /// A `Rows` reference on a connection whose tier withholds row data is
+    /// refused here, with the reason, rather than accepted and silently emptied
+    /// at send.
+    pub(crate) fn add_reference(
+        &mut self,
+        reference: super::refs::ContextRef,
+        cx: &mut Context<Self>,
+    ) {
+        let reads_allowed = matches!(
+            self.ai_tier_effective(),
+            red_core::AiTier::Read | red_core::AiTier::Write
+        );
+        if reference.is_data() && !reads_allowed {
+            self.notify(
+                flint::ToastVariant::Info,
+                "This connection's agent cannot read row data (raise its access tier in Settings)",
+                cx,
+            );
+            return;
+        }
+        // A reference has to land somewhere the user can see; a chip staged into a
+        // closed panel is a change with no feedback.
+        let Some(conversation_id) = self.assistant.as_ref().map(|s| s.active().conversation_id)
+        else {
+            self.notify(
+                flint::ToastVariant::Info,
+                "Open the assistant panel first",
+                cx,
+            );
+            return;
+        };
+        self.with_chat_mut(conversation_id, |chat| {
+            // Pointing at the same thing twice is a slip, not a request for two
+            // copies of it in the prompt.
+            if !chat.references.iter().any(|r| r.same_target(&reference)) {
+                chat.references.push(reference);
+            }
+        });
+        cx.notify();
+    }
+
+    /// Remove one staged reference from the active chat (the chip's ✕).
+    pub(crate) fn remove_reference(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(conversation_id) = self.assistant.as_ref().map(|s| s.active().conversation_id)
+        else {
+            return;
+        };
+        self.with_chat_mut(conversation_id, |chat| {
+            if index < chat.references.len() {
+                chat.references.remove(index);
+            }
+        });
+        cx.notify();
+    }
+
+    /// Set (and repaint) the panel's drop highlight, skipping the notify when
+    /// nothing changed — `on_drag_move` fires on every pointer move.
+    pub(crate) fn set_assistant_drop_active(&mut self, active: bool, cx: &mut Context<Self>) {
+        if let Some(state) = self.assistant.as_mut()
+            && state.drop_active != active
+        {
+            state.drop_active = active;
+            cx.notify();
+        }
+    }
+
+    /// Open the OS file picker and stage whatever comes back (the composer's `+`).
+    pub(crate) fn pick_attachments(&mut self, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: Some("Attach".into()),
+        });
+        cx.spawn(
+            async move |this: gpui::WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let Ok(Ok(Some(paths))) = paths.await else {
+                    return;
+                };
+                let _ = this.update(cx, |this, cx| this.attach_paths(paths, cx));
+            },
+        )
+        .detach();
     }
 
     /// Run `f` against the [`ChatSession`] that owns `conversation_id` (events route
@@ -731,6 +1003,7 @@ impl AppState {
                     let mut msg = ChatMessage::new(role, m.text.clone(), m.thinking.clone());
                     msg.activity = m.activity.clone();
                     msg.plan = m.plan.clone();
+                    msg.attachments = m.attachments.clone();
                     msg
                 })
                 .collect();
@@ -1906,7 +2179,9 @@ impl AppState {
             current_tab,
             editor_sql,
             last_error,
-            selection: None,
+            // Filled per-turn by `dispatch_turn` from the chat's chips; `ai_context`
+            // describes what is on screen, references are what was pointed at.
+            references: Vec::new(),
             // Set per-turn by `send_turn` only on the first turn after a restore.
             prior_transcript: None,
             connection: format!(
@@ -1979,6 +2254,22 @@ fn settle_running_nodes(nodes: &mut [red_core::ActivityNode]) {
 /// chat with no real assistant reply yet (only a pending/aborted user turn) isn't
 /// saved; there's nothing worth keeping. Best-effort: a write failure is logged,
 /// never surfaced mid-turn.
+/// One staged attachment as the transcript remembers it: name, size, kind and
+/// where it came from — never the bytes.
+fn stored_attachment(a: &super::attach::Attachment) -> crate::conversations::StoredAttachment {
+    crate::conversations::StoredAttachment {
+        name: a.name.clone(),
+        bytes: a.bytes,
+        path: a.path.to_string_lossy().into_owned(),
+        kind: match a.kind {
+            super::attach::AttachmentKind::Text => "text",
+            super::attach::AttachmentKind::Image => "image",
+            super::attach::AttachmentKind::Pdf => "pdf",
+        }
+        .to_string(),
+    }
+}
+
 fn persist_chat(chat: &mut ChatSession) {
     // Need at least one assistant turn with content to be worth saving.
     let has_answer = chat
@@ -2018,6 +2309,7 @@ fn persist_chat(chat: &mut ChatSession) {
                 thinking: m.thinking.clone(),
                 activity: m.activity.clone(),
                 plan: m.plan.clone(),
+                attachments: m.attachments.clone(),
             })
             .collect(),
         path: Default::default(),

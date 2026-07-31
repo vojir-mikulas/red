@@ -171,9 +171,9 @@ pub(crate) trait TabWorkspace {
         self.ws_layout_mut().set_gap(pane, gap)
     }
 
-    /// Drop the strip drop indicator (the cursor left the strip mid-drag).
-    fn clear_drop_gap(&mut self) -> bool {
-        self.ws_layout_mut().clear_gap()
+    /// Drop `pane`'s strip drop indicator (the cursor left that strip mid-drag).
+    fn clear_drop_gap(&mut self, pane: PaneId) -> bool {
+        self.ws_layout_mut().clear_gap_of(pane)
     }
 
     /// Toggle the pinned flag of the tab at `index`. Returns whether it hit a tab.

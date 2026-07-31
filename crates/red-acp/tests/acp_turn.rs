@@ -38,7 +38,10 @@ async fn handshake_then_streamed_turn() {
         .expect("agent comes up");
 
     let (sink, mut deltas) = mpsc::unbounded_channel();
-    let done = conv.prompt("hello there".to_string(), sink);
+    let done = conv.prompt(
+        vec![red_acp::AcpPromptBlock::Text("hello there".to_string())],
+        sink,
+    );
 
     let mut text = String::new();
     let mut saw_thinking = false;
@@ -64,7 +67,10 @@ async fn cancel_stops_an_inflight_turn() {
 
     let (sink, mut deltas) = mpsc::unbounded_channel();
     // "HANG" makes the fake agent wait for session/cancel before finishing.
-    let done = conv.prompt("please HANG".to_string(), sink);
+    let done = conv.prompt(
+        vec![red_acp::AcpPromptBlock::Text("please HANG".to_string())],
+        sink,
+    );
 
     // Once any streamed delta lands, the turn is in flight; cancel it.
     let _ = deltas.recv().await;
@@ -83,7 +89,10 @@ async fn auto_allows_a_known_readonly_tool() {
         .expect("agent comes up");
 
     let (sink, mut deltas) = mpsc::unbounded_channel();
-    let done = conv.prompt("PERMIT please".to_string(), sink);
+    let done = conv.prompt(
+        vec![red_acp::AcpPromptBlock::Text("PERMIT please".to_string())],
+        sink,
+    );
 
     let text = collect_text(&mut deltas).await;
     done.await.expect("reply").expect("turn ok");
@@ -103,7 +112,10 @@ async fn prompts_the_user_for_an_unknown_tool() {
 
     // `UNKNOWN` makes the fake agent request an un-allowlisted tool → user decides.
     let (sink, mut deltas) = mpsc::unbounded_channel();
-    let done = conv.prompt("PERMIT UNKNOWN".to_string(), sink);
+    let done = conv.prompt(
+        vec![red_acp::AcpPromptBlock::Text("PERMIT UNKNOWN".to_string())],
+        sink,
+    );
 
     let perm = perm_rx.recv().await.expect("a permission to surface");
     assert_eq!(perm.title, "transmogrify");
@@ -124,7 +136,10 @@ async fn detects_a_crashed_agent() {
     // "EXIT" makes the fake agent kill its process mid-turn (a crash). The turn
     // fails and the handle must report itself dead so the service restarts it.
     let (sink, mut deltas) = mpsc::unbounded_channel();
-    let done = conv.prompt("please EXIT".to_string(), sink);
+    let done = conv.prompt(
+        vec![red_acp::AcpPromptBlock::Text("please EXIT".to_string())],
+        sink,
+    );
     while deltas.recv().await.is_some() {}
     let outcome = done.await;
     assert!(
@@ -150,7 +165,10 @@ async fn denies_an_unknown_tool_when_no_ui_is_wired() {
         .expect("agent comes up");
 
     let (sink, mut deltas) = mpsc::unbounded_channel();
-    let done = conv.prompt("PERMIT UNKNOWN".to_string(), sink);
+    let done = conv.prompt(
+        vec![red_acp::AcpPromptBlock::Text("PERMIT UNKNOWN".to_string())],
+        sink,
+    );
 
     let text = collect_text(&mut deltas).await;
     done.await.expect("reply").expect("turn ok");

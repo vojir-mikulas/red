@@ -2822,6 +2822,7 @@ async fn ai_turn_resolves_agent_id_with_clear_errors() {
     send(
         &handle,
         Command::AiTurn {
+            attachments: Vec::new(),
             sandbox: false,
             conversation_id: ConversationId::new(1),
             agent: "ghost".into(),
@@ -2840,6 +2841,7 @@ async fn ai_turn_resolves_agent_id_with_clear_errors() {
     send(
         &handle,
         Command::AiTurn {
+            attachments: Vec::new(),
             sandbox: false,
             conversation_id: ConversationId::new(2),
             agent: "api".into(),

@@ -181,6 +181,10 @@ pub(crate) struct AiState {
     pub(super) histories: HashMap<ConversationId, Vec<Message>>,
     pub(super) cancels: HashMap<ConversationId, CancelToken>,
     pub(super) tool_calls: HashMap<ConversationId, usize>,
+    /// Tokens each conversation has spent so far. Kept here rather than recomputed
+    /// per turn because the question the footer answers -- "should I start a new
+    /// chat?" -- is about the conversation, not the last exchange.
+    pub(super) usage: HashMap<ConversationId, crate::protocol::AiUsage>,
     /// Write-tool approval prompts awaiting the user's Allow/Deny, keyed
     /// by request id. The turn task parks a decision sink here; `AiPermission` takes
     /// it back out and fires it, the API-key analogue of the ACP path's
@@ -232,6 +236,23 @@ impl AiState {
         }
     }
 
+    /// Fold one turn's tokens into the conversation's running total and return
+    /// the total. `used`/`window` describe how full the model's context is right
+    /// now rather than what was spent, so they replace rather than accumulate.
+    pub(super) fn charge_usage(
+        &mut self,
+        conversation_id: ConversationId,
+        turn: crate::protocol::AiUsage,
+    ) -> crate::protocol::AiUsage {
+        let total = self.usage.entry(conversation_id).or_default();
+        total.input_tokens += turn.input_tokens;
+        total.output_tokens += turn.output_tokens;
+        total.cache_read_input_tokens += turn.cache_read_input_tokens;
+        total.context_used_tokens = turn.context_used_tokens;
+        total.context_tokens = turn.context_tokens;
+        *total
+    }
+
     /// Flip the cancel token for an in-flight turn, if any (the panel's Stop).
     pub(crate) fn cancel(&mut self, conversation_id: ConversationId) {
         if let Some(tok) = self.cancels.get(&conversation_id) {
@@ -255,6 +276,7 @@ impl AiState {
         }
         self.histories.remove(&conversation_id);
         self.tool_calls.remove(&conversation_id);
+        self.usage.remove(&conversation_id);
         // An open cursor holds a connection; a conversation that is gone can
         // never read from it again.
         self.cursors.close_conversation(conversation_id);

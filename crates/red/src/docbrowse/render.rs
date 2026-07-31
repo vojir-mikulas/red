@@ -587,7 +587,7 @@ impl AppState {
             },
             move |this, from, cx| this.doc_drop_tab(session, from, pane, cx),
             move |this, slot, cx| this.doc_set_tab_drop_target(session, pane, slot, cx),
-            move |this, cx| this.doc_clear_tab_drop_target(session, cx),
+            move |this, cx| this.doc_clear_tab_drop_target(session, pane, cx),
         )
         .tabs(tabs)
         .gap(v.layout.gap_in(pane))

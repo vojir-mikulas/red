@@ -29,9 +29,10 @@ mod update;
 
 pub use protocol::{
     AiAgentKind, AiAgentProfile, AiAuthStatus, AiCommand, AiConfig, AiConfigCategory,
-    AiConfigChoice, AiConfigOption, AiContext, AiDelta, AiUsage, Command, ConversationId, Epoch,
-    Event, OpId, ReportTheme, RequestId, RunFetch, SandboxEntry, SessionId, SortKey, SqlReview,
-    StatementPreview, UpdateConfig, WritePreview,
+    AiConfigChoice, AiConfigOption, AiContext, AiDelta, AiUsage, AttachmentBody, Command,
+    ContextRefSpec, ConversationId, Epoch, Event, OpId, ReportTheme, RequestId, RunFetch,
+    SandboxEntry, SessionId, SortKey, SqlReview, StatementPreview, TurnAttachment, UpdateConfig,
+    WritePreview,
 };
 pub use red_acp::DEFAULT_AGENT_COMMAND;
 pub use red_core::{AiLimits, AiPolicy, AiTier};

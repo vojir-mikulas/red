@@ -638,18 +638,42 @@ mod lease_guard_tests {
                 let Ok(text) = std::fs::read_to_string(&path) else {
                     continue;
                 };
+                // Whitespace-stripped, with each surviving byte's line number
+                // alongside it.
+                //
+                // Matching line by line is what let the real one through: rustfmt
+                // had wrapped it into `cx\n.entity()\n.read(cx)`, so the needle
+                // never appeared on any single line and the guard reported clean
+                // while the app aborted on every turn that produced a timeline.
+                // Comment lines are dropped first, since the notes here and in
+                // `ActiveConn::new` spell the pattern out on purpose.
+                let mut flat = String::new();
+                let mut lines = Vec::new();
                 for (n, line) in text.lines().enumerate() {
-                    // The doc comment in `ActiveConn::new` names the pattern to
-                    // warn about it, so skip comment lines.
-                    let trimmed = line.trim_start();
-                    if trimmed.starts_with("//") {
+                    if line.trim_start().starts_with("//") {
                         continue;
                     }
-                    // Assembled at runtime so this scanner does not match its own
-                    // source and report itself.
-                    let needle = format!("cx.entity().{}(", "read");
-                    if line.contains(&needle) {
-                        offenders.push(format!("{}:{}", path.display(), n + 1));
+                    for ch in line.chars().filter(|c| !c.is_whitespace()) {
+                        flat.push(ch);
+                        lines.push(n + 1);
+                    }
+                }
+                // Assembled at runtime so this scanner does not match its own
+                // source and report itself.
+                let verb = "read";
+                for needle in [
+                    format!("cx.entity().{verb}("),
+                    // A weak handle upgraded and read. Worse than the direct
+                    // form, because it compiles, runs fine most of the time, and
+                    // only aborts when the callback happens to fire while the
+                    // entity is leased.
+                    format!(".upgrade().is_some_and(|e|e.{verb}("),
+                ] {
+                    let mut from = 0;
+                    while let Some(hit) = flat[from..].find(&needle) {
+                        let at = from + hit;
+                        offenders.push(format!("{}:{}", path.display(), lines[at]));
+                        from = at + needle.len();
                     }
                 }
             }

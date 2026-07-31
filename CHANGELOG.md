@@ -7,6 +7,54 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- You can point the agent at things instead of describing them. Drag a table, a
+  column, a schema or a query tab onto the assistant panel and it becomes a chip
+  on your next message; right-click anything in the schema tree and pick "Ask AI
+  about this" for the same result without the drag. Selected rows in the grid
+  have their own entry too. The agent then gets the object's real definition -
+  the same text `describe_table` would have returned, not a paraphrase - so
+  "the one with the unit price, no wait, `public.order_items`" stops being how a
+  question starts. References resolve when you hit Enter, not when you drop, so
+  a tab you edit in between sends what is actually there; one that is gone, or a
+  table that has been dropped, says so rather than failing the turn. Structure
+  works at any access tier; row data still needs the read tier, and says so at
+  the point you ask rather than silently arriving empty.
+- You can now attach files to a chat. Drop them anywhere on the assistant panel,
+  or use the `+` beside the composer: a CSV the vendor sent, a screenshot of the
+  dashboard that shows the wrong number, a PDF spec, a stack trace from prod.
+  Text files ride as fenced blocks, images and PDFs as themselves, and every
+  attachment shows as a chip you can remove before sending. Nothing is guessed
+  at: an unsupported type or an oversized file is refused in the composer, with
+  the reason and what to do instead - a CSV over the limit points you at
+  importing it into a table and asking about that, which is both better and
+  something RED already does (there is an "import" action on the chip for
+  exactly that). Files are read off the UI thread at send time, so attaching a
+  20 MB PDF does not stall the window. Saved chats remember what was attached by
+  name and size, never by content. On the subscription path images go to agents
+  that accept them and are described by name to those that do not, rather than
+  disappearing. Attachments are treated as data throughout: the agent is told to
+  read them as information to analyse and never as instructions, and every write
+  still needs your approval.
+- Long investigations no longer end in an error. The assistant's reply length is
+  now a setting (Settings → AI, 16K by default, up to 64K) instead of a fixed
+  8K ceiling, and a reply that still hits it is asked to carry on from where it
+  stopped rather than failing the turn - so a long answer or a generated report
+  arrives whole. A turn may take twice as many tool steps as before, and running
+  out of them now ends with the agent summarising what it found instead of a
+  trace that simply stops mid-investigation and settles as though it were
+  finished. On top of that the conversation is kept inside the model's context
+  window: old tool results the agent has already drawn its conclusions from are
+  cleared, and the conversation is summarised as it fills, both by the model
+  provider rather than by guesswork here. Where that is not available RED trims
+  locally and says so in the activity trace, because context lost silently is
+  how an agent starts contradicting itself for no visible reason.
+- The usage gauge in the assistant now works on the API-key path too, not just
+  the subscription one, and reads the whole conversation rather than the last
+  exchange. It fills as the chat fills, turns amber at three fifths - early
+  enough to finish your thought - and red at nine tenths, and its tooltip shows
+  what the chat has cost so far. A model whose context window RED does not
+  recognise shows the token count rather than a percentage it would have had to
+  invent.
 - The assistant can now read through a large result instead of stopping at the
   first page. A query that returns more than fits comes back with a cursor the
   agent continues, window by window, through the same streaming machinery the
