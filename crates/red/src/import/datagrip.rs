@@ -128,6 +128,10 @@ fn map_kind(driver: &str, jdbc: &str) -> Option<DbKind> {
         Some(DbKind::Sqlite)
     } else if d.starts_with("clickhouse") || d == "ch" {
         Some(DbKind::Clickhouse)
+    } else if d.starts_with("mongo") {
+        Some(DbKind::Mongo)
+    } else if d.starts_with("redis") || d.starts_with("valkey") {
+        Some(DbKind::Redis)
     } else {
         None
     };
@@ -142,6 +146,8 @@ fn scheme_to_kind(scheme: &str) -> Option<DbKind> {
         "mysql" | "mariadb" => Some(DbKind::Mysql),
         "sqlite" => Some(DbKind::Sqlite),
         "clickhouse" | "ch" => Some(DbKind::Clickhouse),
+        "mongodb" | "mongodb+srv" | "mongo" => Some(DbKind::Mongo),
+        "redis" | "rediss" | "valkey" => Some(DbKind::Redis),
         _ => None,
     }
 }
@@ -245,6 +251,14 @@ mod tests {
     <driver-ref>sqlserver</driver-ref>
     <jdbc-url>jdbc:sqlserver://mssql;databaseName=x</jdbc-url>
   </data-source>
+  <data-source source="LOCAL" name="Mongo prod" uuid="e">
+    <driver-ref>mongo</driver-ref>
+    <jdbc-url>jdbc:mongodb://mongo.example.com:27018/appdb</jdbc-url>
+  </data-source>
+  <data-source source="LOCAL" name="Redis cache" uuid="f">
+    <driver-ref>redis</driver-ref>
+    <jdbc-url>jdbc:redis://redis.example.com:6380/3</jdbc-url>
+  </data-source>
 </component>"#;
 
     fn find<'a>(r: &'a ImportReport, name: &str) -> &'a ImportedConnection {
@@ -289,6 +303,22 @@ mod tests {
         assert_eq!(lite.config.database, "/data/app.db");
         assert!(lite.config.host.is_empty());
         assert!(lite.warning.is_none(), "a file engine needs no password");
+    }
+
+    #[test]
+    fn maps_mongo_and_redis_data_sources() {
+        let r = parse(SAMPLE);
+        let mg = find(&r, "Mongo prod");
+        assert_eq!(mg.config.kind, DbKind::Mongo);
+        assert_eq!(mg.config.host, "mongo.example.com");
+        assert_eq!(mg.config.port, Some(27018));
+        assert_eq!(mg.config.database, "appdb");
+
+        let rd = find(&r, "Redis cache");
+        assert_eq!(rd.config.kind, DbKind::Redis);
+        assert_eq!(rd.config.host, "redis.example.com");
+        assert_eq!(rd.config.port, Some(6380));
+        assert_eq!(rd.config.database, "3");
     }
 
     #[test]

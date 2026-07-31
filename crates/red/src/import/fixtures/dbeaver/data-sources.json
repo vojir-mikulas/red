@@ -54,6 +54,26 @@
         "host": "win.example.com",
         "port": "1433"
       }
+    },
+    "mongo-1": {
+      "provider": "mongodb",
+      "driver": "mongo",
+      "name": "Mongo prod",
+      "save-password": true,
+      "configuration": {
+        "host": "mongo.example.com",
+        "port": "27018",
+        "database": "appdb"
+      }
+    },
+    "redis-1": {
+      "provider": "redis",
+      "driver": "redis",
+      "name": "Redis cache",
+      "save-password": true,
+      "configuration": {
+        "url": "jdbc:rediss://redis.example.com:6380/3"
+      }
     }
   }
 }

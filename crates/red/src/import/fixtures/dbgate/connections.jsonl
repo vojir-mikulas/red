@@ -3,4 +3,6 @@
 {"_id":"raw1","engine":"postgres@dbgate-plugin-postgres","displayName":"Raw Pw","server":"h","port":5432,"user":"u","password":"plainpw","passwordMode":"saveRaw"}
 {"_id":"lite1","engine":"sqlite@dbgate-plugin-sqlite","displayName":"Local SQLite","databaseFile":"/data/app.sqlite"}
 {"_id":"ms1","engine":"mssql@dbgate-plugin-mssql","displayName":"SQL Server","server":"win","port":1433}
+{"_id":"mg1","engine":"mongo@dbgate-plugin-mongo","displayName":"Mongo prod","useDatabaseUrl":true,"databaseUrl":"mongodb://mreader:mongopw@mongo.example.com:27018/appdb"}
+{"_id":"rd1","engine":"redis@dbgate-plugin-redis","displayName":"Redis cache","server":"redis.example.com","port":6379,"password":"crypt:96c3097e4c4332975657bd06e246e0b6e01175118cf65a8f45b4c3f0eaf8c34e07070707070707070707070707070707VooQkZ2RxJ+3zLmRdx6xNQ==","passwordMode":"saveEncrypted","defaultDatabase":"3","useSsl":true}
 {"_id":"folder1","folder":"Group A"}

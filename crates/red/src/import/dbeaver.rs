@@ -21,7 +21,7 @@ use aes::Aes128;
 use anyhow::{Context, Result, anyhow, bail};
 use cbc::Decryptor;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
-use red_core::{ConnectionConfig, DbKind, SshAuth, SshConfig};
+use red_core::{ConnectionConfig, DbKind, ParsedDsn, SshAuth, SshConfig};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 
@@ -56,7 +56,7 @@ pub fn import(dir: &Path) -> Result<ImportReport> {
             conn.name.clone()
         };
 
-        let Some(kind) = map_kind(&conn.provider, &conn.driver) else {
+        let Some(kind) = map_kind(&conn.provider, &conn.driver, &conn.configuration.url) else {
             let engine = if !conn.provider.is_empty() {
                 conn.provider.clone()
             } else {
@@ -74,8 +74,19 @@ pub fn import(dir: &Path) -> Result<ImportReport> {
         let password = db_cred.map(|c| c.password.clone()).unwrap_or_default();
 
         let cfg = &conn.configuration;
+        // A data source saved in DBeaver's URL configuration mode leaves
+        // host/port/database empty and keeps only the JDBC url, so fall back to it
+        // rather than importing a host-less stub.
+        let from_url = cfg
+            .host
+            .trim()
+            .is_empty()
+            .then(|| url_fields(&cfg.url))
+            .flatten();
         let (host, port, database) = if kind.is_file() {
             (String::new(), None, sqlite_path(cfg))
+        } else if let Some(u) = &from_url {
+            (u.host.clone(), u.port, u.database.clone())
         } else {
             (
                 cfg.host.clone(),
@@ -110,9 +121,9 @@ pub fn import(dir: &Path) -> Result<ImportReport> {
                 color: 0,
                 read_only: conn.read_only,
                 env: Default::default(),
-                // TLS isn't extracted from the external store yet; a `rediss://`
-                // etc. pasted later still sets it.
-                tls: false,
+                // Only a url-mode data source states TLS somewhere we read; the
+                // field-mode SSL handler isn't extracted yet.
+                tls: from_url.as_ref().is_some_and(|u| u.tls),
                 ai_enabled: None,
                 ai_tier: None,
                 ssh,
@@ -156,27 +167,54 @@ fn decrypt_credentials(bytes: &[u8]) -> Result<String> {
 }
 
 /// Map DBeaver's `provider` (falling back to `driver` for old `generic`-parented
-/// exports) onto a RED engine. Unknown engines yield `None` → skipped.
-fn map_kind(provider: &str, driver: &str) -> Option<DbKind> {
-    match provider.to_ascii_lowercase().as_str() {
+/// exports, then to the JDBC url's scheme) onto a RED engine. Unknown engines yield
+/// `None` → skipped.
+fn map_kind(provider: &str, driver: &str, url: &str) -> Option<DbKind> {
+    let by_provider = match provider.to_ascii_lowercase().as_str() {
         // PG-wire relatives (redshift/cockroach/greenplum/timescale/yugabyte) live
         // under the postgresql provider and speak the Postgres protocol.
         "postgresql" => Some(DbKind::Postgres),
         "mysql" => Some(DbKind::Mysql),
         "sqlite" => Some(DbKind::Sqlite),
         "clickhouse" => Some(DbKind::Clickhouse),
+        // The NoSQL providers, which RED reaches over its KV and document seams
+        // rather than `DatabaseDriver`.
+        "redis" | "valkey" => Some(DbKind::Redis),
+        "mongodb" | "mongo" => Some(DbKind::Mongo),
         "generic" => {
             let d = driver.to_ascii_lowercase();
             if d.contains("sqlite") || d.contains("libsql") {
                 Some(DbKind::Sqlite)
             } else if d.contains("clickhouse") {
                 Some(DbKind::Clickhouse)
+            } else if d.contains("mongo") {
+                Some(DbKind::Mongo)
+            } else if d.contains("redis") || d.contains("valkey") {
+                Some(DbKind::Redis)
             } else {
                 None
             }
         }
         _ => None,
-    }
+    };
+    // The url names the wire protocol directly, which survives DBeaver spelling a
+    // provider id per vendor and edition (`mongodb`, `mongo`, an EE-only variant).
+    by_provider.or_else(|| jdbc_kind(url))
+}
+
+/// The engine named by a JDBC url's scheme (`jdbc:mongodb://…` → Mongo). `None`
+/// for a non-JDBC or unsupported scheme.
+fn jdbc_kind(url: &str) -> Option<DbKind> {
+    let scheme = url.trim().strip_prefix("jdbc:")?.split([':', '/']).next()?;
+    DbKind::from_scheme(scheme)
+}
+
+/// Decompose a JDBC url into host/port/database/TLS, for the data sources DBeaver
+/// stores as a url with the individual fields left empty. The engine is *not* taken
+/// from here (`map_kind` owns that); only the target fields are.
+fn url_fields(url: &str) -> Option<ParsedDsn> {
+    let url = url.trim();
+    ConnectionConfig::parse_conn_str(url.strip_prefix("jdbc:").unwrap_or(url))
 }
 
 /// Parse a DBeaver string port, falling back to the engine's default.
@@ -374,6 +412,43 @@ mod tests {
         assert_eq!(lite.config.database, "/data/app.db");
         assert!(lite.config.host.is_empty());
         assert!(lite.config.port.is_none());
+    }
+
+    #[test]
+    fn maps_mongo_provider_with_credentials() {
+        let report = import(&fixture_dir()).expect("import");
+        let mg = find(&report, "Mongo prod");
+        assert_eq!(mg.config.kind, DbKind::Mongo);
+        assert_eq!(mg.config.host, "mongo.example.com");
+        assert_eq!(mg.config.port, Some(27018));
+        assert_eq!(mg.config.database, "appdb");
+        assert_eq!(mg.config.user, "mreader");
+        assert_eq!(mg.config.password, "mongopw");
+        assert!(mg.warning.is_none());
+    }
+
+    #[test]
+    fn maps_redis_from_a_url_only_data_source() {
+        let report = import(&fixture_dir()).expect("import");
+        let rd = find(&report, "Redis cache");
+        assert_eq!(rd.config.kind, DbKind::Redis);
+        // host/port/database live only in the url here.
+        assert_eq!(rd.config.host, "redis.example.com");
+        assert_eq!(rd.config.port, Some(6380));
+        assert_eq!(rd.config.database, "3");
+        assert!(rd.config.tls, "the rediss:// scheme means TLS");
+        assert_eq!(rd.config.password, "redispw");
+    }
+
+    #[test]
+    fn falls_back_to_the_url_scheme_for_an_unfamiliar_provider() {
+        // The engine ids DBeaver uses vary by vendor and edition; the JDBC url
+        // names the wire protocol either way.
+        assert_eq!(
+            map_kind("cosmosdb-mongo", "", "jdbc:mongodb+srv://c.example.net/app"),
+            Some(DbKind::Mongo)
+        );
+        assert_eq!(map_kind("sqlserver", "mssql", "jdbc:sqlserver://win"), None);
     }
 
     #[test]

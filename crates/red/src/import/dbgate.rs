@@ -27,7 +27,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use cbc::Decryptor;
 use cbc::cipher::{BlockDecryptMut, KeyIvInit, block_padding::Pkcs7};
 use hmac::{Hmac, Mac};
-use red_core::{ConnectionConfig, DbKind, SshAuth, SshConfig};
+use red_core::{ConnectionConfig, DbKind, ParsedDsn, SshAuth, SshConfig};
 use serde::Deserialize;
 use serde_json::Value as JsonValue;
 use sha2::{Digest, Sha256};
@@ -81,8 +81,19 @@ pub fn import(dir: &Path) -> Result<ImportReport> {
 
         let mut warnings: Vec<String> = Vec::new();
 
+        let (password, pw_warn) = resolve_secret(&conn.password, enc_key.as_deref());
+        if let Some(w) = pw_warn {
+            warnings.push(w.into());
+        }
+
+        // In "use database URL" mode the whole target lives in one string and the
+        // separate server/port/user fields keep whatever they held before the
+        // toggle, so the URL wins wherever it carries a value.
+        let url = database_url(&conn, enc_key.as_deref(), &mut warnings);
         let (host, port, database) = if kind.is_file() {
             (String::new(), None, json_str(&conn.database_file))
+        } else if let Some(u) = &url {
+            (u.host.clone(), u.port, u.database.clone())
         } else {
             (
                 conn.server.clone(),
@@ -90,11 +101,9 @@ pub fn import(dir: &Path) -> Result<ImportReport> {
                 conn.default_database.clone(),
             )
         };
-
-        let (password, pw_warn) = resolve_secret(&conn.password, enc_key.as_deref());
-        if let Some(w) = pw_warn {
-            warnings.push(w.into());
-        }
+        let user = url_or(url.as_ref().map(|u| u.user.as_str()), &conn.user);
+        let password = url_or(url.as_ref().map(|u| u.password.as_str()), &password);
+        let tls = conn.use_ssl || url.as_ref().is_some_and(|u| u.tls);
 
         let ssh = map_ssh(&conn, enc_key.as_deref(), &mut warnings);
 
@@ -104,14 +113,13 @@ pub fn import(dir: &Path) -> Result<ImportReport> {
                 kind,
                 host,
                 port,
-                user: conn.user.clone(),
+                user,
                 password,
                 database,
                 color: 0,
                 read_only: false,
                 env: Default::default(),
-                // TLS isn't extracted from the external store yet.
-                tls: false,
+                tls,
                 ai_enabled: None,
                 ai_tier: None,
                 ssh,
@@ -213,8 +221,46 @@ fn map_engine(engine: &str) -> Option<DbKind> {
         "mysql" | "mariadb" => Some(DbKind::Mysql),
         "sqlite" => Some(DbKind::Sqlite),
         "clickhouse" => Some(DbKind::Clickhouse),
+        // The two non-SQL plugins; both spell their engine `<base>@dbgate-plugin-<base>`.
+        "redis" => Some(DbKind::Redis),
+        "mongo" | "mongodb" => Some(DbKind::Mongo),
         _ => None,
     }
+}
+
+/// Decompose the connection's `databaseUrl` when it is in "use database URL" mode
+/// (`useDatabaseUrl`, or an older record that only ever filled the URL). That mode
+/// is the default for DBGate's Mongo and Redis plugins, so without this those
+/// connections would import as host-less stubs. `None` means the connection uses
+/// the individual server/port/user fields.
+fn database_url(
+    conn: &RawConn,
+    enc_key: Option<&str>,
+    warnings: &mut Vec<String>,
+) -> Option<ParsedDsn> {
+    if !conn.use_database_url && !conn.server.trim().is_empty() {
+        return None;
+    }
+    let (url, warn) = resolve_secret(&conn.database_url, enc_key);
+    if let Some(w) = warn {
+        warnings.push(format!("database URL: {w}"));
+    }
+    if url.trim().is_empty() {
+        return None;
+    }
+    let parsed = ConnectionConfig::parse_conn_str(&url);
+    if parsed.is_none() {
+        warnings.push("database URL not understood; re-enter the host after import".into());
+    }
+    parsed
+}
+
+/// The URL's value when it carries one, else the separate field's.
+fn url_or(from_url: Option<&str>, field: &str) -> String {
+    from_url
+        .filter(|v| !v.is_empty())
+        .unwrap_or(field)
+        .to_string()
 }
 
 /// Build an [`SshConfig`] when the connection tunnels; pushes any secret-recovery
@@ -312,6 +358,12 @@ struct RawConn {
     default_database: String,
     #[serde(default, rename = "databaseFile")]
     database_file: JsonValue,
+    #[serde(default, rename = "useDatabaseUrl")]
+    use_database_url: bool,
+    #[serde(default, rename = "databaseUrl")]
+    database_url: String,
+    #[serde(default, rename = "useSsl")]
+    use_ssl: bool,
     #[serde(default, rename = "useSshTunnel")]
     use_ssh_tunnel: bool,
     #[serde(default, rename = "sshHost")]
@@ -412,6 +464,33 @@ mod tests {
             }
         );
         assert_eq!(ssh.passphrase, "keyphrase");
+    }
+
+    #[test]
+    fn maps_mongo_from_its_database_url() {
+        // The Mongo plugin's default mode leaves server/port/user empty, so the
+        // whole target has to come out of `databaseUrl`.
+        let report = import(&fixture_dir()).expect("import");
+        let mg = find(&report, "Mongo prod");
+        assert_eq!(mg.config.kind, DbKind::Mongo);
+        assert_eq!(mg.config.host, "mongo.example.com");
+        assert_eq!(mg.config.port, Some(27018));
+        assert_eq!(mg.config.database, "appdb");
+        assert_eq!(mg.config.user, "mreader");
+        assert_eq!(mg.config.password, "mongopw");
+        assert!(mg.warning.is_none(), "warning: {:?}", mg.warning);
+    }
+
+    #[test]
+    fn maps_redis_with_db_index_and_tls() {
+        let report = import(&fixture_dir()).expect("import");
+        let rd = find(&report, "Redis cache");
+        assert_eq!(rd.config.kind, DbKind::Redis);
+        assert_eq!(rd.config.host, "redis.example.com");
+        assert_eq!(rd.config.port, Some(6379));
+        assert_eq!(rd.config.database, "3"); // logical db index
+        assert_eq!(rd.config.password, "redispw");
+        assert!(rd.config.tls, "useSsl carried over");
     }
 
     #[test]

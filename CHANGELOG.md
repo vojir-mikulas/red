@@ -208,6 +208,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   that arrived in the moment between the statement being prepared and being run
   was discarded by the engine, so a flung scrollbar or a re-sort could leave the
   old query scanning to completion on the server while RED had already moved on.
+- Importing connections from DBeaver, DBGate, and DataGrip now offers your Redis
+  and MongoDB entries as well as the SQL ones. They were listed as "unsupported
+  engine" and skipped, even though RED speaks both. Connections the source tool
+  stores as a single connection string - the default for DBGate's Mongo and Redis
+  plugins, and DBeaver's URL mode - now arrive with their host, port, database
+  number, credentials and TLS setting filled in rather than as an empty stub.
 
 ## [0.20.0] - 2026-07-30
 

@@ -39,6 +39,8 @@ const dbeaverCreds = {
     'network/ssh_tunnel': { user: 'ec2-user', password: 'keypass' },
   },
   'mysql8-1': { '#connection': { user: 'root', password: 'rootpw' } },
+  'mongo-1': { '#connection': { user: 'mreader', password: 'mongopw' } },
+  'redis-1': { '#connection': { user: 'default', password: 'redispw' } },
 };
 const dbeaverDataSources = {
   connections: {
@@ -68,6 +70,16 @@ const dbeaverDataSources = {
       provider: 'sqlserver', driver: 'mssql', name: 'SQL Server',
       configuration: { host: 'win.example.com', port: '1433' },
     },
+    'mongo-1': {
+      provider: 'mongodb', driver: 'mongo', name: 'Mongo prod', 'save-password': true,
+      configuration: { host: 'mongo.example.com', port: '27018', database: 'appdb' },
+    },
+    // A url-mode data source: DBeaver leaves host/port/database empty and keeps
+    // only the JDBC url.
+    'redis-1': {
+      provider: 'redis', driver: 'redis', name: 'Redis cache', 'save-password': true,
+      configuration: { url: 'jdbc:rediss://redis.example.com:6380/3' },
+    },
   },
 };
 fs.writeFileSync(path.join(DBEAVER, 'data-sources.json'), JSON.stringify(dbeaverDataSources, null, 2));
@@ -90,6 +102,9 @@ const lines = [
   { _id: 'raw1', engine: 'postgres@dbgate-plugin-postgres', displayName: 'Raw Pw', server: 'h', port: 5432, user: 'u', password: 'plainpw', passwordMode: 'saveRaw' },
   { _id: 'lite1', engine: 'sqlite@dbgate-plugin-sqlite', displayName: 'Local SQLite', databaseFile: '/data/app.sqlite' },
   { _id: 'ms1', engine: 'mssql@dbgate-plugin-mssql', displayName: 'SQL Server', server: 'win', port: 1433 },
+  // The Mongo plugin's default: everything in one connection string.
+  { _id: 'mg1', engine: 'mongo@dbgate-plugin-mongo', displayName: 'Mongo prod', useDatabaseUrl: true, databaseUrl: 'mongodb://mreader:mongopw@mongo.example.com:27018/appdb' },
+  { _id: 'rd1', engine: 'redis@dbgate-plugin-redis', displayName: 'Redis cache', server: 'redis.example.com', port: 6379, password: enc('redispw'), passwordMode: 'saveEncrypted', defaultDatabase: '3', useSsl: true },
   { _id: 'folder1', folder: 'Group A' },
 ];
 fs.writeFileSync(path.join(DBGATE, 'connections.jsonl'), lines.map((l) => JSON.stringify(l)).join('\n') + '\n');
