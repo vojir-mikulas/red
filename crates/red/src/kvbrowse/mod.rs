@@ -2713,11 +2713,11 @@ impl AppState {
         browse.exhausted = page.exhausted;
         browse.loading = false;
         cx.notify();
-        // Outside the `browse` borrow: if a fuzzy search is under-matched,
+        // Outside the `browse` borrow: if a filter left this page under-matched,
         // this page landing is what chains the next one (see
         // `kv_maybe_grow_pool`'s doc comment for the full loop shape).
         if let Some(session) = session {
-            self.kv_maybe_grow_pool(session, cx);
+            self.kv_grow_pool(session, epoch, cx);
         }
     }
 
@@ -2871,39 +2871,48 @@ impl AppState {
         self.kv_relaunch_browse(session, cx);
     }
 
-    /// While a fuzzy search is active and under-matched, keep requesting
-    /// more scan pages in the background (reusing the ordinary
+    /// While the active Browse tab's list is under-filled by a filter, keep
+    /// requesting more scan pages in the background (reusing the ordinary
     /// `KvFetchScan`/`on_kv_scan_page` round trip, budgeted exactly like a
-    /// scroll-triggered load-more) until either `FUZZY_MATCH_TARGET` matches
-    /// are found or the keyspace is exhausted. This is what makes fuzzy
-    /// search feel like it covers "the whole keyspace" for a query with
-    /// reasonably few true matches, without ever doing a synchronous,
-    /// unbounded full walk: each step is the same bounded round trip the
-    /// live browse already uses, chained by `on_kv_scan_page` as pages land
-    /// and re-armed here on every keystroke.
+    /// scroll-triggered load-more) until either `FUZZY_MATCH_TARGET` rows show
+    /// or the keyspace is exhausted. This is what makes a filtered browse feel
+    /// like it covers "the whole keyspace" for a query with reasonably few true
+    /// matches, without ever doing a synchronous, unbounded full walk: each step
+    /// is the same bounded round trip the live browse already uses, chained by
+    /// `on_kv_scan_page` as pages land and re-armed here on every keystroke.
     pub(crate) fn kv_maybe_grow_pool(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        let Some(active) = self.conn_mut(Some(session)) else {
-            return;
-        };
-        let Some(browse) = active.kv_view.as_mut().and_then(|v| v.active_browse_mut()) else {
-            return;
-        };
-        if browse.loading || browse.exhausted {
-            return;
+        let epoch = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_ref())
+            .and_then(|v| v.active_browse())
+            .map(|b| b.epoch);
+        if let Some(epoch) = epoch {
+            self.kv_grow_pool(session, epoch, cx);
         }
-        // The client-side filters (fuzzy query, TTL bucket, favourite/tag) narrow
-        // the resident window rather than the scan, so a short match set can hide
-        // matches that live deeper in the keyspace. While any is active and
-        // under-matched, chase more pages so the grid keeps filling.
+    }
+
+    /// [`Self::kv_maybe_grow_pool`] for the tab that owns `epoch` rather than
+    /// the focused one, so a page landing in a background tab (auto-refresh, or
+    /// the other half of a split) chains *that* tab's next page.
+    fn kv_grow_pool(
+        &mut self,
+        session: SessionId,
+        epoch: red_service::Epoch,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(browse) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|v| v.browse_by_scan_epoch_mut(epoch))
+        else {
+            return;
+        };
         let query = browse.filter.read(cx).content().to_string();
         let fuzzy_active = browse.is_fuzzy() && !query.is_empty();
         let ttl = browse.ttl_filter;
         let fav_only = browse.fav_only;
         let tag_active = browse.tag_filter.is_some();
-        if !fuzzy_active && ttl.is_none() && !fav_only && !tag_active {
-            return;
-        }
-        let matches = browse
+        let shown = browse
             .rows
             .iter()
             .filter(|r| ttl.is_none_or(|t| t.matches(r.ttl)))
@@ -2911,20 +2920,35 @@ impl AppState {
             .filter(|r| !fav_only || browse.fav_set.contains(&r.key))
             .filter(|r| !tag_active || browse.tag_set.contains(&r.key))
             .count();
-        if matches >= FUZZY_MATCH_TARGET {
+        let status = PoolStatus {
+            loading: browse.loading,
+            exhausted: browse.exhausted,
+            filtered: browse.pattern.is_some()
+                || browse.value_needle.is_some()
+                || fuzzy_active
+                || ttl.is_some()
+                || fav_only
+                || tag_active,
+            shown,
+        };
+        if !wants_more_pages(status) {
             return;
         }
         browse.loading = true;
-        let epoch = browse.epoch;
+        // Every filter rides along: the follow-up page must be narrowed exactly
+        // like the one that landed, or a `MATCH`/value-filtered browse would
+        // start pouring unmatched keys into the grid from its second page on.
+        let pattern = browse.pattern.clone();
         let type_filter = browse.type_filter.clone();
+        let value_needle = browse.value_needle.clone();
         let cursor = browse.cursor;
         self.service.send_to(
             session,
             Command::KvFetchScan {
                 epoch,
-                pattern: None,
+                pattern,
                 type_filter,
-                value_needle: None,
+                value_needle,
                 cursor,
                 budget: scan_budget(self.settings.data.page_size),
             },
@@ -2985,12 +3009,45 @@ fn type_pill(kv_type: &KvType, theme: &Theme) -> impl IntoElement + use<> {
         .child(kv_type.label().to_string())
 }
 
-/// How many fuzzy-matched keys is "enough" before the auto-continue scan
+/// How many matched keys is "enough" before the auto-continue scan
 /// (see `AppState::kv_maybe_grow_pool`) stops chasing more pages.
-/// Keeps a fuzzy search from silently walking the entire keyspace just to
+/// Keeps a filtered browse from silently walking the entire keyspace just to
 /// find a handful of matches, while still finding more than the first
 /// page's worth for a query that's genuinely common.
 const FUZZY_MATCH_TARGET: usize = 40;
+
+/// What a landed scan page leaves behind, as the "chain another page?" decision
+/// sees it. A struct rather than a pile of `bool` parameters so each input is
+/// named at the one call site that builds it ([`AppState::kv_grow_pool`]).
+#[derive(Debug, Clone, Copy)]
+struct PoolStatus {
+    /// Another page is already in flight for this browse.
+    loading: bool,
+    /// The keyspace is walked out, so there is nothing left to chase.
+    exhausted: bool,
+    /// Some filter is narrowing the list, server-side (`MATCH` pattern, value
+    /// needle) or client-side (fuzzy query, TTL bucket, favourite, tag).
+    filtered: bool,
+    /// How many rows the grid shows once every active filter has applied.
+    shown: usize,
+}
+
+/// Whether an under-filled browse should chain another bounded scan page.
+///
+/// Both filter families under-fill the grid, for different reasons, and both
+/// want the same answer. A server-side filter has the *driver* hand back a
+/// short - often empty - page while matches still lie deeper in the keyspace,
+/// because a `SCAN` round trip is budgeted by wall clock and `COUNT`, not by
+/// how many keys survive its `MATCH`; a client-side predicate instead narrows
+/// the window after it loads. Leaving the server-side case out is what made a
+/// selective glob look like "no keys match this filter" on a large keyspace:
+/// the first page landed empty, and with no rows there was no scrolling to
+/// trigger the next one. An unfiltered browse still chases nothing - it fills
+/// its first page by construction, and scrolling pulls the rest (see
+/// [`AppState::kv_maybe_load_more`]).
+fn wants_more_pages(status: PoolStatus) -> bool {
+    !status.loading && !status.exhausted && status.filtered && status.shown < FUZZY_MATCH_TARGET
+}
 
 /// A fast, dependency-free subsequence fuzzy match + score (fzf-ish, not a
 /// byte-for-byte reimplementation): every character of `query` must appear
@@ -3177,6 +3234,38 @@ mod tests {
         // An empty box never yields a pattern, in any mode.
         assert_eq!(QueryMode::Glob.scan_pattern(""), None);
         assert_eq!(QueryMode::Prefix.scan_pattern(""), None);
+    }
+
+    #[test]
+    fn wants_more_pages_chases_any_filter_until_target_or_exhaustion() {
+        let base = PoolStatus {
+            loading: false,
+            exhausted: false,
+            filtered: true,
+            shown: 0,
+        };
+        // A server-side `MATCH` that landed an empty page keeps walking: the
+        // matches may simply lie past the first page's budget.
+        assert!(wants_more_pages(base));
+        // Enough rows showing, keyspace walked out, or a page already in
+        // flight: each on its own stops the chase.
+        assert!(!wants_more_pages(PoolStatus {
+            shown: FUZZY_MATCH_TARGET,
+            ..base
+        }));
+        assert!(!wants_more_pages(PoolStatus {
+            exhausted: true,
+            ..base
+        }));
+        assert!(!wants_more_pages(PoolStatus {
+            loading: true,
+            ..base
+        }));
+        // An unfiltered browse is scroll-driven, never chased.
+        assert!(!wants_more_pages(PoolStatus {
+            filtered: false,
+            ..base
+        }));
     }
 
     #[test]

@@ -298,8 +298,8 @@ fn render_block(block: &Block, theme: &Theme, leaf: &mut TextLeaf) -> AnyElement
                         .flex()
                         .gap_1p5()
                         .text_size(theme.scale(12.5))
-                        .child(div().text_color(theme.text_muted).child("•"))
-                        .child(div().flex_1().child(inline(item, theme, leaf))),
+                        .child(div().flex_none().text_color(theme.text_muted).child("•"))
+                        .child(list_body(inline(item, theme, leaf))),
                 );
             }
             list.into_any_element()
@@ -314,10 +314,11 @@ fn render_block(block: &Block, theme: &Theme, leaf: &mut TextLeaf) -> AnyElement
                         .text_size(theme.scale(12.5))
                         .child(
                             div()
+                                .flex_none()
                                 .text_color(theme.text_muted)
                                 .child(format!("{}.", i + 1)),
                         )
-                        .child(div().flex_1().child(inline(item, theme, leaf))),
+                        .child(list_body(inline(item, theme, leaf))),
                 );
             }
             list.into_any_element()
@@ -355,6 +356,18 @@ fn render_block(block: &Block, theme: &Theme, leaf: &mut TextLeaf) -> AnyElement
         }
         Block::Rule => div().h(px(1.)).my_1().bg(theme.border).into_any_element(),
     }
+}
+
+/// A list item's text cell.
+///
+/// `min_w(0)` is load-bearing, not cosmetic. GPUI measures text at its *unwrapped*
+/// width under `AvailableSpace::MinContent`, so a text element's min-content size
+/// equals its max-content size. A flex item's automatic minimum size is that
+/// min-content size, so without this the cell refuses to shrink to the row and a
+/// long item runs off the right edge instead of wrapping. Every text cell in a
+/// *row*-direction flex needs it (see [`table_row`]).
+fn list_body(text: AnyElement) -> gpui::Div {
+    div().flex_1().min_w(px(0.)).child(text)
 }
 
 /// One table row: equal-width cells, a bottom rule, and a subtle header tint.

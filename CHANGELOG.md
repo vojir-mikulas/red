@@ -214,6 +214,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   stores as a single connection string - the default for DBGate's Mongo and Redis
   plugins, and DBeaver's URL mode - now arrive with their host, port, database
   number, credentials and TLS setting filled in rather than as an empty stub.
+- A Redis glob or prefix search keeps scanning until it finds your keys. On a
+  large keyspace a selective pattern such as `user:*` would report "No keys
+  match this filter" whenever the matching keys sat beyond the first bounded
+  scan window, and with nothing on screen there was no scrolling left to pull
+  the rest. The search now walks on in the background until it has a screenful
+  of matches or the keyspace runs out, exactly as fuzzy search already did.
+  Combining a pattern with a TTL, favourite or tag filter also no longer lets
+  unmatched keys leak into the list from the second page on.
+- Assistant answers no longer run off the right edge of the panel. A bulleted or
+  numbered list wrapped only as far as the first line and then kept going past
+  the panel, so the ends of the agent's notes were simply unreadable; the same
+  applied to a long plan step, a failed tool call's error line in the activity
+  trace, and a chip carrying a long filename or table name. All of them now wrap
+  or ellipsize inside the panel.
 
 ## [0.20.0] - 2026-07-30
 

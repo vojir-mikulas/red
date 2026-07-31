@@ -655,6 +655,9 @@ impl AppState {
                 div()
                     .flex()
                     .items_center()
+                    // Shrinkable, so a long label (a tab title, a qualified table)
+                    // ellipsizes rather than widening the chip past the composer.
+                    .min_w_0()
                     .gap_1()
                     .px_1p5()
                     .py(px(2.))
@@ -669,10 +672,16 @@ impl AppState {
                         theme.scale(11.),
                         theme.accent,
                     ))
-                    .child(SharedString::from(reference.label()))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .child(SharedString::from(reference.label())),
+                    )
                     .child(
                         div()
                             .id(("assistant-reference-remove", i))
+                            .flex_none()
                             .cursor_pointer()
                             .hover(|s| s.text_color(theme.red))
                             .child(crate::icons::icon("x", theme.scale(11.), theme.text_faint))
@@ -688,6 +697,10 @@ impl AppState {
                     .id(("assistant-attachment-chip", i))
                     .flex()
                     .items_center()
+                    // Shrinkable, so a long filename ellipsizes inside the chip
+                    // instead of widening it past the composer (see the bubble's
+                    // copy of this chip).
+                    .min_w_0()
                     .gap_1()
                     .px_1p5()
                     .py(px(2.))
@@ -707,10 +720,15 @@ impl AppState {
                         theme.scale(11.),
                         theme.text_faint,
                     ))
-                    .child(SharedString::from(attachment.name.clone()))
-                    .child(div().text_color(theme.text_faint).child(SharedString::from(
-                        super::attach::human_bytes(attachment.bytes),
-                    )))
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .child(SharedString::from(attachment.name.clone())),
+                    )
+                    .child(div().flex_none().text_color(theme.text_faint).child(
+                        SharedString::from(super::attach::human_bytes(attachment.bytes)),
+                    ))
                     // Tabular data is usually better asked *about* than read, so
                     // the doorway into the import pipeline sits on the chip.
                     .when(attachment.is_importable(), |chip| {
@@ -2058,6 +2076,10 @@ impl AppState {
                         )))
                         .flex()
                         .items_center()
+                        // A long filename must ellipsize inside the chip rather than
+                        // push it past the panel; the chip has to be shrinkable for
+                        // the name's `truncate` to have a width to truncate against.
+                        .min_w_0()
                         .gap_1()
                         .px_1p5()
                         .py(px(2.))
@@ -2075,10 +2097,15 @@ impl AppState {
                             theme.scale(11.),
                             theme.text_faint,
                         ))
-                        .child(SharedString::from(attachment.name.clone()))
-                        .child(div().text_color(theme.text_faint).child(SharedString::from(
-                            super::attach::human_bytes(attachment.bytes),
-                        ))),
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .child(SharedString::from(attachment.name.clone())),
+                        )
+                        .child(div().flex_none().text_color(theme.text_faint).child(
+                            SharedString::from(super::attach::human_bytes(attachment.bytes)),
+                        )),
                 );
             }
             bubble = bubble.child(chips);
@@ -2324,7 +2351,16 @@ fn render_plan(steps: &[red_core::PlanStep], theme: &flint::Theme) -> AnyElement
                         .items_center()
                         .child(crate::icons::icon(icon_name, theme.scale(12.), color)),
                 )
-                .child(div().text_color(title_color).child(step.title.clone())),
+                // `min_w_0` so a long step title wraps inside the card instead of
+                // running off the right edge: a text element's automatic minimum
+                // size is its *unwrapped* width (see `markdown::list_body`).
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(title_color)
+                        .child(step.title.clone()),
+                ),
         );
     }
     col.into_any_element()
@@ -2738,6 +2774,13 @@ fn render_activity_row(
     if let Some(detail) = &node.detail {
         row = row.child(
             div()
+                // A failure's detail is an error line (capped at 120 chars upstream),
+                // which is wider than the panel. `min_w_0` + `truncate` keeps the
+                // trace on one line: the args summary above collapses first (it has a
+                // zero flex basis), so the error is what survives — which is the right
+                // order when a call failed.
+                .min_w_0()
+                .truncate()
                 .text_color(if node.status == Failed {
                     theme.red
                 } else {
