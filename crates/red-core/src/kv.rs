@@ -8,6 +8,7 @@ use std::time::Duration;
 use crate::Value;
 
 mod export;
+mod info;
 mod json;
 mod modules;
 
@@ -16,6 +17,7 @@ pub use export::{
     b64_encode, command_line, commands_header, dump_frame, expire_line, is_lossy_text, json_binary,
     json_string, quote_arg, read_dump_frame,
 };
+pub use info::parse_info;
 pub use json::{
     JSON_INLINE_STR_MAX, JSON_NODE_WINDOW, JSON_WHOLE_DOC_MAX, JsonDoc, JsonFetch, JsonKind,
     JsonNode, JsonNodeView, JsonPath, JsonSeg, JsonSyntaxError, json_fetch_mode,

@@ -10,6 +10,7 @@ pub mod doc;
 pub mod health;
 pub mod kv;
 pub mod schema_diff;
+pub mod server;
 pub mod sql;
 pub mod typemap;
 
@@ -196,6 +197,19 @@ impl DbKind {
         matches!(self, DbKind::Clickhouse)
     }
 
+    /// Whether this engine can answer a live
+    /// [`ServerSnapshot`](server::ServerSnapshot): memory, throughput,
+    /// connections, uptime. Gates the Server panel's Overview view and, with it,
+    /// whether the panel is offered at all on an engine that has no sessions to
+    /// list.
+    ///
+    /// True everywhere there is a server process to ask. SQLite is a file opened
+    /// in-process: there is nothing to be out of memory, nothing to be busy, and
+    /// nothing to have been up since Tuesday.
+    pub const fn reports_metrics(self) -> bool {
+        !matches!(self, DbKind::Sqlite)
+    }
+
     /// What this engine lets RED see and stop about the server's other sessions
     /// (see [`ServerSession`]). Gates the Server panel and its kill affordances.
     pub const fn session_caps(self) -> SessionCaps {
@@ -232,13 +246,25 @@ impl DbKind {
                 can_terminate: false,
                 has_wait_graph: false,
             },
-            // Redis has its own equivalent already (the Monitor panel's CLIENT
-            // LIST / CLIENT KILL); Mongo's would ride `DocDriver`. Neither routes
-            // through this SQL-shaped descriptor.
-            DbKind::Redis | DbKind::Mongo => SessionCaps {
-                supported: false,
+            // `CLIENT LIST` + `CLIENT KILL ID`. There is no query-level cancel
+            // (a Redis command is atomic and already running) and no lock
+            // manager to build a wait graph from. The Monitor tab keeps the
+            // richer per-client view; this is the shared-panel arm.
+            DbKind::Redis => SessionCaps {
+                supported: true,
                 can_cancel: false,
-                can_terminate: false,
+                can_terminate: true,
+                has_wait_graph: false,
+            },
+            // `$currentOp` + `killOp`. `killOp` stops the operation rather than
+            // the connection, which is nearer "cancel" than "terminate"; it is
+            // reported as terminate because that is the rung the confirm modal
+            // already grades, and because an interrupted multi-document write is
+            // not rolled back, so it deserves the heavier prompt.
+            DbKind::Mongo => SessionCaps {
+                supported: true,
+                can_cancel: false,
+                can_terminate: true,
                 has_wait_graph: false,
             },
         }

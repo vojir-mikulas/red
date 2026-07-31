@@ -96,8 +96,6 @@ palette-cmd_knowledge = [çöññéçtíöñ: dátábásé kñöwlédgé…]
 
 palette-cmd_compare_schema = [sçhémá: çömpáré ágáíñst…]
 
-palette-cmd_server_panel = [víéw: tögglé sérvér páñél]
-
 palette-cmd_refresh = [sçhémá: réfrésh]
 
 palette-cmd_er_diagram = [sçhémá: ÉR díágrám]
@@ -113,6 +111,8 @@ palette-cmd_ai_learn = [ágéñt: léárñ thís dátábásé]
 palette-cmd_ai_storage = [ágéñt: öpéñ çöñvérsátíöñ störágé]
 
 palette-cmd_new_conn = [çöññéçtíöñ: ñéw]
+
+palette-cmd_server_panel = [víéw: tögglé sérvér páñél]
 
 palette-cmd_switch_conn = [çöññéçtíöñ: swítçh…]
 

@@ -1,11 +1,14 @@
 //! Rendering Redis replies and rollups as the text the model reads.
 //!
-//! Pure over already-fetched values. The curation is the point: `INFO` is a
-//! thousand lines the model should not pay for, so only the fields that change
-//! an answer survive, and a credential-shaped `CONFIG` value never appears here
-//! at all (see `is_secret_config_param`).
+//! Pure over already-fetched values. The curation is the point: a value listing
+//! is capped before the model pays for it, and a credential-shaped `CONFIG`
+//! value never appears here at all (see `is_secret_config_param`).
+//!
+//! `INFO` used to be curated here, for the model alone. It is now parsed into a
+//! [`ServerSnapshot`](red_core::server::ServerSnapshot) by the driver and
+//! rendered by `util::fmt_server_snapshot`, so the Server panel and the agent
+//! read the same numbers out of one parser.
 
-use std::collections::HashMap;
 use std::time::Duration;
 
 use red_core::kv::{
@@ -16,62 +19,6 @@ use super::super::sql::format::render_cell;
 use super::super::util::fmt_bytes;
 use super::catalog::KV_VALUE_ELEMS;
 
-/// Curate the giant INFO reply down to the fields that matter, plus a computed
-/// hit rate and the per-database key counts.
-pub(super) fn kv_info_summary(info: &str) -> String {
-    let map: HashMap<&str, &str> = info
-        .lines()
-        .map(str::trim)
-        .filter(|l| !l.is_empty() && !l.starts_with('#'))
-        .filter_map(|l| l.split_once(':'))
-        .collect();
-    let get = |k: &str| map.get(k).copied().unwrap_or("?");
-    let hits: f64 = get("keyspace_hits").parse().unwrap_or(0.0);
-    let misses: f64 = get("keyspace_misses").parse().unwrap_or(0.0);
-    let hit_rate = if hits + misses > 0.0 {
-        format!("{:.1}%", hits / (hits + misses) * 100.0)
-    } else {
-        "n/a".to_string()
-    };
-    let mut s = String::new();
-    s.push_str(&format!(
-        "Redis {} ({}), uptime {} days\n",
-        get("redis_version"),
-        get("redis_mode"),
-        get("uptime_in_days"),
-    ));
-    s.push_str(&format!(
-        "Memory: {} used, maxmemory {} (policy {}), fragmentation {}\n",
-        get("used_memory_human"),
-        get("maxmemory_human"),
-        get("maxmemory_policy"),
-        get("mem_fragmentation_ratio"),
-    ));
-    s.push_str(&format!(
-        "Clients: {} connected · {} ops/sec\n",
-        get("connected_clients"),
-        get("instantaneous_ops_per_sec"),
-    ));
-    s.push_str(&format!(
-        "Hit rate: {hit_rate} ({} hits / {} misses) · evicted {} · expired {}\n",
-        get("keyspace_hits"),
-        get("keyspace_misses"),
-        get("evicted_keys"),
-        get("expired_keys"),
-    ));
-    let dbs: Vec<&str> = info
-        .lines()
-        .map(str::trim)
-        .filter(|l| l.starts_with("db") && l.contains("keys="))
-        .collect();
-    if !dbs.is_empty() {
-        s.push_str("Keyspace:\n");
-        for db in dbs {
-            s.push_str(&format!("  {db}\n"));
-        }
-    }
-    s
-}
 /// Format inferred key templates as the keyspace's schema. The sample size and
 /// whether it was exhaustive lead, because every number below is only as good as
 /// the walk that produced it and a truncated sample reads as fact otherwise.

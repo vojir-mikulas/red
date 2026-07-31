@@ -1,254 +1,30 @@
-//! The Server panel: what the database server is doing right now, and how to
-//! stop it.
+//! The Sessions view: one row per server session, longest-running first, with
+//! the blocked ones marked and the kill actions where they are allowed.
 //!
-//! Redis has had this since `kvmonitor.rs` (SLOWLOG / MONITOR / CLIENT LIST with
-//! `CLIENT KILL`); ClickHouse had half of it in the Mutations panel; the SQL
-//! engines had none of it. Pointing RED at a production database and asking
-//! "what is holding this lock" meant leaving RED.
-//!
-//! **One dock, two views.** Mutations was already a dock panel about the
-//! connection rather than the focused result, and Sessions is the same kind of
-//! thing, so they share one dock with a segmented switch rather than becoming two
-//! adjacent docks that each claim a column of the window.
-//!
-//! The kill ladder is deliberate and lives mostly outside this file:
-//! `is_self` sessions offer nothing, a read-only connection offers nothing, the
-//! engine must advertise the mode in `session_caps`, and the confirm rides the
-//! shared [`PendingWrite`] modal so a production connection cannot silence it.
-//! `kill_session` is not, and should not become, an AI or MCP tool.
+//! Engine-agnostic by construction. The backend's dispatch adapters flatten a
+//! Postgres backend, a Redis client and a Mongo current-op into the same
+//! [`ServerSession`], so nothing here knows which seam answered beyond what
+//! [`SessionCaps`](red_core::SessionCaps) reports: whether a cancel exists,
+//! whether a terminate exists, and whether an empty `blocked_by` means "free"
+//! or "this engine has no wait graph".
 
 use flint::prelude::*;
 use flint::{Button, ButtonSize, ButtonVariant};
 use gpui::{Context, SharedString, div, prelude::*, px};
 use red_core::{KillMode, ServerSession, SessionKey};
-use red_service::Command;
 
-use crate::app::{ActiveConn, AppState, PendingWrite, Phase};
+use crate::app::{ActiveConn, AppState};
 
 /// How much of a statement a session row shows before clipping. Enough to tell
 /// two queries apart; the full text is one click away in the expanded row.
 const QUERY_CHARS: usize = 220;
 
-/// Which view the Server dock is showing.
-#[derive(Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) enum ServerView {
-    #[default]
-    Sessions,
-    Mutations,
-}
-
 impl AppState {
-    /// Whether the active connection has a server worth inspecting: other
-    /// sessions, background mutations, or both. Gates the dock and its toggle.
-    pub(crate) fn has_server_panel(&self) -> bool {
-        match &self.phase {
-            Phase::Connected(a) => {
-                a.config.kind.session_caps().supported || a.config.kind.tracks_mutations()
-            }
-            _ => false,
-        }
-    }
-
-    /// Show or hide the Server dock, refreshing on the way in so it never opens
-    /// on a stale list.
-    pub(crate) fn toggle_server_panel(&mut self, cx: &mut Context<Self>) {
-        if !self.has_server_panel() {
-            return;
-        }
-        let opened = match &mut self.phase {
-            Phase::Connected(active) => {
-                active.server_open = !active.server_open;
-                // Land on the view the engine actually has, so a ClickHouse-only
-                // user is not shown an empty Sessions tab and a Postgres user is
-                // not shown a Mutations tab that can never populate.
-                if !active.config.kind.session_caps().supported {
-                    active.server_view = ServerView::Mutations;
-                }
-                active.server_open
-            }
-            _ => false,
-        };
-        if opened {
-            self.refresh_server_panel(cx);
-        }
-        cx.notify();
-    }
-
-    pub(crate) fn set_server_view(&mut self, view: ServerView, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase {
-            active.server_view = view;
-        }
-        self.refresh_server_panel(cx);
-        cx.notify();
-    }
-
-    /// Refresh whichever view is showing.
-    pub(crate) fn refresh_server_panel(&mut self, cx: &mut Context<Self>) {
-        let view = match &self.phase {
-            Phase::Connected(a) => a.server_view,
-            _ => return,
-        };
-        match view {
-            ServerView::Mutations => self.refresh_mutations(cx),
-            ServerView::Sessions => {
-                if let Phase::Connected(active) = &mut self.phase {
-                    active.sessions_loading = true;
-                }
-                self.send_active(Command::ListServerSessions);
-                cx.notify();
-            }
-        }
-    }
-
-    /// A session listing arrived.
-    pub(crate) fn on_server_sessions(
-        &mut self,
-        session: Option<red_service::SessionId>,
-        sessions: Vec<ServerSession>,
-        restricted: bool,
-        cx: &mut Context<Self>,
-    ) {
-        if let Some(active) = self.conn_mut(session) {
-            active.sessions = sessions;
-            active.sessions_restricted = restricted;
-            active.sessions_loading = false;
-        }
-        cx.notify();
-    }
-
-    /// A kill was accepted: re-list rather than mutating the local copy, so what
-    /// the panel shows is always what the server reports.
-    pub(crate) fn on_server_session_killed(&mut self, cx: &mut Context<Self>) {
-        self.notify(flint::ToastVariant::Success, "The server accepted it.", cx);
-        self.refresh_server_panel(cx);
-    }
-
-    /// Raise the confirm for stopping one session. The ladder's UI half; the
-    /// backend re-checks read-only, and the driver refuses again beneath that.
-    fn confirm_kill_session(&mut self, key: SessionKey, mode: KillMode, cx: &mut Context<Self>) {
-        let Phase::Connected(active) = &self.phase else {
-            return;
-        };
-        let Some(s) = active.sessions.iter().find(|s| s.key == key) else {
-            return;
-        };
-        // Never RED's own connection: stopping it produces a reconnect dance and
-        // no useful outcome. Guarded here as well as in the render, because a
-        // stale list could still hand this path a self row.
-        if s.is_self {
-            return;
-        }
-        let who = match (&s.user, &s.database) {
-            (Some(u), Some(d)) => format!("{u} on {d}"),
-            (Some(u), None) => u.clone(),
-            (None, Some(d)) => format!("a session on {d}"),
-            (None, None) => format!("session {key}"),
-        };
-        let who = format!("{who} ({})", fmt_elapsed(s.elapsed_secs));
-        let query = s
-            .query
-            .clone()
-            .unwrap_or_else(|| "(this role cannot see the statement)".to_string());
-        self.confirm_exec = self.pending_confirm(PendingWrite::KillSession {
-            key,
-            mode,
-            who,
-            query,
-        });
-        cx.notify();
-    }
-
-    /// Fire the confirmed kill against the connection it was raised on. A server
-    /// session key means nothing on another server, so routing this to whichever
-    /// connection is foreground at click time could kill an unrelated session — or,
-    /// where keys are small integers, an arbitrary one.
-    pub(crate) fn run_kill_session(
-        &mut self,
-        session: red_service::SessionId,
-        key: SessionKey,
-        mode: KillMode,
-    ) {
-        self.service
-            .send_to(session, Command::KillServerSession { key, mode });
-    }
-
-    /// The Server dock.
-    pub(crate) fn render_server_panel(
+    pub(super) fn render_sessions(
         &self,
         active: &ActiveConn,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let theme = cx.theme().clone();
-        let caps = active.config.kind.session_caps();
-        let view = active.server_view;
-
-        // The view switch, offered only where both views exist. On an engine with
-        // one of them the dock is just that panel, with no control that does
-        // nothing.
-        let switch = (caps.supported && active.config.kind.tracks_mutations()).then(|| {
-            let mut row = div().flex().items_center().gap_1();
-            for (label, which) in [
-                ("Sessions", ServerView::Sessions),
-                ("Mutations", ServerView::Mutations),
-            ] {
-                row = row.child(
-                    Button::new(SharedString::from(format!("server-view-{label}")), label)
-                        .variant(if view == which {
-                            ButtonVariant::Secondary
-                        } else {
-                            ButtonVariant::Ghost
-                        })
-                        .size(ButtonSize::Sm)
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.set_server_view(which, cx)),
-                        ),
-                );
-            }
-            row
-        });
-
-        let header = div()
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .h(px(34.))
-            .border_b_1()
-            .border_color(theme.border_soft)
-            .child(
-                div()
-                    .text_size(theme.scale(12.))
-                    .text_color(theme.text)
-                    .child(crate::i18n::tr!("server.title", "Server")),
-            )
-            .children(switch)
-            .child(
-                div().ml_auto().child(
-                    Button::new("server-refresh", "Refresh")
-                        .variant(ButtonVariant::Ghost)
-                        .size(ButtonSize::Sm)
-                        .on_click(cx.listener(|this, _, _, cx| this.refresh_server_panel(cx))),
-                ),
-            );
-
-        let body = match view {
-            ServerView::Mutations => self.render_mutations(active, cx).into_any_element(),
-            ServerView::Sessions => self.render_sessions(active, cx),
-        };
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(theme.bg_panel)
-            .child(header)
-            .child(div().flex_1().min_h(px(0.)).child(body))
-    }
-
-    /// The Sessions view: one row per server session, longest-running first,
-    /// with the blocked ones marked and the kill actions where they are allowed.
-    fn render_sessions(&self, active: &ActiveConn, cx: &mut Context<Self>) -> gpui::AnyElement {
+    ) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let caps = active.config.kind.session_caps();
         let writable = !active.config.read_only;
@@ -484,7 +260,7 @@ impl AppState {
 
 /// A duration a human reads at a glance. Sub-minute stays in seconds because that
 /// is the resolution that matters when deciding whether to stop something.
-fn fmt_elapsed(secs: f64) -> String {
+pub(super) fn fmt_elapsed(secs: f64) -> String {
     let s = secs.max(0.0);
     if s < 60.0 {
         format!("{s:.1}s")

@@ -14,6 +14,12 @@ server-mutations_title = Mutations
 
 server-title = Server
 
+server-sampled_at = as of { $when }
+
+server-not_visible = Not visible to this connection:
+
+server-redis_monitor_hint = Slow log, MONITOR and per-client detail are in the Monitor tab.
+
 server-sessions_blocking = { $blocking_count } session(s) blocking { $blocked } other(s)
 
 server-this_connection = this connection

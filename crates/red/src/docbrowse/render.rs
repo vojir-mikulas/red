@@ -35,6 +35,9 @@ impl AppState {
         let view = cx.entity().downgrade();
         let topbar = self.render_topbar(&theme, &view, window, cx);
         let workspace = self.render_doc_body(active, window, cx);
+        // The Server dock, on the same terms as the SQL and Redis shells: it is
+        // about the connection, so it sits outside the collection workspace.
+        let workspace = self.with_server_dock(active, "doc-split-server", workspace, cx);
 
         // Dock the assistant to the right of the workspace when it's open, the
         // same resizable split the SQL/Redis shells use.
@@ -276,7 +279,8 @@ impl AppState {
             )
             .child(div().min_w_0().truncate().child(config.display_target()))
             .child(div().min_w_0().truncate().child(config.name.clone()))
-            .children(read_only_badge);
+            .children(read_only_badge)
+            .children(self.render_server_toggle(active, "doc-toggle-server", theme, cx));
 
         // Right: the focused collection's document count (the whole collection,
         // not one window; the grid scrolls the whole thing).

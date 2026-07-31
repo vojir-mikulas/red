@@ -151,6 +151,7 @@ impl AppState {
             // Read here, not inside `ActiveConn::new`: that runs with `AppState`
             // leased (see its doc comment), so it cannot read settings itself.
             let kv_mode = self.settings.kv.default_query_mode.into();
+            let server_refresh = self.settings.behavior.server_refresh_interval();
             self.phase = Phase::Connected(Box::new(ActiveConn::new(
                 id,
                 conn.conn_id,
@@ -159,6 +160,11 @@ impl AppState {
                 kv_mode,
                 cx,
             )));
+            // Same reason `kv_mode` is read out here: `ActiveConn::new` runs with
+            // `AppState` leased and cannot reach a setting itself.
+            if let Phase::Connected(active) = &mut self.phase {
+                active.server_refresh = server_refresh;
+            }
             self.foreground_session = Some(id);
             if is_redis {
                 // Restore the persisted recently-viewed keys for this

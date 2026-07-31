@@ -383,6 +383,11 @@ pub struct DocOp {
     /// Whether the operation is blocked waiting for a lock, the signature of a
     /// stall that is somebody else's fault.
     pub waiting_for_lock: bool,
+    /// This is the `$currentOp` aggregation that produced this very listing.
+    /// Never offered a kill, for the same reason
+    /// [`ServerSession::is_self`](crate::ServerSession::is_self) is not: killing
+    /// it stops the read the panel is showing and achieves nothing else.
+    pub is_self: bool,
 }
 
 /// A document store's deployment topology, detected at connect. Mirrors

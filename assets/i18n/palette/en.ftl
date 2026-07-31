@@ -96,8 +96,6 @@ palette-cmd_knowledge = connection: database knowledge…
 
 palette-cmd_compare_schema = schema: compare against…
 
-palette-cmd_server_panel = view: toggle server panel
-
 palette-cmd_refresh = schema: refresh
 
 palette-cmd_er_diagram = schema: ER diagram
@@ -113,6 +111,8 @@ palette-cmd_ai_learn = agent: learn this database
 palette-cmd_ai_storage = agent: open conversation storage
 
 palette-cmd_new_conn = connection: new
+
+palette-cmd_server_panel = view: toggle server panel
 
 palette-cmd_switch_conn = connection: switch…
 

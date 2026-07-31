@@ -1653,14 +1653,36 @@ pub(crate) struct ActiveConn {
     /// restores the previous width.
     pub history_w: Pixels,
     pub history_drag: Option<DragAnchor>,
-    /// Whether the Mutations panel is shown in the left dock. Offered only on an
-    /// engine whose row edits are asynchronous background work
-    /// ([`DbKind::tracks_mutations`](red_core::DbKind::tracks_mutations)); on every
-    /// other engine a write is finished when the statement returns and there would be
-    /// nothing to show.
+    /// Whether the Server dock is shown in the left dock. Offered on every
+    /// engine with a server behind it, which is all of them but SQLite (see
+    /// [`AppState::has_server_panel`](crate::app::AppState::has_server_panel)).
     pub server_open: bool,
-    /// Which view the Server dock shows (Sessions / Mutations).
+    /// Which view the Server dock shows (Overview / Sessions / Mutations).
     pub server_view: crate::server_panel::ServerView,
+    /// The latest metrics sample, and the one before it.
+    ///
+    /// The previous sample is kept for exactly one reason: a monotonic counter
+    /// such as MySQL `Questions` or Postgres `xact_commit` is unreadable on its
+    /// own, and the *rate* is what the user wants. The panel is the only place
+    /// that knows the interval between two refreshes, so it is the only place
+    /// that can derive one. It is not a history and must not grow into one.
+    pub metrics: Option<red_core::server::ServerSnapshot>,
+    pub metrics_prev: Option<red_core::server::ServerSnapshot>,
+    /// The in-flight sample's epoch; a reply carrying any other is dropped, so a
+    /// slow sample cannot land after a newer one and corrupt the rate pair.
+    pub metrics_epoch: red_service::Epoch,
+    pub metrics_loading: bool,
+    /// The sample failed outright, as opposed to individual metrics being
+    /// invisible to this role (which the snapshot carries in `unavailable`).
+    pub metrics_error: Option<String>,
+    /// How often the panel re-samples on its own; `None` (the default) is off.
+    /// Floored at [`MIN_REFRESH_SECS`](crate::server_panel::MIN_REFRESH_SECS):
+    /// polling `CLIENT LIST` or `pg_stat_activity` against production is real
+    /// load, so this is opt-in and its interval is shown in the panel.
+    pub server_refresh: Option<std::time::Duration>,
+    /// Bumped whenever the interval changes, so a timer armed under the old one
+    /// retires instead of firing once more at the wrong cadence.
+    pub server_refresh_gen: u64,
     /// The last server-session listing, longest-running first.
     pub sessions: Vec<red_core::ServerSession>,
     /// The connected role could not see other sessions' SQL, so the panel says so
@@ -1778,6 +1800,13 @@ impl ActiveConn {
             history_drag: None,
             server_open: false,
             server_view: crate::server_panel::ServerView::default(),
+            metrics: None,
+            metrics_prev: None,
+            metrics_epoch: red_service::Epoch::ZERO,
+            metrics_loading: false,
+            metrics_error: None,
+            server_refresh: None,
+            server_refresh_gen: 0,
             sessions: Vec::new(),
             sessions_restricted: false,
             sessions_loading: false,

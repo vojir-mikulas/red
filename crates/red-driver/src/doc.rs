@@ -136,6 +136,21 @@ pub trait DocDriver: Send + Sync {
     /// a failed close is not worth surfacing (the cursor times out server-side).
     async fn close_cursor(&self, cursor: &DocCursor);
 
+    /// One live sample of the deployment's state (`serverStatus`), the document
+    /// arm of the shared Server panel. The same method exists on
+    /// `DatabaseDriver` and `KvDriver`; see
+    /// [`ServerSnapshot`](red_core::server::ServerSnapshot).
+    ///
+    /// Mongo needs the most care about privilege of the three: an unprivileged
+    /// user gets a *truncated* `serverStatus` rather than an error, so the
+    /// sections that came back empty become `unavailable` entries instead of
+    /// zeroes.
+    async fn server_metrics(&self) -> Result<red_core::server::ServerSnapshot> {
+        Err(red_core::RedError::Driver(
+            "this engine reports no live server metrics".to_string(),
+        ))
+    }
+
     /// What the deployment is running right now (`$currentOp`), longest-running
     /// first. The document-store analogue of
     /// [`DatabaseDriver::server_sessions`](crate::DatabaseDriver::server_sessions),

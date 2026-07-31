@@ -37,6 +37,7 @@ use crate::format::{ExportWriter, ProgressThrottle, strip_trailing};
 use crate::pg_text;
 use crate::{
     AbortSignal, ArmGuard, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor, driver_err,
+    now_unix, secs_to_duration,
 };
 
 /// Warm fetch connections kept ready for the one-shot read paths. `tokio-postgres`
@@ -1401,6 +1402,234 @@ impl DatabaseDriver for PostgresDriver {
                 .to_string(),
         });
         Ok(report)
+    }
+
+    async fn server_metrics(&self) -> Result<red_core::server::ServerSnapshot> {
+        use red_core::server::{MetricGroup as G, MetricValue as V, ServerMetric as M};
+
+        let mut snap =
+            red_core::server::ServerSnapshot::new(red_core::DbKind::Postgres, now_unix());
+
+        // Whether this role may see the whole server, asked once and used twice
+        // below. `pg_monitor` arrived in PG 10; on anything older (or any managed
+        // provider that hides it) the query errors and the answer is "no", which
+        // is the safe reading either way.
+        let privileged = self
+            .client
+            .query_one(
+                "SELECT pg_has_role(current_user, 'pg_monitor', 'MEMBER')",
+                &[],
+            )
+            .await
+            .map(|r| r.get::<_, bool>(0))
+            .unwrap_or(false);
+
+        // Connections, uptime, size and the oldest open transaction, which is the
+        // metric that actually predicts an outage: a transaction left open holds
+        // back vacuum for the whole cluster.
+        match self
+            .client
+            .query_one(
+                "SELECT (SELECT count(*) FROM pg_stat_activity)::int8, \
+                        current_setting('max_connections')::int8, \
+                        (SELECT count(*) FROM pg_stat_activity \
+                          WHERE state = 'active')::int8, \
+                        (SELECT count(*) FROM pg_stat_activity \
+                          WHERE state = 'idle in transaction')::int8, \
+                        EXTRACT(EPOCH FROM (now() - pg_postmaster_start_time()))::float8, \
+                        COALESCE((SELECT EXTRACT(EPOCH FROM max(now() - xact_start)) \
+                                  FROM pg_stat_activity WHERE xact_start IS NOT NULL), 0)::float8, \
+                        pg_database_size(current_database())::int8, \
+                        version()",
+                &[],
+            )
+            .await
+        {
+            Ok(r) => {
+                snap.push(M::new(
+                    G::Connections,
+                    "connections",
+                    "Connections",
+                    V::Ratio {
+                        used: r.get::<_, i64>(0).max(0) as u64,
+                        total: r.get::<_, i64>(1).max(0) as u64,
+                    },
+                ));
+                snap.push(M::new(
+                    G::Connections,
+                    "active_backends",
+                    "Running statements",
+                    V::Count(r.get::<_, i64>(2).max(0) as u64),
+                ));
+                snap.push(
+                    M::new(
+                        G::Connections,
+                        "idle_in_transaction",
+                        "Idle in transaction",
+                        V::Count(r.get::<_, i64>(3).max(0) as u64),
+                    )
+                    .with_detail("open transactions doing nothing; these hold back vacuum"),
+                );
+                snap.push(
+                    M::new(
+                        G::Connections,
+                        "oldest_transaction",
+                        "Oldest transaction",
+                        V::Duration(secs_to_duration(r.get::<_, f64>(5))),
+                    )
+                    .with_detail("age of the longest-open transaction on this server"),
+                );
+                snap.push(M::new(
+                    G::Storage,
+                    "database_size",
+                    "Database size",
+                    V::Bytes(r.get::<_, i64>(6).max(0) as u64),
+                ));
+                snap.push(M::new(
+                    G::Server,
+                    "uptime",
+                    "Uptime",
+                    V::Duration(secs_to_duration(r.get::<_, f64>(4))),
+                ));
+                snap.push(M::new(
+                    G::Server,
+                    "version",
+                    "Version",
+                    V::Text(r.get::<_, String>(7)),
+                ));
+                if !privileged {
+                    snap.note_unavailable(
+                        "connection and transaction figures: this role is not a member of \
+                         pg_monitor, so it may not see every backend",
+                    );
+                }
+            }
+            Err(e) => snap.note_unavailable(format!("connections, uptime and size: {e}")),
+        }
+
+        // Cumulative counters from `pg_stat_database`, reported as totals so the
+        // panel derives their rates from two samples: a raw `xact_commit` of
+        // four billion says nothing on its own.
+        match self
+            .client
+            .query_one(
+                "SELECT COALESCE(sum(xact_commit), 0)::int8, \
+                        COALESCE(sum(xact_rollback), 0)::int8, \
+                        COALESCE(sum(blks_hit), 0)::int8, \
+                        COALESCE(sum(blks_read), 0)::int8, \
+                        COALESCE(sum(tup_returned), 0)::int8, \
+                        COALESCE(sum(deadlocks), 0)::int8 \
+                 FROM pg_stat_database",
+                &[],
+            )
+            .await
+        {
+            Ok(r) => {
+                let n = |i: usize| r.get::<_, i64>(i).max(0) as u64;
+                snap.push(M::new(
+                    G::Throughput,
+                    "xact_commit",
+                    "Transactions committed",
+                    V::Total(n(0)),
+                ));
+                snap.push(M::new(
+                    G::Throughput,
+                    "xact_rollback",
+                    "Transactions rolled back",
+                    V::Total(n(1)),
+                ));
+                snap.push(M::new(
+                    G::Throughput,
+                    "tup_returned",
+                    "Rows read",
+                    V::Total(n(4)),
+                ));
+                snap.push(M::new(
+                    G::Throughput,
+                    "deadlocks",
+                    "Deadlocks",
+                    V::Total(n(5)),
+                ));
+                // The cache hit ratio, which is the number people actually open
+                // this panel for. Withheld on a server that has read nothing:
+                // 0% would read as a cache missing everything.
+                let (hit, read) = (n(2), n(3));
+                if hit + read > 0 {
+                    snap.push(
+                        M::new(
+                            G::Memory,
+                            "cache_hit_ratio",
+                            "Cache hit ratio",
+                            V::Percent(hit as f64 / (hit + read) as f64),
+                        )
+                        .with_detail("blocks served from shared buffers rather than disk"),
+                    );
+                }
+            }
+            Err(e) => snap.note_unavailable(format!("throughput and cache hit ratio: {e}")),
+        }
+
+        if let Ok(r) = self
+            .client
+            .query_one(
+                "SELECT setting FROM pg_settings WHERE name = 'shared_buffers'",
+                &[],
+            )
+            .await
+            .map(|r| r.get::<_, String>(0))
+        {
+            // Reported in 8 KiB blocks, which nobody wants to read.
+            if let Ok(blocks) = r.parse::<u64>() {
+                snap.push(M::new(
+                    G::Memory,
+                    "shared_buffers",
+                    "Shared buffers",
+                    V::Bytes(blocks.saturating_mul(8 * 1024)),
+                ));
+            }
+        }
+
+        // Replication. An unprivileged role reads `pg_stat_replication` as zero
+        // rows rather than an error, so "no replicas" and "you may not look" are
+        // indistinguishable from the count alone: hence the privilege check.
+        match self
+            .client
+            .query_one(
+                "SELECT count(*)::int8, \
+                        COALESCE(max(EXTRACT(EPOCH FROM replay_lag)), 0)::float8 \
+                 FROM pg_stat_replication",
+                &[],
+            )
+            .await
+        {
+            Ok(r) => {
+                let replicas = r.get::<_, i64>(0).max(0) as u64;
+                if replicas == 0 && !privileged {
+                    snap.note_unavailable(
+                        "replication: this role is not a member of pg_monitor, so \
+                         pg_stat_replication reads empty whether or not there are replicas",
+                    );
+                } else {
+                    snap.push(M::new(
+                        G::Replication,
+                        "replicas",
+                        "Connected replicas",
+                        V::Count(replicas),
+                    ));
+                    if replicas > 0 {
+                        snap.push(M::new(
+                            G::Replication,
+                            "replay_lag",
+                            "Replay lag",
+                            V::Duration(secs_to_duration(r.get::<_, f64>(1))),
+                        ));
+                    }
+                }
+            }
+            Err(e) => snap.note_unavailable(format!("replication: {e}")),
+        }
+
+        Ok(snap)
     }
 
     async fn server_sessions(&self) -> Result<(Vec<red_core::ServerSession>, bool)> {
@@ -2850,6 +3079,35 @@ mod tests {
         let url = url_or_skip!();
         let driver = PostgresDriver::connect(&url, true).await.unwrap();
         battery::read_only_rejects_write(&driver, "CREATE TABLE red_ro_should_fail (x INT)").await;
+    }
+
+    #[tokio::test]
+    async fn server_metrics_come_back_whole_from_a_real_server() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, true).await.unwrap();
+        let snap = driver.server_metrics().await.unwrap();
+
+        assert_eq!(snap.engine, red_core::DbKind::Postgres);
+        assert!(snap.taken_at > 0);
+        for key in [
+            "connections",
+            "oldest_transaction",
+            "xact_commit",
+            "database_size",
+            "uptime",
+            "version",
+        ] {
+            assert!(snap.get(key).is_some(), "{key} is missing: {snap:?}");
+        }
+        // A superuser sees everything, so the only line that may be here is the
+        // replication one on a server that genuinely has no replicas.
+        assert!(
+            snap.unavailable
+                .iter()
+                .all(|u| u.starts_with("replication")),
+            "unexpected gaps: {:?}",
+            snap.unavailable
+        );
     }
 
     #[tokio::test]

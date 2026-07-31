@@ -78,6 +78,51 @@ pub(in crate::ai) fn fmt_bytes(n: u64) -> String {
         format!("{n}B")
     }
 }
+/// Render a [`ServerSnapshot`](red_core::server::ServerSnapshot) as the text the
+/// model reads, grouped the way the Server panel draws it.
+///
+/// Deliberately the *same* snapshot the human sees, rather than a second parse
+/// of the same server reply: when the model reports a memory figure and the user
+/// looks at the panel, the two agreeing is the whole point. What differs is the
+/// medium, not the numbers.
+///
+/// `unavailable` is rendered last and never omitted, so the model can say "this
+/// role cannot see replication" instead of concluding there are no replicas.
+pub(in crate::ai) fn fmt_server_snapshot(snap: &red_core::server::ServerSnapshot) -> String {
+    use red_core::server::MetricGroup;
+
+    let mut out = String::new();
+    for group in MetricGroup::ORDER {
+        let mut metrics = snap.group(group).peekable();
+        if metrics.peek().is_none() {
+            continue;
+        }
+        out.push_str(group.heading());
+        out.push('\n');
+        for m in metrics {
+            out.push_str("  ");
+            out.push_str(&m.label);
+            out.push_str(": ");
+            out.push_str(&m.value.render());
+            if let Some(detail) = &m.detail {
+                out.push_str(" (");
+                out.push_str(detail);
+                out.push(')');
+            }
+            out.push('\n');
+        }
+    }
+    if !snap.unavailable.is_empty() {
+        out.push_str("Not visible to this connection:\n");
+        for reason in &snap.unavailable {
+            out.push_str("  - ");
+            out.push_str(reason);
+            out.push('\n');
+        }
+    }
+    out
+}
+
 /// Append the grounding footer every seam's system prompt shares: the live
 /// connection line, the read-only notice when set, and the connection's knowledge
 /// file when the user has written one. One place so the footer can't drift per

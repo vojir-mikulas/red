@@ -478,6 +478,30 @@ impl DocDriver for MongoDriver {
             .await;
     }
 
+    async fn server_metrics(&self) -> Result<red_core::server::ServerSnapshot> {
+        let status = self
+            .client
+            .database("admin")
+            .run_command(doc! { "serverStatus": 1 })
+            .await
+            .map_err(query_err)?;
+
+        // Only ask a replica set. On a standalone the command is an error, and
+        // turning that error into an "unavailable" line would tell the user
+        // something is missing when nothing is.
+        let repl = match self.topology {
+            DocTopology::Standalone => None,
+            _ => Some(
+                self.client
+                    .database("admin")
+                    .run_command(doc! { "replSetGetStatus": 1 })
+                    .await
+                    .map_err(|e| e.to_string()),
+            ),
+        };
+        Ok(mongo_metrics(&status, repl.as_ref(), crate::now_unix()))
+    }
+
     async fn current_ops(&self) -> Result<Vec<red_core::doc::DocOp>> {
         // `$currentOp` on `admin`, not the deprecated `currentOp` command: the
         // aggregation stage is the supported path on 5.0+ and the only one that
@@ -506,8 +530,23 @@ impl DocDriver for MongoDriver {
             else {
                 continue;
             };
+            // The aggregation running this very pipeline shows up in its own
+            // output. Identified by what it *is* rather than by a connection id,
+            // because the pool hands this call whichever connection is free, so
+            // there is no stable "RED's connection" to compare against.
+            let is_self = op
+                .get_document("command")
+                .ok()
+                .and_then(|c| c.get_array("pipeline").ok())
+                .is_some_and(|stages| {
+                    stages.iter().any(|s| {
+                        s.as_document()
+                            .is_some_and(|d| d.contains_key("$currentOp"))
+                    })
+                });
             out.push(red_core::doc::DocOp {
                 opid,
+                is_self,
                 op: op.get_str("op").unwrap_or("unknown").to_string(),
                 namespace: op.get_str("ns").unwrap_or("").to_string(),
                 secs_running: op
@@ -965,10 +1004,411 @@ fn document_to_bson(doc: &Document) -> BsonDocument {
     doc_to_bson_document(&doc.to_doc_value())
 }
 
+/// A dotted path into a BSON document (`"wiredTiger.cache"`), so a nested
+/// `serverStatus` field is one lookup rather than a chain of `get_document`s
+/// that each have to be error-handled.
+fn bson_path<'a>(doc: &'a BsonDocument, path: &str) -> Option<&'a Bson> {
+    let mut cursor: Option<&Bson> = None;
+    for (i, seg) in path.split('.').enumerate() {
+        cursor = Some(if i == 0 {
+            doc.get(seg)?
+        } else {
+            cursor?.as_document()?.get(seg)?
+        });
+    }
+    cursor
+}
+
+/// A BSON number as `u64`, whatever width the server chose. `serverStatus`
+/// reports the same field as `Int32` on one deployment and `Int64` or `Double`
+/// on another, and matching one arm silently drops the metric on the others.
+fn bson_u64(doc: &BsonDocument, path: &str) -> Option<u64> {
+    match bson_path(doc, path)? {
+        Bson::Int32(v) => u64::try_from(*v).ok(),
+        Bson::Int64(v) => u64::try_from(*v).ok(),
+        Bson::Double(v) if v.is_finite() && *v >= 0.0 => Some(*v as u64),
+        _ => None,
+    }
+}
+
+fn bson_f64(doc: &BsonDocument, path: &str) -> Option<f64> {
+    match bson_path(doc, path)? {
+        Bson::Int32(v) => Some(f64::from(*v)),
+        Bson::Int64(v) => Some(*v as f64),
+        Bson::Double(v) => Some(*v),
+        _ => None,
+    }
+}
+
+/// `serverStatus` (+ an optional `replSetGetStatus`) as a [`ServerSnapshot`].
+///
+/// Pure, and taking the raw documents, because Mongo is the seam that needs the
+/// most care about privilege: an unprivileged user gets a *truncated*
+/// `serverStatus` rather than an error, so "the section is missing" is the
+/// common case and not the exceptional one. Every section that did not come back
+/// becomes an `unavailable` line, and the whole of that behaviour is testable
+/// here from fixture documents.
+fn mongo_metrics(
+    status: &BsonDocument,
+    repl: Option<&std::result::Result<BsonDocument, String>>,
+    taken_at: i64,
+) -> red_core::server::ServerSnapshot {
+    use red_core::server::{MetricGroup as G, MetricValue as V, ServerMetric as M, ServerSnapshot};
+
+    let mut snap = ServerSnapshot::new(red_core::DbKind::Mongo, taken_at);
+
+    // --- connections
+    match (
+        bson_u64(status, "connections.current"),
+        bson_u64(status, "connections.available"),
+    ) {
+        (Some(current), Some(available)) => {
+            // Mongo reports what is *left*, not the ceiling, so the ceiling is
+            // the sum. Rendering `current / available` would show a busy server
+            // as nearly idle.
+            snap.push(M::new(
+                G::Connections,
+                "connections",
+                "Connections",
+                V::Ratio {
+                    used: current,
+                    total: current + available,
+                },
+            ));
+        }
+        _ => snap.note_unavailable(
+            "connection counts: serverStatus returned no `connections` section, \
+             which usually means this user lacks the clusterMonitor role",
+        ),
+    }
+    if let Some(queue) = bson_u64(status, "globalLock.currentQueue.total") {
+        snap.push(
+            M::new(
+                G::Connections,
+                "global_lock_queue",
+                "Queued for the lock",
+                V::Count(queue),
+            )
+            .with_detail("operations waiting on the global lock"),
+        );
+    }
+
+    // --- throughput: opcounters are cumulative, so they derive rates.
+    let mut counted = false;
+    for (field, key, label) in [
+        ("query", "opcounters_query", "Queries"),
+        ("insert", "opcounters_insert", "Inserts"),
+        ("update", "opcounters_update", "Updates"),
+        ("delete", "opcounters_delete", "Deletes"),
+        ("getmore", "opcounters_getmore", "Cursor fetches"),
+        ("command", "opcounters_command", "Commands"),
+    ] {
+        if let Some(n) = bson_u64(status, &format!("opcounters.{field}")) {
+            snap.push(M::new(G::Throughput, key, label, V::Total(n)));
+            counted = true;
+        }
+    }
+    if !counted {
+        snap.note_unavailable("throughput: serverStatus returned no `opcounters` section");
+    }
+
+    // --- memory: the WiredTiger cache, which is where a Mongo deployment's
+    // memory pressure actually shows up.
+    match (
+        bson_u64(status, "wiredTiger.cache.bytes currently in the cache"),
+        bson_u64(status, "wiredTiger.cache.maximum bytes configured"),
+    ) {
+        (Some(used), Some(total)) => snap.push(M::new(
+            G::Memory,
+            "wt_cache",
+            "WiredTiger cache",
+            V::Ratio { used, total },
+        )),
+        _ => snap.note_unavailable(
+            "cache use: serverStatus returned no `wiredTiger` section (a non-WiredTiger \
+             storage engine, or an unprivileged user)",
+        ),
+    }
+    if let Some(mb) = bson_u64(status, "mem.resident") {
+        snap.push(M::new(
+            G::Memory,
+            "mem_resident",
+            "Resident memory",
+            // Reported in MiB, which is the one unit conversion in this arm.
+            V::Bytes(mb.saturating_mul(1024 * 1024)),
+        ));
+    }
+
+    // --- storage / network
+    if let Some(bytes) = bson_u64(status, "network.bytesOut") {
+        snap.push(M::new(
+            G::Storage,
+            "network_bytes_out",
+            "Bytes sent",
+            V::Total(bytes),
+        ));
+    }
+
+    // --- server
+    if let Some(uptime) = bson_f64(status, "uptime") {
+        snap.push(M::new(
+            G::Server,
+            "uptime",
+            "Uptime",
+            V::Duration(crate::secs_to_duration(uptime)),
+        ));
+    }
+    if let Some(Bson::String(version)) = bson_path(status, "version") {
+        snap.push(M::new(
+            G::Server,
+            "version",
+            "Version",
+            V::Text(version.clone()),
+        ));
+    }
+
+    match repl {
+        Some(Ok(rs)) => replica_set_metrics(rs, &mut snap),
+        Some(Err(e)) => snap.note_unavailable(format!(
+            "replication: replSetGetStatus was refused ({e}), which usually means this \
+             user lacks the clusterMonitor role"
+        )),
+        // A standalone. Not a gap: there is no replication to report.
+        None => {}
+    }
+    snap
+}
+
+/// The replica-set half: set name, member count, and the worst secondary lag.
+fn replica_set_metrics(rs: &BsonDocument, snap: &mut red_core::server::ServerSnapshot) {
+    use red_core::server::{MetricGroup as G, MetricValue as V, ServerMetric as M};
+
+    if let Some(Bson::String(set)) = bson_path(rs, "set") {
+        snap.push(M::new(
+            G::Replication,
+            "replica_set",
+            "Replica set",
+            V::Text(set.clone()),
+        ));
+    }
+    let Some(Bson::Array(members)) = bson_path(rs, "members") else {
+        snap.note_unavailable("replica lag: replSetGetStatus listed no members");
+        return;
+    };
+    let optime = |m: &BsonDocument| match m.get("optimeDate") {
+        Some(Bson::DateTime(d)) => Some(d.timestamp_millis()),
+        _ => None,
+    };
+    let state = |m: &BsonDocument| m.get_str("stateStr").unwrap_or("").to_string();
+
+    let docs: Vec<&BsonDocument> = members.iter().filter_map(Bson::as_document).collect();
+    snap.push(M::new(
+        G::Replication,
+        "replica_members",
+        "Members",
+        V::Count(docs.len() as u64),
+    ));
+
+    // Lag is measured against the primary's optime, so without a visible primary
+    // there is no baseline and reporting zero would claim a healthy set during
+    // exactly the outage worth noticing.
+    let Some(primary) = docs
+        .iter()
+        .find(|m| state(m) == "PRIMARY")
+        .and_then(|m| optime(m))
+    else {
+        snap.note_unavailable("replica lag: this set reports no primary right now");
+        return;
+    };
+    let worst = docs
+        .iter()
+        .filter(|m| state(m) == "SECONDARY")
+        .filter_map(|m| optime(m))
+        .map(|t| (primary - t).max(0))
+        .max();
+    if let Some(ms) = worst {
+        snap.push(
+            M::new(
+                G::Replication,
+                "replica_lag",
+                "Replica lag",
+                V::Duration(std::time::Duration::from_millis(ms as u64)),
+            )
+            .with_detail("the furthest-behind secondary"),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use mongodb::bson::{Binary, spec::BinarySubtype};
+
+    fn full_status() -> BsonDocument {
+        doc! {
+            "version": "7.0.5",
+            "uptime": 86_400.0_f64,
+            "connections": { "current": 30_i32, "available": 70_i32 },
+            "globalLock": { "currentQueue": { "total": 2_i32 } },
+            "opcounters": {
+                "insert": 10_i64, "query": 500_i64, "update": 20_i64,
+                "delete": 3_i64, "getmore": 40_i64, "command": 900_i64,
+            },
+            "wiredTiger": { "cache": {
+                "bytes currently in the cache": 1_073_741_824_i64,
+                "maximum bytes configured": 2_147_483_648_i64,
+            } },
+            "mem": { "resident": 512_i32 },
+            "network": { "bytesOut": 4096_i64 },
+        }
+    }
+
+    fn value(snap: &red_core::server::ServerSnapshot, key: &str) -> red_core::server::MetricValue {
+        snap.get(key)
+            .unwrap_or_else(|| panic!("metric {key} is missing"))
+            .value
+            .clone()
+    }
+
+    #[test]
+    fn a_full_server_status_reports_every_group() {
+        use red_core::server::MetricValue as V;
+        let snap = mongo_metrics(&full_status(), None, 99);
+        assert_eq!(snap.engine, red_core::DbKind::Mongo);
+        assert_eq!(snap.taken_at, 99);
+        assert!(snap.unavailable.is_empty(), "{:?}", snap.unavailable);
+        assert_eq!(value(&snap, "opcounters_query"), V::Total(500));
+        assert_eq!(value(&snap, "global_lock_queue"), V::Count(2));
+        assert_eq!(
+            value(&snap, "uptime"),
+            V::Duration(std::time::Duration::from_secs(86_400))
+        );
+        assert_eq!(value(&snap, "version"), V::Text("7.0.5".into()));
+    }
+
+    #[test]
+    fn connections_are_measured_against_the_ceiling_not_the_remainder() {
+        // Mongo reports how many are *left*. Using that as the total would show
+        // 30 of 70 on a server that is actually 30% full.
+        let snap = mongo_metrics(&full_status(), None, 0);
+        assert_eq!(
+            value(&snap, "connections"),
+            red_core::server::MetricValue::Ratio {
+                used: 30,
+                total: 100
+            }
+        );
+    }
+
+    #[test]
+    fn a_truncated_server_status_names_the_missing_sections() {
+        // What an unprivileged user gets: a document, not an error, with whole
+        // sections absent.
+        let status = doc! { "version": "7.0.5", "uptime": 10.0_f64 };
+        let snap = mongo_metrics(&status, None, 0);
+        assert!(snap.get("connections").is_none());
+        assert!(snap.get("opcounters_query").is_none());
+        assert_eq!(snap.unavailable.len(), 3);
+        assert!(
+            snap.unavailable
+                .iter()
+                .any(|u| u.contains("clusterMonitor")),
+            "{:?}",
+            snap.unavailable
+        );
+        // What did come back is still reported.
+        assert_eq!(
+            value(&snap, "version"),
+            red_core::server::MetricValue::Text("7.0.5".into())
+        );
+    }
+
+    #[test]
+    fn numeric_widths_are_all_accepted() {
+        // The same field is Int32 here, Int64 there, Double on a third
+        // deployment; matching one arm would silently drop it on the others.
+        for current in [Bson::Int32(5), Bson::Int64(5), Bson::Double(5.0)] {
+            let status = doc! { "connections": { "current": current, "available": 5_i32 } };
+            assert_eq!(
+                value(&mongo_metrics(&status, None, 0), "connections"),
+                red_core::server::MetricValue::Ratio { used: 5, total: 10 }
+            );
+        }
+    }
+
+    #[test]
+    fn a_standalone_reports_no_replication_gap() {
+        // `None` means "we did not ask, because there is no replica set", which
+        // is not something missing.
+        let snap = mongo_metrics(&full_status(), None, 0);
+        assert!(!snap.unavailable.iter().any(|u| u.contains("replication")));
+        assert!(snap.get("replica_set").is_none());
+    }
+
+    #[test]
+    fn a_refused_repl_status_is_reported_as_a_privilege_gap() {
+        let refused = Err("not authorized on admin".to_string());
+        let snap = mongo_metrics(&full_status(), Some(&refused), 0);
+        assert!(
+            snap.unavailable
+                .iter()
+                .any(|u| u.contains("replSetGetStatus")),
+            "{:?}",
+            snap.unavailable
+        );
+    }
+
+    #[test]
+    fn replica_lag_is_the_furthest_behind_secondary() {
+        use mongodb::bson::DateTime;
+        let rs = Ok(doc! {
+            "set": "rs0",
+            "members": [
+                { "stateStr": "PRIMARY", "optimeDate": DateTime::from_millis(10_000) },
+                { "stateStr": "SECONDARY", "optimeDate": DateTime::from_millis(9_500) },
+                { "stateStr": "SECONDARY", "optimeDate": DateTime::from_millis(7_000) },
+            ],
+        });
+        let snap = mongo_metrics(&full_status(), Some(&rs), 0);
+        assert_eq!(
+            value(&snap, "replica_set"),
+            red_core::server::MetricValue::Text("rs0".into())
+        );
+        assert_eq!(
+            value(&snap, "replica_members"),
+            red_core::server::MetricValue::Count(3)
+        );
+        assert_eq!(
+            value(&snap, "replica_lag"),
+            red_core::server::MetricValue::Duration(std::time::Duration::from_millis(3_000))
+        );
+    }
+
+    #[test]
+    fn a_set_with_no_visible_primary_reports_no_lag_rather_than_zero() {
+        // Mid-election, or a partition: zero lag here would claim a healthy set
+        // during exactly the outage worth seeing.
+        use mongodb::bson::DateTime;
+        let rs = Ok(doc! {
+            "set": "rs0",
+            "members": [
+                { "stateStr": "SECONDARY", "optimeDate": DateTime::from_millis(9_500) },
+            ],
+        });
+        let snap = mongo_metrics(&full_status(), Some(&rs), 0);
+        assert!(snap.get("replica_lag").is_none());
+        assert!(snap.unavailable.iter().any(|u| u.contains("no primary")));
+    }
+
+    #[test]
+    fn a_dotted_path_walks_nested_documents_and_stops_at_a_scalar() {
+        let d = doc! { "a": { "b": { "c": 1_i32 } }, "flat": 2_i32 };
+        assert_eq!(bson_u64(&d, "a.b.c"), Some(1));
+        assert_eq!(bson_u64(&d, "flat"), Some(2));
+        assert_eq!(bson_u64(&d, "a.b.missing"), None);
+        // `flat` is not a document, so walking through it must not panic.
+        assert_eq!(bson_u64(&d, "flat.deeper"), None);
+    }
 
     #[test]
     fn bson_docvalue_roundtrip_lossy_types() {
@@ -1029,6 +1469,58 @@ mod tests {
         assert_eq!(
             topology_from_hello(&doc! { "ok": 1.0 }),
             DocTopology::Standalone
+        );
+    }
+
+    /// Live tests, against a MongoDB provided via `RED_TEST_MONGO_URL`. A missing
+    /// URL reads as "not run" rather than a silent pass, the same contract the
+    /// other drivers' live suites use.
+    fn test_url() -> Option<String> {
+        std::env::var("RED_TEST_MONGO_URL").ok()
+    }
+
+    macro_rules! url_or_skip {
+        () => {
+            match test_url() {
+                Some(u) => u,
+                None => {
+                    eprintln!("SKIP {}: RED_TEST_MONGO_URL not set", module_path!());
+                    return;
+                }
+            }
+        };
+    }
+
+    #[tokio::test]
+    async fn server_metrics_come_back_whole_from_a_real_server() {
+        let url = url_or_skip!();
+        let driver = MongoDriver::connect(&url, true).await.unwrap();
+        let snap = driver.server_metrics().await.unwrap();
+
+        assert_eq!(snap.engine, red_core::DbKind::Mongo);
+        assert!(snap.taken_at > 0);
+        for key in ["connections", "opcounters_query", "uptime", "version"] {
+            assert!(snap.get(key).is_some(), "{key} is missing: {snap:?}");
+        }
+        // An unrestricted user against a standalone gets the whole document and
+        // is not asked about replication at all.
+        assert!(
+            snap.unavailable.is_empty(),
+            "unexpected gaps against a live server: {:?}",
+            snap.unavailable
+        );
+    }
+
+    #[tokio::test]
+    async fn current_ops_marks_the_listing_own_operation() {
+        let url = url_or_skip!();
+        let driver = MongoDriver::connect(&url, true).await.unwrap();
+        let ops = driver.current_ops().await.unwrap();
+        // The `$currentOp` aggregation appears in its own output; the panel must
+        // never offer to kill the read that is drawing it.
+        assert!(
+            ops.iter().any(|o| o.is_self),
+            "our own $currentOp should be marked: {ops:?}"
         );
     }
 }

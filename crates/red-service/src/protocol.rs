@@ -182,7 +182,24 @@ pub enum Command {
     BuildHealthReport,
     /// List what the server is doing right now, for the Server panel's Sessions
     /// view. Read-only; polled while the panel is open.
+    ///
+    /// Answered by whichever seam this session holds: SQL sessions, Redis
+    /// clients and Mongo current-ops all come back as `ServerSession`, so the
+    /// panel has one code path and never branches on the engine.
     ListServerSessions,
+    /// Sample the server's live state for the Server panel's Overview view
+    /// (see [`ServerSnapshot`](red_core::server::ServerSnapshot)). Read-only and
+    /// bounded; answered by all three seams.
+    ///
+    /// `epoch` is echoed back on the reply so a sample that arrives after the
+    /// user switched views or refreshed again is dropped rather than overwriting
+    /// a newer one. That matters more here than for a plain listing: the panel
+    /// keeps the previous sample to derive rates from, and folding an
+    /// out-of-order sample into that pair would produce a wrong rate rather than
+    /// merely stale numbers.
+    FetchServerMetrics {
+        epoch: Epoch,
+    },
     /// Stop one server session, either its statement (`Cancel`) or the whole
     /// session (`Terminate`).
     ///
@@ -1252,6 +1269,18 @@ pub enum Event {
     ServerSessionKilled {
         key: SessionKey,
         mode: KillMode,
+    },
+    /// One sample of the server's live state, in response to
+    /// `FetchServerMetrics`. `epoch` echoes the request's.
+    ServerMetricsReady {
+        epoch: Epoch,
+        snapshot: red_core::server::ServerSnapshot,
+    },
+    /// The sample could not be taken at all, as opposed to an individual metric
+    /// being invisible to this role, which the snapshot carries in `unavailable`.
+    ServerMetricsFailed {
+        epoch: Epoch,
+        message: String,
     },
     /// One object's DDL, in response to `ObjectDdl`.
     ObjectDdlReady {

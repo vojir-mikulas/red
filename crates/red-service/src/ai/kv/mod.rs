@@ -3,7 +3,7 @@
 //! [`kv_run_tool`] is the executor. Layout mirrors [`sql`](super::sql): tool
 //! definitions and the prompt in [`catalog`], the paging/diagnostic reads in
 //! [`tools`], the write gate and its approval shapes in [`write`], the `kv_set`
-//! plan in [`set`], and the INFO/analysis/value rendering in [`format`].
+//! plan in [`set`], and the analysis/value rendering in [`format`].
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -20,11 +20,9 @@ use super::grounding::{run_recent_keys, run_search_history};
 use super::knowledge::run_save_knowledge;
 use super::report::run_generate_report;
 use super::state::ReportSink;
-use super::util::{cap_result_bytes, fmt_bytes};
+use super::util::{cap_result_bytes, fmt_bytes, fmt_server_snapshot};
 use catalog::{KV_BIGGEST_TOP, KV_BULK_MAX, KV_SAMPLE_MAX, KV_TEMPLATE_TOP};
-use format::{
-    fmt_kv_value, kv_format_analysis, kv_format_templates, kv_info_summary, kv_ttl, resp_scalar,
-};
+use format::{fmt_kv_value, kv_format_analysis, kv_format_templates, kv_ttl, resp_scalar};
 use json::{kv_json_get, kv_json_set, kv_json_shape};
 use set::{kv_apply_set, kv_set_plan};
 use tools::{kv_collect_keys, kv_read_collection, kv_stream_groups};
@@ -80,11 +78,10 @@ pub(in crate::ai) async fn kv_run_tool(
                 driver.topology(),
                 driver.db_size().await.unwrap_or(0),
             );
-            match driver.command(&["INFO".to_string()]).await {
-                Ok(RespValue::Bulk(info)) | Ok(RespValue::Simple(info)) => {
-                    (format!("{header}{}", kv_info_summary(&info)), true)
-                }
-                Ok(other) => (format!("{header}unexpected INFO reply: {other:?}"), true),
+            // The same snapshot the Server panel's Overview draws, so the model
+            // and the user can never quote different numbers at each other.
+            match driver.server_metrics().await {
+                Ok(snap) => (format!("{header}{}", fmt_server_snapshot(&snap)), true),
                 Err(e) => (format!("error: {e}"), false),
             }
         }

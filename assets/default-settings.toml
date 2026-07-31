@@ -207,6 +207,13 @@ max_columns = 12
 # the OS keychain). Off shows the connection picker.
 restore_last_session = false
 
+# How often the Server panel re-samples live metrics and the session list, in
+# seconds; 0 is off and is the default. Polling pg_stat_activity or CLIENT LIST
+# against a production server is real load, so this is opt-in, floored at 2, and
+# the live interval is shown in the panel itself. Changeable per connection from
+# the panel's own control.
+server_refresh_secs = 0
+
 [update]
 # Poll GitHub Releases for newer signed builds in the background and stage them
 # for a one-click restart. false is a true off switch: no timer, no network.

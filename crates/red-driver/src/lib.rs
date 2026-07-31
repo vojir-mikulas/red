@@ -1643,6 +1643,30 @@ pub trait DatabaseDriver: Send + Sync {
         ))
     }
 
+    /// One live sample of the server's state: memory, throughput, connections,
+    /// uptime (see [`ServerSnapshot`](red_core::server::ServerSnapshot)).
+    ///
+    /// The same method exists on all three driver seams, because "what is this
+    /// server using and doing" is the one question a Postgres, a Redis and a
+    /// MongoDB answer alike, and the panel that asks it must not branch on the
+    /// engine. Read-only, bounded, and polled while the panel is open, so every
+    /// arm is a handful of catalog or `SHOW` round trips and never a scan.
+    ///
+    /// Individually fallible, like [`health`](Self::health): a check a role may
+    /// not run lands in `unavailable` rather than failing the snapshot, because
+    /// a panel that silently drops a metric reads as "zero".
+    ///
+    /// No empty default. An engine RED claims reports metrics
+    /// ([`DbKind::reports_metrics`](red_core::DbKind::reports_metrics)) but has
+    /// no arm here is a bug, and an empty snapshot would ship it as a blank
+    /// panel; the error at least says which engine forgot. The gate is what
+    /// keeps this from ever being called on SQLite.
+    async fn server_metrics(&self) -> Result<red_core::server::ServerSnapshot> {
+        Err(RedError::Driver(
+            "this engine reports no live server metrics".to_string(),
+        ))
+    }
+
     /// What the server is doing right now, longest-running first (see
     /// [`ServerSession`](red_core::ServerSession)).
     ///
@@ -1968,6 +1992,18 @@ pub(crate) fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+/// Seconds from a server, as a `Duration`. Every engine reports an uptime or a
+/// lag as a float, and every one of them can hand back a negative or a NaN
+/// (a clock stepped backwards, a `NULL` coalesced through a division); a
+/// `Duration` cannot hold either, and `from_secs_f64` *panics* on both.
+pub(crate) fn secs_to_duration(secs: f64) -> std::time::Duration {
+    if secs.is_finite() && secs > 0.0 {
+        std::time::Duration::from_secs_f64(secs)
+    } else {
+        std::time::Duration::ZERO
+    }
 }
 
 /// A byte count a human reads at a glance, for finding prose. Binary units, since

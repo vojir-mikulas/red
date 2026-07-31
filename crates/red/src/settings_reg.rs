@@ -485,6 +485,30 @@ static DEFS: &[SettingDef] = &[
         set: |s, v| s.behavior.restore_last_session = v.as_bool(),
         warn: None,
     },
+    SettingDef {
+        key: "behavior.server_refresh_secs",
+        tab: SettingsTab::Behavior,
+        group: "Server panel",
+        en_label: "Auto-refresh the server panel",
+        en_help: "How often the Server panel re-samples metrics and sessions. Off by default; \
+               change it for an open connection from the panel's own control.",
+        applies: Applies::All,
+        control: Control::Segments(&[
+            seg("Off", int(0)),
+            seg("2s", int(2)),
+            seg("5s", int(5)),
+            seg("10s", int(10)),
+            seg("30s", int(30)),
+        ]),
+        get: |s| Value::Int(s.behavior.server_refresh_secs as i64),
+        set: |s, v| s.behavior.server_refresh_secs = v.as_int().max(0) as u64,
+        warn: Some(|s| {
+            (s.behavior.server_refresh_secs > 0 && s.behavior.server_refresh_secs < 5).then_some(
+                "Polling pg_stat_activity or CLIENT LIST this often is real load on a \
+                 production server.",
+            )
+        }),
+    },
     // --- data view (every grid) ---
     SettingDef {
         key: "data.density",

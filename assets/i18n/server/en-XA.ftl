@@ -14,6 +14,12 @@ server-mutations_title = [Mútátíöñs]
 
 server-title = [Sérvér]
 
+server-sampled_at = [ás öf { $when }]
+
+server-not_visible = [Ñöt vísíblé tö thís çöññéçtíöñ:]
+
+server-redis_monitor_hint = [Slöw lög, MÖÑÍTÖR áñd pér-çlíéñt détáíl áré íñ thé Möñítör táb.]
+
 server-sessions_blocking = [{ $blocking_count } séssíöñ(s) blöçkíñg { $blocked } öthér(s)]
 
 server-this_connection = [thís çöññéçtíöñ]

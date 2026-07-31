@@ -42,9 +42,18 @@ impl AppState {
         let Phase::Connected(active) = &self.phase else {
             return;
         };
-        if !active.config.kind.session_caps().supported
-            && !matches!(active.config.kind, red_core::DbKind::Sqlite)
-        {
+        // The health report is a `DatabaseDriver` feature: it is built from a
+        // SQL catalog, and the other two seams have their own equivalents (the
+        // Redis keyspace analysis, Mongo's `audit_collection`). Asked directly
+        // rather than inferred from `session_caps`, which now answers true for
+        // Redis and Mongo too and would open a tab that can never fill.
+        if !matches!(
+            active.config.kind,
+            red_core::DbKind::Postgres
+                | red_core::DbKind::Mysql
+                | red_core::DbKind::Clickhouse
+                | red_core::DbKind::Sqlite
+        ) {
             return;
         }
         if let Some(i) = active.tabs.iter().position(|t| t.health().is_some()) {

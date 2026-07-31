@@ -1275,6 +1275,55 @@ impl KvDriver for RedisDriver {
             .map_err(|e| RedError::Driver(e.to_string()))
     }
 
+    async fn server_metrics(&self) -> Result<red_core::server::ServerSnapshot> {
+        let mut conn = self.conn.clone();
+        // Read as bytes, then lossily: `INFO` is documented as text but carries
+        // whatever an `executable` or a config value happens to hold, and one
+        // non-UTF-8 byte must not cost the whole panel.
+        let raw: Vec<u8> = redis::cmd("INFO")
+            .query_async(&mut conn)
+            .await
+            .map_err(|e| RedError::Driver(e.to_string()))?;
+        let mut snap = red_core::kv::parse_info(&String::from_utf8_lossy(&raw), crate::now_unix());
+
+        // Modules ride the connect probe rather than `INFO`, so they are added
+        // here instead of inside the parser, which stays pure text-in.
+        let loaded = self.modules().loaded().to_vec();
+        if !loaded.is_empty() {
+            snap.push(red_core::server::ServerMetric::new(
+                red_core::server::MetricGroup::Server,
+                "modules",
+                "Modules",
+                red_core::server::MetricValue::Text(
+                    loaded
+                        .iter()
+                        .map(|m| m.name.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                ),
+            ));
+        }
+        // A cluster's INFO is the seed node's, like every other server-scoped
+        // read here. Saying so is the difference between "this cluster uses
+        // 2 GiB" and "one of its nodes does".
+        if self.cluster.is_some() {
+            snap.note_unavailable(
+                "cluster-wide totals: INFO reports the seed node only, so these figures \
+                 cover one node of the cluster",
+            );
+        }
+        Ok(snap)
+    }
+
+    async fn client_id(&self) -> Option<i64> {
+        let mut conn = self.conn.clone();
+        redis::cmd("CLIENT")
+            .arg("ID")
+            .query_async(&mut conn)
+            .await
+            .ok()
+    }
+
     async fn slowlog(&self, count: usize) -> Result<Vec<SlowlogEntry>> {
         let mut conn = self.conn.clone();
         let reply: redis::Value = redis::cmd("SLOWLOG")
@@ -2823,6 +2872,47 @@ mod tests {
             "our named connection should appear in CLIENT LIST"
         );
         assert!(clients.iter().all(|c| c.id > 0 && !c.addr.is_empty()));
+    }
+
+    #[tokio::test]
+    async fn server_metrics_come_back_whole_from_a_real_server() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, true).await.unwrap();
+        let snap = driver.server_metrics().await.unwrap();
+
+        assert_eq!(snap.engine, red_core::DbKind::Redis);
+        assert!(snap.taken_at > 0);
+        // A plain, unrestricted server answers every section, so anything in
+        // `unavailable` here is a parser bug rather than a permission.
+        assert!(
+            snap.unavailable.is_empty(),
+            "unexpected gaps against a live server: {:?}",
+            snap.unavailable
+        );
+        // The four questions the Overview exists to answer.
+        for key in [
+            "used_memory",
+            "instantaneous_ops_per_sec",
+            "connected_clients",
+            "uptime_in_seconds",
+        ] {
+            assert!(snap.get(key).is_some(), "{key} is missing: {snap:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn client_id_names_this_connection_in_the_client_list() {
+        let url = url_or_skip!();
+        let driver = RedisDriver::connect(&url, true).await.unwrap();
+        let own = driver
+            .client_id()
+            .await
+            .expect("a live server answers CLIENT ID");
+        let clients = driver.client_list().await.unwrap();
+        assert!(
+            clients.iter().any(|c| c.id == own),
+            "our own id should be in the list the panel marks `is_self` from"
+        );
     }
 
     #[tokio::test]

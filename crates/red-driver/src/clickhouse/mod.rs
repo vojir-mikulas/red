@@ -52,8 +52,8 @@ use uuid::Uuid;
 
 use crate::format::{ExportWriter, ProgressThrottle, strip_trailing};
 use crate::{
-    AbortSignal, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor, driver_err,
-    window_prealloc,
+    AbortSignal, CancelToken, CellCap, DatabaseDriver, PageCap, QueryCursor, driver_err, now_unix,
+    secs_to_duration, window_prealloc,
 };
 
 mod write;
@@ -1539,6 +1539,208 @@ impl DatabaseDriver for ClickhouseDriver {
             reason: "ClickHouse has no secondary-index usage statistics to read".to_string(),
         });
         Ok(report)
+    }
+
+    async fn server_metrics(&self) -> Result<red_core::server::ServerSnapshot> {
+        use red_core::server::{MetricGroup as G, MetricValue as V, ServerMetric as M};
+
+        let mut snap =
+            red_core::server::ServerSnapshot::new(red_core::DbKind::Clickhouse, now_unix());
+
+        // One query per system table rather than one joined query: they are
+        // three different shapes, and a role denied one of them must lose only
+        // that group. `system.metrics` and `system.events` are gauges and
+        // counters respectively, which is exactly the `Count`/`Total` split.
+        let gauges = self
+            .run_simple(
+                "SELECT metric, value FROM system.metrics \
+                 WHERE metric IN ('Query', 'Merge', 'PartMutation', 'TCPConnection', \
+                                  'HTTPConnection', 'ReadonlyReplica', 'DelayedInserts')"
+                    .to_string(),
+                &[],
+            )
+            .await;
+        match gauges {
+            Ok((_, _, rows)) => {
+                let find = |name: &str| {
+                    rows.iter()
+                        .find(|r| r.first().and_then(Cell::as_str).as_deref() == Some(name))
+                        .and_then(|r| r.get(1))
+                        .and_then(Cell::as_i64)
+                        .map(|v| v.max(0) as u64)
+                };
+                for (metric, key, label, group) in [
+                    ("Query", "queries", "Running queries", G::Throughput),
+                    ("Merge", "merges", "Running merges", G::Throughput),
+                    (
+                        "PartMutation",
+                        "part_mutations",
+                        "Running mutations",
+                        G::Throughput,
+                    ),
+                    (
+                        "DelayedInserts",
+                        "delayed_inserts",
+                        "Delayed inserts",
+                        G::Throughput,
+                    ),
+                    (
+                        "TCPConnection",
+                        "tcp_connections",
+                        "Native connections",
+                        G::Connections,
+                    ),
+                    (
+                        "HTTPConnection",
+                        "http_connections",
+                        "HTTP connections",
+                        G::Connections,
+                    ),
+                    (
+                        "ReadonlyReplica",
+                        "readonly_replicas",
+                        "Read-only replicas",
+                        G::Replication,
+                    ),
+                ] {
+                    if let Some(v) = find(metric) {
+                        snap.push(M::new(group, key, label, V::Count(v)));
+                    }
+                }
+            }
+            Err(e) => snap.note_unavailable(format!("query, merge and connection counts: {e}")),
+        }
+
+        // Memory and uptime. `asynchronous_metrics` is sampled by the server on
+        // its own schedule, so these lag by up to a minute by design; that is
+        // still the only place ClickHouse publishes them.
+        match self
+            .run_simple(
+                "SELECT metric, value FROM system.asynchronous_metrics \
+                 WHERE metric IN ('MemoryResident', 'Uptime', 'OSMemoryTotal', \
+                                  'ReplicasMaxAbsoluteDelay')"
+                    .to_string(),
+                &[],
+            )
+            .await
+        {
+            Ok((_, _, rows)) => {
+                let find = |name: &str| {
+                    rows.iter()
+                        .find(|r| r.first().and_then(Cell::as_str).as_deref() == Some(name))
+                        .and_then(|r| r.get(1))
+                        .and_then(Cell::as_f64)
+                };
+                if let Some(rss) = find("MemoryResident") {
+                    let used = rss.max(0.0) as u64;
+                    snap.push(M::new(
+                        G::Memory,
+                        "memory_resident",
+                        "Resident memory",
+                        match find("OSMemoryTotal").map(|t| t.max(0.0) as u64) {
+                            Some(total) if total > 0 => V::Ratio { used, total },
+                            _ => V::Bytes(used),
+                        },
+                    ));
+                }
+                if let Some(uptime) = find("Uptime") {
+                    snap.push(M::new(
+                        G::Server,
+                        "uptime",
+                        "Uptime",
+                        V::Duration(secs_to_duration(uptime)),
+                    ));
+                }
+                if let Some(delay) = find("ReplicasMaxAbsoluteDelay") {
+                    snap.push(
+                        M::new(
+                            G::Replication,
+                            "replica_delay",
+                            "Replica delay",
+                            V::Duration(secs_to_duration(delay)),
+                        )
+                        .with_detail("largest absolute delay across replicated tables"),
+                    );
+                }
+            }
+            Err(e) => snap.note_unavailable(format!("memory and uptime: {e}")),
+        }
+
+        match self
+            .run_simple(
+                "SELECT event, value FROM system.events \
+                 WHERE event IN ('Query', 'SelectedBytes', 'InsertedRows', 'FailedQuery')"
+                    .to_string(),
+                &[],
+            )
+            .await
+        {
+            Ok((_, _, rows)) => {
+                for (event, key, label) in [
+                    ("Query", "total_queries", "Queries run"),
+                    ("SelectedBytes", "selected_bytes", "Bytes read"),
+                    ("InsertedRows", "inserted_rows", "Rows inserted"),
+                    ("FailedQuery", "failed_queries", "Queries failed"),
+                ] {
+                    let Some(v) = rows
+                        .iter()
+                        .find(|r| r.first().and_then(Cell::as_str).as_deref() == Some(event))
+                        .and_then(|r| r.get(1))
+                        .and_then(Cell::as_i64)
+                    else {
+                        continue;
+                    };
+                    let n = v.max(0) as u64;
+                    snap.push(M::new(
+                        G::Throughput,
+                        key,
+                        label,
+                        // Bytes read is a byte total; the rest are plain counts.
+                        // Both are cumulative, so both derive a rate.
+                        V::Total(n),
+                    ));
+                }
+            }
+            Err(e) => snap.note_unavailable(format!("cumulative query counters: {e}")),
+        }
+
+        match self
+            .run_simple(
+                "SELECT sum(bytes_on_disk), sum(rows) FROM system.parts WHERE active".to_string(),
+                &[],
+            )
+            .await
+        {
+            Ok((_, _, rows)) => {
+                if let Some(row) = rows.first() {
+                    if let Some(bytes) = row.first().and_then(Cell::as_i64) {
+                        snap.push(M::new(
+                            G::Storage,
+                            "bytes_on_disk",
+                            "Data on disk",
+                            V::Bytes(bytes.max(0) as u64),
+                        ));
+                    }
+                    if let Some(n) = row.get(1).and_then(Cell::as_i64) {
+                        snap.push(M::new(
+                            G::Storage,
+                            "total_rows",
+                            "Rows stored",
+                            V::Count(n.max(0) as u64),
+                        ));
+                    }
+                }
+            }
+            Err(e) => snap.note_unavailable(format!("stored size: {e}")),
+        }
+
+        snap.push(M::new(
+            G::Server,
+            "version",
+            "Version",
+            V::Text(self.server_version()),
+        ));
+        Ok(snap)
     }
 
     async fn server_sessions(&self) -> Result<(Vec<red_core::ServerSession>, bool)> {

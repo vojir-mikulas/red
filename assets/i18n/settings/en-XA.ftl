@@ -89,6 +89,22 @@ settings-behavior-restore_last_session =
     .label = [Réstöré lást séssíöñ]
     .help = [Réçöññéçt tö thé möst réçéñtly úséd çöññéçtíöñ öñ láúñçh (çrédéñtíáls çömé fröm thé kéyçháíñ). Tákés éfféçt ñéxt láúñçh.]
 
+settings-group-server_panel = [Sérvér páñél]
+
+settings-behavior-server_refresh_secs =
+    .label = [Áútö-réfrésh thé sérvér páñél]
+    .help = [Höw öftéñ thé Sérvér páñél ré-sámplés métríçs áñd séssíöñs. Öff by défáúlt; çháñgé ít för áñ öpéñ çöññéçtíöñ fröm thé páñél's öwñ çöñtröl.]
+
+settings-behavior-server_refresh_secs-seg-off = [Öff]
+
+settings-behavior-server_refresh_secs-seg-2s = [2s]
+
+settings-behavior-server_refresh_secs-seg-5s = [5s]
+
+settings-behavior-server_refresh_secs-seg-10s = [10s]
+
+settings-behavior-server_refresh_secs-seg-30s = [30s]
+
 settings-group-display = [Díspláy]
 
 settings-data-density =

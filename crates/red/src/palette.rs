@@ -719,12 +719,6 @@ impl AppState {
                         Cmd::CompareSchema,
                     ));
                 }
-                if self.has_server_panel() {
-                    out.push((
-                        item("cmd:server-panel", "view: toggle server panel"),
-                        Cmd::ToggleServerPanel,
-                    ));
-                }
                 out.push((
                     item("cmd:refresh", "schema: refresh").hint("⌘R"),
                     Cmd::RefreshSchema,
@@ -799,6 +793,15 @@ impl AppState {
             Phase::Connecting(_) => {}
         }
 
+        // In the shared tail rather than a per-engine branch: the Server panel is
+        // one dock over all three seams, and its own gate already answers for the
+        // engines that have no server (SQLite is a file).
+        if self.has_server_panel() {
+            out.push((
+                item("cmd:server-panel", "view: toggle server panel"),
+                Cmd::ToggleServerPanel,
+            ));
+        }
         out.push((
             item("cmd:switch-conn", "connection: switch…").hint("⌘P"),
             Cmd::SwitchConnection,

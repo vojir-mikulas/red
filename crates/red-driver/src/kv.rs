@@ -389,6 +389,26 @@ pub trait KvDriver: Send + Sync {
     /// so it's refused on a read-only connection.
     async fn slowlog_reset(&self) -> Result<()>;
 
+    /// One live sample of the server's state, parsed from `INFO` (see
+    /// [`ServerSnapshot`](red_core::server::ServerSnapshot)). The KV arm of the
+    /// shared Server panel; the same method exists on `DatabaseDriver` and
+    /// `DocDriver`, and the panel does not branch on which seam answered.
+    ///
+    /// A managed provider that strips `INFO` sections produces a partial
+    /// snapshot with the gaps named in `unavailable`, never a metric reading
+    /// zero. Under a cluster this describes the seed node, like every other
+    /// server-scoped read on this trait.
+    async fn server_metrics(&self) -> Result<red_core::server::ServerSnapshot>;
+
+    /// This connection's own client id (`CLIENT ID`), so the Server panel can
+    /// refuse to offer a kill on RED's own connection.
+    ///
+    /// `None` where the server does not answer (`CLIENT ID` predates nothing
+    /// RED supports, but a proxy can refuse it), which the caller must read as
+    /// "cannot tell", not as "no client here is ours": the panel degrades to
+    /// offering the kill, and the confirm still names the address and command.
+    async fn client_id(&self) -> Option<i64>;
+
     /// The connected clients (`CLIENT LIST`), for the diagnostics panel's
     /// clients viewer.
     /// Under a cluster this reports the seed node's clients only (client lists

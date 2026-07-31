@@ -1709,6 +1709,12 @@ impl AppState {
                 restricted,
             } => self.on_server_sessions(session, sessions, restricted, cx),
             Event::ServerSessionKilled { .. } => self.on_server_session_killed(cx),
+            Event::ServerMetricsReady { epoch, snapshot } => {
+                self.on_server_metrics(session, epoch, snapshot, cx)
+            }
+            Event::ServerMetricsFailed { epoch, message } => {
+                self.on_server_metrics_failed(session, epoch, message, cx)
+            }
             Event::ObjectDdlReady {
                 epoch,
                 ddl,

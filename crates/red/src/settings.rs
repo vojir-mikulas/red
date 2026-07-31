@@ -583,6 +583,31 @@ impl SqlSettings {
 #[serde(default)]
 pub struct BehaviorSettings {
     pub restore_last_session: bool,
+    /// The interval the Server panel starts auto-refreshing at (`0` = off, the
+    /// default); changeable per connection from the panel's own pill.
+    ///
+    /// Lives under `[behavior]` rather than a seam section because the panel is
+    /// one dock over all three seams. Off by default and floored by
+    /// [`Self::server_refresh_interval`]: a five-second poll of `CLIENT LIST` or
+    /// `pg_stat_activity` against production is a real second workload, so this
+    /// is opt-in and the live interval is shown in the panel rather than only
+    /// here.
+    pub server_refresh_secs: u64,
+}
+
+impl BehaviorSettings {
+    /// The Server panel's default auto-refresh interval, or `None` when off.
+    /// A non-zero value is clamped to
+    /// [`MIN_REFRESH_SECS`](crate::server_panel::MIN_REFRESH_SECS) so a stray
+    /// hand-edit cannot turn the panel into a poller.
+    pub fn server_refresh_interval(&self) -> Option<std::time::Duration> {
+        (self.server_refresh_secs > 0).then(|| {
+            std::time::Duration::from_secs(
+                self.server_refresh_secs
+                    .max(crate::server_panel::MIN_REFRESH_SECS),
+            )
+        })
+    }
 }
 
 // --- kv ----------------------------------------------------------------------

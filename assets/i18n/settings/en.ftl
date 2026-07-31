@@ -89,6 +89,22 @@ settings-behavior-restore_last_session =
     .label = Restore last session
     .help = Reconnect to the most recently used connection on launch (credentials come from the keychain). Takes effect next launch.
 
+settings-group-server_panel = Server panel
+
+settings-behavior-server_refresh_secs =
+    .label = Auto-refresh the server panel
+    .help = How often the Server panel re-samples metrics and sessions. Off by default; change it for an open connection from the panel's own control.
+
+settings-behavior-server_refresh_secs-seg-off = Off
+
+settings-behavior-server_refresh_secs-seg-2s = 2s
+
+settings-behavior-server_refresh_secs-seg-5s = 5s
+
+settings-behavior-server_refresh_secs-seg-10s = 10s
+
+settings-behavior-server_refresh_secs-seg-30s = 30s
+
 settings-group-display = Display
 
 settings-data-density =

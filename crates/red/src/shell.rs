@@ -153,56 +153,11 @@ impl AppState {
             with_columns
         };
 
-        // Mutations | (schema | columns | editor / results): sits between History and
+        // Server | (schema | columns | editor / results): sits between History and
         // Schema, since it's about the connection rather than the focused result.
-        let with_mutations = if active.server_open {
-            let pane = self.render_server_panel(active, cx);
-            let start = view.clone();
-            let resize = view.clone();
-            let end = view.clone();
-            SplitPane::new("shell-split-mutations", Axis::Horizontal)
-                .size(active.server_w)
-                .gutter(px(1.))
-                .drag(active.server_drag)
-                .min_first(px(240.))
-                .max_first(px(560.))
-                .on_drag_start(move |anchor, _, cx| {
-                    start
-                        .update(cx, |this, cx| {
-                            if let Phase::Connected(a) = &mut this.phase {
-                                a.server_drag = Some(anchor);
-                            }
-                            cx.notify();
-                        })
-                        .ok();
-                })
-                .on_resize(move |size, _, cx| {
-                    resize
-                        .update(cx, |this, cx| {
-                            if let Phase::Connected(a) = &mut this.phase {
-                                a.server_w = size;
-                            }
-                            cx.notify();
-                        })
-                        .ok();
-                })
-                .on_drag_end(move |_, cx| {
-                    end.update(cx, |this, cx| {
-                        if let Phase::Connected(a) = &mut this.phase {
-                            a.server_drag = None;
-                        }
-                        cx.notify();
-                    })
-                    .ok();
-                })
-                .first(pane)
-                .second(with_schema)
-                .into_any_element()
-        } else {
-            with_schema
-        };
+        let with_mutations = self.with_server_dock(active, "shell-split-server", with_schema, cx);
 
-        // Outermost column boundary: History | (mutations | schema | editor / results).
+        // Outermost column boundary: History | (server | schema | editor / results).
         let workspace = if show_history {
             let history_pane = self.render_history(active, cx);
             let start = view.clone();
@@ -1596,6 +1551,11 @@ impl AppState {
             .and_then(|v| v.auto_menu)
             .map(|pos| self.render_kv_auto_menu(active, pos, cx));
 
+        // Optional Server dock, then the optional History dock outside it: the
+        // same nesting order as the SQL shell, so the two shells' left docks
+        // line up column for column.
+        let work = self.with_server_dock(active, "kv-split-server", work, cx);
+
         // Optional left History dock (⌘Y), mirroring the SQL shell's history
         // dock: a leading resizable SplitPane over the work area.
         let workspace = if active.history_open {
@@ -1780,7 +1740,8 @@ impl AppState {
                             .bg(theme.green),
                     )
                     .child(div().min_w_0().truncate().child(config.display_target()))
-                    .child(div().min_w_0().truncate().px_2().child(config.name.clone())),
+                    .child(div().min_w_0().truncate().px_2().child(config.name.clone()))
+                    .children(self.render_server_toggle(active, "kv-toggle-server", &theme, cx)),
             )
             .child(
                 div()

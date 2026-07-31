@@ -1259,6 +1259,66 @@ impl DatabaseDriver for MysqlDriver {
         Ok(report)
     }
 
+    async fn server_metrics(&self) -> Result<red_core::server::ServerSnapshot> {
+        let mut conn = self.conn().await?;
+
+        // Two `SHOW GLOBAL` reads and nothing else. Both are served from memory,
+        // and pulling them whole into a map is cheaper than the several hundred
+        // round trips a `WHERE Variable_name IN (...)` per metric would cost.
+        let status: HashMap<String, String> = conn
+            .query::<(String, String), _>("SHOW GLOBAL STATUS")
+            .await
+            .map_err(driver_err)?
+            .into_iter()
+            .collect();
+        let vars: HashMap<String, String> = conn
+            .query::<(String, String), _>("SHOW GLOBAL VARIABLES")
+            .await
+            .map_err(driver_err)?
+            .into_iter()
+            .collect();
+
+        let mut snap = mysql_metrics(&status, &vars, crate::now_unix());
+
+        // Replication lag, which needs REPLICATION CLIENT and is spelled two
+        // different ways: MySQL 8.0.22 renamed the statement and its columns,
+        // MariaDB kept the old ones. Try the new spelling, fall back, and report
+        // the privilege gap rather than showing a server with no replication.
+        let replica: Option<mysql_async::Row> = match conn.query_first("SHOW REPLICA STATUS").await
+        {
+            Ok(row) => row,
+            Err(_) => conn.query_first("SHOW SLAVE STATUS").await.unwrap_or(None),
+        };
+        match replica {
+            Some(mut row) => {
+                match mysql_replica_lag(&mut row) {
+                    Some(secs) => snap.push(red_core::server::ServerMetric::new(
+                        red_core::server::MetricGroup::Replication,
+                        "seconds_behind_source",
+                        "Replication lag",
+                        red_core::server::MetricValue::Duration(std::time::Duration::from_secs(
+                            secs,
+                        )),
+                    )),
+                    // The row exists but the lag is NULL: replication is
+                    // configured and currently stopped, which is a fact worth
+                    // showing rather than a zero-second lag.
+                    None => snap.push(red_core::server::ServerMetric::new(
+                        red_core::server::MetricGroup::Replication,
+                        "replica_state",
+                        "Replica",
+                        red_core::server::MetricValue::Text("not replicating".to_string()),
+                    )),
+                }
+            }
+            None => snap.note_unavailable(
+                "replication lag: this server reports no replica status, or this user \
+                 lacks the REPLICATION CLIENT privilege",
+            ),
+        }
+        Ok(snap)
+    }
+
     async fn server_sessions(&self) -> Result<(Vec<red_core::ServerSession>, bool)> {
         let mut conn = self.conn().await?;
         // `information_schema.processlist` takes an internal mutex and is not free
@@ -1940,6 +2000,156 @@ impl crate::Sandbox for MySandbox {
     }
 }
 
+/// `SHOW GLOBAL STATUS` + `SHOW GLOBAL VARIABLES` as a [`ServerSnapshot`].
+///
+/// Split out of the driver method and taking plain maps, because this is where
+/// all the interesting cases are and none of them need a server: a field absent
+/// on an older MySQL, a MariaDB that spells one differently, a buffer pool that
+/// has served nothing yet. Every lookup is optional and a missing field produces
+/// no metric rather than a zero.
+fn mysql_metrics(
+    status: &HashMap<String, String>,
+    vars: &HashMap<String, String>,
+    taken_at: i64,
+) -> red_core::server::ServerSnapshot {
+    use red_core::server::{MetricGroup as G, MetricValue as V, ServerMetric as M, ServerSnapshot};
+
+    // Both statements report every name in the server's own case, which differs
+    // across versions (`Uptime` vs `uptime` on some builds).
+    let num = |map: &HashMap<String, String>, key: &str| -> Option<u64> {
+        map.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .and_then(|(_, v)| v.parse().ok())
+    };
+    let text = |map: &HashMap<String, String>, key: &str| -> Option<String> {
+        map.iter()
+            .find(|(k, _)| k.eq_ignore_ascii_case(key))
+            .map(|(_, v)| v.clone())
+    };
+
+    let mut snap = ServerSnapshot::new(red_core::DbKind::Mysql, taken_at);
+
+    // --- memory: the InnoDB buffer pool, which is the whole of MySQL's memory
+    // story that an operator acts on.
+    if let Some(size) = num(vars, "innodb_buffer_pool_size") {
+        snap.push(M::new(
+            G::Memory,
+            "innodb_buffer_pool_size",
+            "Buffer pool",
+            V::Bytes(size),
+        ));
+    }
+    if let (Some(requests), Some(reads)) = (
+        num(status, "Innodb_buffer_pool_read_requests"),
+        num(status, "Innodb_buffer_pool_reads"),
+    ) && requests > 0
+    {
+        // `reads` is the subset that missed and went to disk, so the hit ratio
+        // is 1 - reads/requests rather than a ratio of the two.
+        snap.push(
+            M::new(
+                G::Memory,
+                "innodb_buffer_pool_hit_ratio",
+                "Buffer pool hit ratio",
+                V::Percent(1.0 - (reads.min(requests) as f64 / requests as f64)),
+            )
+            .with_detail("pages served from the pool rather than disk"),
+        );
+    }
+
+    // --- throughput
+    for (key, label) in [
+        ("Questions", "Statements run"),
+        ("Slow_queries", "Slow queries"),
+        ("Innodb_row_lock_waits", "Row lock waits"),
+    ] {
+        if let Some(n) = num(status, key) {
+            snap.push(M::new(G::Throughput, key, label, V::Total(n)));
+        }
+    }
+
+    // --- connections
+    if let (Some(connected), Some(max)) = (
+        num(status, "Threads_connected"),
+        num(vars, "max_connections"),
+    ) {
+        snap.push(M::new(
+            G::Connections,
+            "threads_connected",
+            "Connections",
+            V::Ratio {
+                used: connected,
+                total: max,
+            },
+        ));
+    }
+    if let Some(running) = num(status, "Threads_running") {
+        snap.push(
+            M::new(
+                G::Connections,
+                "threads_running",
+                "Running statements",
+                V::Count(running),
+            )
+            .with_detail("threads not sleeping; the number that tracks load"),
+        );
+    }
+    if let Some(aborted) = num(status, "Aborted_connects") {
+        snap.push(M::new(
+            G::Connections,
+            "aborted_connects",
+            "Aborted connects",
+            V::Total(aborted),
+        ));
+    }
+
+    // --- storage and server
+    if let Some(bytes) = num(status, "Innodb_data_written") {
+        snap.push(M::new(
+            G::Storage,
+            "innodb_data_written",
+            "InnoDB data written",
+            V::Total(bytes),
+        ));
+    }
+    if let Some(uptime) = num(status, "Uptime") {
+        snap.push(M::new(
+            G::Server,
+            "uptime",
+            "Uptime",
+            V::Duration(std::time::Duration::from_secs(uptime)),
+        ));
+    }
+    if let Some(version) = text(vars, "version") {
+        let m = M::new(G::Server, "version", "Version", V::Text(version));
+        snap.push(match text(vars, "version_comment") {
+            Some(comment) => m.with_detail(comment),
+            None => m,
+        });
+    }
+
+    if snap.metrics.is_empty() {
+        snap.note_unavailable(
+            "everything: this user may not run SHOW GLOBAL STATUS, or the server \
+             returned nothing",
+        );
+    }
+    snap
+}
+
+/// The replica lag out of a `SHOW REPLICA STATUS` row, under either spelling.
+/// MySQL 8.0.22 renamed the column and MariaDB kept the old name, so both are
+/// tried. `None` means the row exists but reports no lag, which is replication
+/// configured and currently stopped -- not a lag of zero.
+fn mysql_replica_lag(row: &mut mysql_async::Row) -> Option<u64> {
+    for name in ["Seconds_Behind_Source", "Seconds_Behind_Master"] {
+        if let Some(Ok(lag)) = row.get_opt::<Option<u64>, _>(name) {
+            return lag;
+        }
+    }
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1947,6 +2157,128 @@ mod tests {
 
     fn test_url() -> Option<String> {
         std::env::var("RED_TEST_MYSQL_URL").ok()
+    }
+
+    fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect()
+    }
+
+    fn full_status() -> HashMap<String, String> {
+        map(&[
+            ("Threads_connected", "24"),
+            ("Threads_running", "3"),
+            ("Aborted_connects", "5"),
+            ("Questions", "918273"),
+            ("Slow_queries", "12"),
+            ("Innodb_row_lock_waits", "2"),
+            ("Innodb_buffer_pool_read_requests", "1000"),
+            ("Innodb_buffer_pool_reads", "40"),
+            ("Innodb_data_written", "8388608"),
+            ("Uptime", "7200"),
+        ])
+    }
+
+    fn full_vars() -> HashMap<String, String> {
+        map(&[
+            ("max_connections", "151"),
+            ("innodb_buffer_pool_size", "134217728"),
+            ("version", "8.0.36"),
+            ("version_comment", "MySQL Community Server - GPL"),
+        ])
+    }
+
+    fn value(snap: &red_core::server::ServerSnapshot, key: &str) -> red_core::server::MetricValue {
+        snap.get(key)
+            .unwrap_or_else(|| panic!("metric {key} is missing"))
+            .value
+            .clone()
+    }
+
+    #[test]
+    fn a_full_status_reply_reports_every_group() {
+        use red_core::server::MetricValue as V;
+        let snap = mysql_metrics(&full_status(), &full_vars(), 42);
+        assert_eq!(snap.taken_at, 42);
+        assert_eq!(snap.engine, red_core::DbKind::Mysql);
+        assert!(snap.unavailable.is_empty());
+        assert_eq!(
+            value(&snap, "threads_connected"),
+            V::Ratio {
+                used: 24,
+                total: 151
+            }
+        );
+        assert_eq!(value(&snap, "threads_running"), V::Count(3));
+        // A monotonic counter, so the panel derives a rate from two samples.
+        assert_eq!(value(&snap, "Questions"), V::Total(918_273));
+        assert_eq!(
+            value(&snap, "uptime"),
+            V::Duration(std::time::Duration::from_secs(7200))
+        );
+    }
+
+    #[test]
+    fn the_buffer_pool_hit_ratio_counts_misses_not_a_ratio_of_the_two() {
+        // 40 of 1000 requests missed, so 96% hit -- not 40/1000 = 4%.
+        let snap = mysql_metrics(&full_status(), &full_vars(), 0);
+        assert_eq!(
+            value(&snap, "innodb_buffer_pool_hit_ratio"),
+            red_core::server::MetricValue::Percent(0.96)
+        );
+    }
+
+    #[test]
+    fn a_pool_that_has_served_nothing_reports_no_hit_ratio() {
+        // 0% would read as a pool missing every page rather than an idle server.
+        let status = map(&[
+            ("Innodb_buffer_pool_read_requests", "0"),
+            ("Innodb_buffer_pool_reads", "0"),
+            ("Uptime", "5"),
+        ]);
+        let snap = mysql_metrics(&status, &full_vars(), 0);
+        assert!(snap.get("innodb_buffer_pool_hit_ratio").is_none());
+    }
+
+    #[test]
+    fn a_field_this_server_does_not_report_produces_no_metric() {
+        // An older or cut-down server: what is there is reported, what is not
+        // is absent rather than zero.
+        let snap = mysql_metrics(&map(&[("Uptime", "10")]), &HashMap::new(), 0);
+        assert!(snap.get("threads_connected").is_none());
+        assert!(snap.get("Questions").is_none());
+        assert_eq!(
+            value(&snap, "uptime"),
+            red_core::server::MetricValue::Duration(std::time::Duration::from_secs(10))
+        );
+    }
+
+    #[test]
+    fn field_names_are_matched_case_insensitively() {
+        // Builds differ on the casing of these names; matching exactly would
+        // silently drop every metric on one of them.
+        let snap = mysql_metrics(
+            &map(&[("uptime", "60"), ("threads_running", "2")]),
+            &HashMap::new(),
+            0,
+        );
+        assert_eq!(
+            value(&snap, "uptime"),
+            red_core::server::MetricValue::Duration(std::time::Duration::from_secs(60))
+        );
+        assert_eq!(
+            value(&snap, "threads_running"),
+            red_core::server::MetricValue::Count(2)
+        );
+    }
+
+    #[test]
+    fn a_server_that_answered_nothing_says_so_rather_than_looking_healthy() {
+        let snap = mysql_metrics(&HashMap::new(), &HashMap::new(), 0);
+        assert!(snap.metrics.is_empty());
+        assert_eq!(snap.unavailable.len(), 1);
     }
 
     /// The tree labels an object for a human; a statement needs the identifier out
@@ -1990,6 +2322,22 @@ mod tests {
         let driver = MysqlDriver::connect(&url, true).await.unwrap();
         assert!(!driver.server_version().is_empty());
         driver.ping().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn server_metrics_come_back_whole_from_a_real_server() {
+        let url = url_or_skip!();
+        let driver = MysqlDriver::connect(&url, true).await.unwrap();
+        let snap = driver.server_metrics().await.unwrap();
+
+        assert_eq!(snap.engine, red_core::DbKind::Mysql);
+        assert!(snap.taken_at > 0);
+        for key in ["threads_connected", "Questions", "uptime", "version"] {
+            assert!(snap.get(key).is_some(), "{key} is missing: {snap:?}");
+        }
+        // A standalone server reports no replica status, and that gap is named
+        // rather than shown as a healthy zero-second lag.
+        assert!(snap.get("seconds_behind_source").is_none() || snap.unavailable.is_empty());
     }
 
     #[tokio::test]

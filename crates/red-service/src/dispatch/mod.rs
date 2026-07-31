@@ -27,6 +27,7 @@ mod connect;
 mod kvexport;
 mod paging;
 mod schema_cmds;
+mod server_cmds;
 mod session;
 
 // The dispatch loop's command arms reference these by their bare names; glob
@@ -1329,10 +1330,13 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 schema_cmds::build_health_report(&sessions, session_id, &events)
             }
             Command::ListServerSessions => {
-                schema_cmds::list_server_sessions(&sessions, session_id, &events)
+                server_cmds::list_server_sessions(&sessions, session_id, &events)
+            }
+            Command::FetchServerMetrics { epoch } => {
+                server_cmds::fetch_server_metrics(&sessions, session_id, &events, epoch)
             }
             Command::KillServerSession { key, mode } => {
-                schema_cmds::kill_server_session(&sessions, session_id, &events, key, mode)
+                server_cmds::kill_server_session(&sessions, session_id, &events, key, mode)
             }
             Command::ObjectDdl {
                 epoch,

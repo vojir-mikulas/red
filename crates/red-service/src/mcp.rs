@@ -888,6 +888,18 @@ mod tests {
         async fn slowlog_reset(&self) -> red_core::Result<()> {
             unimplemented!()
         }
+        async fn server_metrics(&self) -> red_core::Result<red_core::server::ServerSnapshot> {
+            // Through the real parser, so this exercises the same path the driver
+            // takes rather than a hand-built snapshot that could drift from it.
+            Ok(red_core::kv::parse_info(
+                "# Server\nredis_version:7.2.0\n\n# Memory\nused_memory:1024\n\
+                 \n# Clients\nconnected_clients:1\n",
+                0,
+            ))
+        }
+        async fn client_id(&self) -> Option<i64> {
+            unimplemented!()
+        }
         async fn client_list(&self) -> red_core::Result<Vec<red_core::kv::ClientInfo>> {
             unimplemented!()
         }
