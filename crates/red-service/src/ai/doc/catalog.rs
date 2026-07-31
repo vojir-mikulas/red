@@ -12,6 +12,7 @@ use serde_json::{Value as Json, json};
 
 use super::super::export::export_tool_def;
 use super::super::gate::gate_catalog;
+use super::super::knowledge::knowledge_tool_def;
 use super::super::report::report_tool_def;
 use super::super::turn::spawn_subagent_tool_def;
 use super::super::util::finish_system_prompt;
@@ -208,6 +209,7 @@ pub(in crate::ai) fn doc_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             &["db", "coll"],
         ),
         report_tool_def(),
+        knowledge_tool_def(),
         spawn_subagent_tool_def(),
         // --- gated writes (Write tier, writable connection only) ---
         ToolDef {
@@ -309,13 +311,14 @@ pub(in crate::ai) fn doc_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> St
              sample_documents, get_document (one document by _id), find, aggregate ($out/$merge \
              rejected), count, distinct, explain_query (optionally with execution stats), \
              index_advice, audit_collection, doc_current_op (what is running now), export_result, \
-             and generate_report. Ground every answer in the live deployment."
+             generate_report, and save_knowledge (draft this connection's knowledge file for the \
+             user to review). Ground every answer in the live deployment."
         }
         AiTier::Write => {
             "You have the read-only MongoDB tools (doc_server_info, list_collections, \
              describe_collection, profile_collection, sample_documents, find, aggregate, count, \
              distinct, explain_query, index_advice, audit_collection, doc_current_op, \
-             export_result) AND gated write tools: propose_doc_write, propose_index, \
+             export_result, save_knowledge) AND gated write tools: propose_doc_write, propose_index, \
              propose_collection_op, and doc_kill_op. Every write requires the user's explicit \
              Allow; update/delete require a non-empty filter, and dropping a collection always \
              confirms."
@@ -334,6 +337,11 @@ pub(in crate::ai) fn doc_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> St
              about performance and health. Before writing an aggregation that joins collections \
              with $lookup, call doc_reference_map: Mongo has no foreign keys, so a field named \
              `user_id` may not resolve, and the map tells you the hit rate.\n\n\
+             Each tool result is labelled `[source N]`. When you state a figure or a fact you \
+             read from a tool, append that marker to the claim - \"revenue was $4.2M [3]\". One \
+             marker per claim, never the same source twice in a sentence, and never a marker on \
+             something you reasoned out rather than read: a citation says where a number came \
+             from, not that it is right.\n\n\
              Queries are filter documents and aggregation pipelines (extended JSON), never SQL. Be \
              concise: lead with the answer, then the detail.\n",
         ),

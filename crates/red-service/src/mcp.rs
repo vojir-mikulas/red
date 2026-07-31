@@ -48,10 +48,20 @@ impl McpServer {
     /// guards) is captured here and enforced on every `tools/list`/
     /// `tools/call`, so the subscription agent sees exactly the catalog the tier
     /// allows and can't exceed the limits, the same gate the API-key path runs under.
+    ///
+    /// `conn_id` is the saved connection this server is bound to
+    /// (`AiContext::conn_id`), captured for the agent's lifetime like the policy;
+    /// the grounding tools use it to scope the query history.
     pub(crate) async fn start(
         backend: AiBackend,
+        conn_id: String,
         policy: AiPolicy,
         report: ReportSink,
+        // The assistant's shared state, so a `run_select` over this transport can
+        // hand back a cursor the agent continues with `fetch_more` instead of
+        // truncating at the first window.
+        state: std::sync::Arc<std::sync::Mutex<crate::ai::AiState>>,
+        conversation_id: crate::protocol::ConversationId,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).await?;
         let port = listener.local_addr()?.port();
@@ -72,6 +82,8 @@ impl McpServer {
                 };
                 let io = TokioIo::new(stream);
                 let backend = backend.clone();
+                let conn_id = conn_id.clone();
+                let state = state.clone();
                 let token = token_task.clone();
                 let calls = calls.clone();
                 let report = report.clone();
@@ -80,6 +92,9 @@ impl McpServer {
                         handle_request(
                             req,
                             backend.clone(),
+                            conn_id.clone(),
+                            state.clone(),
+                            conversation_id,
                             token.clone(),
                             policy,
                             calls.clone(),
@@ -114,9 +129,16 @@ impl Drop for McpServer {
 
 /// One HTTP request → one JSON-RPC reply. Never errors (`Infallible`): every
 /// failure is encoded as an HTTP status or a JSON-RPC error envelope.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one HTTP entry point; each argument is a distinct piece of the request's context"
+)]
 async fn handle_request(
     req: Request<Incoming>,
     backend: AiBackend,
+    conn_id: String,
+    state: std::sync::Arc<std::sync::Mutex<crate::ai::AiState>>,
+    conversation_id: crate::protocol::ConversationId,
     token: String,
     policy: AiPolicy,
     calls: Arc<AtomicUsize>,
@@ -147,7 +169,19 @@ async fn handle_request(
         return Ok(empty(StatusCode::ACCEPTED));
     };
 
-    let envelope = match dispatch(method, &params, &backend, policy, &calls, &report).await {
+    let envelope = match dispatch(
+        method,
+        &params,
+        &backend,
+        &conn_id,
+        &state,
+        conversation_id,
+        policy,
+        &calls,
+        &report,
+    )
+    .await
+    {
         Ok(result) => json!({ "jsonrpc": "2.0", "id": id, "result": result }),
         Err((code, message)) => rpc_error(id, code, &message),
     };
@@ -156,10 +190,17 @@ async fn handle_request(
 
 /// Dispatch one MCP method under the access policy. Returns the JSON-RPC `result`
 /// payload, or a `(code, message)` JSON-RPC error.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one JSON-RPC entry point; every argument is a distinct piece of the call's context"
+)]
 async fn dispatch(
     method: &str,
     params: &Json,
     backend: &AiBackend,
+    conn_id: &str,
+    state: &std::sync::Arc<std::sync::Mutex<crate::ai::AiState>>,
+    conversation_id: crate::protocol::ConversationId,
     policy: AiPolicy,
     calls: &AtomicUsize,
     report: &ReportSink,
@@ -244,7 +285,22 @@ async fn dispatch(
             // A fresh cancel token: the agent owns turn cancellation over ACP; a
             // single tool call is short and runs to completion here.
             let (content, ok) = backend
-                .run_tool(name, &args, &policy, &CancelToken::new(), report)
+                .run_tool(
+                    crate::ai::ConnCtx {
+                        conn_id,
+                        dialect: backend.dialect(),
+                        conversation_id,
+                        state,
+                        // Writes are never advertised over this transport, so there
+                        // is nothing here a sandbox would hold.
+                        sandbox: None,
+                    },
+                    name,
+                    &args,
+                    &policy,
+                    &CancelToken::new(),
+                    report,
+                )
                 .await;
             Ok(json!({
                 "content": [ { "type": "text", "text": content } ],
@@ -348,8 +404,11 @@ mod tests {
                 driver,
                 dialect: red_core::sql::Dialect::Sqlite,
             },
+            String::new(),
             policy,
             ReportSink::disabled(),
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::AiState::default())),
+            crate::protocol::ConversationId::new(1),
         )
         .await
         .unwrap();
@@ -404,6 +463,7 @@ mod tests {
                 "relationship_map",
                 "profile_table",
                 "run_select",
+                "fetch_more",
                 "search_data",
                 "explain",
                 "health_report",
@@ -413,6 +473,12 @@ mod tests {
                 "suggest_index",
                 "export_result",
                 "generate_report",
+                // Hands the app a draft knowledge file to open for review. GUI-bound,
+                // and this server has a GUI: it backs the in-app ACP agent.
+                "save_knowledge",
+                "search_query_history",
+                "list_saved_queries",
+                "read_saved_query",
                 "open_query",
                 "save_query",
             ]
@@ -492,7 +558,12 @@ mod tests {
                 "list_schema",
                 "describe_table",
                 "object_ddl",
-                "relationship_map"
+                "relationship_map",
+                // Retrieval from the user's own history/library: read-only, and
+                // this server carries the connection id they scope by.
+                "search_query_history",
+                "list_saved_queries",
+                "read_saved_query"
             ]
         );
         // And a run_select call is refused by the server-side tier check (defense in
@@ -561,11 +632,14 @@ mod tests {
                 driver,
                 dialect: red_core::sql::Dialect::Sqlite,
             },
+            String::new(),
             AiPolicy {
                 tier: red_core::AiTier::Write,
                 ..AiPolicy::default()
             },
             ReportSink::disabled(),
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::AiState::default())),
+            crate::protocol::ConversationId::new(1),
         )
         .await
         .unwrap();
@@ -837,9 +911,16 @@ mod tests {
     /// Spin up the server over a KV backend at `policy`.
     async fn kv_fixture(policy: AiPolicy) -> (McpServer, reqwest::Client) {
         let driver: Arc<dyn red_driver::KvDriver> = Arc::new(StubKv);
-        let server = McpServer::start(AiBackend::Kv(driver), policy, ReportSink::disabled())
-            .await
-            .unwrap();
+        let server = McpServer::start(
+            AiBackend::Kv(driver),
+            String::new(),
+            policy,
+            ReportSink::disabled(),
+            std::sync::Arc::new(std::sync::Mutex::new(crate::ai::AiState::default())),
+            crate::protocol::ConversationId::new(1),
+        )
+        .await
+        .unwrap();
         (server, reqwest::Client::new())
     }
 

@@ -16,6 +16,8 @@ use serde_json::Value as Json;
 
 use super::export::kv_export;
 use super::gate::WriteAssessment;
+use super::grounding::{run_recent_keys, run_search_history};
+use super::knowledge::run_save_knowledge;
 use super::report::run_generate_report;
 use super::state::ReportSink;
 use super::util::{cap_result_bytes, fmt_bytes};
@@ -43,6 +45,7 @@ pub(super) mod write;
 /// has taken the user's approval, and are re-vetted here regardless.
 pub(in crate::ai) async fn kv_run_tool(
     driver: &Arc<dyn KvDriver>,
+    conn: super::ConnCtx<'_>,
     name: &str,
     input: &Json,
     policy: &AiPolicy,
@@ -64,6 +67,7 @@ pub(in crate::ai) async fn kv_run_tool(
         return (format!("error: {why}"), false);
     }
     let limits = &policy.limits;
+    let conn_id = conn.conn_id;
     let (content, ok) = match name {
         "kv_server_info" => {
             // Topology and DBSIZE lead: this is the "call this first" tool, and
@@ -532,6 +536,11 @@ pub(in crate::ai) async fn kv_run_tool(
         }
         "export_result" => kv_export(driver, input, report).await,
         "generate_report" => run_generate_report(input, report),
+        "save_knowledge" => run_save_knowledge(input, report),
+        // The Redis console records into the same per-connection log the SQL
+        // editor does, so "what has a human run here" works on this seam too.
+        "search_query_history" => run_search_history(conn_id, conn.dialect, input, limits),
+        "kv_recent_keys" => run_recent_keys(conn_id, input, limits),
         other => (format!("error: unknown tool `{other}`"), false),
     };
     (content, ok)

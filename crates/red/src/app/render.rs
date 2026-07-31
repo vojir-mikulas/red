@@ -325,13 +325,17 @@ impl Render for AppState {
         if self.focus_modal {
             self.focus_modal = false;
             // A type-to-confirm box is the whole point of the modal it sits in, so
-            // put the caret there rather than making the user Tab to it. Everything
-            // else focuses the modal root, where Flint's Enter/Esc handling lives.
-            match self.confirm_input.as_ref() {
-                Some(typed) => {
-                    let handle = typed.input.focus_handle(cx);
-                    window.focus(&handle, cx);
-                }
+            // put the caret there rather than making the user Tab to it; the
+            // knowledge editor is the same case (the modal *is* the editor).
+            // Everything else focuses the modal root, where Flint's Enter/Esc
+            // handling lives.
+            let inner = self
+                .confirm_input
+                .as_ref()
+                .map(|typed| typed.input.focus_handle(cx))
+                .or_else(|| self.knowledge_editor.as_ref().map(|k| k.focus_handle(cx)));
+            match inner {
+                Some(handle) => window.focus(&handle, cx),
                 None => window.focus(&self.modal_focus.clone(), cx),
             }
         }
@@ -752,6 +756,9 @@ impl Render for AppState {
             // phase (the welcome screen *and* the connected shell, e.g. opened from
             // the switcher's "New connection…").
             .children(self.form.as_ref().map(|f| self.render_form(f, cx)))
+            // The "Database knowledge" editor, root-mounted so it overlays the
+            // whole shell like the other modals.
+            .children(self.render_knowledge_modal(cx))
             // The Redis "New key" modal, rooted here so it overlays the whole
             // shell (not just the browse pane) like the other modals.
             .children(self.render_kv_create_modal(cx))

@@ -558,6 +558,7 @@ pub(in crate::ai) async fn relationship_map(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ai::ConnCtx;
     use crate::ai::sql::run_tool;
     use crate::ai::state::ReportSink;
     use red_ai::CancelToken;
@@ -587,7 +588,15 @@ mod tests {
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
         let (content, ok) = run_tool(
             &driver,
-            Dialect::Sqlite,
+            ConnCtx {
+                conn_id: "",
+                dialect: Dialect::Sqlite,
+                conversation_id: crate::protocol::ConversationId::new(1),
+                state: &std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::ai::state::AiState::default(),
+                )),
+                sandbox: None,
+            },
             "profile_table",
             &json!({ "schema": "main", "table": "child" }),
             &AiPolicy::default(),
@@ -641,7 +650,15 @@ mod tests {
         let search = async |term: &str| {
             run_tool(
                 &driver,
-                Dialect::Sqlite,
+                ConnCtx {
+                    conn_id: "",
+                    dialect: Dialect::Sqlite,
+                    conversation_id: crate::protocol::ConversationId::new(1),
+                    state: &std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::ai::state::AiState::default(),
+                    )),
+                    sandbox: None,
+                },
                 "search_data",
                 &json!({ "schema": "main", "table": "people", "term": term }),
                 &AiPolicy::default(),
@@ -683,7 +700,15 @@ mod tests {
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
         let (content, ok) = run_tool(
             &driver,
-            Dialect::Sqlite,
+            ConnCtx {
+                conn_id: "",
+                dialect: Dialect::Sqlite,
+                conversation_id: crate::protocol::ConversationId::new(1),
+                state: &std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::ai::state::AiState::default(),
+                )),
+                sandbox: None,
+            },
             "relationship_map",
             &json!({}),
             &AiPolicy::default(),
@@ -716,7 +741,15 @@ mod tests {
         let driver: Arc<dyn DatabaseDriver> = Arc::new(red_driver::SqliteDriver::new(db, true));
         let (content, ok) = run_tool(
             &driver,
-            Dialect::Sqlite,
+            ConnCtx {
+                conn_id: "",
+                dialect: Dialect::Sqlite,
+                conversation_id: crate::protocol::ConversationId::new(1),
+                state: &std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::ai::state::AiState::default(),
+                )),
+                sandbox: None,
+            },
             "suggest_index",
             &json!({ "sql": "SELECT * FROM t WHERE city = 'x'", "schema": "main", "table": "t" }),
             &AiPolicy::default(),

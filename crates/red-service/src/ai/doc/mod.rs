@@ -16,6 +16,7 @@ use serde_json::Value as Json;
 
 use super::export::doc_export;
 use super::gate::WriteAssessment;
+use super::knowledge::run_save_knowledge;
 use super::report::run_generate_report;
 use super::state::ReportSink;
 use super::util::{cap_result_bytes, fmt_bytes, truncate_summary};
@@ -384,6 +385,7 @@ pub(in crate::ai) async fn doc_run_tool(
         "audit_collection" => doc_audit_collection(driver, input, limits).await,
         "export_result" => doc_export(driver, input, report).await,
         "generate_report" => run_generate_report(input, report),
+        "save_knowledge" => run_save_knowledge(input, report),
         // Gated writes — the approval already happened in the turn loop.
         "propose_doc_write" => doc_apply_write(driver, input).await,
         "propose_index" => match doc_index_spec(input) {

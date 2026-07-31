@@ -579,8 +579,8 @@ pub(crate) struct RecentKey {
 impl RecentKey {
     /// The serde-friendly persisted form (see `recent_keys.rs`): type as its
     /// label, TTL as whole seconds.
-    fn to_rec(&self) -> crate::recent_keys::RecentKeyRec {
-        crate::recent_keys::RecentKeyRec {
+    fn to_rec(&self) -> red_config::recent_keys::RecentKeyRec {
+        red_config::recent_keys::RecentKeyRec {
             key: self.key.clone(),
             kv_type: self.kv_type.label().to_string(),
             ttl_secs: self.ttl.map(|d| d.as_secs()),
@@ -590,7 +590,7 @@ impl RecentKey {
 
     /// Rebuild from the persisted form; an unknown type label round-trips as
     /// `KvType::Other` rather than being dropped.
-    fn from_rec(rec: &crate::recent_keys::RecentKeyRec) -> Self {
+    fn from_rec(rec: &red_config::recent_keys::RecentKeyRec) -> Self {
         RecentKey {
             key: rec.key.clone(),
             kv_type: KvType::parse(&rec.kv_type)

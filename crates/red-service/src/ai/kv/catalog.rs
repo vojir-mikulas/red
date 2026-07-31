@@ -11,6 +11,8 @@ use serde_json::json;
 
 use super::super::export::export_tool_def;
 use super::super::gate::gate_catalog;
+use super::super::grounding::{history_tool_def, recent_keys_tool_def};
+use super::super::knowledge::knowledge_tool_def;
 use super::super::report::report_tool_def;
 use super::super::turn::spawn_subagent_tool_def;
 use super::super::util::finish_system_prompt;
@@ -257,6 +259,9 @@ pub(in crate::ai) fn kv_tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             &[],
         ),
         report_tool_def(),
+        knowledge_tool_def(),
+        history_tool_def("Redis commands"),
+        recent_keys_tool_def(),
         spawn_subagent_tool_def(),
         // --- gated writes (Write tier, writable connection only) ---
         ToolDef {
@@ -413,8 +418,9 @@ pub(in crate::ai) fn kv_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> Str
         }
         AiTier::Schema => {
             "You have metadata-only Redis tools: kv_server_info, kv_scan_keys, kv_key_schema, and \
-             kv_key_info. You can see the server's stats, the keyspace's key templates, and keys' \
-             types/TTLs/sizes, but you CANNOT read a key's value."
+             kv_key_info, plus search_query_history and kv_recent_keys (what this user has \
+             already run and looked at here). You can see the server's stats, the keyspace's key \
+             templates, and keys' types/TTLs/sizes, but you CANNOT read a key's value."
         }
         AiTier::Read => {
             "You have read-only Redis tools: kv_server_info (INFO summary, topology and size), \
@@ -427,13 +433,17 @@ pub(in crate::ai) fn kv_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> Str
              commands), kv_client_list (connected clients), kv_config_get (read a CONFIG \
              parameter), export_result (write keys to a file for the user), and generate_report \
              (author an HTML report from what you've read, with optional Chart.js charts; it \
-             appears as a card the user can open — use it when the user asks for a report). Ground \
-             every answer in the live server with these tools rather than guessing."
+             appears as a card the user can open — use it when the user asks for a report), and \
+             save_knowledge (draft this connection's knowledge file for the user to review), \
+             search_query_history (the commands this user has actually run here) and \
+             kv_recent_keys (the keys they have been looking at). Ground every answer in the live \
+             server with these tools rather than guessing."
         }
         AiTier::Write => {
             "You have the read-only Redis tools (kv_server_info, kv_scan_keys, kv_key_info, \
-             kv_get_value, kv_biggest_keys, kv_analyze, kv_slowlog, kv_config_get, generate_report) \
-             AND gated tools: kv_set (write a key of any type — this is how you create or update \
+             kv_get_value, kv_biggest_keys, kv_analyze, kv_slowlog, kv_config_get, \
+             generate_report, save_knowledge, search_query_history, kv_recent_keys) AND gated \
+             tools: kv_set (write a key of any type — this is how you create or update \
              data), kv_expire (set/remove a key's TTL), kv_delete (delete keys), kv_rename, \
              kv_copy_key, kv_client_kill, kv_config_set, and kv_command (introspection verbs only). \
              Every one requires the user's explicit Allow on the exact operation; assume it may be \
@@ -450,7 +460,17 @@ pub(in crate::ai) fn kv_system_prompt(ctx: &AiContext, policy: &AiPolicy) -> Str
              {tools_line}\n\n\
              Call kv_server_info first — it tells you the topology, and a SCAN means something \
              different on a cluster. Call kv_key_schema before reasoning about what the keyspace \
-             holds; the key template is the schema.\n\n\
+             holds; the key template is the schema. Then check kv_recent_keys and \
+             search_query_history: what somebody chose to open, and what they have already run \
+             here, is the closest thing a schemaless store has to documentation. Where they \
+             disagree with what the user has written down about this connection above, the \
+             written notes win on what something MEANS and the history wins on how it is \
+             WRITTEN here.\n\n\
+             Each tool result is labelled `[source N]`. When you state a figure or a fact you \
+             read from a tool, append that marker to the claim - \"revenue was $4.2M [3]\". One \
+             marker per claim, never the same source twice in a sentence, and never a marker on \
+             something you reasoned out rather than read: a citation says where a number came \
+             from, not that it is right.\n\n\
              Redis keys are addressed by glob patterns (e.g. `user:*`), not SQL — there are no \
              tables or joins. Be concise: lead with the answer, then the supporting detail. When \
              you show a command, put it in a fenced ```sh block (e.g. `redis-cli GET foo`).\n",

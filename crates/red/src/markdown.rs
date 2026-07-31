@@ -382,6 +382,11 @@ enum Span {
     Bold,
     Italic,
     Code,
+    /// A `[N]` source citation the agent attached to a claim, resolving to the
+    /// turn's N-th data-returning tool call. Rendered small and tinted so a cited
+    /// figure reads differently from an uncited one at a glance -- which is the
+    /// point, since "this paragraph cites nothing" is a claim about the answer.
+    Citation,
 }
 
 /// Render inline Markdown (`**bold**`, `*italic*`, `` `code` ``) as wrapping
@@ -392,16 +397,24 @@ fn inline(text: &str, theme: &Theme, leaf: &mut TextLeaf) -> AnyElement {
     let mut s = String::new();
     let mut runs = Vec::new();
     for (seg, span) in segments {
+        // A citation keeps its brackets on screen: the marker survives being
+        // copied out of the chat, and `[3]` is what people already read as a
+        // citation.
+        let seg = if span == Span::Citation {
+            format!("[{seg}]")
+        } else {
+            seg
+        };
         let f = match span {
             Span::Plain => font(theme.font_family.clone()),
             Span::Bold => font(theme.font_family.clone()).bold(),
             Span::Italic => font(theme.font_family.clone()).italic(),
             Span::Code => font(theme.mono_family.clone()),
+            Span::Citation => font(theme.mono_family.clone()),
         };
-        let color = if span == Span::Code {
-            theme.accent
-        } else {
-            theme.text
+        let color = match span {
+            Span::Code | Span::Citation => theme.accent,
+            _ => theme.text,
         };
         runs.push(TextRun {
             len: seg.len(),
@@ -477,6 +490,19 @@ fn parse_inline(text: &str) -> Vec<(String, Span)> {
             i = end + 2;
             continue;
         }
+        // A `[N]` citation. Bounded to digits, so ordinary bracketed prose and a
+        // Markdown link (`[text](url)`, which has the paren) are left alone.
+        if c == '['
+            && let Some(end) = find(&chars, i + 1, ']')
+            && end > i + 1
+            && chars[i + 1..end].iter().all(|c| c.is_ascii_digit())
+            && chars.get(end + 1) != Some(&'(')
+        {
+            push_plain(&mut plain, &mut out);
+            out.push((chars[i + 1..end].iter().collect(), Span::Citation));
+            i = end + 1;
+            continue;
+        }
         // Italic: `*…*` or `_…_`.
         if (c == '*' || c == '_')
             && let Some(end) = find(&chars, i + 1, c)
@@ -507,6 +533,58 @@ fn find_seq(chars: &[char], from: usize, a: char, b: char) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn spans(text: &str) -> Vec<(String, Span)> {
+        parse_inline(text)
+    }
+
+    /// A `[N]` marker becomes a citation; ordinary bracketed prose does not.
+    /// The negative cases are the ones that matter: a false citation is a link to
+    /// a source that does not exist.
+    #[test]
+    fn only_a_numeric_bracket_is_a_citation() {
+        let segs = spans("revenue was $4.2M [3] last month");
+        assert_eq!(
+            segs.iter().map(|(_, s)| *s).collect::<Vec<_>>(),
+            vec![Span::Plain, Span::Citation, Span::Plain]
+        );
+        assert_eq!(segs[1].0, "3");
+
+        // Not citations: words, empty brackets, and a Markdown link.
+        for text in ["see [foo] here", "empty [] here", "a [text](url) link"] {
+            assert!(
+                spans(text).iter().all(|(_, s)| *s != Span::Citation),
+                "{text} must not parse as a citation"
+            );
+        }
+    }
+
+    /// SQL is full of brackets, and a fenced block is verbatim by construction:
+    /// `parse_inline` never sees a code block's contents, so `[3]` inside one
+    /// stays literal.
+    #[test]
+    fn a_citation_inside_a_code_block_stays_literal() {
+        let blocks = parse("```sql\nSELECT a[3] FROM t\n```");
+        match &blocks[..] {
+            [Block::Code(code)] => assert!(code.contains("a[3]"), "{code}"),
+            other => panic!("expected one code block, got {} blocks", other.len()),
+        }
+        // An inline code span is verbatim too.
+        let segs = spans("run `SELECT a[3]` first");
+        assert!(segs.iter().all(|(_, s)| *s != Span::Citation));
+    }
+
+    /// An out-of-range marker is still a citation *token* -- resolving it is the
+    /// panel's job, and the panel simply finds no chip with that number. What
+    /// must not happen is a panic or a link to nothing.
+    #[test]
+    fn an_out_of_range_marker_is_harmless() {
+        let segs = spans("total was 9 [99]");
+        assert_eq!(
+            segs.last().map(|(t, s)| (t.as_str(), *s)),
+            Some(("99", Span::Citation))
+        );
+    }
 
     #[test]
     fn splits_inline_styles() {

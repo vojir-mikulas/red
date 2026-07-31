@@ -830,7 +830,7 @@ impl AppState {
             .text_color(text);
         for (ix, entry) in recent.iter().enumerate() {
             let Some(mode) = entry.mode() else { continue };
-            let when = crate::history::relative_time(entry.used_unix);
+            let when = red_config::history::relative_time(entry.used_unix);
             list = list.child(
                 div()
                     .id(("filter-recall-row", ix))

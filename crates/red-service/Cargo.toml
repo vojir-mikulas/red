@@ -11,6 +11,7 @@ authors.workspace = true
 
 [dependencies]
 red-core.workspace = true
+red-config.workspace = true
 red-driver.workspace = true
 red-ai.workspace = true
 red-acp.workspace = true

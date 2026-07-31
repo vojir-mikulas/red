@@ -12,6 +12,8 @@
 
 assistant-default = Default
 
+assistant-fast = Fast
+
 assistant-writes = writes
 
 assistant-save_key = Save key

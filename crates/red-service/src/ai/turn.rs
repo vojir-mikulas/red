@@ -18,6 +18,7 @@ use super::doc::catalog::doc_tool_catalog;
 use super::gate::is_write_tool;
 use super::gate::{WriteAssessment, assess_write, narrow_to_subagent};
 use super::kv::catalog::kv_tool_catalog;
+use super::preview::{model_note, preview_write};
 use super::sql::catalog::{tool_catalog, user_turn};
 use super::state::{AiState, ReportSink, await_write_approval, lock};
 use super::util::truncate_summary;
@@ -47,9 +48,27 @@ pub(crate) async fn run_turn(
     policy: AiPolicy,
     user_message: String,
     context: AiContext,
+    // Run this turn's writes in one uncommitted transaction the user reviews at
+    // the end. Already vetted by the caller against the engine, the tier, and the
+    // connection's posture; by here it only says which mode to run.
+    sandbox_mode: bool,
     cancel: CancelToken,
 ) {
+    // Fill in what only the service knows before the prompt is built: which of
+    // this conversation's cursors are still readable.
+    let mut context = context;
+    context.open_cursors = lock(&state).cursors.open_line(conversation_id);
     let system = backend.system_prompt(&context, &policy);
+    // Which saved connection this turn is grounded in. The grounding tools scope
+    // the query history by it; everything else ignores it.
+    let conn_id = context.conn_id.clone();
+    // Opened lazily on the first write, so a turn that only reads never holds a
+    // transaction open. Most turns only read, and an open transaction takes locks.
+    let mut sandbox: Option<Arc<dyn red_driver::Sandbox>> = None;
+    // Source numbering restarts each turn: a citation is only ever resolved
+    // against its own bubble's sources, so a stable global counter would buy
+    // nothing and make the markers longer.
+    let mut next_source: u32 = 0;
     // The tier decides which tools the model is even offered: `off` grounds
     // nothing, `schema` withholds row data, `read` is the full catalog. The KV
     // (Redis) backend offers its own read-only `kv_*` catalog.
@@ -202,6 +221,10 @@ pub(crate) async fn run_turn(
                                 task: truncate_summary(&task, 120),
                             },
                             status: ActivityStatus::Running,
+                            // Only a subagent's final report crosses back, so the
+                            // parent cannot cite the child's individual queries
+                            // and must not appear to.
+                            source_ordinal: None,
                         },
                     },
                 );
@@ -210,6 +233,7 @@ pub(crate) async fn run_turn(
                 let (content, ok) = run_subagent(
                     &provider,
                     &backend,
+                    &conn_id,
                     &events,
                     &state,
                     session,
@@ -229,10 +253,12 @@ pub(crate) async fn run_turn(
                         conversation_id,
                         delta: AiDelta::ActivityUpdated {
                             id: id.clone().into(),
-                            status: Some(if ok {
-                                ActivityStatus::Ok
-                            } else {
+                            status: Some(if !ok {
                                 ActivityStatus::Failed
+                            } else if content.starts_with(SHAPE_CHECK_PREFIX) {
+                                ActivityStatus::Warned
+                            } else {
+                                ActivityStatus::Ok
                             }),
                             detail: activity_detail(name, ok, &content),
                         },
@@ -250,6 +276,10 @@ pub(crate) async fn run_turn(
             // UPDATE/DELETE) is reported to the model without ever prompting; an
             // allowed shape surfaces the exact SQL as an Allow/Deny prompt and runs
             // only on Allow. A read tool falls straight through.
+            // What the preview found that the model should hear about, carried
+            // past the approval so it reaches the tool result whichever way the
+            // user answered. A write that matched nothing is worth saying twice.
+            let mut write_note: Option<String> = None;
             match assess_write(name, input, &policy, backend.dialect()) {
                 WriteAssessment::Reject(why) => {
                     results.push(ContentBlock::ToolResult {
@@ -259,13 +289,59 @@ pub(crate) async fn run_turn(
                     });
                     continue;
                 }
+                WriteAssessment::NeedsApproval { sql } if sandbox_mode => {
+                    // Sandbox mode relaxes the *approval*, never the gate: the
+                    // shape checks above (DDL, chained statements, a WHERE-less
+                    // UPDATE) already ran and already rejected. What changes is
+                    // that nothing is committed, so asking per statement is
+                    // friction without a decision behind it.
+                    if sandbox.is_none() {
+                        match open_sandbox(&backend, &state, session, conversation_id).await {
+                            Ok(opened) => sandbox = Some(opened),
+                            Err(why) => {
+                                results.push(ContentBlock::ToolResult {
+                                    tool_use_id: id.clone(),
+                                    content: format!("error: {why}"),
+                                    is_error: true,
+                                });
+                                continue;
+                            }
+                        }
+                    }
+                    // Shown as pending, because that is what it is: run, not
+                    // committed, and still revocable by the user.
+                    emit(
+                        &events,
+                        session,
+                        Event::AiDelta {
+                            conversation_id,
+                            delta: AiDelta::ActivityStarted {
+                                id: id.clone().into(),
+                                parent: None,
+                                kind: ActivityKind::Write { sql: sql.clone() },
+                                status: ActivityStatus::Pending,
+                                // A write changes the world rather than describing
+                                // it; there is nothing here to cite a figure to.
+                                source_ordinal: None,
+                            },
+                        },
+                    );
+                }
                 WriteAssessment::NeedsApproval { sql } => {
+                    // Count what it would touch first, so the prompt asks a
+                    // question the user can actually answer. A failed or skipped
+                    // preview yields `None` and the prompt still goes up.
+                    let preview = preview_write(&backend, name, input, &policy).await;
+                    // What the model is told about the preview, kept out of the
+                    // sample rows: it needs the scale, not the user's data.
+                    write_note = model_note(preview.as_ref());
                     let allowed = await_write_approval(
                         &state,
                         &events,
                         session,
                         conversation_id,
                         &sql,
+                        preview,
                         &cancel,
                     )
                     .await;
@@ -282,14 +358,23 @@ pub(crate) async fn run_turn(
                                     parent: None,
                                     kind: ActivityKind::Write { sql: sql.clone() },
                                     status: ActivityStatus::Denied,
+                                    source_ordinal: None,
                                 },
                             },
                         );
                         results.push(ContentBlock::ToolResult {
                             tool_use_id: id.clone(),
-                            content: "the user denied this write. Do not retry it; explain it or \
-                                propose an alternative"
-                                .into(),
+                            content: match &write_note {
+                                // A denial *and* an empty predicate: the second is
+                                // very likely why, so say both.
+                                Some(note) => format!(
+                                    "the user denied this write. Do not retry it as-is; explain \
+                                     it or propose an alternative. Note: {note}"
+                                ),
+                                None => "the user denied this write. Do not retry it; explain it \
+                                     or propose an alternative"
+                                    .into(),
+                            },
                             is_error: true,
                         });
                         continue;
@@ -297,6 +382,14 @@ pub(crate) async fn run_turn(
                 }
                 WriteAssessment::NotWrite => {}
             }
+            // A call that returns data the answer could cite gets a source number,
+            // which is the join key between the prose and the trace: the tool
+            // result carries `[source N]` for the model and the node carries the
+            // same N for the panel.
+            let source_ordinal = super::gate::is_source_tool(name).then(|| {
+                next_source += 1;
+                next_source
+            });
             emit(
                 &events,
                 session,
@@ -310,12 +403,41 @@ pub(crate) async fn run_turn(
                             args_summary: summarize_tool_args(name, input),
                         },
                         status: ActivityStatus::Running,
+                        source_ordinal,
                     },
                 },
             );
-            let (content, ok) = backend
-                .run_tool(name, input, &policy, &cancel, &report)
+            let (mut content, ok) = backend
+                .run_tool(
+                    crate::ai::ConnCtx {
+                        conn_id: &conn_id,
+                        dialect: backend.dialect(),
+                        conversation_id,
+                        state: &state,
+                        sandbox: sandbox.clone(),
+                    },
+                    name,
+                    input,
+                    &policy,
+                    &cancel,
+                    &report,
+                )
                 .await;
+            // Execution feedback, which is the kind of correction signal that
+            // actually works: the statement ran, and it changed nothing.
+            if let Some(note) = &write_note {
+                content.push_str(&format!("\n\nNote: {note}"));
+            }
+            // Record what the sandbox actually ran, so the review card lists the
+            // statements and their row counts rather than a bare "3 changes".
+            if sandbox.is_some()
+                && ok
+                && let Some(session) = session
+            {
+                for (stmt, rows) in ran_statements(name, input, &content) {
+                    lock(&state).record_sandbox_write(session, &stmt, rows);
+                }
+            }
             emit(
                 &events,
                 session,
@@ -334,7 +456,13 @@ pub(crate) async fn run_turn(
             );
             results.push(ContentBlock::ToolResult {
                 tool_use_id: id.clone(),
-                content,
+                // The label the model cites back. Prefixed rather than appended so
+                // it is read before the data it belongs to, and only on a call
+                // that actually produced data.
+                content: match source_ordinal {
+                    Some(n) => format!("[source {n}]\n{content}"),
+                    None => content,
+                },
                 is_error: !ok,
             });
         }
@@ -354,6 +482,34 @@ pub(crate) async fn run_turn(
         let mut st = lock(&state);
         st.histories.insert(conversation_id, messages);
         st.cancels.remove(&conversation_id);
+    }
+
+    // A turn that wrote into a sandbox does not settle here: the writes are run
+    // but uncommitted, so the user reviews them and answers. `AiTurnFinished`
+    // follows once they do (see the dispatch loop's `AiSandboxResolve`).
+    if result.is_ok()
+        && sandbox.is_some()
+        && let Some(session) = session
+        && let Some((statements, total_rows)) = lock(&state).sandbox_log(session)
+    {
+        emit(
+            &events,
+            session_opt(session),
+            Event::AiSandboxReady {
+                conversation_id,
+                statements,
+                total_rows,
+                expires_in_secs: policy.sandbox_timeout_secs,
+            },
+        );
+        arm_sandbox_deadline(
+            events.clone(),
+            state.clone(),
+            session,
+            conversation_id,
+            policy.sandbox_timeout_secs,
+        );
+        return;
     }
 
     match result {
@@ -389,6 +545,9 @@ const SUBAGENT_MAX_STEPS: usize = 6;
 async fn run_subagent(
     provider: &Arc<dyn AiProvider>,
     backend: &AiBackend,
+    // The parent turn's connection id, so a subagent researching a topic can
+    // read the same query history the parent can.
+    conn_id: &str,
     events: &Events,
     state: &Arc<Mutex<AiState>>,
     session: Option<SessionId>,
@@ -474,6 +633,9 @@ async fn run_subagent(
                             args_summary: summarize_tool_args(name, input),
                         },
                         status: ActivityStatus::Running,
+                        // A subagent's own calls are its children and never reach
+                        // the parent's prose, so they carry no source number.
+                        source_ordinal: None,
                     },
                 },
             );
@@ -493,7 +655,27 @@ async fn run_subagent(
                     false,
                 )
             } else {
-                backend.run_tool(name, input, policy, cancel, report).await
+                backend
+                    .run_tool(
+                        crate::ai::ConnCtx {
+                            conn_id,
+                            dialect: backend.dialect(),
+                            conversation_id,
+                            state,
+                            // A subagent never writes (its catalog excludes them and
+                            // the check above refuses them), so it reads the
+                            // committed state. Routing it through the parent's
+                            // transaction would hand a delegated researcher a view
+                            // nobody else has.
+                            sandbox: None,
+                        },
+                        name,
+                        input,
+                        policy,
+                        cancel,
+                        report,
+                    )
+                    .await
             };
             emit(
                 events,
@@ -640,6 +822,11 @@ fn summarize_tool_args(name: &str, input: &Json) -> Option<String> {
 /// A one-line result summary for a finished tool node: on failure, the error's
 /// first line; on success, a short per-tool signal (row count, rows affected) so the
 /// trace reads at a glance. `None` when there's nothing concise to show.
+/// How a tool result announces that the shape check found something. Matched as a
+/// prefix rather than searched for, so a result that merely *contains* the phrase
+/// (a query about the shape check, say) cannot flag itself.
+pub(in crate::ai) const SHAPE_CHECK_PREFIX: &str = "SHAPE CHECK";
+
 fn activity_detail(name: &str, ok: bool, content: &str) -> Option<String> {
     if !ok {
         let line = content.split('\n').find(|l| !l.trim().is_empty())?.trim();
@@ -648,6 +835,12 @@ fn activity_detail(name: &str, ok: bool, content: &str) -> Option<String> {
     let summary = match name {
         // The write tools return a single summary sentence; surface it verbatim.
         "propose_write" | "propose_changeset" => content.split('\n').next()?.trim().to_string(),
+        // A flagged query is what the reader most needs to see, so the caveat
+        // outranks the row count it would otherwise show.
+        "run_select" if content.starts_with(SHAPE_CHECK_PREFIX) => content
+            .lines()
+            .find_map(|l| l.trim().strip_prefix("- "))
+            .map(str::to_string)?,
         // `format_page` ends with a `(N rows)` line; skip the `(truncated …)` note.
         "run_select" => content
             .lines()
@@ -666,6 +859,148 @@ fn activity_detail(name: &str, ok: bool, content: &str) -> Option<String> {
         _ => return None,
     };
     (!summary.is_empty()).then(|| truncate_summary(&summary, 120))
+}
+
+/// `Some(session)` as the event envelope wants it. A sandbox only ever exists on
+/// a real session, so this is a shape adapter rather than a decision.
+fn session_opt(session: SessionId) -> Option<SessionId> {
+    Some(session)
+}
+
+/// Open a sandbox transaction for this turn and register it against the session.
+///
+/// Fails with a message meant for the model when the engine has no transactions,
+/// when there is no session to attach one to, or when **another conversation**
+/// already holds this session's sandbox: two chats writing to one database in two
+/// transactions is a deadlock generator, so the second is refused rather than
+/// given its own.
+async fn open_sandbox(
+    backend: &AiBackend,
+    state: &Arc<Mutex<AiState>>,
+    session: Option<SessionId>,
+    conversation_id: ConversationId,
+) -> Result<Arc<dyn red_driver::Sandbox>, String> {
+    let Some(session) = session else {
+        return Err("there is no connected session to open a transaction on".into());
+    };
+    // Already open on this session: reuse it if it is ours, refuse if it isn't.
+    if let Some((existing, owner)) = lock(state).sandbox_for(session) {
+        return if owner == conversation_id {
+            Ok(existing)
+        } else {
+            Err(
+                "another chat has an open review transaction on this connection; ask the user \
+                 to commit or roll it back first"
+                    .into(),
+            )
+        };
+    }
+    let AiBackend::Sql { driver, .. } = backend else {
+        return Err("review transactions are only available on SQL connections".into());
+    };
+    let opened = driver
+        .begin_sandbox()
+        .await
+        .map_err(|e| format!("could not open a review transaction: {e}"))?;
+    let Some(opened) = opened else {
+        return Err(
+            "this engine has no multi-statement transactions, so changes cannot be \
+                    held for review"
+                .into(),
+        );
+    };
+    let opened: Arc<dyn red_driver::Sandbox> = Arc::from(opened);
+    // Racy by construction: another turn could have registered between the check
+    // above and here, so the registry's own answer is the authority.
+    if !lock(state).open_sandbox(session, conversation_id, opened.clone()) {
+        let _ = opened.rollback().await;
+        return Err("another chat opened a review transaction on this connection first".into());
+    }
+    Ok(opened)
+}
+
+/// The statements a completed write tool actually ran, paired with their row
+/// counts, for the sandbox log.
+///
+/// Row counts are parsed back out of the tool's own result text rather than
+/// re-derived: the executor is the only thing that knows what the engine
+/// reported, and threading a second channel out of it for the sandbox alone would
+/// be a parallel truth to keep in sync. A count that cannot be read shows as 0 in
+/// the review card, which understates rather than overstates.
+fn ran_statements(name: &str, input: &Json, content: &str) -> Vec<(String, u64)> {
+    let rows = content
+        .split_once("row(s) affected")
+        .and_then(|(head, _)| {
+            head.rsplit(|c: char| !c.is_ascii_digit())
+                .find(|t| !t.is_empty())
+                .and_then(|n| n.parse::<u64>().ok())
+        })
+        .unwrap_or(0);
+    match name {
+        "propose_write" => input
+            .get("sql")
+            .and_then(Json::as_str)
+            .map(|sql| vec![(sql.to_string(), rows)])
+            .unwrap_or_default(),
+        // The changeset reports one total, and splitting it back per statement
+        // would be a guess. Attribute it to the first statement and list the rest
+        // at 0; the card's total is what the user answers on.
+        "propose_changeset" => {
+            let statements = super::gate::changeset_statements(input);
+            statements
+                .into_iter()
+                .enumerate()
+                .map(|(i, sql)| (sql, if i == 0 { rows } else { 0 }))
+                .collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// Floor on the sandbox deadline. Below this a user cannot realistically read the
+/// review card before it expires, and an expiry the user never had a chance to
+/// answer is just a failed turn with extra steps.
+const SANDBOX_TIMEOUT_FLOOR_SECS: u64 = 30;
+
+/// Roll the sandbox back if nobody answers in time.
+///
+/// An open transaction holds locks, so a user who walks away mid-review can block
+/// production writes -- this feature can cause an outage if it is careless. Rolling
+/// back is the only defensible expiry: committing an agent's writes because a
+/// timer fired is not something RED does under any condition.
+///
+/// Taking the slot out of the registry is what makes this safe against a race
+/// with the user's own answer: whoever removes it first is the one who resolves it.
+fn arm_sandbox_deadline(
+    events: Events,
+    state: Arc<Mutex<AiState>>,
+    session: SessionId,
+    conversation_id: ConversationId,
+    secs: u64,
+) {
+    let secs = secs.max(SANDBOX_TIMEOUT_FLOOR_SECS);
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(secs)).await;
+        // Peek before taking, so a slot re-opened by *another* chat in the meantime
+        // is never removed by this timer (taking and putting it back would lose its
+        // log, which is the review card's whole contents).
+        let expired = {
+            let mut st = lock(&state);
+            match st.sandbox_for(session) {
+                Some((_, owner)) if owner == conversation_id => st.take_sandbox(session),
+                _ => None,
+            }
+        };
+        let Some(slot) = expired else {
+            return; // the user answered, teardown got there first, or it is not ours
+        };
+        emit(
+            &events,
+            Some(session),
+            Event::AiSandboxExpired { conversation_id },
+        );
+        crate::dispatch::resolve_sandbox(&events, session, conversation_id, slot, false).await;
+    });
 }
 
 #[cfg(test)]
@@ -832,6 +1167,235 @@ mod tests {
         }
     }
 
+    /// A fixture DB with `t (id, name)` holding `(1, 'before')`, plus a writable
+    /// driver over it.
+    fn write_fixture(tag: &str) -> (std::path::PathBuf, Arc<dyn DatabaseDriver>) {
+        let db =
+            std::env::temp_dir().join(format!("red-{tag}-{}.db", uuid::Uuid::new_v4().simple()));
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO t VALUES (1, 'before');",
+            )
+            .unwrap();
+        }
+        let driver: Arc<dyn DatabaseDriver> =
+            Arc::new(red_driver::SqliteDriver::new(db.clone(), false));
+        (db, driver)
+    }
+
+    /// `t.name` read through a **fresh** connection, so an uncommitted sandbox
+    /// write is invisible here.
+    async fn committed_name(db: &std::path::Path) -> String {
+        let driver: Arc<dyn DatabaseDriver> =
+            Arc::new(red_driver::SqliteDriver::new(db.to_path_buf(), true));
+        let page = driver
+            .fetch_page(
+                "SELECT name FROM t WHERE id = 1",
+                0,
+                1,
+                PageCap::Display { key: None },
+                &AbortSignal::new(),
+            )
+            .await
+            .unwrap();
+        page.rows[0][0].to_string()
+    }
+
+    fn write_policy() -> AiPolicy {
+        AiPolicy {
+            tier: AiTier::Write,
+            ..AiPolicy::default()
+        }
+    }
+
+    fn scripted(sql: &str) -> Arc<dyn red_ai::AiProvider> {
+        Arc::new(ScriptedWrite {
+            calls: std::sync::atomic::AtomicUsize::new(0),
+            sql: sql.into(),
+        })
+    }
+
+    /// Run one sandbox-mode turn to its review handoff and return the state, the
+    /// session, and every event it emitted.
+    async fn sandbox_turn(
+        driver: Arc<dyn DatabaseDriver>,
+        sql: &str,
+    ) -> (Arc<Mutex<AiState>>, SessionId, Vec<Event>) {
+        let (tx, mut rx) = futures::channel::mpsc::unbounded();
+        let state = Arc::new(Mutex::new(AiState::default()));
+        let session = SessionId::new(1);
+        run_turn(
+            scripted(sql),
+            AiBackend::Sql {
+                driver,
+                dialect: Dialect::Sqlite,
+            },
+            tx,
+            state.clone(),
+            Some(session),
+            ConversationId::new(1),
+            "m".into(),
+            false,
+            write_policy(),
+            "change it".into(),
+            AiContext::default(),
+            true,
+            CancelToken::new(),
+        )
+        .await;
+        let mut events = Vec::new();
+        while let Ok((_, e)) = rx.try_recv() {
+            events.push(e);
+        }
+        (state, session, events)
+    }
+
+    /// A citable call is numbered and its result carries the label the model
+    /// cites back; a write is neither.
+    #[tokio::test]
+    async fn a_source_call_is_numbered_and_labelled() {
+        let (db, driver) = write_fixture("src");
+        // The scripted provider proposes a write, which is *not* a source.
+        let (_, _, events) = sandbox_turn(driver, "UPDATE t SET name = 'x' WHERE id = 1").await;
+        assert!(
+            events.iter().all(|e| !matches!(
+                e,
+                Event::AiDelta {
+                    delta: AiDelta::ActivityStarted {
+                        source_ordinal: Some(_),
+                        ..
+                    },
+                    ..
+                }
+            )),
+            "a write must not be offered as a source"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// The whole point of the mode: the write runs, nothing is asked per
+    /// statement, and nothing is durable until the user answers.
+    #[tokio::test]
+    async fn a_sandbox_turn_runs_the_write_without_prompting_and_commits_nothing() {
+        let (db, driver) = write_fixture("sbx");
+        let (state, session, events) =
+            sandbox_turn(driver, "UPDATE t SET name = 'after' WHERE id = 1").await;
+
+        // Per-statement approval is *replaced*, not added to.
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::AiPermissionRequest { .. })),
+            "sandbox mode must not prompt per statement"
+        );
+        // The turn hands over for review instead of settling.
+        let ready = events
+            .iter()
+            .find_map(|e| match e {
+                Event::AiSandboxReady {
+                    statements,
+                    total_rows,
+                    ..
+                } => Some((statements.clone(), *total_rows)),
+                _ => None,
+            })
+            .expect("the turn ends in a review handoff");
+        assert_eq!(ready.0.len(), 1);
+        assert!(ready.0[0].sql.contains("UPDATE t SET name"));
+        assert_eq!(ready.1, 1, "the card totals the rows actually touched");
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::AiTurnFinished { .. })),
+            "a turn holding uncommitted changes has not finished"
+        );
+        // And the database is untouched from anywhere else.
+        assert_eq!(committed_name(&db).await, "before");
+
+        // Rolling back leaves it that way.
+        let (_, slot) = lock(&state)
+            .take_sandbox_for_conversation(ConversationId::new(1))
+            .expect("the sandbox is registered against the session");
+        assert_eq!(slot.total_rows(), 1);
+        slot.sandbox.rollback().await.unwrap();
+        assert_eq!(committed_name(&db).await, "before");
+        assert!(
+            lock(&state).sandbox_for(session).is_none(),
+            "taking the slot is what makes a resolve single-use"
+        );
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// Committing is what makes it durable, and only then.
+    #[tokio::test]
+    async fn committing_a_sandbox_applies_the_turn() {
+        let (db, driver) = write_fixture("sbxc");
+        let (state, _, _) = sandbox_turn(driver, "UPDATE t SET name = 'after' WHERE id = 1").await;
+        assert_eq!(committed_name(&db).await, "before");
+
+        let (_, slot) = lock(&state)
+            .take_sandbox_for_conversation(ConversationId::new(1))
+            .unwrap();
+        slot.sandbox.commit().await.unwrap();
+        assert_eq!(committed_name(&db).await, "after");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// The sandbox relaxes the *approval*, never the gate. A shape the write gate
+    /// rejects is still rejected here, and asserting it matters because the two
+    /// are independent: it would be easy to route around the gate while removing
+    /// the prompt.
+    #[tokio::test]
+    async fn the_shape_gate_still_rejects_ddl_in_sandbox_mode() {
+        let (db, driver) = write_fixture("sbxddl");
+        let (state, session, events) = sandbox_turn(driver, "DROP TABLE t").await;
+
+        assert!(
+            !events
+                .iter()
+                .any(|e| matches!(e, Event::AiSandboxReady { .. })),
+            "a rejected statement opens no transaction"
+        );
+        assert!(
+            lock(&state).sandbox_for(session).is_none(),
+            "a rejected statement must not leave a connection checked out"
+        );
+        // The table is still there.
+        assert_eq!(committed_name(&db).await, "before");
+        let _ = std::fs::remove_file(&db);
+    }
+
+    /// One sandbox per session: a second conversation's write is refused rather
+    /// than given its own transaction, because two transactions against one
+    /// database from one app is a deadlock generator.
+    #[tokio::test]
+    async fn a_second_conversation_cannot_open_a_second_sandbox() {
+        let (db, driver) = write_fixture("sbx2");
+        let (state, session, _) =
+            sandbox_turn(driver.clone(), "UPDATE t SET name = 'a' WHERE id = 1").await;
+        assert!(lock(&state).sandbox_for(session).is_some());
+
+        let backend = AiBackend::Sql {
+            driver,
+            dialect: Dialect::Sqlite,
+        };
+        let why = match open_sandbox(&backend, &state, Some(session), ConversationId::new(2)).await
+        {
+            Err(why) => why,
+            Ok(_) => panic!("a second chat must not get its own transaction"),
+        };
+        assert!(why.contains("another chat"), "{why}");
+
+        // The first conversation still gets its own back, rather than a new one.
+        let mine = open_sandbox(&backend, &state, Some(session), ConversationId::new(1))
+            .await
+            .expect("the owner reuses its sandbox");
+        mine.rollback().await.unwrap();
+        let _ = std::fs::remove_file(&db);
+    }
+
     #[tokio::test]
     async fn api_key_write_is_gated_by_approval_then_executes() {
         use futures::StreamExt;
@@ -889,6 +1453,8 @@ mod tests {
             policy,
             "change it".into(),
             AiContext::default(),
+            // Per-statement approval, which is what this test is about.
+            false,
             CancelToken::new(),
         ));
 

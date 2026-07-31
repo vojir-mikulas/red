@@ -690,6 +690,16 @@ impl AiTier {
                     // own definition are catalog reads, never a row.
                     | "relationship_map"
                     | "object_ddl"
+                    // Retrieval from what the user already ran or saved. Available
+                    // at Schema on purpose: this is *user-authored* SQL, not row
+                    // data. A WHERE clause can embed a literal, so history can leak
+                    // a value — which is why both stores are `0o600`. If that trade
+                    // is unacceptable for a deployment, Schema is the wrong tier and
+                    // the right answer is `off`.
+                    | "search_query_history"
+                    | "list_saved_queries"
+                    | "read_saved_query"
+                    | "kv_recent_keys"
                     | "kv_server_info"
                     | "kv_scan_keys"
                     | "kv_key_info"
@@ -707,7 +717,14 @@ impl AiTier {
                     | "describe_table"
                     | "relationship_map"
                     | "object_ddl"
+                    | "search_query_history"
+                    | "list_saved_queries"
+                    | "read_saved_query"
+                    | "kv_recent_keys"
                     | "run_select"
+                    // Continues a `run_select`, so it returns the same class of
+                    // data and sits at the same tier.
+                    | "fetch_more"
                     | "search_data"
                     | "explain"
                     | "profile_table"
@@ -724,6 +741,12 @@ impl AiTier {
                     | "generate_report"
                     | "open_query"
                     | "save_query"
+                    // Drafts the connection's knowledge file for the user to
+                    // review. Read tier is the floor on purpose: at Schema the
+                    // agent cannot sample a single value, so its "glossary" would
+                    // be column-name inference — the failure mode the knowledge
+                    // file exists to fix.
+                    | "save_knowledge"
                     // Delegation grants no new capability — a subagent runs a
                     // read-only subset of this same tier — so it rides with Read.
                     | "spawn_subagent"
@@ -868,6 +891,15 @@ pub struct AiPolicy {
     /// the same guard the human write path is held to. Authoritative (set from the
     /// session), not the UI-supplied `AiContext.read_only`.
     pub read_only: bool,
+    /// Whether to count the rows a proposed write would affect and show them with
+    /// the approval prompt. Only ever consulted at [`AiTier::Write`], since that
+    /// is the only tier where a write can be proposed at all.
+    pub preview_writes: bool,
+    /// How long an agent sandbox transaction may sit unresolved before RED rolls
+    /// it back. An open transaction holds locks, so a user who walks away
+    /// mid-review can block production writes; rolling back is the only defensible
+    /// expiry, since committing unasked is not a thing RED does.
+    pub sandbox_timeout_secs: u64,
 }
 
 impl Default for AiPolicy {
@@ -877,6 +909,8 @@ impl Default for AiPolicy {
             tier: AiTier::Read,
             limits: AiLimits::default(),
             read_only: false,
+            preview_writes: true,
+            sandbox_timeout_secs: 120,
         }
     }
 }
@@ -893,6 +927,8 @@ impl AiPolicy {
             tier: tier.unwrap_or(self.tier),
             limits: self.limits,
             read_only: self.read_only,
+            preview_writes: self.preview_writes,
+            sandbox_timeout_secs: self.sandbox_timeout_secs,
         }
     }
 }
@@ -975,6 +1011,12 @@ pub enum ActivityStatus {
     Running,
     /// Finished successfully.
     Ok,
+    /// Finished successfully, but the result carries a caveat the reader should
+    /// see: a query that ran fine and may answer a different question than it
+    /// looks like it asks. Distinct from [`Failed`](Self::Failed) because nothing
+    /// went wrong, and distinct from [`Ok`](Self::Ok) because a glance at the
+    /// timeline should show that something was flagged.
+    Warned,
     /// Finished with an error (`detail` carries the message).
     Failed,
     /// The user denied it; it never ran.
@@ -991,6 +1033,20 @@ pub struct ActivityNode {
     pub id: ActivityId,
     pub kind: ActivityKind,
     pub status: ActivityStatus,
+    /// This node's per-turn **source number**, when it produced data the answer
+    /// could be citing.
+    ///
+    /// The prose says "revenue was $4.2M"; the timeline knows which call returned
+    /// that number; nothing connected the two. This is the join key: the tool
+    /// result is labelled `[source N]` for the model, the node carries the same
+    /// `N`, and a `[N]` in the answer resolves back here.
+    ///
+    /// `None` for calls that return no data (`open_query`, `save_query`,
+    /// `generate_report`), for writes, and for subagent nodes -- only a subagent's
+    /// final report crosses back to the parent, so the parent cannot cite the
+    /// child's individual queries and must not pretend to.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub source_ordinal: Option<u32>,
     /// A one-line result summary once known: a row count, a byte size, or the
     /// error message on failure. `None` until the node completes.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -1006,6 +1062,7 @@ impl ActivityNode {
             id: id.into(),
             kind,
             status: ActivityStatus::Running,
+            source_ordinal: None,
             detail: None,
             children: Vec::new(),
         }
@@ -3511,6 +3568,8 @@ mod ai_policy_tests {
             tier: AiTier::Read,
             limits: AiLimits::default(),
             read_only: false,
+            preview_writes: true,
+            sandbox_timeout_secs: 120,
         };
         // Unset overrides inherit the global policy verbatim.
         assert_eq!(global.with_overrides(None, None), global);

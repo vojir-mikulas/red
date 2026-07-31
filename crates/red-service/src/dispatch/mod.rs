@@ -563,6 +563,22 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     // path's per-conversation budget and the HTTP MCP server's `calls` counter).
     let mut mcp_tool_calls: usize = 0;
     let ai_state = Arc::new(Mutex::new(crate::ai::AiState::default()));
+    // An idle cursor holds a connection, and nothing else would ever close one the
+    // model simply stopped reading from. Ticked rather than checked on access,
+    // because "abandoned" is exactly the case where no access comes.
+    {
+        let state = ai_state.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(60));
+            loop {
+                tick.tick().await;
+                let closed = lock(&state).cursors.reap_idle();
+                if closed > 0 {
+                    tracing::debug!("closed {closed} idle agent cursor(s)");
+                }
+            }
+        });
+    }
     // The subscription (ACP) path keeps one live agent conversation per
     // `conversation_id`; the tokio Mutex lets a slow agent start await off-loop.
     let ai_acp = Arc::new(tokio::sync::Mutex::new(crate::acp::AcpManager::default()));
@@ -603,6 +619,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // A re-connect on the same id (a retry, or replacing a dropped
                 // session) tears down whatever was there first.
                 if let Some(mut old) = sessions.remove(&id) {
+                    rollback_session_sandbox(&ai_state, id);
                     old.teardown();
                     // The new driver replaces the old one, so any subscription
                     // agent bound to the old session must go too; the next
@@ -663,6 +680,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     // The global default is writable-posture; each turn overrides
                     // this with the connection's authoritative read-only flag.
                     read_only: false,
+                    preview_writes: cfg.preview_writes,
+                    sandbox_timeout_secs: cfg.sandbox_timeout_secs,
                 };
                 ai_default_agent = cfg.default_agent;
                 // Build each configured agent's runtime. An API agent with an empty
@@ -723,6 +742,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 agent,
                 message,
                 context,
+                sandbox,
             } => {
                 // The turn grounds in the connected session's driver, either the
                 // SQL `DatabaseDriver` or the Redis `KvDriver` seam (each has its
@@ -794,6 +814,29 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     continue;
                 };
 
+                // The UI offers sandbox mode; the service decides whether it can
+                // be honoured. Silently downgrading to per-statement approval would
+                // be worse than refusing: the user believes nothing is committed
+                // until they say so, and would be wrong.
+                let sandbox_mode = sandbox
+                    && effective.tier == red_core::AiTier::Write
+                    && !effective.read_only
+                    && session_driver.supports_sandbox();
+                if sandbox && !sandbox_mode {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::AiError {
+                            conversation_id,
+                            message: "review-transaction mode is not available here (the engine \
+                                      has no multi-statement transactions, the connection is \
+                                      read-only, or the agent is not at the write tier)."
+                                .into(),
+                        },
+                    );
+                    continue;
+                }
+
                 match runtime {
                     AiProfileRuntime::Api { provider, model } => {
                         let Some(provider) = provider.clone() else {
@@ -826,6 +869,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             effective,
                             message,
                             context,
+                            sandbox_mode,
                             cancel,
                         ));
                     }
@@ -843,6 +887,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         tokio::spawn(crate::acp::run_turn(
                             ai_acp.clone(),
                             backend,
+                            ai_state.clone(),
                             command,
                             cwd,
                             events.clone(),
@@ -854,6 +899,26 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         ));
                     }
                 }
+            }
+
+            Command::AiSandboxResolve {
+                conversation_id,
+                commit,
+            } => {
+                // Removing the slot *is* the single-use guarantee: a user's Commit
+                // racing the deadline's rollback cannot both land, because only one
+                // of them gets the sandbox out of the registry.
+                let Some((session, slot)) =
+                    lock(&ai_state).take_sandbox_for_conversation(conversation_id)
+                else {
+                    // Already resolved or expired. Not an error: the card may have
+                    // been on screen when the deadline fired.
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    resolve_sandbox(&events, session, conversation_id, slot, commit).await;
+                });
             }
 
             Command::AiToolList { call_id } => {
@@ -955,9 +1020,31 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // the CLI has no UI to surface a report card.
                 let report = crate::ai::ReportSink::disabled();
                 let events = events.clone();
+                let ai_state = ai_state.clone();
                 tokio::spawn(async move {
                     let (text, ok) = backend
-                        .run_tool(&name, &args, &policy, &red_ai::CancelToken::new(), &report)
+                        .run_tool(
+                            crate::ai::ConnCtx {
+                                // No connection id on the headless transport: the
+                                // service knows a session, not which saved entry
+                                // dialled it. The grounding tools are withheld here
+                                // for that reason (see `UI_ONLY_TOOLS`), so nothing
+                                // reaches this empty value.
+                                conn_id: "",
+                                dialect: backend.dialect(),
+                                // No conversation either: the stdio transport is a
+                                // single caller, so its cursors are filed under one
+                                // fixed id and reaped on idle like everyone else's.
+                                conversation_id: crate::protocol::ConversationId::new(0),
+                                state: &ai_state,
+                                sandbox: None,
+                            },
+                            &name,
+                            &args,
+                            &policy,
+                            &red_ai::CancelToken::new(),
+                            &report,
+                        )
                         .await;
                     emit(
                         &events,
@@ -981,6 +1068,18 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 // The conversation was closed/deleted in the UI, so drop its backend
                 // state on both paths so the maps stay bounded. The API-key forget is
                 // a quick sync lock; the ACP one awaits, so it runs off the loop.
+                // A closed chat can no longer answer its own review card, so its
+                // transaction would sit holding locks until the deadline. Roll it
+                // back now.
+                if let Some((_, slot)) =
+                    lock(&ai_state).take_sandbox_for_conversation(conversation_id)
+                {
+                    tokio::spawn(async move {
+                        if let Err(e) = slot.sandbox.rollback().await {
+                            tracing::warn!("rolling back an abandoned sandbox failed: {e}");
+                        }
+                    });
+                }
                 lock(&ai_state).forget(conversation_id);
                 let manager = ai_acp.clone();
                 tokio::spawn(async move { manager.lock().await.forget(conversation_id) });
@@ -1108,6 +1207,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
 
             Command::Disconnect | Command::CloseSession => {
                 let Some(id) = session_id else { continue };
+                // Roll an open sandbox back *explicitly* before the session goes,
+                // rather than letting connection teardown imply it. Same outcome on
+                // a healthy engine, but stated rather than inferred - and it frees
+                // the locks now instead of whenever the backend notices.
+                rollback_session_sandbox(&ai_state, id);
                 if let Some(mut state) = sessions.remove(&id) {
                     state.teardown();
                 }
@@ -4915,6 +5019,69 @@ impl StreamRate {
 
 pub(crate) mod jobs;
 use jobs::*;
+
+/// Commit or roll back a sandbox and tell the UI what happened.
+///
+/// The turn deliberately did not settle when it produced the sandbox, so this is
+/// also where `AiTurnFinished` finally lands: from the panel's point of view the
+/// turn is over only once the changes are either durable or gone.
+pub(crate) async fn resolve_sandbox(
+    events: &Events,
+    session: SessionId,
+    conversation_id: crate::protocol::ConversationId,
+    slot: crate::ai::SandboxSlot,
+    commit: bool,
+) {
+    let rows = slot.total_rows();
+    let outcome = if commit {
+        slot.sandbox.commit().await
+    } else {
+        slot.sandbox.rollback().await
+    };
+    // A failed commit is not a silent partial: the transaction is gone either way,
+    // and saying which way is the whole point of the feature.
+    let error = match outcome {
+        Ok(()) => None,
+        Err(e) => {
+            tracing::warn!("resolving the agent sandbox failed: {e}");
+            Some(e.to_string())
+        }
+    };
+    emit(
+        events,
+        Some(session),
+        Event::AiSandboxResolved {
+            conversation_id,
+            committed: commit && error.is_none(),
+            rows,
+            error,
+        },
+    );
+    emit(
+        events,
+        Some(session),
+        Event::AiTurnFinished {
+            conversation_id,
+            usage: crate::protocol::AiUsage::default(),
+        },
+    );
+}
+
+/// Roll back `session`'s open sandbox, if it has one, off the dispatch loop.
+///
+/// Called before a session is replaced or closed. Silent by design: the user is
+/// disconnecting, so an uncommitted transaction going away is what they asked
+/// for, and there is no card left to report to.
+fn rollback_session_sandbox(ai_state: &Arc<Mutex<crate::ai::AiState>>, session: SessionId) {
+    let Some(slot) = lock(ai_state).take_sandbox(session) else {
+        return;
+    };
+    tokio::spawn(async move {
+        if let Err(e) = slot.sandbox.rollback().await {
+            tracing::warn!("rolling back the session's sandbox failed: {e}");
+        }
+    });
+}
 
 #[cfg(test)]
 mod review_tests {

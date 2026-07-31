@@ -7,6 +7,84 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- The assistant can now read through a large result instead of stopping at the
+  first page. A query that returns more than fits comes back with a cursor the
+  agent continues, window by window, through the same streaming machinery the
+  result grid uses - so the windows tile the result exactly, with no rows
+  repeated and none skipped, and without re-running the query. Previously the
+  read was truncated and whatever fell off the end was simply gone, which left
+  the agent either reasoning over the first page as though it were the data or
+  hand-rolling `OFFSET` paging (slow, and silently wrong whenever the ordering
+  is not total). Windows are bounded by size rather than row count, so a table
+  with a wide text column returns fewer, larger rows. Open cursors are capped,
+  closed when you stop a turn or close the chat, and expire on their own after
+  five minutes.
+- Every answer the assistant gives now shows its sources. A turn that read data
+  gets a numbered "Sources" line above the prose, one chip per query, and the
+  agent is asked to mark the figures it read with the matching `[3]`. Clicking a
+  chip rings the exact call in the activity trace; hovering it shows the tool, its
+  arguments and what came back, without leaving the paragraph. The point is what
+  becomes visible at a glance: "this paragraph cites three queries" and "this
+  paragraph cites nothing" used to render identically. It is labelled Sources, not
+  Verified, and deliberately so - a citation shows you where a number came from,
+  not that the sentence around it is right.
+- The assistant now checks the *shape* of a query before it believes the number
+  it got back. The most common way an answer about a database is wrong is a join
+  that quietly multiplies rows: the query runs, nothing errors, and the total is
+  three times too big. RED now reads the query for the structures that cause
+  that (an aggregate over a join with no DISTINCT, a join with no predicate, a
+  join on something other than equality, `SELECT *` across a join) and, when it
+  finds one, runs one extra pair of counts to see whether the join *actually*
+  fanned out. If it did, the agent is told so with the real numbers before it
+  writes its answer, so it corrects itself against what executed rather than
+  against a second reading of its own SQL. Flagged queries are marked in the
+  activity timeline. Nothing is blocked: a cross join is sometimes exactly what
+  you meant.
+- A chat can now run the agent's writes inside a single transaction that you
+  commit or roll back at the end, instead of approving each statement as it
+  comes. Turn on "review" in the composer before the first message; every write
+  that turn runs against a real open transaction, the agent's own reads see its
+  uncommitted changes (so it can check its work), and nothing is durable until
+  you answer. At the end you get the list of what it did with the rows each
+  statement touched, and two buttons. Rolling back is free, which is the point:
+  five separately reasonable approvals can still add up to the wrong change, and
+  until now clicking Allow was final. Available on PostgreSQL, MySQL/MariaDB and
+  SQLite; ClickHouse has no multi-statement transaction, and the option says so
+  rather than quietly falling back. An unanswered review rolls itself back after
+  two minutes (configurable), because an open transaction holds locks.
+- The approval prompt for an agent write now tells you what it would actually
+  do. Instead of asking you to mentally run a `WHERE` clause against a database
+  you cannot see, it counts the rows first: "Affects 4,213 of 812,004 rows in
+  public.orders", with three of them shown so you can tell at a glance whether
+  they are the ones you meant. A statement that matches **no** rows is called out
+  as a warning rather than a reassuring small number, because that almost always
+  means the predicate is wrong, and the agent is told so too. Each statement of a
+  multi-statement changeset gets its own count. The counting runs on a short
+  budget and never delays or blocks the prompt: if it cannot finish, the prompt
+  still appears and says the count was unavailable rather than showing a zero.
+  Turn it off under Settings → AI agent → Safety if you are on a slow link.
+- The assistant can now read what you have already written. It searches the
+  statements you ran against this connection for the tables and concepts it is
+  about to query, so it picks up the join path people actually use (often not the
+  one the foreign keys declare), the date column you filter on, and the values
+  your status columns really hold, instead of inferring all of it from column
+  names. It also reads your saved-query library, so when you ask about a metric
+  you have already defined it uses your definition rather than inventing a fourth
+  one. Same on Redis, where it reads the commands you have run and the keys you
+  have been opening. All of it is scoped to the connection at hand, and nothing
+  the agent runs itself is ever recorded, so it is reading your work, not its own.
+- Each connection can now carry a knowledge file: plain markdown where you write
+  down what the schema cannot tell an agent, such as what "active customer"
+  actually means, which join path is the real one, that amounts are in cents, or
+  which table not to count. It rides in the assistant's prompt for every chat on
+  that connection, so the agent stops re-deriving your business logic and stops
+  guessing at it. Open it from the assistant panel's header, or from
+  `connection: database knowledge…` in the command palette; the panel shows a
+  chip when one is in play. If you would rather not start from a blank page,
+  "Learn this database" has the agent explore the connection and draft one for
+  you, which opens for review rather than being saved: it inferred it from
+  structure and sampling, so it will be right about shape and wrong about
+  intent. Works on SQL databases, Redis, and MongoDB alike.
 - The AI assistant can now reach the parts of RED it was previously blind to.
   Against a SQL database it can read the foreign-key graph in one call, pull an
   object's real definition, search a table for a value without knowing which

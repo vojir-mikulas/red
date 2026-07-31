@@ -308,7 +308,7 @@ impl AppState {
         if conn_id.is_empty() {
             return;
         }
-        let recs: Vec<crate::recent_keys::RecentKeyRec> = active
+        let recs: Vec<red_config::recent_keys::RecentKeyRec> = active
             .kv_view
             .as_ref()
             .map(|v| v.recent_keys.iter().map(RecentKey::to_rec).collect())

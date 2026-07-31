@@ -1,17 +1,21 @@
-//! Saved queries: named SQL snippets persisted as plain `.sql` files (B3).
+//! Saved queries: named SQL snippets persisted as plain `.sql` files.
 //!
-//! Query *history* (per-tab, ephemeral; see `editor.rs`) remembers what you ran;
-//! saved queries are what you choose to **keep**. Each lives as one file under
-//! `<config>/red/queries/*.sql`, beside `themes/`, `settings.toml`, and
-//! `connections.toml`. The file body **is** the query (greppable, editable in any
-//! editor with SQL highlighting, runnable verbatim), with optional metadata in a
-//! leading SQL-comment header (`-- name:` / `-- description:` / `-- tags:`) that
-//! keeps the file valid SQL.
+//! [`crate::history`] remembers what you ran; saved queries are what you chose to
+//! **keep**. Each lives as one file under `<config>/red/queries/*.sql`, beside
+//! `themes/`, `settings.toml`, and `connections.toml`. The file body **is** the
+//! query (greppable, editable in any editor with SQL highlighting, runnable
+//! verbatim), with optional metadata in a leading SQL-comment header
+//! (`-- name:` / `-- description:` / `-- tags:`) that keeps the file valid SQL.
 //!
-//! There is **no** database and no bespoke format: this module mirrors the
-//! user-themes loader in `theme.rs` (read the dir, skip a bad file with a warning,
-//! slug a name on save, write atomically). Nothing is read at startup; the picker
-//! calls [`load`] on demand, so saved queries cost the budget nothing at idle.
+//! There is **no** database and no bespoke format: read the dir, skip a bad file
+//! with a warning, slug a name on save, write atomically. Nothing is read at
+//! startup; callers invoke [`load`] on demand, so saved queries cost the budget
+//! nothing at idle.
+//!
+//! A saved query is the strongest grounding RED has: one a human named, kept, and
+//! reruns is a *verified* query, so the assistant reads them back
+//! (`list_saved_queries` / `read_saved_query`) rather than inventing a fourth
+//! definition of a metric the user already settled.
 
 use std::path::PathBuf;
 
@@ -20,21 +24,16 @@ use anyhow::{Context, Result};
 /// One saved query: its display name, optional metadata, the **full** file body
 /// (runnable verbatim, header included), and the file backing it.
 #[derive(Clone, Debug)]
-pub(crate) struct SavedQuery {
+pub struct SavedQuery {
     /// The header `name:` if present, else the un-slugged filename stem.
     pub name: String,
     /// The header `description:`, shown as a hint in the picker.
     pub description: Option<String>,
     /// The header `tags:` (comma-separated), retained for a future filter.
-    #[allow(
-        dead_code,
-        reason = "parsed and retained for a planned saved-query filter"
-    )]
     pub tags: Vec<String>,
     /// The complete file contents: what drops into the editor, runnable as-is.
     pub sql: String,
     /// The backing `.sql` file, for a future rename / delete.
-    #[allow(dead_code, reason = "retained for a planned saved-query rename/delete")]
     pub path: PathBuf,
 }
 
@@ -47,7 +46,7 @@ fn queries_dir() -> Option<PathBuf> {
 /// warning) any that won't read, so one bad file never blocks the others. Sorted by
 /// name (case-insensitive) for a stable picker order. A missing dir is an empty
 /// list, never an error.
-pub(crate) fn load() -> Vec<SavedQuery> {
+pub fn load() -> Vec<SavedQuery> {
     let Some(dir) = queries_dir() else {
         return Vec::new();
     };
@@ -78,7 +77,7 @@ pub(crate) fn load() -> Vec<SavedQuery> {
 /// over the body, atomically (temp file + rename) so a crash can't leave a partial
 /// file. The file stem is a slug of the name, so re-saving the same name overwrites
 /// in place.
-pub(crate) fn save(name: &str, description: Option<&str>, sql: &str) -> Result<PathBuf> {
+pub fn save(name: &str, description: Option<&str>, sql: &str) -> Result<PathBuf> {
     use std::io::Write;
 
     let dir = queries_dir().context("no config directory for saved queries")?;
@@ -185,8 +184,12 @@ fn strip_managed_header(sql: &str) -> String {
 }
 
 /// A filesystem-safe stem for a query name: lowercased, non-alphanumerics folded
-/// to `-`, edges trimmed. Mirrors `theme.rs`'s `slug`.
-fn slug(name: &str) -> String {
+/// to `-`, edges trimmed.
+///
+/// Public because it is also the *lookup* key: the assistant's `read_saved_query`
+/// slugs whatever name the model produced and matches on that, so it doesn't have
+/// to reproduce capitalization or punctuation exactly.
+pub fn slug(name: &str) -> String {
     let s: String = name
         .chars()
         .map(|c| {

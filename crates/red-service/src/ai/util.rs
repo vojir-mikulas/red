@@ -79,10 +79,14 @@ pub(in crate::ai) fn fmt_bytes(n: u64) -> String {
     }
 }
 /// Append the grounding footer every seam's system prompt shares: the live
-/// connection line and, when set, the read-only notice. One place so the footer
-/// can't drift per seam; the seam passes its already-built body and its own
-/// read-only wording (SQL names the blocked ops; KV/doc keep it terse). SQL's
-/// schema overview is appended by its caller afterward, since only SQL has one.
+/// connection line, the read-only notice when set, and the connection's knowledge
+/// file when the user has written one. One place so the footer can't drift per
+/// seam; the seam passes its already-built body and its own read-only wording (SQL
+/// names the blocked ops; KV/doc keep it terse). SQL's schema overview is appended
+/// by its caller afterward, since only SQL has one — which is what puts the
+/// knowledge file **before** the schema, the order it has to be read in: it
+/// overrides inference, so the model should have it in hand before the structure
+/// it is meant to override.
 pub(in crate::ai) fn finish_system_prompt(
     mut body: String,
     ctx: &AiContext,
@@ -95,8 +99,20 @@ pub(in crate::ai) fn finish_system_prompt(
         body.push('\n');
         body.push_str(read_only_note);
     }
+    if let Some(knowledge) = ctx.knowledge.as_deref().filter(|k| !k.trim().is_empty()) {
+        body.push_str(KNOWLEDGE_HEADING);
+        body.push_str(knowledge.trim());
+    }
     body
 }
+/// The heading the knowledge file is introduced under. It tells the model how to
+/// weigh the file rather than just handing it over: prefer it over inference, and
+/// surface a contradiction with the live schema instead of silently picking a
+/// side — an unreviewed line in a knowledge file is a guess laundered into
+/// something the prompt presents as authoritative.
+const KNOWLEDGE_HEADING: &str = "\n\nWhat the user has told us about this database \
+    (authoritative - prefer this over your own inference; if it contradicts the schema, \
+    say so rather than silently picking one):\n\n";
 
 #[cfg(test)]
 mod tests {
@@ -113,6 +129,30 @@ mod tests {
         let capped = cap_result_bytes("ééééé".into(), 5);
         assert!(capped.starts_with("éé")); // 4 bytes ≤ 5; the 3rd 'é' would cross it
         assert!(capped.contains("result truncated"));
+    }
+
+    #[test]
+    fn knowledge_rides_the_footer_under_a_heading_that_ranks_it() {
+        let ctx = AiContext {
+            connection: "postgres database \"acme\"".into(),
+            knowledge: Some("MRR is in cents.".into()),
+            ..AiContext::default()
+        };
+        let prompt = finish_system_prompt("Tools: run_select.".into(), &ctx, "READ-ONLY.");
+        // The heading has to come with it: handed over bare, the file reads as
+        // just more context rather than as the thing that overrides inference.
+        assert!(prompt.contains("authoritative"));
+        assert!(prompt.contains("MRR is in cents."));
+        // After the connection line, so the seam's own body is never split.
+        assert!(prompt.find("Connected to:") < prompt.find("MRR is in cents."));
+        // Nothing written, nothing added: no empty heading in the prompt.
+        let empty = finish_system_prompt("Tools: run_select.".into(), &AiContext::default(), "ro");
+        assert!(!empty.contains("authoritative"));
+        let blank = AiContext {
+            knowledge: Some("   \n".into()),
+            ..AiContext::default()
+        };
+        assert!(!finish_system_prompt("t".into(), &blank, "ro").contains("authoritative"));
     }
 
     #[test]

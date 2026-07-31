@@ -2388,6 +2388,17 @@ mod tests {
         };
     }
 
+    /// ClickHouse has no multi-statement transactions, so the sandbox is not
+    /// merely unimplemented here - it is *unavailable*, and the driver has to say
+    /// so rather than hand back a handle that would apply every write the moment
+    /// it ran. Both halves are asserted: the capability answer and the refusal.
+    #[tokio::test]
+    async fn has_no_sandbox() {
+        let url = url_or_skip!();
+        let driver = ClickhouseDriver::connect(&url, true).await.unwrap();
+        battery::no_sandbox_when_unsupported(&driver).await;
+    }
+
     /// A unique fixture-name suffix so concurrent tests don't collide on a shared
     /// server.
     fn tag(name: &str) -> String {

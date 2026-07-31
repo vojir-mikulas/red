@@ -11,33 +11,32 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use red_ai::CancelToken;
-use red_core::sql::Dialect;
 use red_core::{AiPolicy, RedError};
-use red_driver::{AbortSignal, DatabaseDriver, PageCap};
+use red_driver::{AbortSignal, DatabaseDriver};
 use serde_json::Value as Json;
 
 use super::export::export_result;
 use super::gate::changeset_statements;
 use super::gate::{WriteAssessment, assess_write, is_read_only_select};
+use super::grounding::{run_list_saved_queries, run_read_saved_query, run_search_history};
+use super::knowledge::run_save_knowledge;
 use super::report::run_generate_report;
 use super::state::ReportSink;
 use super::util::{cap_result_bytes, guard_timeout};
 use diff::{diff_data, diff_schema};
-use format::{
-    format_health, format_page, format_plan, format_schema, format_sessions, format_table_detail,
-};
+use format::{format_health, format_plan, format_schema, format_sessions, format_table_detail};
 use tools::{
     index_args, kill_session, profile_table, relationship_map, search_data, suggest_index,
 };
 
 pub(super) mod catalog;
 pub(super) mod diff;
-pub(super) mod format;
+pub(in crate::ai) mod format;
 pub(super) mod tools;
 
 pub(in crate::ai) async fn run_tool(
     driver: &Arc<dyn DatabaseDriver>,
-    dialect: Dialect,
+    conn: super::ConnCtx<'_>,
     name: &str,
     input: &Json,
     policy: &AiPolicy,
@@ -53,6 +52,12 @@ pub(in crate::ai) async fn run_tool(
         );
     }
     let limits = &policy.limits;
+    let super::ConnCtx {
+        conn_id,
+        dialect,
+        ref sandbox,
+        ..
+    } = conn;
     let (content, ok) = match name {
         "list_schema" => match driver.list_objects().await {
             Ok(schemas) => (format_schema(&schemas), true),
@@ -95,34 +100,72 @@ pub(in crate::ai) async fn run_tool(
                 .and_then(Json::as_u64)
                 .map(|n| n as usize);
             let limit = requested.unwrap_or(max_rows).clamp(1, max_rows);
-            let abort = AbortSignal::new();
-            // Fetch one extra row so a result that's exactly `limit` long (complete)
-            // is told apart from one that genuinely has more rows (truncated). The
-            // probe row is dropped before the page is shown to the model.
-            let probe = limit.saturating_add(1);
-            let fetch = driver.fetch_page(sql, 0, probe, PageCap::Display { key: None }, &abort);
-            match guard_timeout(limits.statement_timeout_ms, &abort, fetch).await {
-                Ok(mut page) => {
-                    let truncated = page.rows.len() > limit;
-                    page.rows.truncate(limit);
-                    let mut out = format_page(&page);
-                    if truncated {
-                        out.push_str(&format!(
-                            "\n(truncated to {limit} rows: the result may have more; add LIMIT or \
-                            a WHERE clause to narrow it)"
-                        ));
+            // Open a *cursor* rather than a one-shot page: what does not fit this
+            // window stays readable through `fetch_more` instead of being
+            // truncated away. This is the same streaming seam the grid uses, which
+            // is the whole reason a large result is answerable at all.
+            let opened = driver.open_cursor(
+                sql,
+                red_core::QueryOptions {
+                    window: limit.max(1),
+                    ..Default::default()
+                },
+            );
+            let cursor =
+                match guard_timeout(limits.statement_timeout_ms, &AbortSignal::new(), opened).await
+                {
+                    Ok(cursor) => cursor,
+                    Err(RedError::Timeout) => {
+                        return (
+                            "error: the query exceeded the agent's statement timeout, so it was \
+                         cancelled. Narrow it (add WHERE/LIMIT) or inspect the plan with explain."
+                                .into(),
+                            false,
+                        );
                     }
-                    (out, true)
+                    Err(e) => return (format!("error: {e}"), false),
+                };
+            let columns = cursor.columns().to_vec();
+            let mut entry = crate::ai::cursors::AgentCursor {
+                conversation_id: conn.conversation_id,
+                cursor,
+                columns,
+                rows_read: 0,
+                last_used: std::time::Instant::now(),
+                sql: sql.to_string(),
+            };
+            let row_cap = (limits.max_rows.max(1) as u64)
+                .saturating_mul(crate::ai::cursors::ROWS_PER_CURSOR_FACTOR);
+            let filled = crate::ai::cursors::fill_window(
+                &mut entry,
+                limit,
+                limits.max_result_bytes,
+                row_cap,
+            )
+            .await;
+            let window = match filled {
+                Ok(w) => w,
+                Err(RedError::Timeout) => {
+                    return (
+                        "error: the query exceeded the agent's statement timeout, so it was \
+                         cancelled. Narrow it (add WHERE/LIMIT) or inspect the plan with explain."
+                            .into(),
+                        false,
+                    );
                 }
-                Err(RedError::Timeout) => (
-                    "error: the query exceeded the agent's statement timeout, so it was \
-                    cancelled. Narrow it (add WHERE/LIMIT) or inspect the plan with explain."
-                        .into(),
-                    false,
-                ),
-                Err(e) => (format!("error: {e}"), false),
+                Err(e) => return (format!("error: {e}"), false),
+            };
+            let mut out = crate::ai::shape::static_notes(sql, dialect, true);
+            if sandbox.is_none() {
+                out.push_str(&crate::ai::shape::fanout_note(driver, sql, dialect, limits).await);
             }
+            out.push_str(&window.text);
+            out.push_str(&crate::ai::cursors::continuation(
+                &window, entry, conn.state,
+            ));
+            (out, true)
         }
+        "fetch_more" => crate::ai::cursors::fetch_more(input, limits, conn.state).await,
         "explain" => {
             let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
             if sql.is_empty() {
@@ -162,7 +205,17 @@ pub(in crate::ai) async fn run_tool(
                     .unwrap_or(Err(RedError::Timeout)),
             };
             match result {
-                Ok(plan) => (format_plan(&plan), true),
+                // The plan tells the model how the query will *run*; the shape
+                // check tells it whether the query asks what it meant to ask.
+                // Both are worth having in front of the same answer.
+                Ok(plan) => (
+                    format!(
+                        "{}{}",
+                        crate::ai::shape::static_notes(sql, dialect, true),
+                        format_plan(&plan)
+                    ),
+                    true,
+                ),
                 Err(RedError::Timeout) => (
                     "error: the EXPLAIN exceeded the agent's statement timeout; \
                      simplify the statement."
@@ -220,6 +273,12 @@ pub(in crate::ai) async fn run_tool(
         },
         "export_result" => export_result(driver, dialect, input, report).await,
         "generate_report" => run_generate_report(input, report),
+        "save_knowledge" => run_save_knowledge(input, report),
+        // Grounding in what the user already did. No driver call at all: these
+        // read the app's own stores, so they cost the database nothing.
+        "search_query_history" => run_search_history(conn_id, dialect, input, limits),
+        "list_saved_queries" => run_list_saved_queries(limits),
+        "read_saved_query" => run_read_saved_query(input, limits),
         "open_query" => {
             let sql = input.get("sql").and_then(Json::as_str).unwrap_or("").trim();
             if sql.is_empty() {
@@ -228,8 +287,18 @@ pub(in crate::ai) async fn run_tool(
             // Hand the SQL to the UI, which opens a new query tab (and runs it if it's
             // a read-only SELECT). Nothing executes here.
             report.announce_open_query(sql);
+            // Not `bounded`: this statement runs in the user's grid, where nothing
+            // clamps it, so a missing LIMIT is a real note rather than a formality.
+            let notes = crate::ai::shape::static_notes(sql, dialect, false);
             (
-                "Opened the query in a new editor tab in the user's workspace.".into(),
+                format!(
+                    "{notes}Opened the query in a new editor tab in the user's workspace.{}",
+                    if notes.is_empty() {
+                        ""
+                    } else {
+                        " Mention the shape check above to the user."
+                    }
+                ),
                 true,
             )
         }
@@ -254,8 +323,18 @@ pub(in crate::ai) async fn run_tool(
             // Hand it to the UI, which writes the `.sql` file into the saved-queries
             // library. Nothing executes here.
             report.announce_save_query(name, description, sql);
+            // A saved query gets rerun, so a wrong one compounds every time.
+            let notes = crate::ai::shape::static_notes(sql, dialect, false);
             (
-                format!("Saved the query as “{name}” to the user's saved-queries library."),
+                format!(
+                    "{notes}Saved the query as “{name}” to the user's saved-queries \
+                     library.{}",
+                    if notes.is_empty() {
+                        ""
+                    } else {
+                        " A saved query gets rerun, so tell the user about the shape check above."
+                    }
+                ),
                 true,
             )
         }
@@ -279,20 +358,40 @@ pub(in crate::ai) async fn run_tool(
             // already gated it. By here the per-call user approval has been granted
             // (run_turn / the ACP permission flow); we only *run* an allowed shape.
             match assess_write(name, input, policy, dialect) {
-                WriteAssessment::NeedsApproval { sql } => match driver.execute(&sql).await {
-                    Ok(affected) => {
-                        // Durable record of what the agent actually changed.
-                        crate::audit::record_write(&sql, affected);
-                        (
-                            format!(
-                                "Executed the write: {affected} row(s) affected. Verify with a \
-                                 SELECT if it matters."
-                            ),
-                            true,
-                        )
+                WriteAssessment::NeedsApproval { sql } => {
+                    // In a sandbox the statement runs on the transaction's own
+                    // connection and nothing is durable until the user commits, so
+                    // the result says so: an agent told "done" would go on to
+                    // report a change that may never land.
+                    let ran = match &sandbox {
+                        Some(sandbox) => sandbox.execute(&sql, &AbortSignal::new()).await,
+                        None => driver.execute(&sql).await,
+                    };
+                    match ran {
+                        Ok(affected) => {
+                            // Durable record of what the agent actually changed.
+                            // Sandbox writes are audited too: they *ran*, and the
+                            // audit log is a record of what was attempted against
+                            // the database, not only of what survived.
+                            crate::audit::record_write(&sql, affected);
+                            let msg = if sandbox.is_some() {
+                                format!(
+                                    "Ran the write inside the review transaction: {affected} \
+                                     row(s) affected. NOTHING IS COMMITTED yet - the user \
+                                     reviews every change at the end of this turn and can roll \
+                                     it all back. Do not tell them it is done."
+                                )
+                            } else {
+                                format!(
+                                    "Executed the write: {affected} row(s) affected. Verify with \
+                                     a SELECT if it matters."
+                                )
+                            };
+                            (msg, true)
+                        }
+                        Err(e) => (format!("error: the write failed: {e}"), false),
                     }
-                    Err(e) => (format!("error: the write failed: {e}"), false),
-                },
+                }
                 WriteAssessment::Reject(why) => (format!("error: {why}"), false),
                 WriteAssessment::NotWrite => (
                     "error: propose_write needs an INSERT/UPDATE/DELETE statement".into(),
@@ -308,21 +407,55 @@ pub(in crate::ai) async fn run_tool(
             match assess_write(name, input, policy, dialect) {
                 WriteAssessment::NeedsApproval { .. } => {
                     let statements = changeset_statements(input);
-                    match driver.execute_batch(&statements).await {
+                    // The sandbox *is* the transaction, so the statements run in it
+                    // one by one rather than opening a nested one; the whole set
+                    // still lands or is rolled back together, just under the user's
+                    // control instead of the driver's. A mid-set failure leaves the
+                    // earlier statements in the sandbox, which the review card shows
+                    // and the user can roll back.
+                    let ran = match &sandbox {
+                        Some(sandbox) => {
+                            let mut affected = Vec::with_capacity(statements.len());
+                            let mut failed = None;
+                            for stmt in &statements {
+                                match sandbox.execute(stmt, &AbortSignal::new()).await {
+                                    Ok(n) => affected.push(n),
+                                    Err(e) => {
+                                        failed = Some(e);
+                                        break;
+                                    }
+                                }
+                            }
+                            match failed {
+                                Some(e) => Err(e),
+                                None => Ok(affected),
+                            }
+                        }
+                        None => driver.execute_batch(&statements).await,
+                    };
+                    match ran {
                         Ok(affected) => {
                             // Audit each executed statement with its own row count.
                             for (stmt, rows) in statements.iter().zip(&affected) {
                                 crate::audit::record_write(stmt, *rows);
                             }
                             let total: u64 = affected.iter().sum();
-                            (
+                            let msg = if sandbox.is_some() {
+                                format!(
+                                    "Ran the changeset inside the review transaction: {} \
+                                     statement(s), {total} row(s) affected. NOTHING IS COMMITTED \
+                                     yet - the user reviews it at the end of this turn and can \
+                                     roll it all back. Do not tell them it is done.",
+                                    statements.len()
+                                )
+                            } else {
                                 format!(
                                     "Executed the changeset: {} statement(s), {total} row(s) \
                                      affected. Verify with a SELECT if it matters.",
                                     statements.len()
-                                ),
-                                true,
-                            )
+                                )
+                            };
+                            (msg, true)
                         }
                         Err(e) => (
                             format!(
@@ -353,6 +486,9 @@ pub(crate) use catalog::user_turn;
 mod tests {
     use super::*;
     use crate::Event;
+    use crate::ai::ConnCtx;
+    use red_core::sql::Dialect;
+    use red_driver::PageCap;
 
     use crate::ai::state::ReportSink;
     use crate::protocol::ConversationId;
@@ -397,7 +533,15 @@ mod tests {
         // Success: both statements commit together.
         let (content, ok) = run_tool(
             &driver,
-            Dialect::Sqlite,
+            ConnCtx {
+                conn_id: "",
+                dialect: Dialect::Sqlite,
+                conversation_id: crate::protocol::ConversationId::new(1),
+                state: &std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::ai::state::AiState::default(),
+                )),
+                sandbox: None,
+            },
             "propose_changeset",
             &json!({ "statements": [
                 "UPDATE t SET n = 20 WHERE id = 1",
@@ -415,7 +559,15 @@ mod tests {
         // back — the first UPDATE must NOT stick (n stays 20, not 99).
         let (content, ok) = run_tool(
             &driver,
-            Dialect::Sqlite,
+            ConnCtx {
+                conn_id: "",
+                dialect: Dialect::Sqlite,
+                conversation_id: crate::protocol::ConversationId::new(1),
+                state: &std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::ai::state::AiState::default(),
+                )),
+                sandbox: None,
+            },
             "propose_changeset",
             &json!({ "statements": [
                 "UPDATE t SET n = 99 WHERE id = 1",
@@ -451,7 +603,15 @@ mod tests {
         let explain = async |sql: &str, analyze: bool, dialect: Dialect| {
             run_tool(
                 &driver,
-                dialect,
+                ConnCtx {
+                    conn_id: "",
+                    dialect,
+                    conversation_id: crate::protocol::ConversationId::new(1),
+                    state: &std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::ai::state::AiState::default(),
+                    )),
+                    sandbox: None,
+                },
                 "explain",
                 &json!({ "sql": sql, "analyze": analyze }),
                 &AiPolicy::default(),
@@ -503,7 +663,15 @@ mod tests {
         let ddl = async |name: &str, kind: Json| {
             run_tool(
                 &driver,
-                Dialect::Sqlite,
+                ConnCtx {
+                    conn_id: "",
+                    dialect: Dialect::Sqlite,
+                    conversation_id: crate::protocol::ConversationId::new(1),
+                    state: &std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::ai::state::AiState::default(),
+                    )),
+                    sandbox: None,
+                },
                 "object_ddl",
                 &json!({ "schema": "main", "name": name, "kind": kind }),
                 &AiPolicy::default(),
@@ -534,7 +702,15 @@ mod tests {
 
         let (content, ok) = run_tool(
             &driver,
-            Dialect::Sqlite,
+            ConnCtx {
+                conn_id: "",
+                dialect: Dialect::Sqlite,
+                conversation_id: crate::protocol::ConversationId::new(1),
+                state: &std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::ai::state::AiState::default(),
+                )),
+                sandbox: None,
+            },
             "save_query",
             &json!({
                 "name": "Monthly revenue",
@@ -567,7 +743,15 @@ mod tests {
         // Missing name or sql is refused, and nothing is announced.
         let (_content, ok) = run_tool(
             &driver,
-            Dialect::Sqlite,
+            ConnCtx {
+                conn_id: "",
+                dialect: Dialect::Sqlite,
+                conversation_id: crate::protocol::ConversationId::new(1),
+                state: &std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::ai::state::AiState::default(),
+                )),
+                sandbox: None,
+            },
             "save_query",
             &json!({ "name": "", "sql": "SELECT 1" }),
             &AiPolicy::default(),

@@ -969,6 +969,20 @@ pub enum Command {
         agent: String,
         message: String,
         context: AiContext,
+        /// Run this turn's writes inside one uncommitted transaction the user
+        /// reviews at the end, instead of approving each statement as it comes.
+        ///
+        /// Chosen per conversation. The service still refuses it where it cannot
+        /// be honoured (engine without transactions, read-only connection, tier
+        /// below `write`, another chat already holding this session's sandbox);
+        /// the UI only offers it, it does not get to assert it.
+        sandbox: bool,
+    },
+    /// Commit or roll back the sandbox transaction this conversation opened.
+    /// A conversation with no open sandbox is a no-op (it may have expired).
+    AiSandboxResolve {
+        conversation_id: ConversationId,
+        commit: bool,
     },
     /// List the AI tool catalog for the envelope's session (the headless
     /// `red mcp` stdio server's `tools/list`). Resolves the session's driver +
@@ -1833,6 +1847,10 @@ pub enum Event {
         request_id: RequestId,
         title: String,
         detail: Option<String>,
+        /// What the write would touch, when it could be previewed. `None` means the
+        /// preview was skipped, unavailable, or timed out; the prompt still shows,
+        /// just without a count. **Never read `None` as "affects nothing".**
+        preview: Option<WritePreview>,
     },
     /// A `generate_report` tool produced a standalone HTML report at `path`; the UI
     /// surfaces it as a card in the originating conversation (with an "Open" button)
@@ -1858,6 +1876,43 @@ pub enum Event {
         name: String,
         description: Option<String>,
         sql: String,
+    },
+    /// The turn finished with writes sitting in an **uncommitted** transaction.
+    /// Nothing is durable yet: the panel shows the log and the user answers with
+    /// [`Command::AiSandboxResolve`]. Sent instead of `AiTurnFinished`, which
+    /// follows once the sandbox resolves.
+    AiSandboxReady {
+        conversation_id: ConversationId,
+        statements: Vec<SandboxEntry>,
+        total_rows: u64,
+        /// Seconds left before the sandbox rolls itself back, so the card can
+        /// count down rather than expiring in the user's face.
+        expires_in_secs: u64,
+    },
+    /// The sandbox was resolved: committed (`committed = true`) or rolled back.
+    /// Follows either the user's answer or an expiry.
+    AiSandboxResolved {
+        conversation_id: ConversationId,
+        committed: bool,
+        rows: u64,
+        /// Set when the resolve itself failed (a commit that the engine refused).
+        /// The transaction is gone either way; this says what happened to it.
+        error: Option<String>,
+    },
+    /// The sandbox hit its deadline and was rolled back without the user
+    /// answering. An open transaction holds locks, so waiting forever is not an
+    /// option and committing unasked is unthinkable.
+    AiSandboxExpired {
+        conversation_id: ConversationId,
+    },
+    /// The agent drafted a knowledge file for this connection (`save_knowledge`).
+    /// The UI opens `body` in the knowledge editor **for review**; nothing is
+    /// written until the user saves. Deliberately not a write: whatever ends up in
+    /// that file is handed to every later turn as authoritative, so an inferred
+    /// draft must pass a human first.
+    AiKnowledgeDraft {
+        conversation_id: ConversationId,
+        body: String,
     },
     /// The subscription agent advertised its slash commands (after its session
     /// opened). Scoped to the conversation; the panel stores them so the composer's
@@ -1977,6 +2032,15 @@ pub struct AiConfig {
     /// The global resource guards (`[ai.limits]`): row cap, statement
     /// timeout, result byte cap, and per-conversation tool-call budget.
     pub limits: AiLimits,
+    /// Count the rows an agent write would affect and show them with the approval
+    /// prompt (`[ai] preview_writes`). On by default; off is for a slow link,
+    /// where the extra round-trips before every prompt cost more than the number
+    /// is worth.
+    pub preview_writes: bool,
+    /// How long a sandbox transaction may sit unresolved before RED rolls it back
+    /// (`[ai] sandbox_timeout_secs`). An open transaction holds locks, so a user
+    /// who walks away mid-review can block production writes.
+    pub sandbox_timeout_secs: u64,
 }
 
 /// What's on screen when the user sends a turn, assembled by the UI (it knows the
@@ -1988,6 +2052,33 @@ pub struct AiContext {
     /// pulls full detail on demand via the `describe_table` tool, so this stays
     /// small even for large databases.
     pub schema_summary: String,
+    /// The stable id of the saved connection this turn runs against
+    /// (`StoredConnection::id`), the key both the query history and the
+    /// recently-viewed-keys store are filed under.
+    ///
+    /// The service has no notion of a connection *id* (a session knows its driver,
+    /// its engine, and its read-only posture, but not which saved entry dialled
+    /// it), so the retrieval tools get it from here. Empty on any path with no
+    /// app-side connection identity, which is what makes those tools refuse rather
+    /// than quietly return another connection's statements.
+    pub conn_id: String,
+    /// The connection's knowledge file (`<config>/red/knowledge/<id>.md`), if the
+    /// user has written one: the glossary, metric definitions, join rules, and
+    /// gotchas that `information_schema` cannot carry.
+    ///
+    /// Stable across a conversation, so it rides in the **system prompt** beside
+    /// `schema_summary` rather than in the per-turn user message. That placement is
+    /// the point: both sit inside the `cache_control: ephemeral` prefix, so the file
+    /// costs one cache write per conversation instead of a re-read every turn.
+    pub knowledge: Option<String>,
+    /// The turn's still-open result cursors, when any survived the last one.
+    ///
+    /// Filled by the **service**, not the UI, unlike every other field here: the
+    /// registry that knows is on the service thread. It rides in `AiContext`
+    /// because the destination is the same (the per-turn user message), and adding
+    /// a second channel for one line would be worse than the small asymmetry.
+    #[doc(hidden)]
+    pub open_cursors: Option<String>,
     /// The currently-viewed tab, so the user can refer to it ("this tab", "the
     /// current query/result"): its name and, at `read` tier, a one-line shape of
     /// the result on screen (row/column counts + column names). The SQL itself rides
@@ -2022,6 +2113,51 @@ pub struct AiContext {
     /// fills it from the user's setting; the directory is created on demand and, if it
     /// can't be used, the report still lands in the temp dir rather than failing.
     pub report_dir: Option<PathBuf>,
+}
+
+/// One statement a sandbox transaction has run but not committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SandboxEntry {
+    pub sql: String,
+    pub rows: u64,
+}
+
+/// What an approved write would actually touch, shown with the approval prompt.
+///
+/// The prompt used to carry the SQL and nothing else, which asks the user to
+/// mentally execute a `WHERE` clause against a database they cannot see. This is
+/// the number that turns the question into one somebody can answer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WritePreview {
+    /// One entry per previewed statement, in the order the prompt lists them: a
+    /// single entry for `propose_write`, up to a cap for a changeset.
+    pub statements: Vec<StatementPreview>,
+    /// How many statements past the cap were listed without a count, so the panel
+    /// can say so rather than implying the rest affect nothing.
+    pub not_previewed: usize,
+}
+
+/// One statement's affected-row preview.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatementPreview {
+    /// The table the statement targets, as written.
+    pub table: String,
+    /// Rows the predicate matches. **`None` is "could not count", never "zero"** -
+    /// a timed-out or unsupported preview must not read as reassuring. `Some(0)`
+    /// is the genuinely alarming case: a write that matches nothing is nearly
+    /// always a wrong predicate.
+    pub matches: Option<u64>,
+    /// The table's total row count, for the "of N" clause. Optional because a bare
+    /// `count(*)` on a huge table is exactly the query the read tools already
+    /// guard against; it is dropped rather than waited on.
+    pub total: Option<u64>,
+    /// Column names of the sample rows.
+    pub columns: Vec<String>,
+    /// A few matched rows, already rendered and cell-capped. **For the user only**:
+    /// these never enter the model's context.
+    pub sample: Vec<Vec<String>>,
+    /// Why there is no count, when there isn't (timed out, shape not previewable).
+    pub note: Option<String>,
 }
 
 /// A snapshot of the active theme's colors as CSS color strings, handed to the
@@ -2073,6 +2209,9 @@ pub enum AiDelta {
         parent: Option<ActivityId>,
         kind: ActivityKind,
         status: ActivityStatus,
+        /// The node's per-turn source number when it produced citable data; see
+        /// [`ActivityNode::source_ordinal`](red_core::ActivityNode::source_ordinal).
+        source_ordinal: Option<u32>,
     },
     /// An open activity node changed state and/or gained a one-line result summary,
     /// matched by `id` anywhere in the tree. `status` is `None` for a detail-only

@@ -418,14 +418,14 @@ pub struct AppState {
     pub(crate) palette_prompt: PromptKind,
     /// The saved queries shown by the open picker, held only while it's open so an
     /// activation can resolve its index. Loaded on demand, never at startup.
-    pub(crate) saved_queries: Vec<crate::queries::SavedQuery>,
+    pub(crate) saved_queries: Vec<red_config::queries::SavedQuery>,
     /// The saved conversations shown by the open history picker, held only
     /// while it's open so an activation can resolve its index. Loaded on demand.
     pub(crate) loaded_conversations: Vec<crate::conversations::Conversation>,
     /// The persistent query-history log, centralized across all connections and
     /// loaded once at startup. Each entry is connection-scoped; the run-bar
     /// popover filters to the active connection's `conn_id`.
-    pub(crate) query_history: crate::history::QueryHistory,
+    pub(crate) query_history: red_config::history::QueryHistory,
     /// Persisted per-connection Redis keyspace-analysis reports (see
     /// `redis_analysis.rs`), loaded once at startup. Keyed by `conn_id`, so a
     /// saved report survives a restart and is shown when the Analysis panel
@@ -440,7 +440,7 @@ pub struct AppState {
     /// Persisted per-connection "recently viewed keys" (see `recent_keys.rs`),
     /// loaded once at startup and seeded into a Redis view when it connects, so
     /// the inspector's browsing history survives a restart.
-    pub(crate) redis_recent_keys: crate::recent_keys::RecentKeysStore,
+    pub(crate) redis_recent_keys: red_config::recent_keys::RecentKeysStore,
     /// Per-key annotations (favorite / note / tags) for the Redis browser,
     /// persisted per connection (see `key_meta.rs`).
     pub(crate) redis_key_meta: crate::key_meta::KeyMetaStore,
@@ -486,6 +486,10 @@ pub struct AppState {
     /// DBGate), scan, then choose which discovered connections to import. `None`
     /// when no import is in flight (see [`import_ui`]).
     pub(crate) import_wizard: Option<import_ui::ImportWizard>,
+    /// The "Database knowledge" editor while it's open: the connection's
+    /// `knowledge/<id>.md` in a markdown editor. `None` when it's closed. See
+    /// [`crate::knowledge_panel`].
+    pub(crate) knowledge_editor: Option<crate::knowledge_panel::KnowledgeEditor>,
     /// Set in [`Self::new`] when this build's version differs from the last one
     /// recorded: the version to announce in a one-shot "RED updated to X" toast,
     /// raised on the first render. `None` on a first-ever launch or an unchanged
@@ -602,6 +606,8 @@ pub(crate) fn ai_config(settings: &Settings) -> red_service::AiConfig {
         // it on the backend. The tier string parses leniently (a typo → `read`).
         enabled: settings.ai.enabled,
         tier: red_service::AiTier::parse(&settings.ai.tier),
+        preview_writes: settings.ai.preview_writes,
+        sandbox_timeout_secs: settings.ai.sandbox_timeout_secs,
         limits: red_service::AiLimits {
             max_rows: settings.ai.limits.max_rows,
             statement_timeout_ms: settings.ai.limits.statement_timeout_ms,
@@ -1288,11 +1294,11 @@ impl AppState {
             palette_prompt: PromptKind::GoToRow,
             saved_queries: Vec::new(),
             loaded_conversations: Vec::new(),
-            query_history: crate::history::QueryHistory::load(),
+            query_history: red_config::history::QueryHistory::load(),
             redis_analysis: crate::redis_analysis::AnalysisStore::load(),
             health_store: crate::health_store::HealthStore::load(),
             compare_schemas: Vec::new(),
-            redis_recent_keys: crate::recent_keys::RecentKeysStore::load(),
+            redis_recent_keys: red_config::recent_keys::RecentKeysStore::load(),
             redis_key_meta: crate::key_meta::KeyMetaStore::load(),
             local_state,
             switcher,
@@ -1306,6 +1312,7 @@ impl AppState {
             shortcuts_open: false,
             whats_new_open: false,
             import_wizard: None,
+            knowledge_editor: None,
             pending_update,
             connect_sel: 0,
             connect_search,
@@ -2148,7 +2155,15 @@ impl AppState {
                 request_id,
                 title,
                 detail,
-            } => self.on_ai_permission_request(conversation_id, request_id, title, detail, cx),
+                preview,
+            } => self.on_ai_permission_request(
+                conversation_id,
+                request_id,
+                title,
+                detail,
+                preview,
+                cx,
+            ),
             Event::AiReportReady {
                 conversation_id,
                 path,
@@ -2164,6 +2179,31 @@ impl AppState {
                 description,
                 sql,
             } => self.on_ai_save_query(conversation_id, name, description, sql, cx),
+            Event::AiKnowledgeDraft {
+                conversation_id,
+                body,
+            } => self.on_ai_knowledge_draft(conversation_id, body, cx),
+            Event::AiSandboxReady {
+                conversation_id,
+                statements,
+                total_rows,
+                expires_in_secs,
+            } => self.on_ai_sandbox_ready(
+                conversation_id,
+                statements,
+                total_rows,
+                expires_in_secs,
+                cx,
+            ),
+            Event::AiSandboxResolved {
+                conversation_id,
+                committed,
+                rows,
+                error,
+            } => self.on_ai_sandbox_resolved(conversation_id, committed, rows, error, cx),
+            Event::AiSandboxExpired { conversation_id } => {
+                self.on_ai_sandbox_expired(conversation_id, cx)
+            }
             Event::AiCommandsAvailable {
                 conversation_id,
                 commands,
@@ -2451,6 +2491,7 @@ impl AppState {
             || self.settings_open
             || self.form.is_some()
             || self.import_wizard.is_some()
+            || self.knowledge_editor.is_some()
             || self.kv_create_key_open()
             || self.kv_import_open()
     }

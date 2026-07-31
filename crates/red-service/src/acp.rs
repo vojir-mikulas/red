@@ -349,6 +349,9 @@ impl AcpManager {
 pub(crate) async fn run_turn(
     manager: Arc<tokio::sync::Mutex<AcpManager>>,
     backend: AiBackend,
+    // Shared with the API-key path: the grounding server hosts the same tools and
+    // files its cursors in the same registry.
+    ai_state: Arc<std::sync::Mutex<crate::ai::AiState>>,
     command: String,
     cwd: PathBuf,
     events: Events,
@@ -362,6 +365,8 @@ pub(crate) async fn run_turn(
     let (agent, first_turn) = match ensure_conversation(
         &manager,
         backend.clone(),
+        context.conn_id.clone(),
+        ai_state.clone(),
         command,
         cwd,
         events.clone(),
@@ -418,6 +423,11 @@ pub(crate) async fn run_turn(
                         parent,
                         kind,
                         status,
+                        // The external agent's tool calls come back through ACP
+                        // with no result text of RED's own, so there is nothing to
+                        // label `[source N]` and nothing for a citation to resolve
+                        // to. Provenance is an API-key-path feature for now.
+                        source_ordinal: None,
                     },
                     AcpDelta::ActivityUpdated { id, status, detail } => {
                         AiDelta::ActivityUpdated { id, status, detail }
@@ -661,6 +671,14 @@ pub(crate) async fn sign_out(
 async fn ensure_conversation(
     manager: &Arc<tokio::sync::Mutex<AcpManager>>,
     backend: AiBackend,
+    // Captured for the agent's lifetime alongside the policy: the grounding tools
+    // scope the query history by it. A settings/connection change takes effect on
+    // the next agent restart, same as the policy.
+    conn_id: String,
+    // The assistant's shared state: the MCP server hosts this session's tools, and
+    // a `run_select` there hands back a cursor the agent continues with
+    // `fetch_more` rather than truncating at the first window.
+    ai_state: Arc<std::sync::Mutex<crate::ai::AiState>>,
     command: String,
     cwd: PathBuf,
     events: Events,
@@ -702,9 +720,16 @@ async fn ensure_conversation(
         // UI (the subscription path never routes individual tool calls back through
         // `run_turn`). Built before `events` is moved into the permission relay.
         let report = ReportSink::new(events.clone(), session, conversation_id, theme, report_dir);
-        let mcp = McpServer::start(backend.clone(), policy, report)
-            .await
-            .map_err(|e| format!("could not start the DB tool server: {e}"))?;
+        let mcp = McpServer::start(
+            backend.clone(),
+            conn_id,
+            policy,
+            report,
+            ai_state,
+            conversation_id,
+        )
+        .await
+        .map_err(|e| format!("could not start the DB tool server: {e}"))?;
         let grounding = McpGrounding {
             name: MCP_SERVER_NAME.into(),
             url: mcp.url().to_string(),
@@ -823,6 +848,10 @@ async fn permission_relay(
                 request_id,
                 title,
                 detail,
+                // Nothing to preview here: this relays a prompt from an *external*
+                // agent for a tool RED didn't auto-allow, and the write tools are
+                // never advertised over this transport in the first place.
+                preview: None,
             },
         );
     }

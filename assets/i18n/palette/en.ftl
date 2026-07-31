@@ -92,6 +92,8 @@ palette-cmd_columns = view: toggle columns panel
 
 palette-cmd_health = connection: health report
 
+palette-cmd_knowledge = connection: database knowledge…
+
 palette-cmd_compare_schema = schema: compare against…
 
 palette-cmd_server_panel = view: toggle server panel
@@ -105,6 +107,8 @@ palette-cmd_disconnect = connection: disconnect
 palette-cmd_ai_new_chat = agent: new chat
 
 palette-cmd_ai_history = agent: conversation history…
+
+palette-cmd_ai_learn = agent: learn this database
 
 palette-cmd_ai_storage = agent: open conversation storage
 

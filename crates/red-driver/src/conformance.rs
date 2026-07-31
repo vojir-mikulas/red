@@ -1361,3 +1361,114 @@ pub(crate) async fn read_only_rejects_batch(
         "read-only connection must reject a batch edit"
     );
 }
+
+/// The sandbox contract, for an engine that claims [`DatabaseDriver::supports_sandbox`].
+///
+/// `table` is a `(id PK, name)` table holding a row with `id = 1`; `second` opens a
+/// **separate** connection to the same database, which is the only way to tell a
+/// real transaction from a convincing one — asking the sandbox itself whether its
+/// own write happened passes trivially either way.
+pub(crate) async fn sandbox_isolates_until_committed<F, Fut>(
+    driver: &dyn DatabaseDriver,
+    table: &str,
+    second: F,
+) where
+    F: Fn() -> Fut,
+    Fut: std::future::Future<Output = String>,
+{
+    assert!(driver.supports_sandbox(), "battery is for sandbox engines");
+    let abort = AbortSignal::new();
+
+    // --- rollback leaves nothing behind ---
+    let sandbox = driver
+        .begin_sandbox()
+        .await
+        .unwrap()
+        .expect("a sandbox engine opens one");
+    let affected = sandbox
+        .execute(
+            &format!("UPDATE {table} SET name = 'sandboxed' WHERE id = 1"),
+            &abort,
+        )
+        .await
+        .unwrap();
+    assert_eq!(affected, 1, "the write reports its affected rows");
+
+    // The property this whole feature rests on: a read *inside* the sandbox sees
+    // the uncommitted write. Without it an agent verifies against stale data and
+    // reports success for a change that isn't there.
+    let page = sandbox
+        .fetch_page(
+            &format!("SELECT name FROM {table} WHERE id = 1"),
+            10,
+            &abort,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        page.rows[0][0],
+        Value::Text("sandboxed".into()),
+        "a read inside the sandbox must see the sandbox's own uncommitted write"
+    );
+    // ...and a read from anywhere else must not.
+    assert_ne!(
+        second().await,
+        "sandboxed",
+        "an uncommitted write must be invisible outside the transaction"
+    );
+
+    sandbox.rollback().await.unwrap();
+    assert_ne!(
+        second().await,
+        "sandboxed",
+        "a rolled-back write must leave nothing behind"
+    );
+
+    // --- commit makes it durable ---
+    let sandbox = driver.begin_sandbox().await.unwrap().unwrap();
+    sandbox
+        .execute(
+            &format!("UPDATE {table} SET name = 'committed' WHERE id = 1"),
+            &abort,
+        )
+        .await
+        .unwrap();
+    sandbox.commit().await.unwrap();
+    assert_eq!(
+        second().await,
+        "committed",
+        "a committed write is visible from another connection"
+    );
+
+    // --- dropping without resolving rolls back ---
+    {
+        let sandbox = driver.begin_sandbox().await.unwrap().unwrap();
+        sandbox
+            .execute(
+                &format!("UPDATE {table} SET name = 'dropped' WHERE id = 1"),
+                &abort,
+            )
+            .await
+            .unwrap();
+        drop(sandbox);
+    }
+    // Give the connection teardown a moment to land (Postgres rolls back when the
+    // backend notices the client is gone).
+    tokio::time::sleep(Duration::from_millis(250)).await;
+    assert_ne!(
+        second().await,
+        "dropped",
+        "a sandbox dropped without commit/rollback must not apply its writes"
+    );
+}
+
+/// An engine that does not support sandboxes says so *and* refuses to open one.
+/// Both halves matter: a driver that answered `false` and then handed back a
+/// working-looking handle would be worse than one that never offered it.
+pub(crate) async fn no_sandbox_when_unsupported(driver: &dyn DatabaseDriver) {
+    assert!(!driver.supports_sandbox());
+    assert!(
+        driver.begin_sandbox().await.unwrap().is_none(),
+        "an engine without transactions must not hand back a sandbox"
+    );
+}

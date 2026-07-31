@@ -39,11 +39,15 @@ use crate::DbKind;
 
 pub mod preflight;
 pub mod risk;
+pub mod shape;
+pub mod target;
 
 pub use preflight::count_preflight;
 pub use risk::{
     Assessment, DANGEROUS_FNS, DropKind, MutateVerb, Risk, RiskLevel, WRITE_TOKENS, assess,
 };
+pub use shape::{JoinProbe, ShapeWarning, inspect, join_probe};
+pub use target::{WriteTarget, write_target};
 
 /// The lexical profile of an engine's SQL: which comment forms exist and how
 /// string escapes work. The scanner must match the engine byte for byte in both
@@ -459,6 +463,52 @@ fn word_end(b: &[u8], i: usize) -> usize {
         j += 1;
     }
     j
+}
+
+/// The byte offset of `word` as a whole-word token at paren depth 0, or `None`.
+///
+/// `haystack` must already be lower-cased and noise-stripped, so a keyword inside
+/// a literal or a comment cannot be found here.
+pub(super) fn top_level_word(haystack: &str, word: &str) -> Option<usize> {
+    let b = haystack.as_bytes();
+    let mut depth = 0i32;
+    let mut i = 0;
+    while i < b.len() {
+        match b[i] {
+            b'(' => {
+                depth += 1;
+                i += 1;
+            }
+            b')' => {
+                depth -= 1;
+                i += 1;
+            }
+            c if is_word_byte(c) => {
+                let end = word_end(b, i);
+                if depth == 0 && &haystack[i..end] == word {
+                    return Some(i);
+                }
+                i = end;
+            }
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Whether a `,` appears at paren depth 0, which is how a second table sneaks
+/// into an `UPDATE`/`DELETE` without a `JOIN` keyword.
+pub(super) fn has_top_level_comma(haystack: &str) -> bool {
+    let mut depth = 0i32;
+    for c in haystack.bytes() {
+        match c {
+            b'(' => depth += 1,
+            b')' => depth -= 1,
+            b',' if depth == 0 => return true,
+            _ => {}
+        }
+    }
+    false
 }
 
 /// The next word at or after `from` with the index just past it, skipping only

@@ -1744,6 +1744,60 @@ pub trait DatabaseDriver: Send + Sync {
         cancel: Arc<AtomicBool>,
         progress: UnboundedSender<u64>,
     ) -> Result<u64>;
+
+    /// Whether this engine can hold a multi-statement transaction open across
+    /// several calls and then commit or roll it back.
+    ///
+    /// Drives the agent sandbox. `false` means per-statement approval is the only
+    /// mode available on this engine, and the UI says so rather than silently
+    /// offering a promise it cannot keep. Defaults to `false` and is overridden
+    /// per engine, the same fail-closed posture as the write gate's allowlist:
+    /// a new driver is not sandbox-capable until someone implements it and says so.
+    fn supports_sandbox(&self) -> bool {
+        false
+    }
+
+    /// Check a connection out of the pool, open a transaction on it, and hand back
+    /// a handle that runs statements on **that** connection.
+    ///
+    /// `Ok(None)` when [`supports_sandbox`](Self::supports_sandbox) is false.
+    ///
+    /// The checkout is the whole point: a transaction is connection-affine, so
+    /// `BEGIN` on one pooled connection and `UPDATE` on another does nothing useful
+    /// and — worse — does something *plausible*. (RED has met this hazard before:
+    /// MySQL 8 leaks `USE` across pool reclaim while MariaDB doesn't, which is why
+    /// `rebind` exists. Pooled connections cannot carry session state implicitly.)
+    async fn begin_sandbox(&self) -> Result<Option<Box<dyn Sandbox>>> {
+        Ok(None)
+    }
+}
+
+/// An open, uncommitted transaction on a connection checked out of the pool.
+///
+/// Every statement runs on that one connection, which is what makes the
+/// transaction real. Dropping the handle without resolving it rolls back — the
+/// safe direction — because the connection is closed or reset rather than
+/// returned to the pool mid-transaction.
+///
+/// [`fetch_page`](Self::fetch_page) is on the trait deliberately: reads taken
+/// while a sandbox is open **must see the sandbox's own uncommitted writes**, or
+/// an agent verifies its work against stale data and reports success for a change
+/// that isn't there. That is the single most important correctness property here.
+#[async_trait]
+pub trait Sandbox: Send + Sync {
+    /// Run one data-modifying statement inside the transaction, returning rows
+    /// affected. Nothing is durable until [`commit`](Self::commit).
+    async fn execute(&self, sql: &str, abort: &AbortSignal) -> Result<u64>;
+
+    /// Read up to `limit` rows **inside** the transaction, so uncommitted writes
+    /// are visible. Display-capped like the grid's own paging.
+    async fn fetch_page(&self, sql: &str, limit: usize, abort: &AbortSignal) -> Result<ResultPage>;
+
+    /// Commit everything and return the connection to the pool.
+    async fn commit(&self) -> Result<()>;
+
+    /// Discard everything and return the connection to the pool.
+    async fn rollback(&self) -> Result<()>;
 }
 
 /// A live, windowed result cursor. Object-safe; the service holds it as
@@ -1782,7 +1836,12 @@ pub(crate) fn window_prealloc(max: usize) -> usize {
 pub struct CancelToken(Arc<dyn Fn() + Send + Sync>);
 
 impl CancelToken {
-    pub(crate) fn new(f: impl Fn() + Send + Sync + 'static) -> Self {
+    /// Wrap `f` as the cancel action for one cursor.
+    ///
+    /// Public because [`QueryCursor`] is: an implementation outside this crate has
+    /// to return one of these from `cancel_token`, and could not construct it
+    /// while this was crate-private -- a public trait nobody else can implement.
+    pub fn new(f: impl Fn() + Send + Sync + 'static) -> Self {
         Self(Arc::new(f))
     }
 

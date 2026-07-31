@@ -18,8 +18,15 @@ use crate::app::{AppState, Phase};
 use super::text::{bubble_key, derive_title};
 use super::{
     AgentMenuKind, AssistantState, ChatMessage, ChatRole, ChatSession, HistoryRow,
-    PendingPermission, QuickAction, Rename, RowKey, RowStatus,
+    PendingPermission, PendingSandbox, QuickAction, Rename, RowKey, RowStatus,
 };
+
+/// The outer height every control in the composer's two toolbar rows is drawn
+/// at — the selector slots, the switch pills, and send/stop. They sit a few
+/// pixels apart in a narrow sidebar, where differing heights read as a
+/// misalignment rather than as deliberate hierarchy. Scaled through
+/// `Theme::scale` at each use so the whole toolbar tracks the UI font size.
+const COMPOSER_CONTROL: f32 = 22.;
 
 /// The session-config selectors the composer always keeps a slot for, in the
 /// order they're drawn, each with the name to fall back on before the agent has
@@ -83,7 +90,7 @@ impl AppState {
             .gap_1p5()
             .min_w(px(0.))
             .px_2()
-            .pt_1p5();
+            .pt_1();
         for slot in CONFIG_SLOTS {
             let opt = options
                 .iter()
@@ -122,6 +129,10 @@ impl AppState {
             .id(SharedString::from(format!("ai-config-slot-{cat:?}")))
             .flex_1()
             .min_w(px(0.))
+            // One height for every control in the composer's two toolbar rows —
+            // see `COMPOSER_CONTROL`. Taffy is border-box, so this is the outer
+            // height and the trigger inside gets the 2px less.
+            .h(theme.scale(COMPOSER_CONTROL))
             .rounded(theme.radius)
             .border_1()
             .border_color(theme.border)
@@ -136,7 +147,7 @@ impl AppState {
                 ))))
                 .child(
                     div()
-                        .h(px(24.))
+                        .size_full()
                         .flex()
                         .items_center()
                         .px_2()
@@ -157,8 +168,10 @@ impl AppState {
         let mut select = Select::new(SharedString::from(format!("ai-config-{}", opt.id)))
             .selected(selected)
             .open(is_open)
-            // The slot draws the box; the trigger only draws its label + chevron.
+            // The slot draws the box; the trigger only draws its label + chevron,
+            // filling the slot minus its border.
             .seamless()
+            .height(theme.scale(COMPOSER_CONTROL - 2.))
             // Neutral, not accent-colored: these toolbar dropdowns shouldn't
             // compete with the Send button for emphasis.
             .accent(false)
@@ -227,19 +240,6 @@ impl AppState {
             .iter()
             .filter(|o| o.boolean)
             .collect();
-
-        let pill = |theme: &flint::Theme| {
-            div()
-                .flex()
-                .items_center()
-                .gap_1p5()
-                .h(px(22.))
-                .px_1p5()
-                .rounded(theme.radius)
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.bg_elevated)
-        };
 
         if switches.is_empty() {
             return Some(
@@ -368,6 +368,7 @@ impl AppState {
                     .text_color(theme.text_muted)
                     .child(hint),
             );
+            body = body.children(self.render_knowledge_prompt(&theme, cx));
             // The chat's agent is chosen in the composer's agent dropdown (shown on
             // a draft when more than one agent is usable); no separate body picker.
         }
@@ -402,7 +403,7 @@ impl AppState {
         let action: AnyElement = if chat.streaming {
             div()
                 .id("assistant-stop")
-                .size(px(24.))
+                .size(theme.scale(COMPOSER_CONTROL))
                 // Hold a square 1:1 regardless of how the toolbar row compresses.
                 .flex_shrink_0()
                 .flex()
@@ -420,7 +421,7 @@ impl AppState {
         } else {
             div()
                 .id("assistant-send")
-                .size(px(24.))
+                .size(theme.scale(COMPOSER_CONTROL))
                 // Hold a square 1:1 regardless of how the toolbar row compresses.
                 .flex_shrink_0()
                 .flex()
@@ -469,9 +470,17 @@ impl AppState {
                     .justify_between()
                     .gap_2()
                     .px_2()
-                    .pt_1p5()
+                    .pt_1()
                     .pb_1p5()
-                    .child(render_usage(chat.last_usage.as_ref(), &theme))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .min_w(px(0.))
+                            .child(render_usage(chat.last_usage.as_ref(), &theme))
+                            .children(self.render_knowledge_chip(&theme, cx)),
+                    )
                     .child(
                         div()
                             .flex()
@@ -482,6 +491,9 @@ impl AppState {
                                 self.render_config_switches(state, chat, &theme, cx),
                                 |row, switches| row.child(switches),
                             )
+                            .when_some(self.render_sandbox_toggle(chat, &theme, cx), |row, t| {
+                                row.child(t)
+                            })
                             .child(action),
                     ),
             );
@@ -498,12 +510,112 @@ impl AppState {
             .when_some(chat.pending_permission.as_ref(), |col, pending| {
                 col.child(self.render_permission(pending, &theme, cx))
             })
+            .when_some(chat.pending_sandbox.as_ref(), |col, pending| {
+                col.child(self.render_sandbox_review(pending, &theme, cx))
+            })
             .when_some(self.render_quick_actions(chat, &theme, cx), |col, chips| {
                 col.child(chips)
             })
             .child(composer)
             .into_any_element();
         self.with_agent_menu(view, cx)
+    }
+
+    /// The composer's "knowledge: 1.2 KB" chip, beside the usage ring. Shown only
+    /// when a knowledge file is actually in the prompt, so it is never a mystery
+    /// why the agent knows something it could not have read off the schema. Clicking
+    /// it opens the file.
+    fn render_knowledge_chip(
+        &self,
+        theme: &flint::Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let bytes = self.knowledge_bytes()?;
+        Some(
+            div()
+                .id("assistant-knowledge-chip")
+                .flex()
+                .items_center()
+                .gap_1()
+                .flex_shrink_0()
+                .cursor_pointer()
+                .tooltip(flint::Tooltip::text(
+                    "This connection's knowledge file is in the agent's prompt. Click to edit.",
+                ))
+                .hover(|s| s.opacity(0.8))
+                .child(crate::icons::icon(
+                    "file-text",
+                    theme.scale(10.),
+                    theme.text_faint,
+                ))
+                .child(
+                    div()
+                        .text_size(theme.scale(10.))
+                        .text_color(theme.text_muted)
+                        .child(SharedString::from(fmt_kb(bytes))),
+                )
+                .on_click(cx.listener(|this, _, _, cx| this.open_knowledge_editor(cx)))
+                .into_any_element(),
+        )
+    }
+
+    /// The empty state's one line about the knowledge file, shown only while the
+    /// connection has none: what the agent is missing, a button that offers to draft
+    /// one, and a link to write it by hand.
+    ///
+    /// Exactly one line, and only when there is nothing: once a file exists the
+    /// footer chip carries the signal, and a panel that keeps asking for a glossary
+    /// is a panel people learn to ignore.
+    fn render_knowledge_prompt(
+        &self,
+        theme: &flint::Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !matches!(self.phase, crate::app::Phase::Connected(_))
+            || self.knowledge_bytes().is_some()
+        {
+            return None;
+        }
+        let link = |id: &'static str, label: &'static str| {
+            div()
+                .id(id)
+                .text_size(theme.scale(11.5))
+                .text_color(theme.accent)
+                .cursor_pointer()
+                .hover(|s| s.opacity(0.8))
+                .child(label)
+        };
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_1p5()
+                .child(
+                    div()
+                        .text_size(theme.scale(11.5))
+                        .text_color(theme.text_faint)
+                        .child(crate::i18n::tr!(
+                            "knowledge.empty_state",
+                            "This connection has no knowledge file. The agent will infer \
+                             everything from the schema."
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .when(self.can_learn_database(), |row| {
+                            row.child(link("ai-learn-db", "Learn this database").on_click(
+                                cx.listener(|this, _, _, cx| this.learn_this_database(cx)),
+                            ))
+                        })
+                        .child(link("ai-edit-knowledge", "Edit").on_click(
+                            cx.listener(|this, _, _, cx| this.open_knowledge_editor(cx)),
+                        )),
+                )
+                .into_any_element(),
+        )
     }
 
     /// Overlay the header's open agent menu (switch / new-chat picker) on top of the
@@ -696,6 +808,37 @@ impl AppState {
                 .on_click(cx.listener(|this, _, _, cx| this.copy_conversation(cx)))
         });
 
+        // The connection's knowledge file: what the agent is told about this
+        // database before it reads a single row. Tinted when one exists, so the
+        // header answers "does the agent know anything about this?" at a glance.
+        let has_knowledge = self.knowledge_bytes().is_some();
+        let knowledge_btn = matches!(self.phase, crate::app::Phase::Connected(_)).then(|| {
+            div()
+                .id("assistant-knowledge")
+                .flex()
+                .items_center()
+                .justify_center()
+                .size(px(20.))
+                .rounded(px(4.))
+                .cursor_pointer()
+                .tooltip(flint::Tooltip::text(if has_knowledge {
+                    "Database knowledge (in this chat's prompt)"
+                } else {
+                    "Database knowledge (none written yet)"
+                }))
+                .hover(|s| s.bg(theme.bg_elevated))
+                .child(crate::icons::icon(
+                    "file-text",
+                    theme.scale(13.),
+                    if has_knowledge {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    },
+                ))
+                .on_click(cx.listener(|this, _, _, cx| this.open_knowledge_editor(cx)))
+        });
+
         // Deletion lives only in the history sidebar (each row's trash); the chat
         // view never deletes the conversation it's showing.
         let header_actions = div()
@@ -703,6 +846,7 @@ impl AppState {
             .items_center()
             .gap_1()
             .when_some(copy_chat, |row, c| row.child(c))
+            .when_some(knowledge_btn, |row, k| row.child(k))
             .when_some(list_btn, |row, l| row.child(l))
             .when_some(new_chat, |row, n| row.child(n));
 
@@ -773,6 +917,28 @@ impl AppState {
                     // A "writes" badge when this connection opted into the write tier
                     //, so the user knows the agent can propose data changes
                     // (each one still gated by per-statement approval).
+                    .when(chat.sandbox, |row| {
+                        row.child(
+                            div()
+                                .id("ai-sandbox-badge")
+                                .flex()
+                                .items_center()
+                                .gap_1()
+                                .px_1p5()
+                                .rounded(theme.radius_sm)
+                                .bg(theme.accent.opacity(0.14))
+                                .text_size(theme.scale(10.))
+                                .text_color(theme.accent)
+                                // "Am I in a transaction right now" must never be
+                                // ambiguous, so it is stated in the header rather
+                                // than only on the card at the end.
+                                .tooltip(flint::Tooltip::text(
+                                    "Writes run in one transaction you commit or roll back at \
+                                     the end of each turn.",
+                                ))
+                                .child("review"),
+                        )
+                    })
                     .when(self.ai_tier_effective() == red_core::AiTier::Write, |row| {
                         row.child(
                             div()
@@ -1246,6 +1412,264 @@ impl AppState {
     /// The tool-permission prompt: what the agent wants to do, plus
     /// Allow/Deny. Docked above the composer so it's visible regardless of scroll;
     /// the agent is blocked until the user answers.
+    /// The Sources line under a settled assistant bubble: one numbered chip per
+    /// data-returning call this turn made, each pointing at its node in the
+    /// timeline above.
+    ///
+    /// The count is the point. "This paragraph cites three queries" and "this
+    /// paragraph cites nothing" are different claims about an answer, and without
+    /// this they render identically -- the trace was always there, collapsed, two
+    /// clicks away, which is the same as absent.
+    ///
+    /// Deliberately labelled *Sources*, never *Verified*: a citation proves a
+    /// source exists, not that the sentence follows from it. No checkmarks, no
+    /// green.
+    fn render_sources(
+        &self,
+        msg: &ChatMessage,
+        theme: &flint::Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let sources = collect_sources(&msg.activity);
+        if sources.is_empty() {
+            // A turn that read nothing gets no footer at all, rather than an empty
+            // one: chrome that says nothing still costs a line and teaches the eye
+            // to skip the row.
+            return None;
+        }
+        let highlighted = self
+            .assistant
+            .as_ref()
+            .and_then(|s| s.highlighted_source.clone());
+        let mut row = div().flex().flex_wrap().items_center().gap_1p5().child(
+            div()
+                .text_size(theme.scale(10.))
+                .text_color(theme.text_faint)
+                .child("Sources"),
+        );
+        for source in sources {
+            let on = highlighted.as_ref() == Some(&source.id);
+            let click_id = source.id.clone();
+            row = row.child(
+                div()
+                    .id(SharedString::from(format!("src-{}", source.id.as_str())))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_1p5()
+                    .rounded(theme.radius_sm)
+                    .border_1()
+                    .border_color(if on { theme.accent } else { theme.border })
+                    .bg(if on {
+                        theme.accent.opacity(0.12)
+                    } else {
+                        theme.bg_elevated
+                    })
+                    .text_size(theme.scale(10.))
+                    .text_color(if on { theme.accent } else { theme.text_muted })
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(theme.accent))
+                    .tooltip(flint::Tooltip::text(SharedString::from(source.peek())))
+                    .child(SharedString::from(format!("[{}]", source.ordinal)))
+                    .child(SharedString::from(source.label()))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.highlight_source(click_id.clone(), cx)
+                    })),
+            );
+        }
+        Some(row.into_any_element())
+    }
+
+    /// The composer's review-transaction switch, shown only on a chat that hasn't
+    /// sent a turn yet.
+    ///
+    /// Locked after the first turn because a conversation cannot change what its
+    /// earlier writes were run under, and shown *disabled with the reason* where
+    /// the mode can't be honoured rather than hidden — "why isn't this here" is a
+    /// worse question than "here's why not".
+    fn render_sandbox_toggle(
+        &self,
+        chat: &ChatSession,
+        theme: &flint::Theme,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !chat.is_draft() {
+            return None;
+        }
+        let blocked = self.sandbox_available();
+        let on = chat.sandbox && blocked.is_none();
+        let tint = if on { theme.accent } else { theme.text_faint };
+        let tip: SharedString = match blocked {
+            Some(why) => format!("Review transaction unavailable: {why}").into(),
+            None => "Run this chat's writes in one transaction you commit or roll back at the                      end of each turn, instead of approving each statement."
+                .into(),
+        };
+        Some(
+            pill(theme)
+                .id("ai-sandbox-toggle")
+                .when(on, |p| p.border_color(theme.accent.opacity(0.5)))
+                .when(blocked.is_some(), |p| p.opacity(0.5))
+                .tooltip(flint::Tooltip::text(tip))
+                .child(crate::icons::icon("lock", theme.scale(11.), tint))
+                .child(
+                    div()
+                        .text_size(theme.scale(10.))
+                        .text_color(tint)
+                        .child("review"),
+                )
+                .when(blocked.is_none(), |p| {
+                    p.cursor_pointer()
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sandbox_mode(cx)))
+                })
+                .into_any_element(),
+        )
+    }
+
+    /// The review card: what the turn changed, and the two answers.
+    ///
+    /// The framing is deliberate. This is not "did that work?" but "do you want
+    /// this?", asked once about the whole change rather than N times about
+    /// statements — five approvals can each be reasonable and the sequence still be
+    /// wrong. Rolling back is free and is the left-hand, unaccented button;
+    /// committing is the one that costs something.
+    fn render_sandbox_review(
+        &self,
+        pending: &PendingSandbox,
+        theme: &flint::Theme,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let remaining = pending
+            .expires_at
+            .saturating_duration_since(std::time::Instant::now());
+        let secs = remaining.as_secs();
+
+        let mut rows = div()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .font_family(theme.mono_family.clone())
+            .text_size(theme.scale(10.5));
+        for entry in &pending.statements {
+            rows = rows.child(
+                div()
+                    .flex()
+                    .items_start()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w(px(0.))
+                            .truncate()
+                            .text_color(theme.text_muted)
+                            .child(SharedString::from(entry.sql.clone())),
+                    )
+                    .child(
+                        div()
+                            .flex_shrink_0()
+                            .text_color(theme.text_faint)
+                            .child(SharedString::from(format!("{} row(s)", entry.rows))),
+                    ),
+            );
+        }
+
+        div()
+            .flex_shrink_0()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .p_3()
+            .bg(theme.bg_panel)
+            .border_t_1()
+            .border_color(theme.accent.opacity(0.5))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1p5()
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.text)
+                    .child(crate::icons::icon("lock", theme.scale(13.), theme.accent))
+                    .child(SharedString::from(format!(
+                        "The agent made {} change(s) in a transaction. Nothing is committed yet.",
+                        pending.statements.len()
+                    ))),
+            )
+            .child(rows)
+            .child(
+                div()
+                    .text_size(theme.scale(10.5))
+                    .text_color(theme.text_faint)
+                    // Everything outside the transaction stayed: a generated
+                    // report, a saved query, an exported file. Rolling back does
+                    // not un-write those, and implying otherwise would be a lie
+                    // about the one thing this feature sells.
+                    .child(
+                        "Rolling back undoes the database changes only. Files the agent wrote \
+                         (reports, exports, saved queries) stay.",
+                    ),
+            )
+            // Past the halfway mark, count down: an expiry should never be a
+            // surprise, because a rollback the user didn't choose still costs them
+            // the turn.
+            .when(secs <= SANDBOX_COUNTDOWN_FROM_SECS, |card| {
+                card.child(
+                    div()
+                        .text_size(theme.scale(10.5))
+                        .text_color(theme.yellow)
+                        .child(SharedString::from(format!(
+                            "Rolls back automatically in {secs}s - an open transaction holds \
+                             locks."
+                        ))),
+                )
+            })
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .id("ai-sandbox-rollback")
+                            .px_3()
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(6.))
+                            .border_1()
+                            .border_color(theme.border)
+                            .text_size(theme.scale(12.))
+                            .text_color(theme.text_muted)
+                            .cursor_pointer()
+                            .hover(|s| s.border_color(theme.text).text_color(theme.text))
+                            .child("Roll back")
+                            .on_click(
+                                cx.listener(|this, _, _, cx| this.resolve_sandbox(false, cx)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("ai-sandbox-commit")
+                            .px_3()
+                            .h(px(26.))
+                            .flex()
+                            .items_center()
+                            .rounded(px(6.))
+                            .bg(theme.accent)
+                            .text_size(theme.scale(12.))
+                            .text_color(theme.bg_app)
+                            .cursor_pointer()
+                            .hover(|s| s.opacity(0.9))
+                            .child(SharedString::from(format!(
+                                "Commit {} row(s)",
+                                pending.total_rows
+                            )))
+                            .on_click(cx.listener(|this, _, _, cx| this.resolve_sandbox(true, cx))),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn render_permission(
         &self,
         pending: &PendingPermission,
@@ -1302,6 +1726,9 @@ impl AppState {
                     .font_family(theme.mono_family.clone())
                     .child(detail.clone()),
             );
+        }
+        if let Some(preview) = &pending.preview {
+            card = card.child(render_write_preview(preview, theme));
         }
         card.child(
             div()
@@ -1413,6 +1840,14 @@ impl AppState {
                 .map(|s| &s.subagent_collapse)
                 .unwrap_or(&empty);
             bubble = bubble.child(render_activity(&msg.activity, collapse, theme, 0, cx));
+        }
+        // Sources sit *above* the answer, where a reader meets them before the
+        // number rather than after having already believed it.
+        if !live
+            && msg.role == ChatRole::Assistant
+            && let Some(footer) = self.render_sources(msg, theme, cx)
+        {
+            bubble = bubble.child(footer);
         }
 
         // Answer text. Assistant turns are Markdown, so render them (on the revealed
@@ -1616,6 +2051,9 @@ fn activity_glyph(
         Pending => ("circle-dashed", theme.text_muted),
         Running => ("loader-circle", theme.accent),
         Ok => ("circle-check", theme.green),
+        // Ran fine, but its result carries a caveat: amber and a different glyph,
+        // so one glance at the timeline shows the query was flagged.
+        Warned => ("alert-triangle", theme.yellow),
         Failed => ("circle-x", theme.red),
         Denied => ("ban", theme.yellow),
     }
@@ -1632,6 +2070,14 @@ fn render_activity(
     depth: usize,
     cx: &mut Context<AppState>,
 ) -> AnyElement {
+    // Which node a Sources chip is currently pointing at, read once for the whole
+    // list rather than per row.
+    let highlighted = cx
+        .entity()
+        .read(cx)
+        .assistant
+        .as_ref()
+        .and_then(|s| s.highlighted_source.clone());
     let mut col = div().flex().flex_col().gap(px(2.));
     for node in nodes {
         if let red_core::ActivityKind::Subagent { task } = &node.kind {
@@ -1648,7 +2094,12 @@ fn render_activity(
             // the tool calls. Skip them here.
             continue;
         }
-        col = col.child(render_activity_row(node, theme, depth));
+        col = col.child(render_activity_row(
+            node,
+            theme,
+            depth,
+            highlighted.as_ref(),
+        ));
         if !node.children.is_empty() {
             col = col.child(render_activity(
                 &node.children,
@@ -1703,9 +2154,9 @@ fn render_subagent_card(
     depth: usize,
     cx: &mut Context<AppState>,
 ) -> AnyElement {
-    use red_core::ActivityStatus::{Denied, Failed, Ok as StatusOk, Pending, Running};
+    use red_core::ActivityStatus::{Denied, Failed, Ok as StatusOk, Pending, Running, Warned};
     let id = SharedString::from(node.id.as_str());
-    let done = matches!(node.status, StatusOk | Failed | Denied);
+    let done = matches!(node.status, StatusOk | Warned | Failed | Denied);
     let running = matches!(node.status, Running | Pending);
     // Default: expanded while working (so its progress shows), collapsed once done;
     // a stored override wins.
@@ -1916,6 +2367,7 @@ fn render_activity_row(
     node: &red_core::ActivityNode,
     theme: &flint::Theme,
     depth: usize,
+    highlighted: Option<&red_core::ActivityId>,
 ) -> AnyElement {
     use red_core::ActivityStatus::Failed;
     let (glyph, glyph_color) = activity_glyph(node.status, theme);
@@ -1933,11 +2385,20 @@ fn render_activity_row(
         red_core::ActivityKind::Report { title, .. } => ("Report".to_string(), title.clone()),
     };
 
+    // A Sources chip points here: ring the row so the answer's `[3]` and the call
+    // that produced it are visibly the same thing.
+    let on = highlighted == Some(&node.id);
     let mut row = div()
         .flex()
         .items_center()
         .gap(px(6.))
         .pl(px(depth as f32 * 14.))
+        .when(on, |r| {
+            r.rounded(theme.radius_sm)
+                .bg(theme.accent.opacity(0.12))
+                .border_1()
+                .border_color(theme.accent.opacity(0.5))
+        })
         .text_size(theme.scale(11.))
         .child(
             div()
@@ -1946,6 +2407,13 @@ fn render_activity_row(
                 .items_center()
                 .child(crate::icons::icon(glyph, theme.scale(12.), glyph_color)),
         )
+        .children(node.source_ordinal.map(|n| {
+            div()
+                .flex_none()
+                .text_color(theme.accent)
+                .font_family(theme.mono_family.clone())
+                .child(SharedString::from(format!("[{n}]")))
+        }))
         .child(div().text_color(theme.text).child(primary));
     if let Some(secondary) = secondary {
         row = row.child(
@@ -2179,6 +2647,243 @@ fn paint_arc(
     }
     if let Ok(path) = pb.build() {
         window.paint_path(path, color);
+    }
+}
+
+/// The affected-row preview above the Allow/Deny row: what an approved write
+/// would actually touch.
+///
+/// The count is the point, so it is the largest thing here. A count of **zero**
+/// is styled as a warning rather than as a reassuring small number: a write that
+/// matches nothing is nearly always a wrong predicate, and it is exactly the case
+/// a bare "Allow this?" hid best.
+fn render_write_preview(preview: &red_service::WritePreview, theme: &flint::Theme) -> AnyElement {
+    let mut col = div().flex().flex_col().gap_1p5();
+    let many = preview.statements.len() > 1;
+    for (i, stmt) in preview.statements.iter().enumerate() {
+        col = col.child(render_statement_preview(stmt, many.then_some(i + 1), theme));
+    }
+    if preview.not_previewed > 0 {
+        col = col.child(
+            div()
+                .text_size(theme.scale(10.5))
+                .text_color(theme.text_faint)
+                // Said out loud, because silence here would read as "the rest
+                // affect nothing".
+                .child(SharedString::from(format!(
+                    "{} more statement(s) were not previewed.",
+                    preview.not_previewed
+                ))),
+        );
+    }
+    col.into_any_element()
+}
+
+/// One statement's line: the count (or why there isn't one) and up to a few of
+/// the rows it matched.
+fn render_statement_preview(
+    stmt: &red_service::StatementPreview,
+    number: Option<usize>,
+    theme: &flint::Theme,
+) -> AnyElement {
+    let empty = stmt.matches == Some(0);
+    let prefix = number.map_or(String::new(), |n| format!("{n}. "));
+    let headline = match (stmt.matches, stmt.total) {
+        (Some(n), Some(total)) => format!(
+            "{prefix}Affects {} of {} rows in {}.",
+            group_digits(n),
+            group_digits(total),
+            stmt.table
+        ),
+        (Some(n), None) => format!(
+            "{prefix}Affects {} row(s) in {}.",
+            group_digits(n),
+            stmt.table
+        ),
+        // No number: say why, and never let the blank read as zero.
+        (None, _) => format!(
+            "{prefix}{} in {}.",
+            stmt.note.as_deref().unwrap_or("could not preview"),
+            stmt.table
+        ),
+    };
+    let color = if empty {
+        theme.yellow
+    } else if stmt.matches.is_some() {
+        theme.text
+    } else {
+        theme.text_faint
+    };
+
+    let mut block = div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .child(
+            div()
+                .text_size(theme.scale(11.5))
+                .text_color(color)
+                .child(SharedString::from(headline)),
+        )
+        .when(empty, |d| {
+            d.child(
+                div()
+                    .text_size(theme.scale(10.5))
+                    .text_color(theme.yellow)
+                    .child(
+                        "This matches no rows - the predicate is probably wrong. Denying is the \
+                         safe answer.",
+                    ),
+            )
+        });
+
+    if !stmt.sample.is_empty() {
+        let mut table = div()
+            .flex()
+            .flex_col()
+            .gap_0p5()
+            .font_family(theme.mono_family.clone())
+            .text_size(theme.scale(10.))
+            .child(sample_row(&stmt.columns, theme.text_faint));
+        for row in &stmt.sample {
+            table = table.child(sample_row(row, theme.text_muted));
+        }
+        // The sample is a recognition aid, not a result: if more matched than fit,
+        // say how many are missing rather than implying that was all of them.
+        if let Some(rest) = stmt
+            .matches
+            .map(|n| n.saturating_sub(stmt.sample.len() as u64))
+            .filter(|rest| *rest > 0)
+        {
+            table = table.child(
+                div()
+                    .text_color(theme.text_faint)
+                    .child(SharedString::from(format!("… {} more", group_digits(rest)))),
+            );
+        }
+        block = block.child(table);
+    }
+    block.into_any_element()
+}
+
+/// One line of the sample table. Cells are already rendered and capped by the
+/// backend (a blob arrives as `<N bytes>`), so this only lays them out.
+fn sample_row(cells: &[String], color: gpui::Hsla) -> AnyElement {
+    div()
+        .flex()
+        .gap_3()
+        .text_color(color)
+        .children(cells.iter().map(|c| {
+            div()
+                .max_w(px(140.))
+                .truncate()
+                .child(SharedString::from(c.clone()))
+        }))
+        .into_any_element()
+}
+
+/// `4213 → 4,213`. A row count is the number the whole prompt turns on, and four
+/// undelimited digits are read as three often enough to matter here.
+fn group_digits(n: u64) -> String {
+    let digits = n.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (i, c) in digits.chars().enumerate() {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(c);
+    }
+    out
+}
+
+/// One control in the composer's toolbar row: a bordered pill at the shared
+/// [`COMPOSER_CONTROL`] height, so the agent's own switches and RED's
+/// review-transaction toggle read as one row rather than as two systems.
+fn pill(theme: &flint::Theme) -> gpui::Div {
+    div()
+        .flex()
+        .items_center()
+        .gap_1p5()
+        .h(theme.scale(COMPOSER_CONTROL))
+        .px_1p5()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.bg_elevated)
+}
+
+/// One citable call from a turn: what the chip shows and what it points at.
+struct Source {
+    id: red_core::ActivityId,
+    ordinal: u32,
+    name: String,
+    args: Option<String>,
+    detail: Option<String>,
+}
+
+impl Source {
+    /// The chip's text: the tool name, which is what the reader recognises.
+    fn label(&self) -> String {
+        self.name.clone()
+    }
+
+    /// The hover peek: the tool, what it was called with, and what came back --
+    /// enough to judge a number without leaving the paragraph.
+    fn peek(&self) -> String {
+        let mut out = self.name.clone();
+        if let Some(args) = &self.args {
+            out.push('\n');
+            out.push_str(args);
+        }
+        if let Some(detail) = &self.detail {
+            out.push_str("\n→ ");
+            out.push_str(detail);
+        }
+        out
+    }
+}
+
+/// The turn's citable calls, in source order.
+///
+/// Top level only: a subagent's own calls are its children and never reach the
+/// parent's prose, so listing them here would offer a citation the parent could
+/// not have made.
+fn collect_sources(nodes: &[red_core::ActivityNode]) -> Vec<Source> {
+    let mut out: Vec<Source> = nodes
+        .iter()
+        .filter_map(|node| {
+            let ordinal = node.source_ordinal?;
+            let (name, args) = match &node.kind {
+                red_core::ActivityKind::Tool { name, args_summary } => {
+                    (name.clone(), args_summary.clone())
+                }
+                _ => return None,
+            };
+            Some(Source {
+                id: node.id.clone(),
+                ordinal,
+                name,
+                args,
+                detail: node.detail.clone(),
+            })
+        })
+        .collect();
+    out.sort_by_key(|s| s.ordinal);
+    out
+}
+
+/// When the review card starts counting down. Half of the 120s default: early
+/// enough to react, late enough not to nag from the first frame.
+const SANDBOX_COUNTDOWN_FROM_SECS: u64 = 60;
+
+/// A knowledge file's size for the composer chip: `900 → 900 B`, `1234 → 1.2 KB`.
+/// Kilobytes are the useful unit here (a file worth writing is a few, and the cap
+/// is 32), so anything larger still reads in KB rather than rounding to "0.1 MB".
+fn fmt_kb(bytes: usize) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else {
+        format!("{:.1} KB", bytes as f64 / 1024.)
     }
 }
 

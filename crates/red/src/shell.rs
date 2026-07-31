@@ -1111,7 +1111,7 @@ impl AppState {
                 let remove_key = r.key.clone();
                 HistoryRow {
                     primary: r.key.into(),
-                    secondary: crate::history::relative_time(r.viewed_unix).into(),
+                    secondary: red_config::history::relative_time(r.viewed_unix).into(),
                     badge: Some(kv_type.label().to_string().into()),
                     nav_index: None,
                     activate: Rc::new(move |this: &mut AppState, _replace, cx| {
@@ -1133,7 +1133,7 @@ impl AppState {
                 let id = entry.id;
                 HistoryRow {
                     primary: crate::editor::history_label(&entry.sql).into(),
-                    secondary: crate::history::relative_time(entry.ran_unix).into(),
+                    secondary: red_config::history::relative_time(entry.ran_unix).into(),
                     badge: None,
                     nav_index: None,
                     activate: Rc::new(move |this: &mut AppState, _replace, cx| {

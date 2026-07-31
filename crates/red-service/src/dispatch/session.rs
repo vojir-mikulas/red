@@ -51,6 +51,17 @@ impl SessionDriver {
     /// SQL-only command handler (`Query`, `OpenResult`, `Execute`, …) calls
     /// this first and emits `Event::Error` on `None` rather than assuming a
     /// `DatabaseDriver` is always behind the session.
+    /// Whether this session's engine can hold a transaction open across several
+    /// statements, which is what the agent sandbox needs. `false` for the non-SQL
+    /// seams by construction: Redis `MULTI`/`EXEC` is not a rollback, and Mongo
+    /// transactions need a replica set.
+    pub(crate) fn supports_sandbox(&self) -> bool {
+        match self {
+            SessionDriver::Sql(d) => d.supports_sandbox(),
+            SessionDriver::Kv(_) | SessionDriver::Doc(_) => false,
+        }
+    }
+
     pub(crate) fn as_sql(&self) -> Option<&Arc<dyn DatabaseDriver>> {
         match self {
             SessionDriver::Sql(d) => Some(d),

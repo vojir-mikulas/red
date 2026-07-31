@@ -19,8 +19,8 @@ use super::text::{
     slash_candidates, summarize_schema,
 };
 use super::{
-    AssistantState, ChatMessage, ChatRole, ChatSession, PendingPermission, QuickAction, Rename,
-    RowKey,
+    AssistantState, ChatMessage, ChatRole, ChatSession, PendingPermission, PendingSandbox,
+    QuickAction, Rename, RowKey,
 };
 
 /// Streaming reveal cadence: the assistant's answer types out at this tick rate
@@ -210,6 +210,7 @@ impl AppState {
                 subagent_collapse: std::collections::HashMap::new(),
                 selection_group: Rc::new(std::cell::Cell::new(0)),
                 next_selection_id: 1,
+                highlighted_source: None,
             });
             self.focus_assistant = true;
         }
@@ -372,7 +373,7 @@ impl AppState {
     /// chat. The caller has already resolved the message text (typed, or a
     /// quick-action prompt). Delegates to [`Self::dispatch_turn`], the shared core
     /// used by the sidebar and the agent tabs alike.
-    fn send_turn(&mut self, message: String, cx: &mut Context<Self>) {
+    pub(crate) fn send_turn(&mut self, message: String, cx: &mut Context<Self>) {
         let Some(state) = self.assistant.as_ref() else {
             return;
         };
@@ -395,17 +396,24 @@ impl AppState {
         if message.trim().is_empty() {
             return;
         }
+        // Re-read the knowledge file first: it shapes every answer this turn, and
+        // the user may have edited it in another editor since the last one.
+        self.refresh_knowledge();
         let (session, mut context) = {
             let Phase::Connected(active) = &self.phase else {
                 return;
             };
             (active.session, self.ai_context(active, cx))
         };
+        // Read the chat's mode while recording the turn, so the command carries what
+        // this conversation was created with rather than a global default.
+        let mut sandbox_mode = false;
         let sent = self
             .with_chat_mut(conversation_id, |chat| {
                 if chat.streaming {
                     return false;
                 }
+                sandbox_mode = chat.sandbox;
                 // A reopened chat seeds its prior transcript into this one turn so
                 // the model resumes coherently despite a fresh session.
                 context.prior_transcript = chat.pending_seed.take();
@@ -436,6 +444,7 @@ impl AppState {
         self.service.send_to(
             session,
             red_service::Command::AiTurn {
+                sandbox: sandbox_mode,
                 conversation_id,
                 agent,
                 message,
@@ -709,6 +718,7 @@ impl AppState {
         let seed = render_transcript(&conv.messages);
         if let Some(state) = self.assistant.as_mut() {
             let mut chat = ChatSession::new(id, conv.provider.clone());
+            chat.sandbox = conv.sandbox;
             chat.messages = conv
                 .messages
                 .iter()
@@ -970,7 +980,7 @@ impl AppState {
         sql: String,
         cx: &mut Context<Self>,
     ) {
-        let _ = match crate::queries::save(&name, description.as_deref(), &sql) {
+        let _ = match red_config::queries::save(&name, description.as_deref(), &sql) {
             Ok(_) => self.notify(
                 flint::ToastVariant::Success,
                 format!("Saved query “{name}” to your library."),
@@ -1348,11 +1358,13 @@ impl AppState {
                     parent,
                     kind,
                     status,
+                    source_ordinal,
                 } => {
                     let node = red_core::ActivityNode {
                         id,
                         kind,
                         status,
+                        source_ordinal,
                         detail: None,
                         children: Vec::new(),
                     };
@@ -1550,12 +1562,160 @@ impl AppState {
 
     /// The agent asked to run a tool RED didn't auto-allow: show the prompt
     /// on its originating chat (the switcher flags a background one).
+    /// The turn finished with writes sitting in an uncommitted transaction: show
+    /// the review card. Nothing is durable until the user answers.
+    pub(crate) fn on_ai_sandbox_ready(
+        &mut self,
+        conversation_id: red_service::ConversationId,
+        statements: Vec<red_service::SandboxEntry>,
+        total_rows: u64,
+        expires_in_secs: u64,
+        cx: &mut Context<Self>,
+    ) {
+        let updated = self
+            .with_chat_mut(conversation_id, |chat| {
+                chat.streaming = false;
+                chat.pending_sandbox = Some(PendingSandbox {
+                    statements,
+                    total_rows,
+                    expires_at: std::time::Instant::now()
+                        + std::time::Duration::from_secs(expires_in_secs),
+                });
+            })
+            .is_some();
+        if updated {
+            cx.notify();
+        }
+    }
+
+    /// The user's Commit / Roll back, or an expiry, landed. Clear the card and say
+    /// what happened: a rollback is not a failure, but it is not a no-op either.
+    pub(crate) fn on_ai_sandbox_resolved(
+        &mut self,
+        conversation_id: red_service::ConversationId,
+        committed: bool,
+        rows: u64,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.with_chat_mut(conversation_id, |chat| chat.pending_sandbox = None);
+        let _ = match error {
+            Some(e) => self.notify(
+                flint::ToastVariant::Error,
+                format!("The review transaction could not be resolved: {e}"),
+                cx,
+            ),
+            None if committed => self.notify(
+                flint::ToastVariant::Success,
+                format!("Committed {rows} row(s) from the agent's changes."),
+                cx,
+            ),
+            None => self.notify(
+                flint::ToastVariant::Info,
+                format!("Rolled back {rows} row(s); nothing was applied."),
+                cx,
+            ),
+        };
+        cx.notify();
+    }
+
+    /// The sandbox hit its deadline before the user answered. Rolled back, because
+    /// an open transaction holds locks and committing unasked is not an option.
+    pub(crate) fn on_ai_sandbox_expired(
+        &mut self,
+        conversation_id: red_service::ConversationId,
+        cx: &mut Context<Self>,
+    ) {
+        self.with_chat_mut(conversation_id, |chat| chat.pending_sandbox = None);
+        let _ = self.notify(
+            flint::ToastVariant::Warning,
+            "The agent's changes were rolled back: the review transaction timed out. An open              transaction holds locks, so it can't wait indefinitely.",
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Point the timeline at the activity node a Sources chip names, or clear the
+    /// highlight when the same chip is clicked again.
+    pub(crate) fn highlight_source(&mut self, id: red_core::ActivityId, cx: &mut Context<Self>) {
+        if let Some(state) = self.assistant.as_mut() {
+            state.highlighted_source =
+                (state.highlighted_source.as_ref() != Some(&id)).then_some(id);
+        }
+        cx.notify();
+    }
+
+    /// Answer the active chat's review card.
+    pub(crate) fn resolve_sandbox(&mut self, commit: bool, cx: &mut Context<Self>) {
+        let Some(state) = self.assistant.as_ref() else {
+            return;
+        };
+        let conversation_id = state.active().conversation_id;
+        if let Phase::Connected(active) = &self.phase {
+            self.service.send_to(
+                active.session,
+                red_service::Command::AiSandboxResolve {
+                    conversation_id,
+                    commit,
+                },
+            );
+        }
+        // The card stays until the backend confirms: the transaction is not gone
+        // until the engine says so, and clearing early would claim otherwise.
+        cx.notify();
+    }
+
+    /// Flip the active *draft* chat into (or out of) review-transaction mode.
+    /// Locked once a chat has sent a turn: a conversation cannot change what its
+    /// earlier writes were run under.
+    pub(crate) fn toggle_sandbox_mode(&mut self, cx: &mut Context<Self>) {
+        if let Some(state) = self.assistant.as_mut() {
+            let chat = state.active_mut();
+            if chat.is_draft() {
+                chat.sandbox = !chat.sandbox;
+            }
+        }
+        cx.notify();
+    }
+
+    /// Whether review-transaction mode can be offered at all: a SQL connection on
+    /// an engine with real transactions, at the write tier, not read-only, on the
+    /// API-key path (the ACP transport never advertises write tools).
+    pub(crate) fn sandbox_available(&self) -> Option<&'static str> {
+        let Phase::Connected(active) = &self.phase else {
+            return Some("Connect to a database first.");
+        };
+        if !matches!(
+            active.config.kind,
+            red_core::DbKind::Postgres | red_core::DbKind::Mysql | red_core::DbKind::Sqlite
+        ) {
+            return Some("This engine has no multi-statement transaction to hold changes in.");
+        }
+        if active.config.read_only {
+            return Some("This connection is read-only, so the agent cannot write at all.");
+        }
+        if self.ai_tier_effective() != red_core::AiTier::Write {
+            return Some("The agent is not at the write tier on this connection.");
+        }
+        if self
+            .assistant
+            .as_ref()
+            .is_some_and(|s| self.agent_is_acp(&s.active().provider))
+        {
+            return Some(
+                "A subscription agent is never offered write tools, so it has nothing                          to hold.",
+            );
+        }
+        None
+    }
+
     pub(crate) fn on_ai_permission_request(
         &mut self,
         conversation_id: red_service::ConversationId,
         request_id: red_service::RequestId,
         title: String,
         detail: Option<String>,
+        preview: Option<red_service::WritePreview>,
         cx: &mut Context<Self>,
     ) {
         if self
@@ -1564,6 +1724,7 @@ impl AppState {
                     request_id,
                     title: title.into(),
                     detail: detail.map(Into::into),
+                    preview,
                 });
             })
             .is_some()
@@ -1594,6 +1755,9 @@ impl AppState {
                         title,
                     },
                     status: red_core::ActivityStatus::Ok,
+                    // A report is a document RED produced, not evidence for a
+                    // figure in the answer.
+                    source_ordinal: None,
                     detail: None,
                     children: Vec::new(),
                 });
@@ -1731,6 +1895,14 @@ impl AppState {
         });
         red_service::AiContext {
             schema_summary: summarize_schema(&active.schema.schemas),
+            // The key the query history and the recent-keys store are filed under;
+            // the service has no other way to know which saved connection this is.
+            conn_id: active.conn_id.clone(),
+            // Filled in by the service, which owns the cursor registry.
+            open_cursors: None,
+            // What the user wrote down about this database: glossary, join rules,
+            // gotchas. Refreshed from disk by `dispatch_turn` just before this runs.
+            knowledge: active.knowledge.clone(),
             current_tab,
             editor_sql,
             last_error,
@@ -1831,6 +2003,7 @@ fn persist_chat(chat: &mut ChatSession) {
     let conv = crate::conversations::Conversation {
         title,
         provider: chat.provider.clone(),
+        sandbox: chat.sandbox,
         created_unix: created,
         updated_unix: now,
         messages: chat

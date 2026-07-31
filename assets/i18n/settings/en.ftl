@@ -391,6 +391,26 @@ settings-ai-limits-max_tool_calls-seg-500 = 500
 
 settings-ai-limits-max_tool_calls-seg-off = Off
 
+settings-group-safety = Safety
+
+settings-ai-preview_writes =
+    .label = Preview affected rows
+    .help = Before you approve an agent write, count the rows it would change and show a few of them. Turning this off leaves the approval prompt showing only the SQL.
+
+settings-ai-sandbox_timeout_secs =
+    .label = Review transaction timeout
+    .help = How long uncommitted agent changes wait for your Commit or Roll back before rolling back on their own. An open transaction holds locks, so it cannot wait indefinitely.
+
+settings-ai-sandbox_timeout_secs-seg-30s = 30s
+
+settings-ai-sandbox_timeout_secs-seg-1m = 1m
+
+settings-ai-sandbox_timeout_secs-seg-2m = 2m
+
+settings-ai-sandbox_timeout_secs-seg-5m = 5m
+
+settings-ai-sandbox_timeout_secs-seg-10m = 10m
+
 settings-ai-show_thinking =
     .label = Show thinking
     .help = Show a summarized “thinking…” affordance while the model reasons.

@@ -441,6 +441,24 @@ impl DatabaseDriver for SqliteDriver {
             .map_err(driver_err)?
     }
 
+    fn supports_sandbox(&self) -> bool {
+        // Full transaction support, single writer.
+        true
+    }
+
+    async fn begin_sandbox(&self) -> Result<Option<Box<dyn crate::Sandbox>>> {
+        let (path, read_only) = (self.path.clone(), self.read_only);
+        // Capacity 1: the handle sends one job and awaits its reply before the
+        // next, so a single slot is the whole contract rather than a buffer.
+        let (jobs, rx) = mpsc::channel::<SandboxJob>(1);
+        let (opened, opened_rx) = oneshot::channel();
+        tokio::task::spawn_blocking(move || sandbox_thread(&path, read_only, opened, rx));
+        opened_rx
+            .await
+            .map_err(|_| RedError::Driver("sandbox thread exited before BEGIN".into()))??;
+        Ok(Some(Box::new(SqliteSandbox { jobs })))
+    }
+
     async fn execute_batch_abort(
         &self,
         statements: &[String],
@@ -1442,6 +1460,183 @@ impl QueryCursor for SqliteCursor {
     }
 }
 
+/// One job for the sandbox's owning thread. `rusqlite::Connection` is neither
+/// `Send`-across-await nor `Sync`, so the connection lives on a single blocking
+/// thread for the sandbox's whole life and every operation is a message — the same
+/// shape [`SqliteCursor`] already uses for its statement.
+enum SandboxJob {
+    Execute {
+        sql: String,
+        abort: AbortSignal,
+        reply: oneshot::Sender<Result<u64>>,
+    },
+    Fetch {
+        sql: String,
+        abort: AbortSignal,
+        reply: oneshot::Sender<Result<ResultPage>>,
+    },
+    /// `COMMIT` or `ROLLBACK`; either way the thread exits afterwards.
+    Finish {
+        verb: &'static str,
+        reply: oneshot::Sender<Result<()>>,
+    },
+}
+
+/// The thread that owns the sandbox connection and its open transaction.
+///
+/// Exits on `Finish`, or when the handle is dropped — in which case the
+/// connection closes with the transaction still open and SQLite rolls it back,
+/// which is the safe direction.
+fn sandbox_thread(
+    path: &Path,
+    read_only: bool,
+    opened: oneshot::Sender<Result<()>>,
+    mut jobs: mpsc::Receiver<SandboxJob>,
+) {
+    let conn = match SqliteDriver::open(path, read_only).and_then(|c| {
+        c.execute_batch("BEGIN IMMEDIATE")
+            .map(|()| c)
+            .map_err(driver_err)
+    }) {
+        Ok(conn) => {
+            let _ = opened.send(Ok(()));
+            conn
+        }
+        Err(e) => {
+            let _ = opened.send(Err(e));
+            return;
+        }
+    };
+    while let Some(job) = jobs.blocking_recv() {
+        match job {
+            SandboxJob::Execute { sql, abort, reply } => {
+                let _guard = arm_interrupt(&conn, &abort);
+                let out = if abort.is_aborted() {
+                    Err(RedError::Interrupted)
+                } else {
+                    conn.execute(&sql, [])
+                        .map(|n| n as u64)
+                        .map_err(map_step_err)
+                };
+                let _ = reply.send(out);
+            }
+            SandboxJob::Fetch { sql, abort, reply } => {
+                let _guard = arm_interrupt(&conn, &abort);
+                let out = if abort.is_aborted() {
+                    Err(RedError::Interrupted)
+                } else {
+                    page_on(&conn, &sql)
+                };
+                let _ = reply.send(out);
+            }
+            SandboxJob::Finish { verb, reply } => {
+                let _ = reply.send(conn.execute_batch(verb).map_err(driver_err));
+                return;
+            }
+        }
+    }
+}
+
+/// Read a display-capped page **on an existing connection**, so the read runs
+/// inside the sandbox's transaction and sees its uncommitted writes.
+fn page_on(conn: &Connection, sql: &str) -> Result<ResultPage> {
+    let mut stmt = conn.prepare(sql).map_err(driver_err)?;
+    let column_count = stmt.column_count();
+    let columns: Vec<Column> = stmt
+        .columns()
+        .iter()
+        .map(|c| Column {
+            name: c.name().to_string(),
+            decl_type: c.decl_type().map(|t| t.to_string()),
+        })
+        .collect();
+    let cap = CellCap::resolve(&PageCap::Display { key: None }, &columns);
+    let mut rows_iter = stmt
+        .query(rusqlite::params_from_iter(
+            Vec::<rusqlite::types::Value>::new(),
+        ))
+        .map_err(driver_err)?;
+    let mut rows = Vec::new();
+    while let Some(row) = rows_iter.next().map_err(map_step_err)? {
+        rows.push(extract_row(row, column_count, cap)?);
+    }
+    Ok(ResultPage { rows, columns })
+}
+
+/// The async handle to a SQLite sandbox thread.
+struct SqliteSandbox {
+    jobs: mpsc::Sender<SandboxJob>,
+}
+
+impl SqliteSandbox {
+    /// Send `job` and await its reply, mapping a dead thread to a clear error
+    /// rather than a hang. A closed channel means the transaction is already gone.
+    async fn send<T>(&self, job: SandboxJob, reply: oneshot::Receiver<Result<T>>) -> Result<T> {
+        self.jobs
+            .send(job)
+            .await
+            .map_err(|_| RedError::Driver("the sandbox transaction is no longer open".into()))?;
+        reply
+            .await
+            .map_err(|_| RedError::Driver("the sandbox thread exited mid-statement".into()))?
+    }
+}
+
+#[async_trait]
+impl crate::Sandbox for SqliteSandbox {
+    async fn execute(&self, sql: &str, abort: &AbortSignal) -> Result<u64> {
+        let (reply, rx) = oneshot::channel();
+        self.send(
+            SandboxJob::Execute {
+                sql: sql.to_string(),
+                abort: abort.clone(),
+                reply,
+            },
+            rx,
+        )
+        .await
+    }
+
+    async fn fetch_page(&self, sql: &str, limit: usize, abort: &AbortSignal) -> Result<ResultPage> {
+        // `limit` is a `usize`, so inlining it can't inject.
+        let sql = format!("SELECT * FROM ({}) LIMIT {limit}", strip_trailing(sql));
+        let (reply, rx) = oneshot::channel();
+        self.send(
+            SandboxJob::Fetch {
+                sql,
+                abort: abort.clone(),
+                reply,
+            },
+            rx,
+        )
+        .await
+    }
+
+    async fn commit(&self) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.send(
+            SandboxJob::Finish {
+                verb: "COMMIT",
+                reply,
+            },
+            rx,
+        )
+        .await
+    }
+
+    async fn rollback(&self) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        self.send(
+            SandboxJob::Finish {
+                verb: "ROLLBACK",
+                reply,
+            },
+            rx,
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1463,6 +1658,42 @@ mod tests {
         static N: AtomicU32 = AtomicU32::new(0);
         let n = N.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("red_{tag}_{}_{n}.db", std::process::id()))
+    }
+
+    /// The sandbox battery, run on every `cargo test`: SQLite is embedded, so
+    /// this is the one engine whose transaction semantics are verified without a
+    /// server, and the properties are identical across the three that support it.
+    #[tokio::test]
+    async fn sandbox_isolates_until_committed() {
+        let path = temp_db_path("sandbox");
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
+                 INSERT INTO t (id, name) VALUES (1, 'original');",
+            )
+            .unwrap();
+        }
+        let driver = SqliteDriver::new(&path, false);
+        // A genuinely separate connection: reading through the sandbox would pass
+        // whether or not the transaction is real.
+        let outside = path.clone();
+        battery::sandbox_isolates_until_committed(&driver, "t", move || {
+            let path = outside.clone();
+            async move {
+                tokio::task::spawn_blocking(move || {
+                    let conn = Connection::open(&path).unwrap();
+                    conn.query_row("SELECT name FROM t WHERE id = 1", [], |r| {
+                        r.get::<_, String>(0)
+                    })
+                    .unwrap()
+                })
+                .await
+                .unwrap()
+            }
+        })
+        .await;
+        let _ = std::fs::remove_file(&path);
     }
 
     #[tokio::test]

@@ -18,11 +18,11 @@ use serde::{Deserialize, Serialize};
 /// that don't need to round-trip as their own types): the type is stored as its
 /// label string and the TTL as whole seconds.
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct RecentKeyRec {
-    pub(crate) key: String,
-    pub(crate) kv_type: String,
-    pub(crate) ttl_secs: Option<u64>,
-    pub(crate) viewed_unix: u64,
+pub struct RecentKeyRec {
+    pub key: String,
+    pub kv_type: String,
+    pub ttl_secs: Option<u64>,
+    pub viewed_unix: u64,
 }
 
 /// The on-disk shape: a wrapper object (not a bare map) so the format can grow.
@@ -43,7 +43,7 @@ fn recent_keys_path() -> Option<PathBuf> {
 
 /// The saved recent-keys store: the recently-viewed list per connection,
 /// persisted immediately on `set` (unless `path` is `None`, as in tests).
-pub(crate) struct RecentKeysStore {
+pub struct RecentKeysStore {
     keys: HashMap<String, Vec<RecentKeyRec>>,
     path: Option<PathBuf>,
 }
@@ -51,7 +51,7 @@ pub(crate) struct RecentKeysStore {
 impl RecentKeysStore {
     /// Read saved recent keys from disk, or start empty. Never fails: a missing
     /// file is an empty store; a corrupt one is warned about and dropped.
-    pub(crate) fn load() -> Self {
+    pub fn load() -> Self {
         let path = recent_keys_path();
         let keys = match path.as_ref().map(std::fs::read_to_string) {
             Some(Ok(contents)) => match serde_json::from_str::<RecentKeysFile>(&contents) {
@@ -67,13 +67,13 @@ impl RecentKeysStore {
     }
 
     /// The saved recent keys for `conn_id`, newest-first, if any.
-    pub(crate) fn get(&self, conn_id: &str) -> Option<&Vec<RecentKeyRec>> {
+    pub fn get(&self, conn_id: &str) -> Option<&Vec<RecentKeyRec>> {
         self.keys.get(conn_id)
     }
 
     /// Save (overwrite) the recent-keys list for `conn_id` and persist. A
     /// persistence failure is logged, not fatal: the list still shows in-session.
-    pub(crate) fn set(&mut self, conn_id: &str, keys: Vec<RecentKeyRec>) {
+    pub fn set(&mut self, conn_id: &str, keys: Vec<RecentKeyRec>) {
         self.keys.insert(conn_id.to_string(), keys);
         self.persist();
     }

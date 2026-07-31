@@ -12,6 +12,8 @@
 
 assistant-default = [Défáúlt]
 
+assistant-fast = [Fást]
+
 assistant-writes = [wrítés]
 
 assistant-save_key = [Sávé kéy]

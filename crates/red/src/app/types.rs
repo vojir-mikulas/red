@@ -1576,6 +1576,15 @@ pub(crate) struct ActiveConn {
     pub inspector_w: Pixels,
     pub inspector_drag: Option<DragAnchor>,
     pub schema: SchemaState,
+    /// This connection's knowledge file (see [`crate::knowledge`]), or `None` when
+    /// the user hasn't written one.
+    ///
+    /// Cached rather than re-read per frame, because the composer's footer chip
+    /// reports its size on every paint. Refreshed from disk at connect, after an
+    /// in-app save, and at the top of every assistant turn, so an edit made in
+    /// another editor still lands on the next message — which is the same freshness
+    /// the agent gets, from the same value.
+    pub knowledge: Option<String>,
     /// The connection-wide foreign-key graph, prefetched once after
     /// connect. Empty until it lands (or when the engine has no FKs); drives the
     /// in-grid FK click-through. See `Command::LoadForeignKeys`.
@@ -1740,6 +1749,7 @@ impl ActiveConn {
                 .then(|| config.database.clone()),
             namespace_menu_pane: None,
             session,
+            knowledge: crate::knowledge::load(&conn_id),
             conn_id,
             config,
             version,

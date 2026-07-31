@@ -2683,7 +2683,6 @@ dependencies = [
 [[package]]
 name = "flint"
 version = "0.1.0"
-source = "git+https://github.com/vojir-mikulas/flint?rev=65f695f362d05cc5a9f2f246e8943b5b821a34b2#65f695f362d05cc5a9f2f246e8943b5b821a34b2"
 dependencies = [
  "gpui",
  "unicode-segmentation",
@@ -6889,6 +6888,7 @@ dependencies = [
  "keyring",
  "red-core",
  "serde",
+ "serde_json",
  "toml 0.8.23",
  "tracing",
  "zeroize",
@@ -6935,6 +6935,7 @@ dependencies = [
  "hyper-util",
  "red-acp",
  "red-ai",
+ "red-config",
  "red-core",
  "red-driver",
  "reqwest",

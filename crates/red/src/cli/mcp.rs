@@ -55,6 +55,10 @@ pub(crate) fn cmd_mcp(args: McpArgs) -> u8 {
         show_thinking: false,
         enabled: settings.ai.enabled,
         tier: red_service::AiTier::parse(&settings.ai.tier),
+        // Headless: no approval prompt to show a preview in, and no card to review
+        // a transaction on.
+        preview_writes: false,
+        sandbox_timeout_secs: 0,
         limits: red_service::AiLimits {
             max_rows: settings.ai.limits.max_rows,
             statement_timeout_ms: settings.ai.limits.statement_timeout_ms,

@@ -101,6 +101,8 @@ pub(in crate::ai) const READ_ONLY_TOOLS: &[&str] = &[
     "object_ddl",
     "profile_table",
     "run_select",
+    // Reads the next window of a `run_select` already in flight.
+    "fetch_more",
     "search_data",
     // Plans; with `analyze` it also *runs* the statement, which is why that
     // branch refuses anything `risk::assess` grades above Safe.
@@ -116,6 +118,15 @@ pub(in crate::ai) const READ_ONLY_TOOLS: &[&str] = &[
     "open_query",
     // Writes a `.sql` file to the user's saved-queries library; no DB mutation.
     "save_query",
+    // Hands the UI a draft knowledge file to open for review; writes nothing at
+    // all (not even a file) and never touches the database.
+    "save_knowledge",
+    // Grounding: these read the app's own stores (query history, saved queries,
+    // recently-viewed keys). No driver call at all, so nothing to mutate.
+    "search_query_history",
+    "list_saved_queries",
+    "read_saved_query",
+    "kv_recent_keys",
     // Redis (KV) read tools: pure reads through the `KvDriver` seam.
     "kv_server_info",
     "kv_scan_keys",
@@ -164,11 +175,41 @@ const UI_ONLY_TOOLS: &[&str] = &[
     "open_query",
     "save_query",
     "generate_report",
+    // The draft is only useful if there's an editor to review it in; a headless
+    // caller has nowhere to put it and no user to check it.
+    "save_knowledge",
     // Writes a file into the app's output folder and announces it as a card for
     // the user to open. Over a headless transport there is nobody to hand it to,
     // and the folder is the app's, not the caller's.
     "export_result",
 ];
+/// Whether a call to `name` produces data an answer could cite, and therefore
+/// earns a source number.
+///
+/// A read that returns facts qualifies; chrome does not. `open_query` hands the
+/// user a tab, `save_query` and `save_knowledge` write a file, `generate_report`
+/// and `export_result` produce a document -- none of them is evidence for a
+/// sentence, and listing them under "Sources" would pad the count with things
+/// nobody can check a number against. Writes are excluded for the same reason:
+/// they change the world rather than describe it.
+///
+/// Defined over [`READ_ONLY_TOOLS`] minus that chrome, so a new read is a source
+/// by default and a new piece of chrome has to be named here. That direction is
+/// deliberate: an uncited source understates provenance, while a source that
+/// isn't evidence overstates it.
+pub(crate) fn is_source_tool(name: &str) -> bool {
+    const NOT_EVIDENCE: &[&str] = &[
+        "open_query",
+        "save_query",
+        "save_knowledge",
+        "generate_report",
+        "export_result",
+        // A subagent's individual reads never cross back to the parent; only its
+        // report does, so the delegation is not a citable source of its own.
+        "spawn_subagent",
+    ];
+    !is_write_tool(name) && !NOT_EVIDENCE.contains(&name)
+}
 /// Whether `name` may run over the headless `red mcp` transport: a read-only tool
 /// that isn't one of the GUI-only [`UI_ONLY_TOOLS`]. Writes are already excluded
 /// by [`is_write_tool`]; this additionally drops the UI-bound reads.
@@ -691,10 +732,65 @@ mod tests {
             "open_query",
             "save_query",
             "generate_report",
+            "save_knowledge",
         ] {
             assert!(!is_write_tool(t));
             assert!(!is_headless_tool(t), "{t} is GUI-bound");
         }
+        // `save_knowledge` writes nothing (not even a file): it hands the UI a
+        // draft to open for review, so it must never be gated as a write and must
+        // never exist below Read, where the agent can't sample a value to learn
+        // anything from.
+        assert!(!AiTier::Schema.allows_tool("save_knowledge"));
+        assert!(AiTier::Read.allows_tool("save_knowledge"));
+        assert!(AiTier::Write.allows_tool("save_knowledge"));
+    }
+
+    /// A source number says "you can check this number against that call", so it
+    /// belongs to reads that return facts and to nothing else. Padding the list
+    /// with chrome would inflate a count the reader is meant to trust.
+    #[test]
+    fn only_data_returning_reads_earn_a_source_number() {
+        for tool in [
+            "run_select",
+            "fetch_more",
+            "profile_table",
+            "search_data",
+            "explain",
+            "list_schema",
+            "describe_table",
+            "relationship_map",
+            "search_query_history",
+            "kv_get_value",
+            "find",
+            "aggregate",
+        ] {
+            assert!(is_source_tool(tool), "{tool} produces citable data");
+        }
+        // Chrome: hands the user a tab, a file or a document, none of which is
+        // evidence for a sentence.
+        for tool in [
+            "open_query",
+            "save_query",
+            "save_knowledge",
+            "generate_report",
+            "export_result",
+            "spawn_subagent",
+        ] {
+            assert!(!is_source_tool(tool), "{tool} is not evidence");
+        }
+        // Writes change the world rather than describing it.
+        for tool in [
+            "propose_write",
+            "propose_changeset",
+            "kv_set",
+            "create_index",
+        ] {
+            assert!(!is_source_tool(tool), "{tool} is a write");
+        }
+        // Fails closed the useful way round: an unknown name is a write, and a
+        // write is never a source.
+        assert!(!is_source_tool("some_tool_nobody_listed"));
     }
 
     /// A kill prompt has to say *what* is being stopped. "Terminate session 4711"

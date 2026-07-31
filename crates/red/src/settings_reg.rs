@@ -976,6 +976,49 @@ static DEFS: &[SettingDef] = &[
         }),
     },
     SettingDef {
+        key: "ai.preview_writes",
+        tab: SettingsTab::Ai,
+        group: "Safety",
+        en_label: "Preview affected rows",
+        en_help: "Before you approve an agent write, count the rows it would change and show a \
+               few of them. Turning this off leaves the approval prompt showing only the SQL.",
+        applies: Applies::All,
+        control: Control::Toggle,
+        get: |s| Value::Bool(s.ai.preview_writes),
+        set: |s, v| s.ai.preview_writes = v.as_bool(),
+        warn: Some(|s| {
+            (!s.ai.preview_writes).then_some(
+                "Without a row count, “Allow this?” is a question you cannot check, and the \
+                 realistic answer is a rubber stamp.",
+            )
+        }),
+    },
+    SettingDef {
+        key: "ai.sandbox_timeout_secs",
+        tab: SettingsTab::Ai,
+        group: "Safety",
+        en_label: "Review transaction timeout",
+        en_help: "How long uncommitted agent changes wait for your Commit or Roll back before \
+               rolling back on their own. An open transaction holds locks, so it cannot wait \
+               indefinitely.",
+        applies: Applies::All,
+        control: Control::Segments(&[
+            seg("30s", int(30)),
+            seg("1m", int(60)),
+            seg("2m", int(120)),
+            seg("5m", int(300)),
+            seg("10m", int(600)),
+        ]),
+        get: |s| Value::Int(s.ai.sandbox_timeout_secs as i64),
+        set: |s, v| s.ai.sandbox_timeout_secs = v.as_int().max(30) as u64,
+        warn: Some(|s| {
+            (s.ai.sandbox_timeout_secs > 300).then_some(
+                "A long-held transaction takes locks and (on Postgres) bloats the table it \
+                 touched, whether or not you commit it.",
+            )
+        }),
+    },
+    SettingDef {
         key: "ai.show_thinking",
         tab: SettingsTab::Ai,
         group: "Display",

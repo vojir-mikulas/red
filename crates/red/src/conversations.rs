@@ -50,6 +50,12 @@ pub(crate) struct Conversation {
     /// for display and for a future per-chat binding. Informational for now,
     /// where a single active chat runs on the current `[ai] provider`.
     pub provider: String,
+    /// Whether this chat runs its writes in a review transaction rather than
+    /// approving them one at a time. Persisted like `provider` because it is a
+    /// property of the conversation, not of the session that happened to be open.
+    /// Defaulted for files written before the mode existed.
+    #[serde(default)]
+    pub sandbox: bool,
     /// Unix seconds when first saved.
     #[serde(default)]
     pub created_unix: u64,
@@ -236,6 +242,7 @@ mod tests {
         let conv = Conversation {
             title: "Active users".into(),
             provider: "subscription".into(),
+            sandbox: false,
             created_unix: 100,
             updated_unix: 200,
             messages: vec![

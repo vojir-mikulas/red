@@ -13,6 +13,10 @@ use serde_json::json;
 
 use super::super::export::export_tool_def;
 use super::super::gate::gate_catalog;
+use super::super::grounding::{
+    history_tool_def, list_saved_queries_tool_def, read_saved_query_tool_def,
+};
+use super::super::knowledge::knowledge_tool_def;
 use super::super::report::report_tool_def;
 use super::super::turn::spawn_subagent_tool_def;
 use super::super::util::finish_system_prompt;
@@ -130,6 +134,23 @@ pub(in crate::ai) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
                     },
                 },
                 "required": ["sql"],
+                "additionalProperties": false,
+            }),
+        },
+        ToolDef {
+            name: "fetch_more".into(),
+            description: "Read the NEXT window of a result you already started with run_select,                 using the cursor handle it gave you. The cursor keeps its place, so the windows                 tile the result exactly - no rows repeated, none skipped, and no re-running the                 query. Never page a large result by rewriting it with OFFSET: that re-executes                 the whole query every time and silently duplicates or drops rows whenever the                 ordering is not total. Reading a window pushes the previous one out of your                 context, so SUMMARIZE AS YOU GO - keep a running tally or a list of what you                 found, rather than trying to hold every window at once."
+                .into(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "cursor": { "type": "string", "description": "The handle run_select returned, e.g. \"c3\"." },
+                    "limit": {
+                        "type": "integer",
+                        "description": format!("Max rows for this window (1..{max_rows}); fewer come back when the window fills its size budget first."),
+                    },
+                },
+                "required": ["cursor"],
                 "additionalProperties": false,
             }),
         },
@@ -289,6 +310,10 @@ pub(in crate::ai) fn tool_catalog(policy: &AiPolicy) -> Vec<ToolDef> {
             &["sql"],
         ),
         report_tool_def(),
+        knowledge_tool_def(),
+        history_tool_def("SQL statements"),
+        list_saved_queries_tool_def(),
+        read_saved_query_tool_def(),
         ToolDef {
             name: "open_query".into(),
             description: "Open a SQL query in a new editor tab in the user's workspace so they have \
@@ -441,8 +466,10 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
         }
         AiTier::Schema => {
             "You have schema-only tools: list_schema, describe_table, relationship_map, and \
-             object_ddl. You can inspect structure (tables, columns, types, keys, definitions) but \
-             you CANNOT read row data; there is no query tool, so do not promise to run one."
+             object_ddl, plus search_query_history, list_saved_queries and read_saved_query (what \
+             this user has already written against this database). You can inspect structure \
+             (tables, columns, types, keys, definitions) but you CANNOT read row data; there is no \
+             query tool, so do not promise to run one."
         }
         AiTier::Read => {
             "You have read-only tools: list_schema, describe_table, relationship_map (the \
@@ -453,16 +480,20 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
              query in a new editor tab in the user's workspace; a read-only SELECT runs \
              automatically), and generate_report (you author an HTML report from data you've read, \
              with optional interactive Chart.js charts; it appears as a card in the chat the user \
-             can open; use it when the user asks for a report). Use them to ground every answer in \
+             can open; use it when the user asks for a report), and save_knowledge (draft this \
+             connection's knowledge file for the user to review). Use them to ground every answer in \
              the live database rather than guessing: discover objects with list_schema, inspect \
              structure with describe_table, and read data with run_select. Use open_query to hand \
              the user a query to explore in the grid. Prefer small, targeted queries with explicit \
-             columns and LIMIT."
+             columns and LIMIT. You also have search_query_history, list_saved_queries and \
+             read_saved_query: what this user has already written against this database."
         }
         AiTier::Write => {
             "You have the read tools (list_schema, describe_table, relationship_map, object_ddl, \
              run_select, search_data, explain, health_report, server_sessions, diff_schema, \
-             diff_data, suggest_index, export_result, open_query, generate_report) AND gated write \
+             diff_data, suggest_index, export_result, open_query, generate_report, \
+             save_knowledge, search_query_history, list_saved_queries, read_saved_query) AND \
+             gated write \
              tools: propose_write for a SINGLE INSERT/UPDATE/DELETE, propose_changeset for several \
              as one unit, create_index, and kill_session. Every one requires the user's explicit \
              Allow on the exact operation; assume it may be denied, and never batch or chain \
@@ -480,6 +511,18 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
              Before any query that joins more than one table, call relationship_map; do not infer \
              join keys from column names. Before explaining a constraint failure or what a view \
              actually does, call object_ddl.\n\n\
+             Before writing a non-trivial query, check list_saved_queries: a saved query is this \
+             user's own blessed definition of a metric, and matching it matters more than writing \
+             something cleverer. Use search_query_history to see how they actually write against \
+             these tables - join paths, date columns, status values - instead of inferring from \
+             column names. Where the two disagree with what the user has written down about this \
+             database above, the written notes win on what something MEANS and the history wins on \
+             how it is WRITTEN here.\n\n\
+             Each tool result is labelled `[source N]`. When you state a figure or a fact you \
+             read from a tool, append that marker to the claim - \"revenue was $4.2M [3]\". One \
+             marker per claim, never the same source twice in a sentence, and never a marker on \
+             something you reasoned out rather than read: a citation says where a number came \
+             from, not that it is right.\n\n\
              When you write SQL for the user, put it in a fenced ```sql block so they can run it. \
              Be concise: lead with the answer, then the supporting query or detail.\n",
         ),
@@ -497,6 +540,14 @@ pub(crate) fn system_prompt(ctx: &AiContext, policy: &AiPolicy) -> String {
 /// with the ACP path for the same per-turn grounding.
 pub(crate) fn user_turn(message: &str, ctx: &AiContext) -> String {
     let mut s = String::new();
+    // Cursors legitimately outlive the turn that opened them ("keep going" is a
+    // real follow-up), but never *silently*: told nothing, a model either forgets
+    // it can continue or invents a handle. Volatile per-turn state, so it rides
+    // here rather than in the cached system prompt.
+    if let Some(line) = ctx.open_cursors.as_deref().filter(|l| !l.trim().is_empty()) {
+        s.push_str(line);
+        s.push_str("\n\n");
+    }
     // A reopened conversation seeds the prior exchange once, so the model
     // picks up where the saved chat left off even though its session is fresh.
     if let Some(prior) = ctx
@@ -562,7 +613,10 @@ mod tests {
                 "list_schema",
                 "describe_table",
                 "object_ddl",
-                "relationship_map"
+                "relationship_map",
+                "search_query_history",
+                "list_saved_queries",
+                "read_saved_query"
             ]
         );
         assert_eq!(
@@ -574,6 +628,7 @@ mod tests {
                 "relationship_map",
                 "profile_table",
                 "run_select",
+                "fetch_more",
                 "search_data",
                 "explain",
                 "health_report",
@@ -583,6 +638,10 @@ mod tests {
                 "suggest_index",
                 "export_result",
                 "generate_report",
+                "save_knowledge",
+                "search_query_history",
+                "list_saved_queries",
+                "read_saved_query",
                 "open_query",
                 "save_query",
                 "spawn_subagent"
@@ -603,6 +662,7 @@ mod tests {
                 "relationship_map",
                 "profile_table",
                 "run_select",
+                "fetch_more",
                 "search_data",
                 "explain",
                 "health_report",
@@ -612,6 +672,10 @@ mod tests {
                 "suggest_index",
                 "export_result",
                 "generate_report",
+                "save_knowledge",
+                "search_query_history",
+                "list_saved_queries",
+                "read_saved_query",
                 "open_query",
                 "save_query",
                 "spawn_subagent"
@@ -646,6 +710,33 @@ mod tests {
             ..AiPolicy::default()
         };
         assert!(names(write_ro).iter().all(|n| n != "propose_write"));
+    }
+
+    /// The ordering *is* the feature, so it is asserted rather than assumed: the
+    /// knowledge file overrides inference, so the model must read it before the
+    /// schema it overrides, and both must stay in the (prompt-cached) system
+    /// prompt rather than drifting into the per-turn message.
+    #[test]
+    fn system_prompt_puts_knowledge_after_the_tools_line_and_before_the_schema() {
+        let ctx = AiContext {
+            schema_summary: "orders(id int, status text)".into(),
+            knowledge: Some("`void` orders never happened; exclude them.".into()),
+            ..Default::default()
+        };
+        let prompt = system_prompt(&ctx, &AiPolicy::default());
+        let tools = prompt.find("You have read-only tools").expect("tools line");
+        let knowledge = prompt
+            .find("`void` orders never happened")
+            .expect("knowledge");
+        let schema = prompt.find("Schema overview").expect("schema overview");
+        assert!(tools < knowledge, "knowledge must follow the tools line");
+        assert!(
+            knowledge < schema,
+            "knowledge must precede the schema overview"
+        );
+        // And it never leaks into the volatile per-turn message, which sits after
+        // the last cache breakpoint and would be re-read on every single turn.
+        assert!(!user_turn("how many orders?", &ctx).contains("`void` orders"));
     }
 
     #[test]

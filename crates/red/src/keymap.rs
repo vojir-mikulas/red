@@ -27,7 +27,9 @@
 
 use std::collections::BTreeMap;
 
-use flint::{CodeEditor, ComboBox, Modal, Palette, SelectableLabel, Switcher, TextInput};
+use flint::{
+    CodeEditor, ComboBox, MarkdownEditor, Modal, Palette, SelectableLabel, Switcher, TextInput,
+};
 use gpui::{
     App, KeyBinding, KeyBindingContextPredicate, Keystroke, NoAction, SharedString, actions,
 };
@@ -907,6 +909,7 @@ pub(crate) fn bind_all(cx: &mut App) {
 fn bind_components(cx: &mut App) {
     TextInput::bind_keys(cx);
     CodeEditor::bind_keys(cx);
+    MarkdownEditor::bind_keys(cx);
     Palette::bind_keys(cx);
     Modal::bind_keys(cx);
     Switcher::bind_keys(cx);

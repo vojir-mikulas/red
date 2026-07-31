@@ -391,6 +391,26 @@ settings-ai-limits-max_tool_calls-seg-500 = [500]
 
 settings-ai-limits-max_tool_calls-seg-off = [Öff]
 
+settings-group-safety = [Sáféty]
+
+settings-ai-preview_writes =
+    .label = [Prévíéw áfféçtéd röws]
+    .help = [Béföré yöú ápprövé áñ ágéñt wríté, çöúñt thé röws ít wöúld çháñgé áñd shöw á féw öf thém. Túrñíñg thís öff léávés thé ápprövál prömpt shöwíñg öñly thé SQL.]
+
+settings-ai-sandbox_timeout_secs =
+    .label = [Révíéw tráñsáçtíöñ tíméöút]
+    .help = [Höw löñg úñçömmíttéd ágéñt çháñgés wáít för yöúr Çömmít ör Röll báçk béföré röllíñg báçk öñ théír öwñ. Áñ öpéñ tráñsáçtíöñ hölds löçks, sö ít çáññöt wáít íñdéfíñítély.]
+
+settings-ai-sandbox_timeout_secs-seg-30s = [30s]
+
+settings-ai-sandbox_timeout_secs-seg-1m = [1m]
+
+settings-ai-sandbox_timeout_secs-seg-2m = [2m]
+
+settings-ai-sandbox_timeout_secs-seg-5m = [5m]
+
+settings-ai-sandbox_timeout_secs-seg-10m = [10m]
+
 settings-ai-show_thinking =
     .label = [Shöw thíñkíñg]
     .help = [Shöw á súmmárízéd “thíñkíñg…” áffördáñçé whílé thé mödél réásöñs.]

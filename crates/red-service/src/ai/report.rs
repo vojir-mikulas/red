@@ -362,6 +362,7 @@ fn strip_scripts(html: &str) -> String {
 mod tests {
     use super::*;
     use crate::Event;
+    use crate::ai::ConnCtx;
     use crate::ai::sql::run_tool;
     use crate::protocol::ConversationId;
     use red_ai::CancelToken;
@@ -384,7 +385,15 @@ mod tests {
 
         let (content, ok) = run_tool(
             &driver,
-            Dialect::Sqlite,
+            ConnCtx {
+                conn_id: "",
+                dialect: Dialect::Sqlite,
+                conversation_id: crate::protocol::ConversationId::new(1),
+                state: &std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::ai::state::AiState::default(),
+                )),
+                sandbox: None,
+            },
             "generate_report",
             &json!({
                 "title": "Widgets",
@@ -422,7 +431,15 @@ mod tests {
         // An empty body is refused, and nothing is announced.
         let (_content, ok) = run_tool(
             &driver,
-            Dialect::Sqlite,
+            ConnCtx {
+                conn_id: "",
+                dialect: Dialect::Sqlite,
+                conversation_id: crate::protocol::ConversationId::new(1),
+                state: &std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::ai::state::AiState::default(),
+                )),
+                sandbox: None,
+            },
             "generate_report",
             &json!({ "html": "   " }),
             &AiPolicy::default(),
@@ -451,7 +468,15 @@ mod tests {
 
         let (_content, ok) = run_tool(
             &driver,
-            Dialect::Sqlite,
+            ConnCtx {
+                conn_id: "",
+                dialect: Dialect::Sqlite,
+                conversation_id: crate::protocol::ConversationId::new(1),
+                state: &std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::ai::state::AiState::default(),
+                )),
+                sandbox: None,
+            },
             "generate_report",
             &json!({ "title": "Here", "html": "<h1>Here</h1>" }),
             &AiPolicy::default(),
@@ -488,7 +513,15 @@ mod tests {
 
         let (content, ok) = run_tool(
             &driver,
-            Dialect::Sqlite,
+            ConnCtx {
+                conn_id: "",
+                dialect: Dialect::Sqlite,
+                conversation_id: crate::protocol::ConversationId::new(1),
+                state: &std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::ai::state::AiState::default(),
+                )),
+                sandbox: None,
+            },
             "generate_report",
             &json!({
                 "title": "Sales",
@@ -544,7 +577,15 @@ mod tests {
 
         let (content, ok) = run_tool(
             &driver,
-            Dialect::Sqlite,
+            ConnCtx {
+                conn_id: "",
+                dialect: Dialect::Sqlite,
+                conversation_id: crate::protocol::ConversationId::new(1),
+                state: &std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::ai::state::AiState::default(),
+                )),
+                sandbox: None,
+            },
             "generate_report",
             &json!({
                 "title": "Sales",
@@ -590,7 +631,15 @@ mod tests {
 
         let (content, ok) = run_tool(
             &driver,
-            Dialect::Sqlite,
+            ConnCtx {
+                conn_id: "",
+                dialect: Dialect::Sqlite,
+                conversation_id: crate::protocol::ConversationId::new(1),
+                state: &std::sync::Arc::new(std::sync::Mutex::new(
+                    crate::ai::state::AiState::default(),
+                )),
+                sandbox: None,
+            },
             "generate_report",
             &json!({
                 "title": "Sales",

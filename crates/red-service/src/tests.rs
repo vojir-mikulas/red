@@ -230,6 +230,8 @@ async fn mcp_tool_list_and_call_round_trip() {
     assert!(!names.contains(&"open_query"));
     assert!(!names.contains(&"save_query"));
     assert!(!names.contains(&"generate_report"));
+    // A knowledge draft is only useful if there is an editor to review it in.
+    assert!(!names.contains(&"save_knowledge"));
 
     // tools/call run_select → a non-error result carrying the value.
     send(
@@ -2810,6 +2812,8 @@ async fn ai_turn_resolves_agent_id_with_clear_errors() {
             show_thinking: false,
             enabled: true,
             tier: AiTier::Read,
+            preview_writes: false,
+            sandbox_timeout_secs: 120,
             limits: AiLimits::default(),
         }),
     );
@@ -2818,6 +2822,7 @@ async fn ai_turn_resolves_agent_id_with_clear_errors() {
     send(
         &handle,
         Command::AiTurn {
+            sandbox: false,
             conversation_id: ConversationId::new(1),
             agent: "ghost".into(),
             message: "hi".into(),
@@ -2835,6 +2840,7 @@ async fn ai_turn_resolves_agent_id_with_clear_errors() {
     send(
         &handle,
         Command::AiTurn {
+            sandbox: false,
             conversation_id: ConversationId::new(2),
             agent: "api".into(),
             message: "hi".into(),

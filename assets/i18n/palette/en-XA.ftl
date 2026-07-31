@@ -92,6 +92,8 @@ palette-cmd_columns = [víéw: tögglé çölúmñs páñél]
 
 palette-cmd_health = [çöññéçtíöñ: héálth répört]
 
+palette-cmd_knowledge = [çöññéçtíöñ: dátábásé kñöwlédgé…]
+
 palette-cmd_compare_schema = [sçhémá: çömpáré ágáíñst…]
 
 palette-cmd_server_panel = [víéw: tögglé sérvér páñél]
@@ -105,6 +107,8 @@ palette-cmd_disconnect = [çöññéçtíöñ: dísçöññéçt]
 palette-cmd_ai_new_chat = [ágéñt: ñéw çhát]
 
 palette-cmd_ai_history = [ágéñt: çöñvérsátíöñ hístöry…]
+
+palette-cmd_ai_learn = [ágéñt: léárñ thís dátábásé]
 
 palette-cmd_ai_storage = [ágéñt: öpéñ çöñvérsátíöñ störágé]
 

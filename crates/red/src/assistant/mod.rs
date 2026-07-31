@@ -209,6 +209,20 @@ pub(crate) struct PendingPermission {
     pub(crate) request_id: red_service::RequestId,
     pub(crate) title: SharedString,
     pub(crate) detail: Option<SharedString>,
+    /// What an approved write would touch, when the backend could count it.
+    /// `None` means the preview was skipped or failed, **never** that the write
+    /// affects nothing; the prompt then shows without a count.
+    pub(crate) preview: Option<red_service::WritePreview>,
+}
+
+/// A turn's writes, run but not committed, waiting on the user's answer.
+pub(crate) struct PendingSandbox {
+    /// What ran, in order, with the rows each statement touched.
+    pub(crate) statements: Vec<red_service::SandboxEntry>,
+    pub(crate) total_rows: u64,
+    /// When the transaction rolls itself back if nobody answers. Shown as a
+    /// countdown past the halfway mark: an expiry should never be a surprise.
+    pub(crate) expires_at: std::time::Instant,
 }
 
 /// One open conversation. The panel holds several of these; the active one
@@ -234,6 +248,14 @@ pub(crate) struct ChatSession {
     /// The most recent finished turn's token/cost accounting, shown as a
     /// compact footer. `None` until the first turn completes.
     pub(crate) last_usage: Option<red_service::AiUsage>,
+    /// Run this chat's writes in one uncommitted transaction the user reviews at
+    /// the end, instead of approving each statement. Chosen before the first turn
+    /// and persisted with the conversation; the service still refuses it where it
+    /// cannot be honoured.
+    pub(crate) sandbox: bool,
+    /// The turn's uncommitted changes awaiting Commit/Roll back, when one is open.
+    /// Present iff a review card is showing.
+    pub(crate) pending_sandbox: Option<PendingSandbox>,
     /// Which agent this chat runs on: the agent profile's id (`"subscription"`,
     /// `"anthropic"`, `"codex"`, …). Chosen at creation (defaulting to the resolved
     /// default agent) and persisted as the conversation's binding; turns carry
@@ -297,6 +319,8 @@ impl ChatSession {
             error: None,
             pending_permission: None,
             last_usage: None,
+            sandbox: false,
+            pending_sandbox: None,
             provider,
             title: None,
             file_stem: None,
@@ -326,9 +350,10 @@ impl ChatSession {
     }
 
     /// Whether this chat needs the user's attention while it isn't shown: a parked
-    /// permission prompt the agent is blocked on. Drives the switcher's dot.
+    /// permission prompt the agent is blocked on, or uncommitted changes waiting
+    /// on an answer. Drives the switcher's dot.
     pub(super) fn needs_attention(&self) -> bool {
-        self.pending_permission.is_some()
+        self.pending_permission.is_some() || self.pending_sandbox.is_some()
     }
 
     /// Ensure the trailing bubble is an assistant bubble (deltas append to it).
@@ -459,6 +484,14 @@ pub(crate) struct AssistantState {
     /// Monotonic id handed to each selectable leaf as it's built, unique within the
     /// panel so [`selection_group`](Self::selection_group) can tell them apart.
     pub(crate) next_selection_id: u64,
+    /// The activity node a Sources chip last pointed at, ringed in the timeline
+    /// until another chip is clicked or the same one is clicked again.
+    ///
+    /// Sticky rather than a flash: the question a source chip answers is "which
+    /// query gave you that number", and answering it usually means looking back
+    /// and forth between the prose and the SQL. A highlight that fades takes the
+    /// answer away mid-comparison.
+    pub(crate) highlighted_source: Option<red_core::ActivityId>,
 }
 
 impl AssistantState {

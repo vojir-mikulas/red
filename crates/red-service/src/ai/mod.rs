@@ -6,8 +6,14 @@
 //! The tree mirrors that shape. Engine-agnostic machinery sits at this level:
 //! [`turn`] runs the loop, [`state`] holds per-conversation state and the
 //! write-approval registry, [`gate`] is the single source of truth for what
-//! counts as a write, and [`report`]/[`export`] are the two ways a tool hands
-//! the user a file. Below it, one subtree per driver seam -- [`sql`], [`kv`],
+//! counts as a write, [`report`]/[`export`] are the two ways a tool hands
+//! the user a file, [`knowledge`] is how the agent hands back a draft of what
+//! it learned, [`grounding`] retrieves what the user has already run, and
+//! [`preview`] counts what a proposed write would touch before the user answers,
+//! [`shape`] catches a read query that answers a different question than it
+//! looks like it asks, and [`cursors`] holds the live windowed reads that let the
+//! agent page a large result instead of truncating it.
+//! Below it, one subtree per driver seam -- [`sql`], [`kv`],
 //! [`doc`] -- each laid out the same way: `catalog` declares the tools and the
 //! system prompt that introduces them, the subtree's own `mod` holds the
 //! executor that dispatches them, `tools` holds the composed reads, and `format`
@@ -29,11 +35,16 @@ use serde_json::Value as Json;
 
 use crate::protocol::AiContext;
 
+mod cursors;
 mod doc;
 mod export;
 mod gate;
+mod grounding;
+mod knowledge;
 mod kv;
+mod preview;
 mod report;
+mod shape;
 mod sql;
 mod state;
 mod turn;
@@ -44,6 +55,7 @@ mod testutil;
 
 pub(crate) use gate::{is_headless_tool, is_write_tool};
 pub(crate) use sql::user_turn;
+pub(crate) use state::SandboxSlot;
 pub(crate) use state::{AiState, ReportSink};
 pub(crate) use turn::run_turn;
 
@@ -53,6 +65,33 @@ use kv::catalog::{kv_system_prompt, kv_tool_catalog};
 use kv::kv_run_tool;
 use sql::catalog::{system_prompt, tool_catalog};
 use sql::run_tool;
+
+/// The two facts about the *connection* a tool call runs against, as opposed to
+/// the driver it runs through: which saved connection this is (the key the query
+/// history and recent-keys stores are filed under) and how to lex its SQL.
+///
+/// Bundled because they travel together through every executor and are the two
+/// things a driver handle cannot tell you. `conn_id` is empty on a transport with
+/// no app-side connection identity; the grounding tools are withheld there and
+/// refuse if called anyway.
+#[derive(Clone)]
+pub(crate) struct ConnCtx<'a> {
+    pub(crate) conn_id: &'a str,
+    pub(crate) dialect: Dialect,
+    /// Whose turn this is, so a cursor it opens is filed against the right chat
+    /// and closed when that chat goes away.
+    pub(crate) conversation_id: crate::protocol::ConversationId,
+    /// The assistant's shared state, which owns the live cursor registry. Passed
+    /// rather than reached for, so a tool cannot acquire it out of band.
+    pub(crate) state: &'a std::sync::Arc<std::sync::Mutex<state::AiState>>,
+    /// The session's open sandbox transaction, when this turn is running in one.
+    ///
+    /// Both writes **and reads** route through it while it is open. The reads are
+    /// the subtle half: a read taken outside the transaction would not see the
+    /// sandbox's own uncommitted writes, so the agent would verify its work
+    /// against stale data and report success for a change that isn't there.
+    pub(crate) sandbox: Option<Arc<dyn red_driver::Sandbox>>,
+}
 
 /// Which engine the agent turn is grounded in. The model→tool loop, streaming,
 /// budget, write gate, and history are identical across all three; only the tool
@@ -116,8 +155,13 @@ impl AiBackend {
     }
 
     /// Run one tool call against this backend's driver, returning `(content, ok)`.
+    ///
+    /// `conn` carries what the driver handle cannot say for itself: which saved
+    /// connection this is (the grounding tools scope by it) and the session's open
+    /// sandbox, if any (writes and reads both route through it).
     pub(crate) async fn run_tool(
         &self,
+        conn: ConnCtx<'_>,
         name: &str,
         input: &Json,
         policy: &AiPolicy,
@@ -125,10 +169,12 @@ impl AiBackend {
         report: &ReportSink,
     ) -> (String, bool) {
         match self {
-            AiBackend::Sql { driver, dialect } => {
-                run_tool(driver, *dialect, name, input, policy, cancel, report).await
+            AiBackend::Sql { driver, .. } => {
+                run_tool(driver, conn, name, input, policy, cancel, report).await
             }
-            AiBackend::Kv(d) => kv_run_tool(d, name, input, policy, cancel, report).await,
+            AiBackend::Kv(d) => kv_run_tool(d, conn, name, input, policy, cancel, report).await,
+            // The doc seam has no store to retrieve from: nothing records a Mongo
+            // query, so there is no history for a connection id to scope.
             AiBackend::Doc(d) => doc_run_tool(d, name, input, policy, cancel, report).await,
         }
     }
@@ -171,7 +217,15 @@ mod tests {
             }
             let (content, _) = run_tool(
                 &sql,
-                Dialect::Sqlite,
+                ConnCtx {
+                    conn_id: "",
+                    dialect: Dialect::Sqlite,
+                    conversation_id: crate::protocol::ConversationId::new(1),
+                    state: &std::sync::Arc::new(std::sync::Mutex::new(
+                        crate::ai::state::AiState::default(),
+                    )),
+                    sandbox: None,
+                },
                 &tool.name,
                 &json!({}),
                 &write,

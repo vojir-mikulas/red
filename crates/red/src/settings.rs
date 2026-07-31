@@ -832,6 +832,17 @@ pub struct AiSettings {
     /// the user can find them. Created on demand; an unusable folder falls back to the
     /// temp dir rather than failing the report.
     pub report_dir: String,
+    /// Count the rows an agent write would affect and show them (with a few of
+    /// them) in the approval prompt. On by default: "Allow this?" over a statement
+    /// whose blast radius is invisible is a question nobody can answer, so the
+    /// realistic outcome is a rubber stamp. Turn it off on a slow link, where the
+    /// round-trips before every prompt cost more than the number is worth.
+    pub preview_writes: bool,
+    /// How long a review transaction may sit unresolved before RED rolls it back,
+    /// in seconds. An open transaction holds locks, so a user who walks away
+    /// mid-review can block production writes; rolling back is the only defensible
+    /// expiry. Floored at 30s so the card is always answerable.
+    pub sandbox_timeout_secs: u64,
     /// Resource guards on the `read` tier (`[ai.limits]`).
     pub limits: AiLimitsSettings,
 }
@@ -864,6 +875,8 @@ impl Default for AiSettings {
             agents: Vec::new(),
             default_agent: String::new(),
             report_dir: String::new(),
+            preview_writes: true,
+            sandbox_timeout_secs: 120,
             limits: AiLimitsSettings::default(),
         }
     }

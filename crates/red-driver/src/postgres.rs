@@ -1896,6 +1896,34 @@ impl DatabaseDriver for PostgresDriver {
         self.release(conn);
         writer.finish().map_err(driver_err)
     }
+
+    fn supports_sandbox(&self) -> bool {
+        // Postgres is the reference implementation: real multi-statement
+        // transactions, DDL included.
+        true
+    }
+
+    async fn begin_sandbox(&self) -> Result<Option<Box<dyn crate::Sandbox>>> {
+        let client = self.acquire().await?;
+        client.batch_execute("BEGIN").await.map_err(driver_err)?;
+        // A server-side backstop for the case RED's own deadline can't cover: if
+        // the app crashes mid-review, this connection would otherwise sit in
+        // `idle in transaction` holding locks until somebody noticed. RED's timer
+        // handles the normal case; this handles the case where RED isn't there.
+        // Set *after* BEGIN so it applies to this transaction only, and treated as
+        // best-effort: an engine or role that refuses it must not fail the sandbox.
+        if let Err(e) = client
+            .batch_execute("SET LOCAL idle_in_transaction_session_timeout = '300s'")
+            .await
+        {
+            tracing::warn!("could not arm the sandbox idle timeout: {e}");
+        }
+        Ok(Some(Box::new(PgSandbox {
+            client,
+            pool: self.pool.clone(),
+            resolved: Arc::new(AtomicBool::new(false)),
+        })))
+    }
 }
 
 /// The async-side cursor: column metadata + the live row stream behind a `Mutex`
@@ -2272,6 +2300,112 @@ fn parse_index_columns(def: &str) -> Vec<String> {
 //   docker run --rm -d -p 5432:5432 -e POSTGRES_PASSWORD=red \
 //     -e POSTGRES_DB=red_test --name red-pg postgres:16
 //   export RED_TEST_POSTGRES_URL='host=127.0.0.1 user=postgres password=red dbname=red_test'
+/// An open transaction on a connection checked out of the Postgres fetch pool.
+///
+/// The connection is held for the sandbox's whole life and handed back only on
+/// commit or rollback, which is what makes the transaction real: every statement
+/// and every read lands on the same backend, so a read sees the sandbox's own
+/// uncommitted writes.
+///
+/// Dropping without resolving does **not** return the connection to the pool. A
+/// connection sitting inside an open transaction is not reusable, and handing one
+/// back would leak the transaction into whoever borrowed it next; letting it close
+/// makes Postgres roll back, which is the safe direction.
+struct PgSandbox {
+    client: Arc<Client>,
+    pool: Arc<StdMutex<Vec<Arc<Client>>>>,
+    /// Set by `commit`/`rollback` so `Drop` knows the transaction was resolved and
+    /// the connection can go back.
+    resolved: Arc<AtomicBool>,
+}
+
+impl PgSandbox {
+    /// Run `f` with `abort` armed to the connection's cancel token, so a statement
+    /// wedged on a lock held elsewhere is still stoppable. Unlike
+    /// `with_fetch_conn`, the connection is *not* released afterwards: it belongs
+    /// to the transaction until it is resolved.
+    async fn armed<T, F, Fut>(&self, abort: &AbortSignal, f: F) -> Result<T>
+    where
+        F: FnOnce(Arc<Client>) -> Fut,
+        Fut: std::future::Future<Output = Result<T>>,
+    {
+        let done = Arc::new(AtomicBool::new(false));
+        let guard = abort.arm(pg_cancel_token_until(&self.client, done.clone()));
+        let result = if abort.is_aborted() {
+            Err(RedError::Interrupted)
+        } else {
+            f(self.client.clone()).await
+        };
+        done.store(true, Ordering::SeqCst);
+        drop::<ArmGuard>(guard);
+        result
+    }
+
+    /// End the transaction with `verb` (`COMMIT`/`ROLLBACK`) and hand the
+    /// connection back.
+    async fn finish(&self, verb: &str) -> Result<()> {
+        if self.resolved.swap(true, Ordering::SeqCst) {
+            // Already committed or rolled back: the caller removed it from the
+            // registry first, so this is a double-resolve and a no-op, not an error.
+            return Ok(());
+        }
+        let out = self.client.batch_execute(verb).await.map_err(driver_err);
+        release_to(&self.pool, self.client.clone());
+        out
+    }
+}
+
+impl Drop for PgSandbox {
+    fn drop(&mut self) {
+        if !self.resolved.load(Ordering::SeqCst) {
+            // Nothing to await in `Drop`, so this relies on the connection being
+            // dropped: Postgres rolls back an open transaction when the client
+            // disconnects. Loud, because reaching here means a resolve path was
+            // missed and a connection was burned.
+            tracing::warn!(
+                "postgres sandbox dropped without commit/rollback; the transaction rolls back \
+                 as the connection closes"
+            );
+        }
+    }
+}
+
+#[async_trait]
+impl crate::Sandbox for PgSandbox {
+    async fn execute(&self, sql: &str, abort: &AbortSignal) -> Result<u64> {
+        let sql = sql.to_string();
+        self.armed(abort, |client| async move {
+            client.execute(sql.as_str(), &[]).await.map_err(map_pg_err)
+        })
+        .await
+    }
+
+    async fn fetch_page(&self, sql: &str, limit: usize, abort: &AbortSignal) -> Result<ResultPage> {
+        let sql = format!(
+            "SELECT * FROM ({}) AS _red LIMIT {limit}",
+            strip_trailing(sql)
+        );
+        self.armed(abort, |client| async move {
+            let (stmt, columns) = prepare_columns(&client, &sql).await?;
+            let rows = client.query(&stmt, &[]).await.map_err(map_pg_err)?;
+            let cap = CellCap::resolve(&PageCap::Display { key: None }, &columns);
+            Ok(ResultPage {
+                rows: rows.iter().map(|r| pg_row(r, cap)).collect(),
+                columns,
+            })
+        })
+        .await
+    }
+
+    async fn commit(&self) -> Result<()> {
+        self.finish("COMMIT").await
+    }
+
+    async fn rollback(&self) -> Result<()> {
+        self.finish("ROLLBACK").await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2752,6 +2886,44 @@ mod tests {
             .unwrap();
         battery::applies_batch_atomic(&driver, &schema, &tb).await;
         battery::read_only_rejects_batch(&ro, &schema, &tb).await;
+
+        // The sandbox: an open transaction the caller commits or rolls back.
+        // `second` dials its *own* connection, since asking the sandbox whether
+        // its own write happened passes whether or not the transaction is real.
+        let ts = tag("sandbox");
+        driver
+            .execute(&format!(
+                "CREATE TABLE {ts} (id INT PRIMARY KEY, name TEXT)"
+            ))
+            .await
+            .unwrap();
+        driver
+            .execute(&format!("INSERT INTO {ts} VALUES (1, 'original')"))
+            .await
+            .unwrap();
+        let outside_url = url.clone();
+        let outside_table = ts.clone();
+        battery::sandbox_isolates_until_committed(&driver, &ts, move || {
+            let (url, table) = (outside_url.clone(), outside_table.clone());
+            async move {
+                let other = PostgresDriver::connect(&url, true).await.unwrap();
+                let page = other
+                    .fetch_page(
+                        &format!("SELECT name FROM {table} WHERE id = 1"),
+                        0,
+                        1,
+                        PageCap::Display { key: None },
+                        &AbortSignal::new(),
+                    )
+                    .await
+                    .unwrap();
+                match &page.rows[0][0] {
+                    Value::Text(s) => s.to_string(),
+                    other => panic!("expected text, got {other:?}"),
+                }
+            }
+        })
+        .await;
 
         // Bulk insert (data import / table copy) on a fresh empty table.
         let ti = tag("insert");

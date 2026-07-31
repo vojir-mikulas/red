@@ -15,7 +15,7 @@ use red_ai::{CancelToken, Message};
 use tokio::sync::oneshot;
 
 use crate::dispatch::{Events, emit};
-use crate::protocol::{ConversationId, ReportTheme, RequestId};
+use crate::protocol::{ConversationId, ReportTheme, RequestId, SandboxEntry, WritePreview};
 use crate::{Event, SessionId};
 
 /// A small, UI-agnostic announcer the `generate_report` tool uses to hand a
@@ -117,6 +117,21 @@ impl ReportSink {
         }
     }
 
+    /// Hand the UI a drafted knowledge file (the agent's `save_knowledge` tool).
+    /// The UI opens it for review; this never writes anything.
+    pub(super) fn announce_knowledge_draft(&self, body: &str) {
+        if let Some(events) = &self.events {
+            emit(
+                events,
+                self.session,
+                Event::AiKnowledgeDraft {
+                    conversation_id: self.conversation_id,
+                    body: body.to_string(),
+                },
+            );
+        }
+    }
+
     pub(super) fn announce_save_query(&self, name: &str, description: Option<&str>, sql: &str) {
         if let Some(events) = &self.events {
             emit(
@@ -132,6 +147,30 @@ impl ReportSink {
         }
     }
 }
+/// An open sandbox transaction and everything that has run inside it.
+///
+/// Registered **per session, not per conversation**: two chats writing to one
+/// database in two transactions is a deadlock generator, so the second one is
+/// refused rather than given its own.
+pub(crate) struct SandboxSlot {
+    /// The live transaction. `Arc` rather than `Box` so it can be cloned out from
+    /// under the state lock before any `await`; single-use is enforced by removing
+    /// the slot from the registry, not by the type.
+    pub(crate) sandbox: Arc<dyn red_driver::Sandbox>,
+    /// Whose turn opened it, so a second conversation's write is refused and the
+    /// resolve/expiry events route back to the right chat.
+    pub(crate) conversation_id: ConversationId,
+    /// What has run so far, in order: the review card's contents.
+    pub(crate) log: Vec<SandboxEntry>,
+}
+
+impl SandboxSlot {
+    /// Rows touched across every statement so far.
+    pub(crate) fn total_rows(&self) -> u64 {
+        self.log.iter().map(|e| e.rows).sum()
+    }
+}
+
 /// Per-conversation state shared between the dispatch loop and the spawned turn
 /// tasks: the running message history (so follow-up turns keep context), the
 /// in-flight cancel tokens (so `AiCancel` can stop a specific turn), and the
@@ -152,6 +191,13 @@ pub(crate) struct AiState {
     /// the ACP manager's (which counts up from 0); `AiPermission` can then resolve
     /// both sides unconditionally.
     next_request: u64,
+    /// Open sandbox transactions, at most one per session. Keyed by session
+    /// because that is what a transaction actually belongs to.
+    sandboxes: HashMap<SessionId, SandboxSlot>,
+    /// Live windowed reads the agent can continue. Here rather than in its own
+    /// global so it inherits [`forget`](Self::forget), which already runs on every
+    /// path that ends a conversation.
+    pub(crate) cursors: super::cursors::CursorRegistry,
 }
 /// Base offset for API-key permission request ids, keeping them disjoint from the
 /// ACP manager's id space so a single `AiPermission` resolves exactly one prompt.
@@ -187,10 +233,14 @@ impl AiState {
     }
 
     /// Flip the cancel token for an in-flight turn, if any (the panel's Stop).
-    pub(crate) fn cancel(&self, conversation_id: ConversationId) {
+    pub(crate) fn cancel(&mut self, conversation_id: ConversationId) {
         if let Some(tok) = self.cancels.get(&conversation_id) {
             tok.cancel();
         }
+        // A stopped turn must not leave a connection pinned. A cursor legitimately
+        // outlives the turn that opened it, but only when that turn *finished*:
+        // the user pressing Stop is them saying they want this to end now.
+        self.cursors.close_conversation(conversation_id);
     }
 
     /// Drop all per-conversation state (history, cancel token, cumulative tool tally)
@@ -205,6 +255,84 @@ impl AiState {
         }
         self.histories.remove(&conversation_id);
         self.tool_calls.remove(&conversation_id);
+        // An open cursor holds a connection; a conversation that is gone can
+        // never read from it again.
+        self.cursors.close_conversation(conversation_id);
+    }
+
+    /// Register a freshly-opened sandbox for `session`.
+    ///
+    /// Returns `false` (and drops nothing) when that session already has one:
+    /// **one sandbox per session**, so a second conversation cannot open a second
+    /// transaction against the same database and deadlock with the first.
+    pub(super) fn open_sandbox(
+        &mut self,
+        session: SessionId,
+        conversation_id: ConversationId,
+        sandbox: Arc<dyn red_driver::Sandbox>,
+    ) -> bool {
+        if self.sandboxes.contains_key(&session) {
+            return false;
+        }
+        self.sandboxes.insert(
+            session,
+            SandboxSlot {
+                sandbox,
+                conversation_id,
+                log: Vec::new(),
+            },
+        );
+        true
+    }
+
+    /// The open sandbox for `session`, if any, and who owns it.
+    pub(super) fn sandbox_for(
+        &self,
+        session: SessionId,
+    ) -> Option<(Arc<dyn red_driver::Sandbox>, ConversationId)> {
+        self.sandboxes
+            .get(&session)
+            .map(|slot| (slot.sandbox.clone(), slot.conversation_id))
+    }
+
+    /// Record a statement that ran inside `session`'s sandbox. A no-op if the
+    /// sandbox is already gone (expired mid-turn), which is why the caller must
+    /// not treat a recorded write as durable.
+    pub(super) fn record_sandbox_write(&mut self, session: SessionId, sql: &str, rows: u64) {
+        if let Some(slot) = self.sandboxes.get_mut(&session) {
+            slot.log.push(SandboxEntry {
+                sql: sql.to_string(),
+                rows,
+            });
+        }
+    }
+
+    /// The current log and row total for `session`'s sandbox.
+    pub(super) fn sandbox_log(&self, session: SessionId) -> Option<(Vec<SandboxEntry>, u64)> {
+        self.sandboxes
+            .get(&session)
+            .map(|slot| (slot.log.clone(), slot.total_rows()))
+    }
+
+    /// Take `session`'s sandbox out of the registry. Removal *is* the single-use
+    /// guarantee: whoever holds the returned slot is the only one who can resolve
+    /// it, so a user's Commit racing the deadline's rollback cannot both land.
+    pub(crate) fn take_sandbox(&mut self, session: SessionId) -> Option<SandboxSlot> {
+        self.sandboxes.remove(&session)
+    }
+
+    /// Take whichever session's sandbox `conversation_id` owns. The UI answers by
+    /// conversation; the registry is keyed by session.
+    pub(crate) fn take_sandbox_for_conversation(
+        &mut self,
+        conversation_id: ConversationId,
+    ) -> Option<(SessionId, SandboxSlot)> {
+        let session = *self
+            .sandboxes
+            .iter()
+            .find(|(_, slot)| slot.conversation_id == conversation_id)
+            .map(|(session, _)| session)?;
+        self.sandboxes.remove(&session).map(|slot| (session, slot))
     }
 
     /// Charge one tool call against the conversation's cumulative budget. Returns
@@ -233,6 +361,7 @@ pub(super) async fn await_write_approval(
     session: Option<SessionId>,
     conversation_id: ConversationId,
     sql: &str,
+    preview: Option<WritePreview>,
     cancel: &CancelToken,
 ) -> bool {
     let (tx, mut rx) = oneshot::channel();
@@ -247,6 +376,7 @@ pub(super) async fn await_write_approval(
             request_id,
             title: "run this write statement".into(),
             detail: Some(sql.to_string()),
+            preview,
         },
     );
     let decision = loop {

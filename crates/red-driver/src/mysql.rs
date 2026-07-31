@@ -838,6 +838,27 @@ impl DatabaseDriver for MysqlDriver {
         }
     }
 
+    fn supports_sandbox(&self) -> bool {
+        // DML on InnoDB is fully transactional. DDL implicitly commits, which the
+        // write gate already makes unreachable (see `MySandbox`).
+        true
+    }
+
+    async fn begin_sandbox(&self) -> Result<Option<Box<dyn crate::Sandbox>>> {
+        let mut conn = self.conn().await?;
+        let conn_id = conn.id();
+        // `begin_stmt` opens READ ONLY on a read-only connection, so the engine
+        // itself refuses a write that slipped past the gate.
+        conn.query_drop(self.begin_stmt())
+            .await
+            .map_err(map_my_err)?;
+        Ok(Some(Box::new(MySandbox {
+            conn: Mutex::new(Some(conn)),
+            pool: self.pool.clone(),
+            conn_id,
+        })))
+    }
+
     async fn execute_batch_abort(
         &self,
         statements: &[String],
@@ -1807,6 +1828,119 @@ fn map_my_err(e: MyError) -> RedError {
 //   docker run --rm -d -p 3306:3306 -e MARIADB_ROOT_PASSWORD=red \
 //     -e MARIADB_DATABASE=red_test --name red-maria mariadb:11
 //   export RED_TEST_MYSQL_URL='mysql://root:red@127.0.0.1:3306/red_test'
+/// An open transaction on a connection held out of the MySQL pool.
+///
+/// `mysql_async::Conn` is owned and its methods take `&mut self`, so the
+/// connection sits behind a `tokio::sync::Mutex`: statements on one sandbox
+/// serialize, which is what a single transaction wants anyway.
+///
+/// **DDL implicitly commits on MySQL**, which would silently break the "nothing
+/// lands until you say so" promise. It is unreachable today because the write
+/// gate rejects every DDL shape before a statement gets here, but a future tool
+/// that runs DDL must be excluded from the sandbox rather than relying on that.
+struct MySandbox {
+    conn: Mutex<Option<mysql_async::Conn>>,
+    /// Kept so a wedged statement can still be killed out of band, exactly like a
+    /// pooled fetch.
+    pool: Pool,
+    conn_id: u32,
+}
+
+impl MySandbox {
+    /// `KILL QUERY` for this sandbox's connection, armed for one statement.
+    fn arm_kill(&self, abort: &AbortSignal) -> KillGuard {
+        let alive = Arc::new(AtomicBool::new(true));
+        let (pool, conn_id, flag) = (self.pool.clone(), self.conn_id, alive.clone());
+        let token = CancelToken::new(move || {
+            let (pool, flag) = (pool.clone(), flag.clone());
+            tokio::spawn(async move {
+                if !flag.load(Ordering::SeqCst) {
+                    return;
+                }
+                if let Ok(mut c) = pool.get_conn().await
+                    && flag.load(Ordering::SeqCst)
+                {
+                    let _ = c.query_drop(format!("KILL QUERY {conn_id}")).await;
+                }
+            });
+        });
+        KillGuard {
+            _arm: abort.arm(token),
+            alive,
+        }
+    }
+
+    /// End the transaction and drop the connection, which returns it to the pool.
+    /// Taking the `Conn` out is what makes a second resolve a no-op.
+    async fn finish(&self, verb: &str) -> Result<()> {
+        let Some(mut conn) = self.conn.lock().await.take() else {
+            return Ok(());
+        };
+        conn.query_drop(verb).await.map_err(map_my_err)
+    }
+}
+
+impl Drop for MySandbox {
+    fn drop(&mut self) {
+        if self.conn.get_mut().is_some() {
+            // The connection is dropped with the transaction open, so the server
+            // rolls it back when the session ends. Loud: reaching here means a
+            // resolve path was missed.
+            tracing::warn!(
+                "mysql sandbox dropped without commit/rollback; the transaction rolls back \
+                 as the connection closes"
+            );
+        }
+    }
+}
+
+#[async_trait]
+impl crate::Sandbox for MySandbox {
+    async fn execute(&self, sql: &str, abort: &AbortSignal) -> Result<u64> {
+        let mut guard = self.conn.lock().await;
+        let conn = guard
+            .as_mut()
+            .ok_or_else(|| RedError::Driver("the sandbox transaction is no longer open".into()))?;
+        let _kill = self.arm_kill(abort);
+        if abort.is_aborted() {
+            return Err(RedError::Interrupted);
+        }
+        conn.query_drop(sql).await.map_err(map_my_err)?;
+        Ok(conn.affected_rows())
+    }
+
+    async fn fetch_page(&self, sql: &str, limit: usize, abort: &AbortSignal) -> Result<ResultPage> {
+        let sql = format!(
+            "SELECT * FROM ({}) AS _red LIMIT {limit}",
+            strip_trailing(sql)
+        );
+        let mut guard = self.conn.lock().await;
+        let conn = guard
+            .as_mut()
+            .ok_or_else(|| RedError::Driver("the sandbox transaction is no longer open".into()))?;
+        let _kill = self.arm_kill(abort);
+        if abort.is_aborted() {
+            return Err(RedError::Interrupted);
+        }
+        let stmt = conn.prep(&sql).await.map_err(map_my_err)?;
+        let columns: Vec<Column> = stmt.columns().iter().map(col_meta).collect();
+        let rows: Vec<Row> = conn.exec(&stmt, ()).await.map_err(map_my_err)?;
+        let cap = CellCap::resolve(&PageCap::Display { key: None }, &columns);
+        Ok(ResultPage {
+            rows: rows.iter().map(|r| my_row(r, cap)).collect(),
+            columns,
+        })
+    }
+
+    async fn commit(&self) -> Result<()> {
+        self.finish("COMMIT").await
+    }
+
+    async fn rollback(&self) -> Result<()> {
+        self.finish("ROLLBACK").await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

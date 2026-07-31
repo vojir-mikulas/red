@@ -248,6 +248,21 @@ model = "claude-opus-4-8"
 # Surface a summarized "thinking…" affordance while the model reasons.
 show_thinking = false
 
+# Before you approve a write the agent proposes, count the rows it would change
+# and show a few of them in the prompt. "Allow this?" over an UPDATE whose WHERE
+# clause you cannot evaluate is a question nobody can answer, so the realistic
+# outcome is a rubber stamp. Turn this off on a slow link, where the extra
+# round-trips before every prompt cost more than the number is worth.
+preview_writes = true
+
+# How long the agent's uncommitted changes wait for your Commit or Roll back
+# before rolling back on their own, in seconds. Only used by chats you put in
+# review-transaction mode (the "review" switch in the composer). An open
+# transaction holds locks, so it cannot wait indefinitely; rolling back is the
+# only defensible expiry, since RED never commits an agent's writes unasked.
+# Floored at 30s.
+sandbox_timeout_secs = 120
+
 # Folder the agent writes generated HTML reports to. Empty uses the system temp
 # dir; set it so reports land somewhere you can find them.
 report_dir = ""

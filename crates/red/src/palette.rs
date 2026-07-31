@@ -128,6 +128,11 @@ pub(crate) enum Cmd {
     AssistantNewChatWith(usize),
     /// Reveal the conversations directory in the OS file manager.
     RevealConversationStorage,
+    /// Open the connection's knowledge file (the agent's semantic layer) in the
+    /// in-app markdown editor.
+    EditKnowledge,
+    /// Ask the agent to draft a knowledge file for this connection.
+    LearnDatabase,
     /// Split the focused pane to the right (a new pane beside it).
     SplitRight,
     /// Split the focused pane downward (a new pane under it).
@@ -386,6 +391,8 @@ impl AppState {
                 }
             }
             Cmd::RevealConversationStorage => self.reveal_conversation_storage(cx),
+            Cmd::EditKnowledge => self.open_knowledge_editor(cx),
+            Cmd::LearnDatabase => self.learn_this_database(cx),
             Cmd::SplitRight => self.split_right(cx),
             Cmd::SplitDown => self.split_down(cx),
             Cmd::Unsplit => self.unsplit(cx),
@@ -700,6 +707,12 @@ impl AppState {
                     item("cmd:health", "connection: health report"),
                     Cmd::HealthReport,
                 ));
+                // Per-connection, not per-panel: the file is worth editing whether
+                // or not the assistant is open right now.
+                out.push((
+                    item("cmd:knowledge", "connection: database knowledge…"),
+                    Cmd::EditKnowledge,
+                ));
                 if active.schema.schemas.len() > 1 {
                     out.push((
                         item("cmd:compare-schema", "schema: compare against…"),
@@ -747,6 +760,15 @@ impl AppState {
                         item("cmd:ai-history", "agent: conversation history…"),
                         Cmd::AssistantHistory,
                     ));
+                    // Withheld below `read` tier: with schema-only tools the agent
+                    // can't sample a value, so the "glossary" would be column-name
+                    // inference - the failure mode the knowledge file exists to fix.
+                    if self.can_learn_database() {
+                        out.push((
+                            item("cmd:ai-learn", "agent: learn this database"),
+                            Cmd::LearnDatabase,
+                        ));
+                    }
                     out.push((
                         item("cmd:ai-storage", "agent: open conversation storage"),
                         Cmd::RevealConversationStorage,
@@ -887,7 +909,7 @@ impl AppState {
             self.notify(ToastVariant::Error, "Give the query a name.", cx);
             return;
         }
-        match crate::queries::save(&name, None, &sql) {
+        match red_config::queries::save(&name, None, &sql) {
             Ok(_) => {
                 self.notify(ToastVariant::Success, format!("Saved query “{name}”."), cx);
             }
@@ -904,7 +926,7 @@ impl AppState {
         if !matches!(self.phase, Phase::Connected(_)) {
             return;
         }
-        let queries = crate::queries::load();
+        let queries = red_config::queries::load();
         if queries.is_empty() {
             self.notify(
                 ToastVariant::Info,
