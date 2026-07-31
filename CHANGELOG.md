@@ -7,6 +7,32 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- The Server panel now answers the same three questions on every engine RED
+  connects to: what the server is using, what it is doing, and who is connected.
+  A new Overview reads live metrics - memory against its ceiling, throughput,
+  connections against `max_connections`, replication lag, uptime - drawn as bars
+  you can read at a glance instead of numbers you have to compare, and coloured
+  only where a real ceiling is close. Counters that only make sense as a rate
+  (statements run, transactions committed, commands processed) show the rate,
+  derived from the previous refresh. Redis fills it from `INFO`, which RED has
+  parsed for the assistant for a while but never showed to a human; Postgres from
+  `pg_stat_database` and `pg_stat_activity`, including the oldest open
+  transaction, which is the number that actually predicts an outage; MySQL from
+  `SHOW GLOBAL STATUS`; ClickHouse from its system tables; MongoDB from
+  `serverStatus`. Whatever your role is not allowed to see is listed as such,
+  because a metric quietly left out reads as a zero.
+- MongoDB gets a server UI for the first time: `$currentOp` in the Sessions view,
+  and a runaway operation can be stopped from the panel through the same confirm
+  that guards a Postgres terminate. Redis clients appear there too, so
+  `CLIENT LIST` and `CLIENT KILL` are no longer only in the Monitor tab. Sessions
+  are ordered longest-running first and capped, so a busy server does not push the
+  one operation you are looking for off the list. RED never offers to kill its own
+  connection, and a read-only connection is offered nothing at all.
+- The Server panel can auto-refresh, off by default, on an interval shown in the
+  panel itself rather than buried in settings, with a floor of two seconds -
+  polling `pg_stat_activity` or `CLIENT LIST` against production is real load, so
+  it is opt-in and visible. The default for new connections is
+  `behavior.server_refresh_secs`.
 - Any query result can now be exported as an Excel workbook. It streams like
   every other export, so a result too large to hold in memory is still too large
   to hold in memory, and it stops at Excel's 1,048,576-row limit with the toast
