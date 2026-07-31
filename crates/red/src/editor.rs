@@ -907,11 +907,10 @@ impl AppState {
             .line_height(px(ed.font_size * ed.line_height))
             .child(tab.editor.clone());
 
-        // --- bottom run bar: Run · Explain · Save · ……… · read-only ---
+        // --- bottom run bar: Run · Explain · Save · ……… · watch · read-only ---
         // (Query history now lives in the left dock, toggled with ⌘Y.)
         let ro_chip = active.config.read_only.then(|| {
             div()
-                .ml_auto()
                 .flex()
                 .items_center()
                 .px_2()
@@ -974,8 +973,19 @@ impl AppState {
                         this.open_save_prompt(cx);
                     })),
             )
-            .children(self.render_watch_pill(active, tab_idx, pane, cx))
-            .children(ro_chip);
+            // Watch and read-only report state rather than invite a click, so
+            // they sit at the far right, opposite the actions. One trailing
+            // group holds them: two separate `ml_auto` children would split the
+            // free space between them instead of pushing both to the edge.
+            .child(
+                div()
+                    .ml_auto()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .children(self.render_watch_pill(active, tab_idx, pane, cx))
+                    .children(ro_chip),
+            );
 
         div()
             .relative()
