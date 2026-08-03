@@ -6,326 +6,131 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.21.0] - 2026-08-03
+
 ### Added
-- The Server panel now answers the same three questions on every engine RED
-  connects to: what the server is using, what it is doing, and who is connected.
-  A new Overview reads live metrics - memory against its ceiling, throughput,
-  connections against `max_connections`, replication lag, uptime - drawn as bars
-  you can read at a glance instead of numbers you have to compare, and coloured
-  only where a real ceiling is close. Counters that only make sense as a rate
-  (statements run, transactions committed, commands processed) show the rate,
-  derived from the previous refresh. Redis fills it from `INFO`, which RED has
-  parsed for the assistant for a while but never showed to a human; Postgres from
-  `pg_stat_database` and `pg_stat_activity`, including the oldest open
-  transaction, which is the number that actually predicts an outage; MySQL from
-  `SHOW GLOBAL STATUS`; ClickHouse from its system tables; MongoDB from
-  `serverStatus`. Whatever your role is not allowed to see is listed as such,
-  because a metric quietly left out reads as a zero.
-- MongoDB gets a server UI for the first time: `$currentOp` in the Sessions view,
-  and a runaway operation can be stopped from the panel through the same confirm
-  that guards a Postgres terminate. Redis clients appear there too, so
-  `CLIENT LIST` and `CLIENT KILL` are no longer only in the Monitor tab. Sessions
-  are ordered longest-running first and capped, so a busy server does not push the
-  one operation you are looking for off the list. RED never offers to kill its own
-  connection, and a read-only connection is offered nothing at all.
-- The Server panel can auto-refresh, off by default, on an interval shown in the
-  panel itself rather than buried in settings, with a floor of two seconds -
-  polling `pg_stat_activity` or `CLIENT LIST` against production is real load, so
-  it is opt-in and visible. The default for new connections is
-  `behavior.server_refresh_secs`.
-- Any query result can now be exported as an Excel workbook. It streams like
-  every other export, so a result too large to hold in memory is still too large
-  to hold in memory, and it stops at Excel's 1,048,576-row limit with the toast
-  saying so rather than quietly dropping the rest. The care is in the cells: a
-  number is a number and a numeric-looking *string* stays a string, so an account
-  number keeps its leading zero and a long id keeps its last digits instead of
-  being rounded off by a spreadsheet. Nulls are empty cells, not the word "NULL",
-  and a stray control character in a text column is escaped rather than producing
-  a file that opens as "unreadable content". Nothing is compressed, so the file
-  is larger than the CSV of the same data. The assistant can write one too.
-- Redis can finally export keys, not just import them. "Export keys…" sits under
-  the browse Actions menu and "Export key…" on any key's right-click, with a
-  choice of scope (the keys shown, everything matching the current filter, or the
-  whole database) and three formats. Commands (`.redis`) is the default and the
-  exact inverse of the import that already shipped - readable, version-agnostic,
-  and re-importable in one click; JSON is for feeding another tool or attaching
-  to a ticket; DUMP (`.rdbdump`) is byte-exact and the only one that carries
-  binary values, with its version caveat on the dialog rather than buried. Every
-  format streams: a million-element set is written as repeated commands and never
-  assembled, and Cancel leaves no partial file. Expiry times are written as
-  absolute deadlines, so importing an hour later does not silently extend every
-  TTL. A value the text formats genuinely cannot carry is skipped and *reported*,
-  pointing you at the format that would carry it, rather than being written
-  mangled - and importing a file RED exported now reconstructs values containing
-  newlines, tabs and other escapes byte for byte. RED recognises a `.rdbdump`
-  file on its own, so there is no import format to pick wrong.
-- RedisJSON documents are now first-class. A `JSON.*` key used to appear in the
-  keyspace with an unreadable `ReJSON-RL` type and no value at all; it now reads
-  as `json`, filters as its own type in the browse toolbar, and opens in a
-  document tree you navigate rather than receive. That distinction is the point:
-  a small document is fetched whole, but a large one is walked a level at a
-  time, so opening a 200 MB document costs the same as opening a small one and
-  RED never pulls one into memory just to show you a preview. A big array pages
-  in place like a list. You can edit a single node - the safe default, since it
-  leaves the parts of the document you did not look at alone - or the whole
-  document from the Raw view, with the JSON validated before it is sent so a
-  typo fails in RED pointing at the character rather than as a bare error from
-  the server. "New key" can create a JSON document, node deletion rides the same
-  confirmation as every other destructive Redis action, and a read-only
-  connection refuses both. Everything module-specific is offered only where the
-  server actually has RedisJSON loaded, detected once when you connect. The
-  assistant learns the same two moves: it can map a document's shape (paths and
-  types, no values) and read any single path, so it can answer "what is in these
-  documents" without downloading any of them, and write one node with your
-  approval.
-- You can point the agent at things instead of describing them. Drag a table, a
-  column, a schema or a query tab onto the assistant panel and it becomes a chip
-  on your next message; right-click anything in the schema tree and pick "Ask AI
-  about this" for the same result without the drag. Selected rows in the grid
-  have their own entry too. The agent then gets the object's real definition -
-  the same text `describe_table` would have returned, not a paraphrase - so
-  "the one with the unit price, no wait, `public.order_items`" stops being how a
-  question starts. References resolve when you hit Enter, not when you drop, so
-  a tab you edit in between sends what is actually there; one that is gone, or a
-  table that has been dropped, says so rather than failing the turn. Structure
-  works at any access tier; row data still needs the read tier, and says so at
-  the point you ask rather than silently arriving empty.
-- You can now attach files to a chat. Drop them anywhere on the assistant panel,
-  or use the `+` beside the composer: a CSV the vendor sent, a screenshot of the
-  dashboard that shows the wrong number, a PDF spec, a stack trace from prod.
-  Text files ride as fenced blocks, images and PDFs as themselves, and every
-  attachment shows as a chip you can remove before sending. Nothing is guessed
-  at: an unsupported type or an oversized file is refused in the composer, with
-  the reason and what to do instead - a CSV over the limit points you at
-  importing it into a table and asking about that, which is both better and
-  something RED already does (there is an "import" action on the chip for
-  exactly that). Files are read off the UI thread at send time, so attaching a
-  20 MB PDF does not stall the window. Saved chats remember what was attached by
-  name and size, never by content. On the subscription path images go to agents
-  that accept them and are described by name to those that do not, rather than
-  disappearing. Attachments are treated as data throughout: the agent is told to
-  read them as information to analyse and never as instructions, and every write
-  still needs your approval.
-- Long investigations no longer end in an error. The assistant's reply length is
-  now a setting (Settings → AI, 16K by default, up to 64K) instead of a fixed
-  8K ceiling, and a reply that still hits it is asked to carry on from where it
-  stopped rather than failing the turn - so a long answer or a generated report
-  arrives whole. A turn may take twice as many tool steps as before, and running
-  out of them now ends with the agent summarising what it found instead of a
-  trace that simply stops mid-investigation and settles as though it were
-  finished. On top of that the conversation is kept inside the model's context
-  window: old tool results the agent has already drawn its conclusions from are
-  cleared, and the conversation is summarised as it fills, both by the model
-  provider rather than by guesswork here. Where that is not available RED trims
-  locally and says so in the activity trace, because context lost silently is
-  how an agent starts contradicting itself for no visible reason.
-- The usage gauge in the assistant now works on the API-key path too, not just
-  the subscription one, and reads the whole conversation rather than the last
-  exchange. It fills as the chat fills, turns amber at three fifths - early
-  enough to finish your thought - and red at nine tenths, and its tooltip shows
-  what the chat has cost so far. A model whose context window RED does not
-  recognise shows the token count rather than a percentage it would have had to
-  invent.
-- The assistant can now read through a large result instead of stopping at the
-  first page. A query that returns more than fits comes back with a cursor the
-  agent continues, window by window, through the same streaming machinery the
-  result grid uses - so the windows tile the result exactly, with no rows
-  repeated and none skipped, and without re-running the query. Previously the
-  read was truncated and whatever fell off the end was simply gone, which left
-  the agent either reasoning over the first page as though it were the data or
-  hand-rolling `OFFSET` paging (slow, and silently wrong whenever the ordering
-  is not total). Windows are bounded by size rather than row count, so a table
-  with a wide text column returns fewer, larger rows. Open cursors are capped,
-  closed when you stop a turn or close the chat, and expire on their own after
-  five minutes.
-- Every answer the assistant gives now shows its sources. A turn that read data
-  gets a numbered "Sources" line above the prose, one chip per query, and the
-  agent is asked to mark the figures it read with the matching `[3]`. Clicking a
-  chip rings the exact call in the activity trace; hovering it shows the tool, its
-  arguments and what came back, without leaving the paragraph. The point is what
-  becomes visible at a glance: "this paragraph cites three queries" and "this
-  paragraph cites nothing" used to render identically. It is labelled Sources, not
-  Verified, and deliberately so - a citation shows you where a number came from,
-  not that the sentence around it is right.
-- The assistant now checks the *shape* of a query before it believes the number
-  it got back. The most common way an answer about a database is wrong is a join
-  that quietly multiplies rows: the query runs, nothing errors, and the total is
-  three times too big. RED now reads the query for the structures that cause
-  that (an aggregate over a join with no DISTINCT, a join with no predicate, a
-  join on something other than equality, `SELECT *` across a join) and, when it
-  finds one, runs one extra pair of counts to see whether the join *actually*
-  fanned out. If it did, the agent is told so with the real numbers before it
-  writes its answer, so it corrects itself against what executed rather than
-  against a second reading of its own SQL. Flagged queries are marked in the
-  activity timeline. Nothing is blocked: a cross join is sometimes exactly what
-  you meant.
-- A chat can now run the agent's writes inside a single transaction that you
-  commit or roll back at the end, instead of approving each statement as it
-  comes. Turn on "review" in the composer before the first message; every write
-  that turn runs against a real open transaction, the agent's own reads see its
-  uncommitted changes (so it can check its work), and nothing is durable until
-  you answer. At the end you get the list of what it did with the rows each
-  statement touched, and two buttons. Rolling back is free, which is the point:
-  five separately reasonable approvals can still add up to the wrong change, and
-  until now clicking Allow was final. Available on PostgreSQL, MySQL/MariaDB and
-  SQLite; ClickHouse has no multi-statement transaction, and the option says so
-  rather than quietly falling back. An unanswered review rolls itself back after
-  two minutes (configurable), because an open transaction holds locks.
-- The approval prompt for an agent write now tells you what it would actually
-  do. Instead of asking you to mentally run a `WHERE` clause against a database
-  you cannot see, it counts the rows first: "Affects 4,213 of 812,004 rows in
-  public.orders", with three of them shown so you can tell at a glance whether
-  they are the ones you meant. A statement that matches **no** rows is called out
-  as a warning rather than a reassuring small number, because that almost always
-  means the predicate is wrong, and the agent is told so too. Each statement of a
-  multi-statement changeset gets its own count. The counting runs on a short
-  budget and never delays or blocks the prompt: if it cannot finish, the prompt
-  still appears and says the count was unavailable rather than showing a zero.
-  Turn it off under Settings → AI agent → Safety if you are on a slow link.
-- The assistant can now read what you have already written. It searches the
-  statements you ran against this connection for the tables and concepts it is
-  about to query, so it picks up the join path people actually use (often not the
-  one the foreign keys declare), the date column you filter on, and the values
-  your status columns really hold, instead of inferring all of it from column
-  names. It also reads your saved-query library, so when you ask about a metric
-  you have already defined it uses your definition rather than inventing a fourth
-  one. Same on Redis, where it reads the commands you have run and the keys you
-  have been opening. All of it is scoped to the connection at hand, and nothing
-  the agent runs itself is ever recorded, so it is reading your work, not its own.
-- Each connection can now carry a knowledge file: plain markdown where you write
-  down what the schema cannot tell an agent, such as what "active customer"
-  actually means, which join path is the real one, that amounts are in cents, or
-  which table not to count. It rides in the assistant's prompt for every chat on
-  that connection, so the agent stops re-deriving your business logic and stops
-  guessing at it. Open it from the assistant panel's header, or from
-  `connection: database knowledge…` in the command palette; the panel shows a
-  chip when one is in play. If you would rather not start from a blank page,
-  "Learn this database" has the agent explore the connection and draft one for
-  you, which opens for review rather than being saved: it inferred it from
-  structure and sampling, so it will be right about shape and wrong about
-  intent. Works on SQL databases, Redis, and MongoDB alike.
-- The AI assistant can now reach the parts of RED it was previously blind to.
-  Against a SQL database it can read the foreign-key graph in one call, pull an
-  object's real definition, search a table for a value without knowing which
-  column holds it, run EXPLAIN with actual row counts, produce a health report,
-  see what the server is running right now, compare two schemas or two tables'
-  rows, and suggest an index. Against Redis it can infer the keyspace's key
-  templates, page deep into a large collection or stream, read consumer-group
-  lag and pending entries, list connected clients, and see the topology up
-  front. Against MongoDB it can discover which fields reference which
-  collections and how reliably they resolve, fetch a document by `_id`, and see
-  what is running now.
-- The Redis agent can finally write a value. Previously it could delete a
-  thousand keys after one approval but could not set a single one; it now has a
-  `kv_set` that writes a string, hash, set, sorted set, list, or stream entry,
-  with an optional expiry, behind the same approval every other write rides.
-  The approval shows the exact commands that will run.
-- The assistant can hand you a file: a query's whole result, a set of Redis
-  keys, or a collection's documents, written out as CSV or JSON and offered as
-  a card in the chat you can open. Unlike what it reads into the conversation,
-  an exported query result is not row-capped.
-- The assistant can stop a runaway session, Redis client, or MongoDB operation,
-  and create an index, each behind an explicit approval that names the target
-  and what stopping it costs. Destructive DDL stays unavailable.
-- MongoDB collections now show their JSON-schema validator, where one is
-  declared, alongside the inferred schema and indexes, and the collection list
-  reports each collection's storage size.
-- The work area can now hold any number of panes, arranged as columns, rows, or
-  any nesting of the two, in the SQL, Redis and MongoDB shells alike. Dragging a
-  tab shows where it would land — into the pane under the cursor, or into a new
-  pane on whichever edge you are nearest — and dropping it there creates that
-  pane, including the very first split of an undivided work area. Nothing
-  highlights where nothing would happen, and nothing happens where the highlight
-  said it would not, so a drop is never offered and then quietly ignored or
-  turned into something else.
-- Panes from the keyboard: ⌘\ splits the focused pane to the right and ⌘⇧\
-  splits it downward (both repeatable), ⌥⌘\ cycles focus, ⌥⌘W closes a pane and
-  folds its tabs into its neighbour, ⌘⇧↩ zooms a pane to fill the work area, and
-  ⌥⌘0 resets every divider to even shares.
-- The AI assistant's composer now offers whichever on/off settings the agent
-  exposes for the session as switches — on Claude Code that includes fast mode,
-  the higher-throughput decode available on the models that support it.
-- Hold Alt on its own and every panel you can type or navigate in shows the
-  single key that jumps to it; press the key to go there, or let go to leave
-  focus where it was. It reaches everything the shell is showing — the schema or
-  collection tree, each pane's editor and result grid, the Redis key list, the
-  history dock, the filter and find bars, the assistant — and works the same in
-  the SQL, Redis and MongoDB shells, which is new: Redis previously had no way
-  to move focus by keyboard at all. The hints are letters from the home row out,
-  because those are the only keys typable without Shift on every layout - a Czech
-  or French number row needs Shift for its digits, which would put a digit hint
-  out of reach of a gesture defined by holding one modifier. Digits are available
-  for layouts that type them directly. The trigger, the hold delay and the hint
-  keys are all settings (`keymap.focus_overlay`), including turning it off.
+- Server panel Overview on every engine: memory, throughput, connections,
+  replication lag and uptime drawn as bars, counters that only make sense as
+  rates shown as rates, and metrics your role cannot read labelled rather than
+  shown as zero. Postgres, MySQL, Redis, ClickHouse and MongoDB.
+- MongoDB gets a Sessions view (`$currentOp`) with a guarded kill, and Redis
+  clients (`CLIENT LIST` / `CLIENT KILL`) now appear there too. Sessions are
+  ordered longest-running first; RED never offers to kill its own connection.
+- Server panel auto-refresh, off by default, interval shown in the panel itself,
+  floor of two seconds (`behavior.server_refresh_secs`).
+- Excel (`.xlsx`) export for any query result: streamed like every other export,
+  numbers stay numbers and numeric-looking strings stay strings, stops at
+  Excel's 1,048,576-row limit with a toast saying so.
+- Redis key export, in Commands (`.redis`), JSON, or DUMP (`.rdbdump`) format,
+  scoped to the visible keys, the current filter, or the whole database. Streams,
+  cancels cleanly, writes expiry as absolute deadlines, reports values a text
+  format cannot carry, and auto-detects `.rdbdump` on import.
+- RedisJSON documents are first-class: they read as `json`, filter as their own
+  type, and open in a document tree walked a level at a time, so a 200 MB
+  document costs no more to open than a small one. Edit a single node or the
+  whole document, create one from "New key", and two read-only agent tools map a
+  document's shape or read one path. Offered only where the module is loaded.
+- Point the agent at things instead of describing them: drag a table, column,
+  schema, query tab or selected rows onto the assistant panel, or use "Ask AI
+  about this" in the schema tree. References resolve on send, not on drop.
+- File attachments in chat, dropped anywhere on the panel or added with the `+`
+  beside the composer: text, images and PDFs, read off the UI thread at send
+  time, with unsupported or oversized files refused in the composer with a
+  reason. Attachments are always treated as data, never as instructions.
+- Reply length is a setting (Settings → AI, 16K by default, up to 64K) and a
+  reply that still hits it is continued rather than failed. Conversations are
+  compacted as they fill, with local trimming noted in the activity trace.
+- The usage gauge works on the API-key path too and reads the whole conversation,
+  with the cost so far on its tooltip.
+- The agent pages through a large result with a cursor over the same streaming
+  machinery the grid uses, so windows tile the result with no rows repeated or
+  skipped and without re-running the query.
+- Answers show their sources: a numbered line above the prose, one chip per
+  query, each linked to the exact call in the activity trace.
+- Queries are checked for join fan-out before the agent believes the number.
+  Suspicious shapes get one extra pair of counts, and the agent is told the real
+  numbers before it writes its answer. Nothing is blocked.
+- Review mode runs a turn's writes inside one open transaction that you commit or
+  roll back at the end, on PostgreSQL, MySQL/MariaDB and SQLite. An unanswered
+  review rolls itself back after two minutes.
+- Write approvals count rows first ("Affects 4,213 of 812,004 rows in
+  public.orders", with three shown) and warn when a statement matches none. The
+  count runs on a short budget and never delays the prompt.
+- The agent reads the queries you have run and your saved-query library for this
+  connection, so it uses the join paths, filters and metric definitions you
+  actually use. Same on Redis, for commands run and keys opened.
+- Per-connection knowledge file: plain markdown that rides in every chat's prompt
+  on that connection, with "Learn this database" to draft one for review.
+- Many new agent tools. On SQL: FK graph, object DDL, cross-column value search,
+  EXPLAIN with actual rows, health report, live sessions, schema and data diff,
+  index advice. On Redis: key templates, deep collection and stream paging,
+  consumer-group lag, clients, topology. On MongoDB: reference discovery, fetch
+  by `_id`, current operations.
+- `kv_set` for the Redis agent: write a string, hash, set, sorted set, list or
+  stream entry with optional expiry, behind the usual approval, which shows the
+  exact commands.
+- The agent can hand you a file: a query result, a set of Redis keys or a
+  collection, as CSV or JSON, offered as a card in the chat. Exported query
+  results are not row-capped.
+- The agent can stop a runaway session, Redis client or MongoDB operation and
+  create an index, each behind an approval naming the target. Destructive DDL
+  stays unavailable.
+- MongoDB collections show their JSON-schema validator where one is declared, and
+  the collection list reports storage size.
+- The work area holds any number of panes, as columns, rows or any nesting of the
+  two, in the SQL, Redis and MongoDB shells. Dragging a tab shows exactly where
+  it would land, including the first split of an undivided work area.
+- Pane keys: ⌘\ splits right, ⌘⇧\ splits down (both repeatable), ⌥⌘\ cycles
+  focus, ⌥⌘W closes a pane into its neighbour, ⌘⇧↩ zooms a pane, ⌥⌘0 resets every
+  divider to even shares.
+- The AI composer offers whichever on/off session settings the agent exposes as
+  switches, including fast mode on Claude Code.
+- Hold Alt and every panel you can type or navigate in shows the single key that
+  jumps to it, in all three shells (Redis had no keyboard focus movement at all
+  before). Hint keys are letters from the home row out, so they stay typable on
+  every layout. Trigger, hold delay and keys are settings
+  (`keymap.focus_overlay`), including turning it off.
 
 ### Changed
-- The AI assistant's composer settings now read as a set: model, thinking level
-  and permission mode sit in three equal slots on one line, keeping their place
-  from the first frame instead of resizing and reshuffling as the agent reports
-  what it supports. Each names itself on hover; a setting the agent has not
-  offered yet shows as an inert slot rather than appearing out of nowhere once
-  the session is up.
-- Context usage in the AI assistant is now a ring showing how full the context
-  window is, amber past three quarters and red past nine tenths, in place of the
-  strip of token counts below the composer. The full breakdown — tokens in
-  context, cached and out, and the running session cost — is on its tooltip.
-- The AI assistant's prompt box starts four lines tall and grows with what you
-  type, up to eight, before it starts scrolling. Wrapped lines count, so a long
-  paragraph opens the box up the same way pressing Return does.
-- ⌘\ now splits the focused pane rather than toggling a fixed two-pane split;
-  existing `keymap.toml` files that bind it keep working unchanged. Pane widths
-  are held as proportions, so resizing the window now widens every pane in step
-  instead of stretching only the last one.
-- F6 and ⇧F6 now cycle through every panel on screen — docks, trees, editors,
-  grids, the open filter or find bar, the assistant — instead of the SQL shell's
-  three fixed stops, and they work in the Redis and MongoDB shells too.
-- The ⌥⌘1 / ⌥⌘2 / ⌥⌘3 jumps to the schema, editor and grid are retired in favour
-  of holding Alt, which reaches far more than three places and works in every
-  shell. A `keymap.toml` that binds them still loads, and those keys now cycle
-  focus rather than doing nothing. The command palette lists every panel it can
-  focus by name, so nothing needs a shortcut to be reachable.
+- The AI composer's model, thinking level and permission mode sit in three equal
+  slots on one line, keeping their place from the first frame instead of
+  reshuffling as the agent reports what it supports.
+- Context usage is a ring, amber past three quarters and red past nine tenths,
+  replacing the strip of token counts below the composer. The full breakdown and
+  session cost are on its tooltip.
+- The prompt box starts four lines tall and grows with what you type, up to
+  eight, before it scrolls.
+- ⌘\ splits the focused pane rather than toggling a fixed two-pane split;
+  existing `keymap.toml` bindings keep working. Pane widths are held as
+  proportions, so resizing the window widens every pane in step.
+- F6 and ⇧F6 cycle every panel on screen, in every shell, instead of the SQL
+  shell's three fixed stops.
+- ⌥⌘1 / ⌥⌘2 / ⌥⌘3 are retired in favour of holding Alt. A `keymap.toml` binding
+  them still loads, and those keys now cycle focus. The command palette lists
+  every panel it can focus by name.
 
 ### Fixed
-- Fixed the bug where ⌘W stopped closing tabs — along with most other shortcuts
-  — until the window was clicked. Collapsing a panel that held the keyboard,
-  closing a pane, or pressing a focus shortcut on a Redis connection could leave
-  focus pointing at something no longer on screen, and RED then matched none of
-  its own shortcuts. The tell was that ⌘K still opened the palette while ⌘W, ⌘T,
-  ⌘B, ⌘Y, ⌘I, ⌘L and Esc all did nothing. Focus is now checked every frame and
-  handed to a real panel if it has come adrift, so the keyboard cannot be lost.
-- The breadcrumb's database picker now belongs to the pane it sits in. In a
-  split it used to open in every visible pane at once, and picking a database
-  then did nothing at all — each of the duplicate menus dismissed the click
-  meant for the others. Each pane's crumb also names that pane's own database
-  rather than the focused pane's, and picking one changes the half you picked
-  it in.
-- Each pane now keeps its own tab-strip scroll position and editor/result
-  divider; previously the two halves of a split shared both, so scrolling one
-  strip scrolled the other.
-- Superseding a Postgres query now reliably stops it at the server. A cancel
-  that arrived in the moment between the statement being prepared and being run
-  was discarded by the engine, so a flung scrollbar or a re-sort could leave the
-  old query scanning to completion on the server while RED had already moved on.
-- Importing connections from DBeaver, DBGate, and DataGrip now offers your Redis
-  and MongoDB entries as well as the SQL ones. They were listed as "unsupported
-  engine" and skipped, even though RED speaks both. Connections the source tool
-  stores as a single connection string - the default for DBGate's Mongo and Redis
-  plugins, and DBeaver's URL mode - now arrive with their host, port, database
-  number, credentials and TLS setting filled in rather than as an empty stub.
-- A Redis glob or prefix search keeps scanning until it finds your keys. On a
-  large keyspace a selective pattern such as `user:*` would report "No keys
-  match this filter" whenever the matching keys sat beyond the first bounded
-  scan window, and with nothing on screen there was no scrolling left to pull
-  the rest. The search now walks on in the background until it has a screenful
-  of matches or the keyspace runs out, exactly as fuzzy search already did.
-  Combining a pattern with a TTL, favourite or tag filter also no longer lets
-  unmatched keys leak into the list from the second page on.
-- Assistant answers no longer run off the right edge of the panel. A bulleted or
-  numbered list wrapped only as far as the first line and then kept going past
-  the panel, so the ends of the agent's notes were simply unreadable; the same
-  applied to a long plan step, a failed tool call's error line in the activity
-  trace, and a chip carrying a long filename or table name. All of them now wrap
-  or ellipsize inside the panel.
+- Fixed the bug where ⌘W stopped closing tabs, along with most other shortcuts,
+  until the window was clicked. Collapsing a panel, closing a pane or a focus
+  shortcut on Redis could leave focus pointing at something no longer on screen;
+  focus is now checked every frame and re-anchored to a real panel.
+- The breadcrumb's database picker belongs to its own pane. In a split it used to
+  open in every pane at once and then do nothing, since each duplicate menu
+  dismissed the others' click; each crumb now names and changes its own pane's
+  database.
+- Each pane keeps its own tab-strip scroll position and editor/result divider,
+  instead of sharing both across a split.
+- Superseding a Postgres query reliably cancels it at the server, including a
+  cancel arriving between the statement being prepared and being run.
+- Importing from DBeaver, DBGate and DataGrip offers your Redis and MongoDB
+  entries, not just the SQL ones, including entries stored as a single connection
+  string, which now arrive filled in rather than as empty stubs.
+- A Redis glob or prefix search keeps scanning until it finds your keys, instead
+  of reporting "No keys match this filter" when they sit beyond the first scan
+  window. Combining a pattern with a TTL, favourite or tag filter no longer lets
+  unmatched keys leak in from the second page on.
+- Assistant answers no longer run off the right edge of the panel: list items,
+  plan steps, tool-call errors and long chips all wrap or ellipsize inside it.
 
 ## [0.20.0] - 2026-07-30
 
