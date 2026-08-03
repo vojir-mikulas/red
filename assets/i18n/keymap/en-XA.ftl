@@ -79,15 +79,6 @@ keymap-RefreshSchema =
 keymap-SearchSchema =
     .label = [Séárçh sçhémá]
 
-keymap-FocusSchema =
-    .label = [Föçús sçhémá sídébár]
-
-keymap-FocusEditor =
-    .label = [Föçús édítör]
-
-keymap-FocusGrid =
-    .label = [Föçús résúlt gríd]
-
 keymap-CycleFocusNext =
     .label = [Çyçlé föçús förwárd]
 

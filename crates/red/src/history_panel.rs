@@ -329,11 +329,16 @@ impl AppState {
 
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(bg_panel)
             .child(header)
             .children(search_strip)
             .child(list)
+            .children(
+                self.focus_hint(crate::focus::FocusTargetId::History)
+                    .map(|h| crate::focus_overlay::badge(h, cx)),
+            )
     }
 }

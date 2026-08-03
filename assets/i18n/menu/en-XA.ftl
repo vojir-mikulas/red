@@ -50,12 +50,6 @@ menu-view-maximize_pane = [Máxímízé / Réstöré Páñé]
 
 menu-view-equalize_panes = [Éqúálízé Páñé Sízés]
 
-menu-view-focus_schema = [Föçús Sçhémá]
-
-menu-view-focus_editor = [Föçús Édítör]
-
-menu-view-focus_grid = [Föçús Gríd]
-
 menu-view-focus_next_pane = [Föçús Ñéxt Páñé]
 
 menu-view-cycle_focus_next = [Çyçlé Föçús Ñéxt]

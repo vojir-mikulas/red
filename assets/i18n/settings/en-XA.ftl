@@ -83,6 +83,32 @@ settings-keymap-vim_mode =
     .label = [Vím ñávígátíöñ]
     .help = [Ádds hjkl / g / G / Çtrl-d / Çtrl-ú mötíöñs tö thé résúlt gríd áñd thé hístöry döçk, álöñgsídé thé árröw kéys. Ápplíés lívé.]
 
+settings-keymap-focus_overlay =
+    .label = [Höld tö shöw föçús híñts]
+    .help = [Höld thís mödífíér by ítsélf áñd évéry föçúsáblé páñél shöws thé kéy thát júmps tö ít. Ált by défáúlt: Çmd/Çtrl stárts álmöst évéry öthér shörtçút, sö ármíñg öñ ít wöúld çömpété wíth yöúr öwñ çhörds.]
+
+settings-keymap-focus_overlay-seg-off = [Öff]
+
+settings-keymap-focus_overlay-seg-alt = [Ált]
+
+settings-keymap-focus_overlay-seg-cmd_ctrl = [Çmd/Çtrl]
+
+settings-keymap-focus_overlay-seg-shift = [Shíft]
+
+settings-keymap-focus_overlay-seg-control = [Çöñtröl]
+
+settings-keymap-focus_overlay_delay_ms =
+    .label = [Föçús híñt déláy]
+    .help = [Höw löñg thé mödífíér múst bé héld béföré thé híñts áppéár. Thé déláy ís whát kééps thém öút öf thé wáy öf ördíñáry shörtçúts, whíçh réléásé thé mödífíér löñg béföré ít élápsés.]
+
+settings-keymap-focus_overlay_delay_ms-seg-instant = [Íñstáñt]
+
+settings-keymap-focus_overlay_delay_ms-seg-150_ms = [150 ms]
+
+settings-keymap-focus_overlay_delay_ms-seg-250_ms = [250 ms]
+
+settings-keymap-focus_overlay_delay_ms-seg-500_ms = [500 ms]
+
 settings-group-startup = [Stártúp]
 
 settings-behavior-restore_last_session =

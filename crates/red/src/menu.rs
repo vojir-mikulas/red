@@ -31,10 +31,10 @@ use flint::components::text_input::{
 use crate::Quit;
 use crate::i18n::tr;
 use crate::keymap::{
-    About, ClosePane, CloseTab, CycleFocusNext, CycleFocusPrev, EqualizePanes, FocusEditor,
-    FocusGrid, FocusOtherHalf, FocusSchema, FormatSql, MaximizePane, NewConnection, NewTab,
-    NextTab, PrevTab, RefreshSchema, ReportBug, RunQuery, SearchSchema, Settings, ShowChangelog,
-    ShowErDiagram, ShowShortcuts, SplitDown, SwitchConnection, ToggleSidebar, ToggleSplit,
+    About, ClosePane, CloseTab, CycleFocusNext, CycleFocusPrev, EqualizePanes, FocusOtherHalf,
+    FormatSql, MaximizePane, NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, ReportBug,
+    RunQuery, SearchSchema, Settings, ShowChangelog, ShowErDiagram, ShowShortcuts, SplitDown,
+    SwitchConnection, ToggleSidebar, ToggleSplit,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -106,9 +106,6 @@ pub(crate) fn build_menus() -> Vec<Menu> {
                 EqualizePanes,
             ),
             MenuItem::separator(),
-            MenuItem::action(tr!("menu.view.focus_schema", "Focus Schema"), FocusSchema),
-            MenuItem::action(tr!("menu.view.focus_editor", "Focus Editor"), FocusEditor),
-            MenuItem::action(tr!("menu.view.focus_grid", "Focus Grid"), FocusGrid),
             MenuItem::action(
                 tr!("menu.view.focus_next_pane", "Focus Next Pane"),
                 FocusOtherHalf,

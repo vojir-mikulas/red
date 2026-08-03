@@ -30,7 +30,7 @@ shortcuts-global-quit = Quit
 
 shortcuts-panes-title = Panes
 
-shortcuts-panes-focus_schema_editor_grid = Focus schema / editor / grid
+shortcuts-panes-focus_hints = Show a jump key on every panel, then press it
 
 shortcuts-panes-cycle_focus_forward_back = Cycle focus forward / back
 

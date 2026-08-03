@@ -870,6 +870,7 @@ impl AppState {
 
         div()
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             // The tree itself owns the focus handle + navigation keys (see its
@@ -878,6 +879,10 @@ impl AppState {
             .child(filter_row)
             .child(div().flex_1().min_h(px(0.)).child(tree))
             .child(footer)
+            .children(
+                self.focus_hint(crate::focus::FocusTargetId::Sidebar)
+                    .map(|h| crate::focus_overlay::badge(h, cx)),
+            )
         // The right-click menu is deliberately NOT a child here: it renders at
         // the shell root (see `render_schema_menu`), because this pane is the
         // narrow sidebar and would both clip the menu and offset its position.

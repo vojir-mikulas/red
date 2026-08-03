@@ -1010,6 +1010,7 @@ impl AppState {
                             .ok();
                     })
             })
+            .relative()
             .child(
                 div()
                     .font_family(theme.font_family.clone())
@@ -1021,6 +1022,18 @@ impl AppState {
                     )),
             )
             .child(cards)
+            .children(
+                v.tabs
+                    .get(tab_idx)
+                    .map(crate::app::WorkspaceTab::pane)
+                    .and_then(|pane| {
+                        self.focus_hint(crate::focus::FocusTargetId::Body {
+                            pane,
+                            area: crate::focus::BodyArea::Chooser,
+                        })
+                    })
+                    .map(|h| crate::focus_overlay::badge(h, cx)),
+            )
     }
 
     /// The Redis History dock (left, ⌘Y): a collapsible "Recently viewed keys"

@@ -25,6 +25,8 @@ mod filter;
 mod filters;
 mod find;
 mod fmt;
+mod focus;
+mod focus_overlay;
 mod gridwindow;
 mod health;
 mod health_store;

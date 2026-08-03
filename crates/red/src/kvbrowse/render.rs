@@ -433,6 +433,18 @@ impl AppState {
         } else {
             "No keys in this database"
         };
+        // This tab's hint, if focus hints are showing. Resolved through the tab's
+        // own pane so a split shows one badge per visible list, not one per tab.
+        let list_hint = view_ref
+            .tabs
+            .get(tab_idx)
+            .map(crate::app::WorkspaceTab::pane)
+            .and_then(|pane| {
+                self.focus_hint(crate::focus::FocusTargetId::Body {
+                    pane,
+                    area: crate::focus::BodyArea::List,
+                })
+            });
         let key_area = if row_count == 0 {
             div()
                 .flex_1()
@@ -445,7 +457,9 @@ impl AppState {
                 .child(empty_msg)
         } else {
             div().flex_1().min_w(px(0.)).child(table)
-        };
+        }
+        .relative()
+        .children(list_hint.map(|h| crate::focus_overlay::badge(h, cx)));
 
         let main = match &browse.big_keys {
             // Live browse: the key list, plus — when a key is selected — the

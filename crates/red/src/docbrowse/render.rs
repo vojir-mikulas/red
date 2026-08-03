@@ -167,9 +167,14 @@ impl AppState {
         let tree = self.render_doc_tree(v, &tree_filter, &theme, &view);
         let tree_pane = div()
             .size_full()
+            .relative()
             .border_r_1()
             .border_color(theme.border)
-            .child(tree);
+            .child(tree)
+            .children(
+                self.focus_hint(crate::focus::FocusTargetId::Sidebar)
+                    .map(|h| crate::focus_overlay::badge(h, cx)),
+            );
         let start = view.clone();
         let resize = view.clone();
         let end = view.clone();
@@ -649,7 +654,25 @@ impl AppState {
                 }
             }))
             .child(strip)
-            .child(div().flex_1().min_h(px(0.)).flex().child(panel))
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h(px(0.))
+                    .flex()
+                    .child(panel)
+                    // On the body rather than on the document grid itself: the
+                    // grid is rendered several `&self` helpers deep, none of
+                    // which carry a `cx` or the pane, and the badge belongs to
+                    // the pane's work area either way.
+                    .children(
+                        self.focus_hint(crate::focus::FocusTargetId::Body {
+                            pane,
+                            area: crate::focus::BodyArea::List,
+                        })
+                        .map(|h| crate::focus_overlay::badge(h, cx)),
+                    ),
+            )
             .children(target.map(|t| drop_overlay(t.zone, t.allowed, accent, muted)))
             .into_any_element()
     }

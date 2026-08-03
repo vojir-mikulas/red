@@ -61,13 +61,10 @@ actions!(
         ToggleColumnsPanel,
         /// Reload the schema tree from the backend.
         RefreshSchema,
-        /// Move keyboard focus to the schema sidebar / editor / result grid.
-        FocusSchema,
-        FocusEditor,
-        FocusGrid,
         /// Reveal the schema sidebar and focus its filter field (search schema).
         SearchSchema,
-        /// Cycle focus to the next / previous pane (schema → editor → grid).
+        /// Cycle focus to the next / previous surface, in focus-target registry
+        /// order. Uniform across the SQL, Redis and MongoDB shells.
         CycleFocusNext,
         CycleFocusPrev,
         /// Open the keyboard-shortcuts reference overlay.
@@ -161,6 +158,20 @@ actions!(
 #[action(namespace = red, no_json)]
 pub(crate) struct SwitchToConnectionSlot(pub usize);
 
+/// A focus-hint key pressed while the hint overlay is up; the payload is the
+/// target's position in the frozen hint order.
+///
+/// This has to be an *action* rather than a plain key listener on the hint layer,
+/// because gpui dispatches keymap bindings before key listeners and returns as
+/// soon as one consumes the event. A hint key that collides with an app shortcut
+/// would never reach a listener: with the trigger set to Cmd/Ctrl, ⌘1–⌘9 are
+/// `SwitchToConnectionSlot`, so pressing hint `1` would switch *connection*
+/// instead of moving focus. Bound in the `FocusHints` context, which only exists
+/// while the layer holds focus and sits deeper than `RedRoot`, so it wins.
+#[derive(Clone, PartialEq, Eq, Default, Debug, gpui::Action)]
+#[action(namespace = red, no_json)]
+pub(crate) struct FocusHintSlot(pub usize);
+
 /// The keyboard reference, grouped, for the shortcuts overlay (`⌘/`) and the
 /// docs. Kept beside the bindings above so the two don't drift; the overlay is
 /// built from this rather than hand-maintained in the view.
@@ -229,9 +240,9 @@ static SHORTCUTS: &[ShortcutGroup] = &[
         "Panes",
         &[
             (
-                "focus_schema_editor_grid",
-                "⌥⌘1 / ⌥⌘2 / ⌥⌘3",
-                "Focus schema / editor / grid",
+                "focus_hints",
+                "hold ⌥",
+                "Show a jump key on every panel, then press it",
             ),
             (
                 "cycle_focus_forward_back",
@@ -589,21 +600,12 @@ const DEFAULTS: &[ActionDef] = &[
     ),
     def("cmd-r", "RefreshSchema", "Refresh schema", Some("RedRoot")),
     def("cmd-f", "SearchSchema", "Search schema", Some("RedRoot")),
-    // Pane focus: direct jumps (⌥⌘1/2/3) and a cycle (F6 / ⇧F6). ⌥⌘ avoids the
-    // bare ⌘+digit keys (macOS / screenshot tools bind several of those).
-    def(
-        "cmd-alt-1",
-        "FocusSchema",
-        "Focus schema sidebar",
-        Some("RedRoot"),
-    ),
-    def("cmd-alt-2", "FocusEditor", "Focus editor", Some("RedRoot")),
-    def(
-        "cmd-alt-3",
-        "FocusGrid",
-        "Focus result grid",
-        Some("RedRoot"),
-    ),
+    // Focus movement. The ⌥⌘1/2/3 jumps are retired: they named the SQL shell's
+    // three panes, which Redis and MongoDB had to pun onto or ignore, and the
+    // hold-to-reveal hint overlay reaches every surface in every seam with one
+    // gesture. The two cycle keys keep their names and keys and are re-pointed at
+    // the focus-target registry — renaming them would silently drop the binding
+    // out of any user's `keymap.toml` for no gain.
     def(
         "f6",
         "CycleFocusNext",
@@ -880,6 +882,21 @@ pub(crate) fn apply(cx: &mut App, overrides: &[KeymapBlock]) -> Vec<String> {
     // skipped on macOS, where ⌘Q is the convention and F4 isn't a close key.
     #[cfg(not(target_os = "macos"))]
     cx.bind_keys([KeyBinding::new("alt-f4", crate::Quit, None)]);
+    // Focus hints: one binding per hint key, in the `FocusHints` context the hint
+    // layer declares while it holds focus. Bound for every modifier a trigger
+    // could be, plus the bare key, because the trigger is a live setting and the
+    // keymap is installed once — and because the whole point is to out-rank the
+    // `RedRoot` bindings some of these keys collide with. Programmatic, like
+    // `SwitchToConnectionSlot`, so they stay out of the rebind editor.
+    for (slot, hint) in crate::focus::hint_keys().iter().enumerate() {
+        for prefix in ["", "alt-", "secondary-", "shift-", "ctrl-"] {
+            cx.bind_keys([KeyBinding::new(
+                &format!("{prefix}{hint}"),
+                FocusHintSlot(slot),
+                Some("FocusHints"),
+            )]);
+        }
+    }
     // Dev-only perf HUD toggle (⌥⌘P). Re-bound here so a keymap reload's clear
     // doesn't drop it; the action itself is declared in `main` under the feature.
     #[cfg(feature = "dev-stats")]
@@ -1021,9 +1038,13 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
         "ToggleColumnsPanel" => kb!(ToggleColumnsPanel),
         "RefreshSchema" => kb!(RefreshSchema),
         "SearchSchema" => kb!(SearchSchema),
-        "FocusSchema" => kb!(FocusSchema),
-        "FocusEditor" => kb!(FocusEditor),
-        "FocusGrid" => kb!(FocusGrid),
+        // Retired in favour of the hold-to-reveal hint overlay, but still
+        // resolvable: `bind_named` doubles as the allowlist for `keymap.toml`, so
+        // dropping the names outright would turn an existing user's binding into
+        // a load warning and a dead key. They now cycle instead of jumping to a
+        // fixed pane, which is the nearest surviving behaviour. Remove a release
+        // after the overlay ships.
+        "FocusSchema" | "FocusEditor" | "FocusGrid" => kb!(CycleFocusNext),
         "CycleFocusNext" => kb!(CycleFocusNext),
         "CycleFocusPrev" => kb!(CycleFocusPrev),
         "ShowShortcuts" => kb!(ShowShortcuts),

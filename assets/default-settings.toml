@@ -79,6 +79,20 @@ tab_width = 2
 # Per-key rebinds live in keymap.toml, not here.
 vim_mode = false
 
+# Hold this modifier by itself and every focusable panel shows the single key
+# that jumps to it; press the key to go there, release to dismiss. One of
+# "off", "alt", "primary" (Cmd on macOS, Ctrl elsewhere), "shift", "control".
+#
+# Alt by default: "primary" prefixes almost every other shortcut RED has, so
+# arming the hints on it means competing with your own chords all day.
+focus_overlay = "alt"
+
+# How long the modifier must be held before the hints appear, in milliseconds
+# (0 shows them instantly; clamped to 0–2000). The delay is what keeps the hints
+# out of the way of ordinary shortcuts, which release the modifier long before
+# it elapses.
+focus_overlay_delay_ms = 250
+
 [data]
 # Data-view defaults, shared by EVERY grid: the SQL result grid, the Redis key
 # list, and the MongoDB document grid. A few knobs only one seam can honour; those

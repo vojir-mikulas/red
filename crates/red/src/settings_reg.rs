@@ -28,8 +28,8 @@ use std::borrow::Cow;
 use gpui::SharedString;
 
 use crate::settings::{
-    ConfirmThreshold, Density, DocView, KvQueryMode, MAX_DOC_COLUMNS, MAX_PREVIEW_COUNT,
-    MAX_RESIDENT_KEYS, Settings,
+    ConfirmThreshold, Density, DocView, FocusTrigger, KvQueryMode, MAX_DOC_COLUMNS,
+    MAX_PREVIEW_COUNT, MAX_RESIDENT_KEYS, Settings,
 };
 
 /// A setting's value, in the three shapes a generic control can edit. Enums ride
@@ -469,6 +469,61 @@ static DEFS: &[SettingDef] = &[
         control: Control::Toggle,
         get: |s| Value::Bool(s.keymap.vim_mode),
         set: |s, v| s.keymap.vim_mode = v.as_bool(),
+        warn: None,
+    },
+    SettingDef {
+        key: "keymap.focus_overlay",
+        tab: SettingsTab::Keymap,
+        group: "Navigation",
+        en_label: "Hold to show focus hints",
+        en_help: "Hold this modifier by itself and every focusable panel shows the key that \
+               jumps to it. Alt by default: Cmd/Ctrl starts almost every other shortcut, so \
+               arming on it would compete with your own chords.",
+        applies: Applies::All,
+        control: Control::Segments(&[
+            seg("Off", text("off")),
+            seg("Alt", text("alt")),
+            seg("Cmd/Ctrl", text("primary")),
+            seg("Shift", text("shift")),
+            seg("Control", text("control")),
+        ]),
+        get: |s| {
+            Value::Text(Cow::Borrowed(match s.keymap.focus_overlay {
+                FocusTrigger::Off => "off",
+                FocusTrigger::Alt => "alt",
+                FocusTrigger::Primary => "primary",
+                FocusTrigger::Shift => "shift",
+                FocusTrigger::Control => "control",
+            }))
+        },
+        set: |s, v| {
+            s.keymap.focus_overlay = match v.as_text() {
+                "off" => FocusTrigger::Off,
+                "primary" => FocusTrigger::Primary,
+                "shift" => FocusTrigger::Shift,
+                "control" => FocusTrigger::Control,
+                _ => FocusTrigger::Alt,
+            }
+        },
+        warn: None,
+    },
+    SettingDef {
+        key: "keymap.focus_overlay_delay_ms",
+        tab: SettingsTab::Keymap,
+        group: "Navigation",
+        en_label: "Focus hint delay",
+        en_help: "How long the modifier must be held before the hints appear. The delay is what \
+               keeps them out of the way of ordinary shortcuts, which release the modifier long \
+               before it elapses.",
+        applies: Applies::All,
+        control: Control::Segments(&[
+            seg("Instant", int(0)),
+            seg("150 ms", int(150)),
+            seg("250 ms", int(250)),
+            seg("500 ms", int(500)),
+        ]),
+        get: |s| Value::Int(s.keymap.focus_overlay_delay_ms as i64),
+        set: |s, v| s.keymap.focus_overlay_delay_ms = v.as_int().clamp(0, 2000) as u64,
         warn: None,
     },
     // --- behavior ---

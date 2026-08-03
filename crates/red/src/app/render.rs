@@ -6,17 +6,17 @@ use flint::prelude::*;
 use gpui::{ClipboardItem, Focusable, KeyDownEvent, Render, Window, div, prelude::*, px};
 use red_core::{BatchMode, CopyMode};
 
-use super::{AppState, ConnectStatus, Connecting, Pane, Phase};
+use super::{AppState, ConnectStatus, Connecting, Phase};
 use crate::app::AiReviewState;
 use crate::app::PreflightCount;
 use crate::keymap::{
     About, AddRow, BeginEdit, CloseInspector, ClosePane, CloseTab, CycleFocusNext, CycleFocusPrev,
-    DeleteRow, EqualizePanes, Explain, FindInResult, FocusEditor, FocusGrid, FocusOtherHalf,
-    FocusSchema, FormatSql, MaximizePane, NewConnection, NewTab, NextTab, OpenSavedQueries,
-    PrevTab, RefreshSchema, ReportBug, RevertChanges, RunQuery, SaveQuery, SearchSchema, SelectAll,
-    SetNull, Settings, ShowChangelog, ShowErDiagram, ShowShortcuts, SplitDown, SubmitChanges,
-    SwitchConnection, SwitchToConnectionSlot, SwitchToPreviousConnection, ToggleAssistant,
-    ToggleColumnsPanel, ToggleFilter, ToggleHistory, ToggleInspector, ToggleSidebar, ToggleSplit,
+    DeleteRow, EqualizePanes, Explain, FindInResult, FocusOtherHalf, FormatSql, MaximizePane,
+    NewConnection, NewTab, NextTab, OpenSavedQueries, PrevTab, RefreshSchema, ReportBug,
+    RevertChanges, RunQuery, SaveQuery, SearchSchema, SelectAll, SetNull, Settings, ShowChangelog,
+    ShowErDiagram, ShowShortcuts, SplitDown, SubmitChanges, SwitchConnection,
+    SwitchToConnectionSlot, SwitchToPreviousConnection, ToggleAssistant, ToggleColumnsPanel,
+    ToggleFilter, ToggleHistory, ToggleInspector, ToggleSidebar, ToggleSplit,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 use red_core::sql::RiskLevel;
@@ -166,6 +166,12 @@ impl Render for AppState {
             self.notify_update(version, cx);
         }
 
+        // Before anything else that touches focus: if the last frame left focus
+        // pointing at an element that is no longer rendered, pull it back to the
+        // root, or every `RedRoot`-scoped binding silently stops matching. See
+        // `ensure_focus_anchored`.
+        self.ensure_focus_anchored(window, cx);
+
         // An overlay just closed (or we're starting up): reclaim focus so the
         // global ⌘K binding has a live dispatch target again.
         if self.refocus_root {
@@ -178,6 +184,13 @@ impl Render for AppState {
         if let Some(pane) = self.pending_focus.take() {
             self.focus_pane(pane, window, cx);
         }
+        if let Some(id) = self.pending_focus_target.take() {
+            self.focus_target_by_id(id, window, cx);
+        }
+
+        // Hints just appeared: move focus onto their layer so the hint keys
+        // reach it rather than a focused editor.
+        self.take_focus_for_hints(window, cx);
 
         // Keep the split's focused half in step with where keyboard focus actually
         // sits, so clicking into either half (incl. its editor) lights it as active
@@ -475,6 +488,14 @@ impl Render for AppState {
             // from any phase, even when no field or editor is focused.
             .key_context("RedRoot")
             .track_focus(&self.root_focus)
+            // Hold-to-reveal focus hints. GPUI dispatches modifier changes down
+            // the focus path, so this fires from anywhere only because the root
+            // is guaranteed to be on that path (see `ensure_focus_anchored`).
+            .on_modifiers_changed(cx.listener(
+                |this, ev: &gpui::ModifiersChangedEvent, window, cx| {
+                    this.on_focus_modifiers(ev, window, cx);
+                },
+            ))
             // Every listener in this chain guards on `globals_enabled`: the root is
             // an *ancestor* of `modal_focus` and Flint's `Modal` does not swallow
             // action dispatch, so without it these all fire straight through an open
@@ -571,16 +592,8 @@ impl Render for AppState {
                 this.focus_search = true;
                 cx.notify();
             }))
-            // Pane focus jumps + cycle.
-            .on_action(cx.listener(|this, _: &FocusSchema, window, cx| {
-                this.focus_pane(Pane::Schema, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &FocusEditor, window, cx| {
-                this.focus_pane(Pane::Editor, window, cx)
-            }))
-            .on_action(cx.listener(|this, _: &FocusGrid, window, cx| {
-                this.focus_pane(Pane::Grid, window, cx)
-            }))
+            // Focus cycling, in focus-target registry order. The direct
+            // ⌥⌘1/2/3 pane jumps are retired in favour of the hint overlay.
             .on_action(cx.listener(|this, _: &CycleFocusNext, window, cx| {
                 this.cycle_focus(true, window, cx)
             }))
@@ -774,6 +787,14 @@ impl Render for AppState {
             .children(self.render_kv_delete_modal(cx))
             // The palette renders its own full-screen overlay; last = on top.
             .children(self.palette.as_ref().map(|(p, _)| p.clone()))
+            // The hint layer takes the keyboard while focus hints show. It paints
+            // nothing — the badges render inside the surfaces they label — so its
+            // place in the stack matters only for key dispatch.
+            .children(
+                self.focus_hints
+                    .is_some()
+                    .then(|| self.render_focus_hint_layer(cx)),
+            )
             // The result-grid dropdowns (cell / export / more) mount here, above
             // every other overlay, each carrying a window-wide dismiss backdrop.
             // Rooting them at the window (not the result pane) is what lets a click

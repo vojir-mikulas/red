@@ -245,6 +245,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - The AI assistant's composer now offers whichever on/off settings the agent
   exposes for the session as switches — on Claude Code that includes fast mode,
   the higher-throughput decode available on the models that support it.
+- Hold Alt on its own and every panel you can type or navigate in shows the
+  single key that jumps to it; press the key to go there, or let go to leave
+  focus where it was. It reaches everything the shell is showing — the schema or
+  collection tree, each pane's editor and result grid, the Redis key list, the
+  history dock, the filter and find bars, the assistant — and works the same in
+  the SQL, Redis and MongoDB shells, which is new: Redis previously had no way
+  to move focus by keyboard at all. The digits come first, so a plain window
+  labels the sidebar `1`, the editor `2` and the grid `3`. The trigger and the
+  hold delay are settings (`keymap.focus_overlay`), including turning it off.
 
 ### Changed
 - The AI assistant's composer settings now read as a set: model, thinking level
@@ -264,8 +273,23 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   existing `keymap.toml` files that bind it keep working unchanged. Pane widths
   are held as proportions, so resizing the window now widens every pane in step
   instead of stretching only the last one.
+- F6 and ⇧F6 now cycle through every panel on screen — docks, trees, editors,
+  grids, the open filter or find bar, the assistant — instead of the SQL shell's
+  three fixed stops, and they work in the Redis and MongoDB shells too.
+- The ⌥⌘1 / ⌥⌘2 / ⌥⌘3 jumps to the schema, editor and grid are retired in favour
+  of holding Alt, which reaches far more than three places and works in every
+  shell. A `keymap.toml` that binds them still loads, and those keys now cycle
+  focus rather than doing nothing. The command palette lists every panel it can
+  focus by name, so nothing needs a shortcut to be reachable.
 
 ### Fixed
+- Fixed the bug where ⌘W stopped closing tabs — along with most other shortcuts
+  — until the window was clicked. Collapsing a panel that held the keyboard,
+  closing a pane, or pressing a focus shortcut on a Redis connection could leave
+  focus pointing at something no longer on screen, and RED then matched none of
+  its own shortcuts. The tell was that ⌘K still opened the palette while ⌘W, ⌘T,
+  ⌘B, ⌘Y, ⌘I, ⌘L and Esc all did nothing. Focus is now checked every frame and
+  handed to a real panel if it has come adrift, so the keyboard cannot be lost.
 - The breadcrumb's database picker now belongs to the pane it sits in. In a
   split it used to open in every visible pane at once, and picking a database
   then did nothing at all — each of the duplicate menus dismissed the click

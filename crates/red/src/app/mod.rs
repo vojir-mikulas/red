@@ -479,6 +479,25 @@ pub struct AppState {
     /// Set when an overlay closed: the next render pulls focus back to the root
     /// so the global ⌘K keeps dispatching (see `close_palette`).
     pub(crate) refocus_root: bool,
+    /// Whether the last focus repair aimed at a registry target rather than the
+    /// root. If the next frame still finds focus adrift, that target was not
+    /// rendered either, so the repair drops to the root instead of retrying a
+    /// handle that will never take. See `ensure_focus_anchored`.
+    focus_repair_pending: bool,
+    /// Live hold-to-reveal focus hints, or `None` when none are showing.
+    pub(crate) focus_hints: Option<crate::focus_overlay::FocusHints>,
+    /// The trigger modifier is down and the reveal delay is running.
+    pub(crate) focus_arm_pending: bool,
+    /// Generation guard for the arm timer, so a superseded gesture's tick is
+    /// dropped rather than having to cancel the timer that carries it.
+    pub(crate) focus_arm_gen: u64,
+    /// Set when hints just appeared: the next render moves focus onto the hint
+    /// layer (and records what it displaced) now that a `Window` is in hand.
+    pub(crate) focus_hints_take_focus: bool,
+    /// Focus anchor for the hint layer. It holds focus while hints show so the
+    /// hint keys reach it ahead of a focused editor, which would otherwise
+    /// swallow them as text.
+    pub(crate) focus_hints_focus: FocusHandle,
     /// Armed on mouse-down in the titlebar/drag strip; the first drag motion
     /// then starts a compositor window-move (client-side decorations only; see
     /// `window_chrome::draggable`). A plain click clears it without moving.
@@ -515,6 +534,11 @@ pub struct AppState {
     /// place without a `Window` (e.g. an editor `Escape` event). Drained in
     /// `render`, which has the `Window` `focus` needs.
     pub(crate) pending_focus: Option<Pane>,
+    /// A focus-registry target to focus on the next render, for the same reason
+    /// as [`Self::pending_focus`]: the palette and the hint overlay both choose a
+    /// target while closing, with no `Window` to hand. Resolved by identity, so a
+    /// target that vanished in the meantime is simply dropped.
+    pub(crate) pending_focus_target: Option<crate::focus::FocusTargetId>,
     /// Set when the connection form just opened: the next render focuses the name
     /// field so the user can type straightaway (the form's `Window`-less opener
     /// can't focus directly).
@@ -1318,6 +1342,12 @@ impl AppState {
             next_active_seq: 0,
             // Focus the root on first paint so the very first ⌘K dispatches.
             refocus_root: true,
+            focus_repair_pending: false,
+            focus_hints: None,
+            focus_arm_pending: false,
+            focus_arm_gen: 0,
+            focus_hints_take_focus: false,
+            focus_hints_focus: cx.focus_handle(),
             titlebar_drag: false,
             shortcuts_open: false,
             whats_new_open: false,
@@ -1331,6 +1361,7 @@ impl AppState {
                 ascending: false,
             },
             pending_focus: None,
+            pending_focus_target: None,
             focus_name_field: false,
             focus_create_key: false,
             focus_history: false,
@@ -2610,6 +2641,53 @@ impl AppState {
 
     // --- pane focus ---
 
+    /// Keep `RedRoot` on the key-dispatch path.
+    ///
+    /// GPUI resolves a key event by walking from the focused node up to the
+    /// dispatch root, collecting each node's `KeyContext`. When the focused
+    /// handle names an element that is *not in the frame that was rendered* —
+    /// a dock that just collapsed, a pane that was closed, a tab that went away
+    /// — it silently falls back to the tree root, whose dispatch path carries no
+    /// context at all. `RedRoot` sits on a child of that root, so in that state
+    /// every `RedRoot`-scoped binding stops matching: ⌘W, ⌘T, ⌘B, ⌘Y, ⌘I, ⌘L,
+    /// ⌘⇧F, ⌘\, ⌘C and Esc all go dead while the handful of context-less globals
+    /// (⌘K, ⌘P, ⌃G, ⌘Q) keep working. That asymmetry is the bug's signature.
+    ///
+    /// Anchoring focus back at the root div — which is always rendered — makes
+    /// the state unreachable, so no close path has to remember to hand focus on.
+    /// `refocus_root` remains as an explicit *intent* ("put focus back now"),
+    /// but correctness no longer depends on anyone setting it.
+    ///
+    /// Repairing to the root is the floor, not the destination: it keeps the
+    /// keymap alive but leaves the caret nowhere the user can type or navigate.
+    /// So the repair prefers the first live focus target, and only falls back to
+    /// the bare root when the registry is empty (the welcome screen) or when
+    /// aiming at a target did not take.
+    ///
+    /// That preference is also what makes every close path correct without
+    /// touching it: collapse a dock while its list holds focus and the next
+    /// frame finds focus adrift, rebuilds the registry (which no longer contains
+    /// the dock) and lands on the first surviving surface.
+    fn ensure_focus_anchored(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // Reads the last painted frame, which is exactly the frame the next key
+        // event will be resolved against. False for a dangling id and for a
+        // handle that has been dropped outright.
+        if self.root_focus.contains_focused(window, cx) {
+            self.focus_repair_pending = false;
+            return;
+        }
+        // One attempt at a real surface per repair. Without the latch, a target
+        // that is itself not rendered (a surface torn down in the same frame it
+        // was listed) would be re-aimed at every frame and focus would stay
+        // outside the tree — the very state this exists to end.
+        if !self.focus_repair_pending && self.focus_first_target(window, cx) {
+            self.focus_repair_pending = true;
+            return;
+        }
+        self.focus_repair_pending = false;
+        window.focus(&self.root_focus.clone(), cx);
+    }
+
     /// Move keyboard focus to `pane` and remember it as the active pane (so the
     /// next focus-cycle starts from here and the pane chrome draws its ring).
     /// Focusing the schema pane also reveals the sidebar if it was collapsed.
@@ -2621,6 +2699,16 @@ impl AppState {
             && a.doc_view.is_some()
         {
             self.doc_focus_pane(pane, window, cx);
+            return;
+        }
+        // The Redis shell has no schema tree and no SQL editor/grid, and its
+        // `ActiveConn` still carries their (never-rendered) handles. Focusing one
+        // would leave focus pointing outside the rendered frame, which is exactly
+        // the state `ensure_focus_anchored` exists to undo — so don't create it.
+        // Redis gains real focus targets with the target registry.
+        if let Phase::Connected(a) = &self.phase
+            && a.kv_view.is_some()
+        {
             return;
         }
         if pane == Pane::Schema
@@ -2662,43 +2750,78 @@ impl AppState {
         cx.notify();
     }
 
-    /// Cycle focus to the next (or previous) pane in visual order
-    /// schema → editor → grid. A collapsed/absent sidebar drops out of the cycle.
+    /// Cycle focus to the next (or previous) surface, in the target registry's
+    /// order (F6 / ⇧F6).
+    ///
+    /// Every seam cycles through the same list, so this works identically in the
+    /// SQL, Redis and MongoDB shells — Redis had no focus cycling at all before
+    /// the registry, because there was no vocabulary its surfaces fit.
     pub(crate) fn cycle_focus(
         &mut self,
         forward: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // A Mongo connection cycles its own two stops (tree <-> document grid).
-        if let Phase::Connected(a) = &self.phase
-            && a.doc_view.is_some()
-        {
-            self.doc_cycle_focus(window, cx);
+        let targets = self.focus_targets(cx);
+        let n = targets.len();
+        if n == 0 {
             return;
         }
-        let (current, order) = match &self.phase {
-            Phase::Connected(active) => {
-                let mut order = Vec::with_capacity(3);
-                if !active.sidebar_collapsed {
-                    order.push(Pane::Schema);
-                }
-                order.push(Pane::Editor);
-                order.push(Pane::Grid);
-                (active.active_pane, order)
-            }
-            _ => return,
+        let next = match self.focused_target(&targets, window, cx) {
+            Some(i) if forward => (i + 1) % n,
+            Some(i) => (i + n - 1) % n,
+            // Focus is somewhere the registry doesn't name — the root anchor, or
+            // a modal. Start at the top rather than guessing a midpoint, so F6
+            // out of limbo always lands on the first surface.
+            None => 0,
         };
-        // Where the active pane sits in the cycle (default to the first if its
-        // pane just dropped out, e.g. the sidebar was collapsed while focused).
-        let at = order.iter().position(|p| *p == current).unwrap_or(0);
-        let n = order.len();
-        let next = if forward {
-            (at + 1) % n
-        } else {
-            (at + n - 1) % n
+        let handle = targets[next].handle.clone();
+        drop(targets);
+        window.focus(&handle, cx);
+        cx.notify();
+    }
+
+    /// Focus the registry target with this identity. Returns whether it was
+    /// still on screen; a target that has since closed is silently dropped,
+    /// which is what makes a deferred focus request safe to hold across a frame.
+    pub(crate) fn focus_target_by_id(
+        &mut self,
+        id: crate::focus::FocusTargetId,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let targets = self.focus_targets(cx);
+        let Some(handle) = targets
+            .iter()
+            .find(|t| t.id == id)
+            .map(|t| t.handle.clone())
+        else {
+            return false;
         };
-        self.focus_pane(order[next], window, cx);
+        drop(targets);
+        window.focus(&handle, cx);
+        cx.notify();
+        true
+    }
+
+    /// Move focus to the first registry target, used when a surface that held
+    /// focus is torn down. Returns whether anything took it.
+    ///
+    /// The registry is rebuilt after the teardown, so a closed dock is already
+    /// gone from it and cannot be handed focus back.
+    pub(crate) fn focus_first_target(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let targets = self.focus_targets(cx);
+        let Some(handle) = targets.first().map(|t| t.handle.clone()) else {
+            return false;
+        };
+        drop(targets);
+        window.focus(&handle, cx);
+        cx.notify();
+        true
     }
 
     // --- panes (N query tabs side by side, or stacked) ---

@@ -83,6 +83,32 @@ settings-keymap-vim_mode =
     .label = Vim navigation
     .help = Adds hjkl / g / G / Ctrl-d / Ctrl-u motions to the result grid and the history dock, alongside the arrow keys. Applies live.
 
+settings-keymap-focus_overlay =
+    .label = Hold to show focus hints
+    .help = Hold this modifier by itself and every focusable panel shows the key that jumps to it. Alt by default: Cmd/Ctrl starts almost every other shortcut, so arming on it would compete with your own chords.
+
+settings-keymap-focus_overlay-seg-off = Off
+
+settings-keymap-focus_overlay-seg-alt = Alt
+
+settings-keymap-focus_overlay-seg-cmd_ctrl = Cmd/Ctrl
+
+settings-keymap-focus_overlay-seg-shift = Shift
+
+settings-keymap-focus_overlay-seg-control = Control
+
+settings-keymap-focus_overlay_delay_ms =
+    .label = Focus hint delay
+    .help = How long the modifier must be held before the hints appear. The delay is what keeps them out of the way of ordinary shortcuts, which release the modifier long before it elapses.
+
+settings-keymap-focus_overlay_delay_ms-seg-instant = Instant
+
+settings-keymap-focus_overlay_delay_ms-seg-150_ms = 150 ms
+
+settings-keymap-focus_overlay_delay_ms-seg-250_ms = 250 ms
+
+settings-keymap-focus_overlay_delay_ms-seg-500_ms = 500 ms
+
 settings-group-startup = Startup
 
 settings-behavior-restore_last_session =

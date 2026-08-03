@@ -153,7 +153,7 @@ pub(crate) struct MongoView {
     actions_menu: Option<gpui::Point<gpui::Pixels>>,
     /// The `database -> collection` sidebar tree's keyboard focus handle; the
     /// `FocusSchema` action and a tree click plant focus here.
-    tree_focus: FocusHandle,
+    pub(crate) tree_focus: FocusHandle,
     /// The sidebar search box: narrows the tree to databases / collections whose
     /// name matches, live as the user types (mirrors the SQL schema filter). ⌘F
     /// from the tree / root focuses it.
@@ -205,7 +205,7 @@ struct DocTreeRow {
 /// The open collection in a tab: its current window of documents plus the sampled
 /// columns, the sub-panel selection, and the inspector. Each carries its own
 /// `epoch` so a stale page for a since-closed or repointed tab is dropped.
-struct CollView {
+pub(crate) struct CollView {
     /// This collection tab's backend epoch; every collection-scoped `Doc*`
     /// command carries it and replies route back by matching it.
     epoch: Epoch,
@@ -291,7 +291,7 @@ struct CollView {
     list_labels: BTreeMap<usize, Entity<SelectableLabel>>,
     /// Shared "who owns the live selection" cell for the List/JSON blocks.
     selection_group: SelectionGroup,
-    list_focus: FocusHandle,
+    pub(crate) list_focus: FocusHandle,
     /// The keyboard row cursor as an absolute ordinal (arrow / vim motions), or
     /// `None` before the grid has been touched. Drives the grid highlight and the
     /// Enter-to-inspect target, falling back to the inspected row.
@@ -682,7 +682,7 @@ impl MongoView {
     }
 
     /// The collection shown by the tab at `idx` (render-time, per split half).
-    fn coll_at(&self, idx: usize) -> Option<&CollView> {
+    pub(crate) fn coll_at(&self, idx: usize) -> Option<&CollView> {
         match self.tabs.get(idx).map(|t| &t.state)? {
             MongoTabState::Collection(c) => Some(&**c),
             MongoTabState::Empty => None,
@@ -1446,19 +1446,6 @@ impl AppState {
         let Some(handle) = handle else { return };
         window.focus(&handle, cx);
         cx.notify();
-    }
-
-    /// Cycle keyboard focus between the Mongo shell's two stops: the collection
-    /// tree and the document grid. The direction is immaterial with two stops.
-    pub(crate) fn doc_cycle_focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let tree_focused = matches!(&self.phase, Phase::Connected(a)
-            if a.doc_view.as_ref().is_some_and(|v| v.tree_focus.is_focused(window)));
-        let pane = if tree_focused {
-            Pane::Grid
-        } else {
-            Pane::Schema
-        };
-        self.doc_focus_pane(pane, window, cx);
     }
 
     /// Open (or, on the same ordinal, close) the inspector on a document, loading

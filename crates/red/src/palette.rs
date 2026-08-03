@@ -51,10 +51,11 @@ pub(crate) enum Cmd {
     ToggleServerPanel,
     RefreshSchema,
     Disconnect,
-    /// Move keyboard focus to the schema / editor / grid pane.
-    FocusSchema,
-    FocusEditor,
-    FocusGrid,
+    /// Move keyboard focus to one of the surfaces the focus-target registry
+    /// lists. Carries the target's identity rather than its position, so the
+    /// command still names the right surface if the layout shifts between the
+    /// palette opening and the command running.
+    FocusTarget(crate::focus::FocusTargetId),
     /// Reveal the sidebar and focus its filter field (search schema).
     SearchSchema,
     /// Copy the result grid's current selection (TSV).
@@ -209,7 +210,7 @@ impl AppState {
             return;
         }
 
-        let entries = self.palette_entries();
+        let entries = self.palette_entries(cx);
         self.palette_cmds = entries
             .iter()
             .map(|(item, cmd)| (item.id.clone(), *cmd))
@@ -349,9 +350,10 @@ impl AppState {
             Cmd::Disconnect => self.disconnect(cx),
             // Pane focus needs a `Window`; defer it to the next render (drained
             // there) the same way the editor's Esc-to-grid does.
-            Cmd::FocusSchema => self.pending_focus = Some(crate::app::Pane::Schema),
-            Cmd::FocusEditor => self.pending_focus = Some(crate::app::Pane::Editor),
-            Cmd::FocusGrid => self.pending_focus = Some(crate::app::Pane::Grid),
+            // Deferred to the next render, like every other focus move made
+            // without a `Window` in hand: the palette is closing this frame, and
+            // focusing before it unmounts would just be undone by its teardown.
+            Cmd::FocusTarget(id) => self.pending_focus_target = Some(id),
             // Deferred to the next render (needs a `Window`), like the focus jumps.
             Cmd::SearchSchema => self.focus_search = true,
             Cmd::CopySelection => self.copy_result_selection(cx),
@@ -480,7 +482,7 @@ impl AppState {
     /// The commands available in the current phase, each paired with its `Cmd`.
     /// Phase-specific actions come first (what the user most likely wants), then
     /// the always-available ones.
-    fn palette_entries(&self) -> Vec<(PaletteItem, Cmd)> {
+    fn palette_entries(&self, cx: &gpui::App) -> Vec<(PaletteItem, Cmd)> {
         let mut out: Vec<(PaletteItem, Cmd)> = Vec::new();
 
         match &self.phase {
@@ -676,19 +678,23 @@ impl AppState {
                         Cmd::FormatSql,
                     ));
                 }
-                // Pane focus.
-                out.push((
-                    item("cmd:focus-schema", "focus: schema sidebar").hint("⌥⌘1"),
-                    Cmd::FocusSchema,
-                ));
-                out.push((
-                    item("cmd:focus-editor", "focus: editor").hint("⌥⌘2"),
-                    Cmd::FocusEditor,
-                ));
-                out.push((
-                    item("cmd:focus-grid", "focus: result grid").hint("⌥⌘3"),
-                    Cmd::FocusGrid,
-                ));
+                // Focus: one entry per live surface, generated from the registry
+                // so every seam offers its own (Redis lists its key lists, Mongo
+                // its collection tree) with no per-shell branch here. The hint is
+                // the digit the hold-to-reveal overlay paints on that surface,
+                // which is positional — so the palette and the overlay always
+                // agree on what "3" means.
+                for (i, target) in self.focus_targets(cx).into_iter().enumerate() {
+                    let label = format!("focus: {}", target.label);
+                    let mut entry = PaletteItem::new(
+                        SharedString::from(format!("cmd:focus-{i}")),
+                        SharedString::from(label),
+                    );
+                    if let Some(hint) = crate::focus::hint_for(i) {
+                        entry = entry.hint(SharedString::from(hint.to_string()));
+                    }
+                    out.push((entry, Cmd::FocusTarget(target.id)));
+                }
                 out.push((
                     item("cmd:search-schema", "schema: search").hint("⌘F"),
                     Cmd::SearchSchema,

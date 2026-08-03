@@ -79,15 +79,6 @@ keymap-RefreshSchema =
 keymap-SearchSchema =
     .label = Search schema
 
-keymap-FocusSchema =
-    .label = Focus schema sidebar
-
-keymap-FocusEditor =
-    .label = Focus editor
-
-keymap-FocusGrid =
-    .label = Focus result grid
-
 keymap-CycleFocusNext =
     .label = Cycle focus forward
 

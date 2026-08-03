@@ -902,10 +902,18 @@ impl AppState {
         let surface = div()
             .flex_1()
             .min_h(px(0.))
+            .relative()
             .font_family(ed.font_family.clone())
             .text_size(px(ed.font_size))
             .line_height(px(ed.font_size * ed.line_height))
-            .child(tab.editor.clone());
+            .child(tab.editor.clone())
+            .children(
+                self.focus_hint(crate::focus::FocusTargetId::Body {
+                    pane,
+                    area: crate::focus::BodyArea::Editor,
+                })
+                .map(|h| crate::focus_overlay::badge(h, cx)),
+            );
 
         // --- bottom run bar: Run · Explain · Save · ……… · watch · read-only ---
         // (Query history now lives in the left dock, toggled with ⌘Y.)

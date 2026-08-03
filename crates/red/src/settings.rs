@@ -105,10 +105,64 @@ impl Settings {
 /// on top of the existing arrow-key navigation; off by default so modality is
 /// never imposed on anyone who didn't ask for it. Live-applied, so flipping it
 /// takes effect without a restart. (Per-key rebinds still live in `keymap.toml`.)
-#[derive(Debug, Clone, PartialEq, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct KeymapSettings {
     pub vim_mode: bool,
+    /// The modifier that, held alone, reveals a jump hint on every focusable
+    /// surface. [`FocusTrigger::Off`] disables the overlay entirely.
+    pub focus_overlay: FocusTrigger,
+    /// How long the trigger must be held before hints appear. A short delay is
+    /// what keeps the overlay out of the way of ordinary chords: the modifier is
+    /// released (or joined by a second one) long before it elapses.
+    pub focus_overlay_delay_ms: u64,
+}
+
+impl Default for KeymapSettings {
+    fn default() -> Self {
+        Self {
+            vim_mode: false,
+            focus_overlay: FocusTrigger::Alt,
+            focus_overlay_delay_ms: 250,
+        }
+    }
+}
+
+/// Which held modifier reveals the focus hints.
+///
+/// Defaults to Alt rather than the platform-primary modifier because Cmd/Ctrl
+/// prefixes nearly every binding RED has: armed on that, the overlay would be
+/// racing the user's own chords all day, and the delay would only mask it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FocusTrigger {
+    Off,
+    #[default]
+    Alt,
+    /// Cmd on macOS, Ctrl elsewhere — the same mapping the keymap's `cmd-` prefix
+    /// uses, so this reads as "the modifier my shortcuts start with".
+    Primary,
+    Shift,
+    Control,
+}
+
+impl FocusTrigger {
+    /// Whether `mods` is exactly this trigger and nothing else. A second modifier
+    /// joining means the user is building a chord, not asking for hints.
+    pub fn held_alone(self, mods: gpui::Modifiers) -> bool {
+        if mods.number_of_modifiers() != 1 {
+            return false;
+        }
+        match self {
+            FocusTrigger::Off => false,
+            FocusTrigger::Alt => mods.alt,
+            FocusTrigger::Primary => {
+                mods.platform || (cfg!(not(target_os = "macos")) && mods.control)
+            }
+            FocusTrigger::Shift => mods.shift,
+            FocusTrigger::Control => mods.control,
+        }
+    }
 }
 
 // --- appearance --------------------------------------------------------------

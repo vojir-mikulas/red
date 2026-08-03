@@ -1008,7 +1008,14 @@ impl AppState {
                         }
                     })
                     .child(table)
-                    .child(scrollbar),
+                    .child(scrollbar)
+                    .children(
+                        self.focus_hint(crate::focus::FocusTargetId::Body {
+                            pane,
+                            area: crate::focus::BodyArea::Grid,
+                        })
+                        .map(|h| crate::focus_overlay::badge(h, cx)),
+                    ),
             )
             // Draft (insert) rows pinned below the grid.
             .when_some(

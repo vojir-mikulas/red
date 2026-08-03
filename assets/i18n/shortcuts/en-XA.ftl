@@ -30,7 +30,7 @@ shortcuts-global-quit = [Qúít]
 
 shortcuts-panes-title = [Páñés]
 
-shortcuts-panes-focus_schema_editor_grid = [Föçús sçhémá / édítör / gríd]
+shortcuts-panes-focus_hints = [Shöw á júmp kéy öñ évéry páñél, théñ préss ít]
 
 shortcuts-panes-cycle_focus_forward_back = [Çyçlé föçús förwárd / báçk]
 

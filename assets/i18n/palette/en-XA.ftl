@@ -78,12 +78,6 @@ palette-cmd_explain_analyze = [qúéry: éxpláíñ áñályzé]
 
 palette-cmd_format_sql = [édítör: förmát SQL]
 
-palette-cmd_focus_schema = [föçús: sçhémá sídébár]
-
-palette-cmd_focus_editor = [föçús: édítör]
-
-palette-cmd_focus_grid = [föçús: résúlt gríd]
-
 palette-cmd_search_schema = [sçhémá: séárçh]
 
 palette-cmd_sidebar = [víéw: tögglé sídébár]

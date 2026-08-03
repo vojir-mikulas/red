@@ -78,12 +78,6 @@ palette-cmd_explain_analyze = query: explain analyze
 
 palette-cmd_format_sql = editor: format SQL
 
-palette-cmd_focus_schema = focus: schema sidebar
-
-palette-cmd_focus_editor = focus: editor
-
-palette-cmd_focus_grid = focus: result grid
-
 palette-cmd_search_schema = schema: search
 
 palette-cmd_sidebar = view: toggle sidebar

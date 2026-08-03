@@ -767,7 +767,7 @@ impl AppState {
 
     /// The focus handle of the open inline-edit field, for the render-time focus
     /// drain (see `focus_inspector_edit`).
-    pub(crate) fn inspector_edit_focus(&self, cx: &Context<Self>) -> Option<FocusHandle> {
+    pub(crate) fn inspector_edit_focus(&self, cx: &gpui::App) -> Option<FocusHandle> {
         let edit = self.inspector.as_ref()?.editing.as_ref()?;
         Some(edit.editor.focus_handle(cx))
     }
