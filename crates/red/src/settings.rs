@@ -116,6 +116,10 @@ pub struct KeymapSettings {
     /// what keeps the overlay out of the way of ordinary chords: the modifier is
     /// released (or joined by a second one) long before it elapses.
     pub focus_overlay_delay_ms: u64,
+    /// Which characters the hints are drawn from. Letters by default because
+    /// they are the only ones typable without Shift on every layout; see
+    /// [`HintAlphabet`].
+    pub focus_overlay_hints: HintAlphabet,
 }
 
 impl Default for KeymapSettings {
@@ -124,8 +128,25 @@ impl Default for KeymapSettings {
             vim_mode: false,
             focus_overlay: FocusTrigger::Alt,
             focus_overlay_delay_ms: 250,
+            focus_overlay_hints: HintAlphabet::Letters,
         }
     }
+}
+
+/// Which characters the focus hints are drawn from.
+///
+/// Digits look like the obvious choice and are the wrong default: several Latin
+/// layouts (Czech, French AZERTY) put the number row's digits on the *shifted*
+/// level, so a digit hint on those keyboards cannot be typed without adding a
+/// modifier to a gesture that is defined by holding exactly one. Letters are
+/// unshifted everywhere. Offered as a setting because on a layout with unshifted
+/// digits they are genuinely nicer to aim at.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HintAlphabet {
+    #[default]
+    Letters,
+    Digits,
 }
 
 /// Which held modifier reveals the focus hints.
@@ -147,21 +168,103 @@ pub enum FocusTrigger {
 }
 
 impl FocusTrigger {
-    /// Whether `mods` is exactly this trigger and nothing else. A second modifier
-    /// joining means the user is building a chord, not asking for hints.
-    pub fn held_alone(self, mods: gpui::Modifiers) -> bool {
-        if mods.number_of_modifiers() != 1 {
-            return false;
-        }
+    /// Whether this trigger's own modifier is down.
+    fn is_down(self, mods: gpui::Modifiers) -> bool {
         match self {
             FocusTrigger::Off => false,
             FocusTrigger::Alt => mods.alt,
+            // Mirrors the keymap's `cmd-` → `secondary` rewrite, so "Cmd/Ctrl"
+            // means the modifier the rest of RED's shortcuts start with.
             FocusTrigger::Primary => {
-                mods.platform || (cfg!(not(target_os = "macos")) && mods.control)
+                if cfg!(target_os = "macos") {
+                    mods.platform
+                } else {
+                    mods.control
+                }
             }
             FocusTrigger::Shift => mods.shift,
             FocusTrigger::Control => mods.control,
         }
+    }
+
+    /// Whether `mods` is this trigger held on its own — the gesture that reveals
+    /// the hints. Any *other* modifier joining means the user is building a
+    /// chord, so ⌥⌘\ never flashes hints on its way to splitting a pane.
+    ///
+    /// Shift is the deliberate exception: it is tolerated alongside the trigger
+    /// rather than counted as a second modifier. On a layout whose digits live
+    /// on the shifted level, typing a digit hint *requires* Shift, and treating
+    /// that as a chord would put those hints permanently out of reach. Nothing
+    /// is shadowed by the allowance, since RED binds no trigger+Shift chord.
+    pub fn held_alone(self, mods: gpui::Modifiers) -> bool {
+        if self == FocusTrigger::Off || !self.is_down(mods) {
+            return false;
+        }
+        // Everything except Shift and the trigger's own flag. Anything left
+        // standing is a real second modifier.
+        let mut rest = gpui::Modifiers {
+            shift: false,
+            ..mods
+        };
+        match self {
+            FocusTrigger::Alt => rest.alt = false,
+            FocusTrigger::Primary => {
+                if cfg!(target_os = "macos") {
+                    rest.platform = false;
+                } else {
+                    rest.control = false;
+                }
+            }
+            FocusTrigger::Control => rest.control = false,
+            FocusTrigger::Shift | FocusTrigger::Off => {}
+        }
+        rest.number_of_modifiers() == 0
+    }
+}
+
+#[cfg(test)]
+mod focus_trigger_tests {
+    use super::FocusTrigger;
+    use gpui::Modifiers;
+
+    fn mods(alt: bool, shift: bool, platform: bool, control: bool) -> Modifiers {
+        Modifiers {
+            alt,
+            shift,
+            platform,
+            control,
+            function: false,
+        }
+    }
+
+    #[test]
+    fn the_bare_trigger_reveals_hints() {
+        assert!(FocusTrigger::Alt.held_alone(mods(true, false, false, false)));
+        assert!(FocusTrigger::Control.held_alone(mods(false, false, false, true)));
+        assert!(FocusTrigger::Shift.held_alone(mods(false, true, false, false)));
+    }
+
+    /// The regression this exists for: a Czech keyboard needs Shift to type a
+    /// digit, so trigger+Shift has to keep the hints up.
+    #[test]
+    fn shift_alongside_the_trigger_is_tolerated() {
+        assert!(FocusTrigger::Alt.held_alone(mods(true, true, false, false)));
+        assert!(FocusTrigger::Control.held_alone(mods(false, true, false, true)));
+    }
+
+    /// Any other modifier means a chord is being built, so the hints stay away.
+    #[test]
+    fn a_second_modifier_cancels() {
+        assert!(!FocusTrigger::Alt.held_alone(mods(true, false, true, false)));
+        assert!(!FocusTrigger::Alt.held_alone(mods(true, true, false, true)));
+        assert!(!FocusTrigger::Control.held_alone(mods(true, false, false, true)));
+    }
+
+    #[test]
+    fn a_trigger_that_is_not_down_never_matches() {
+        assert!(!FocusTrigger::Alt.held_alone(mods(false, true, false, false)));
+        assert!(!FocusTrigger::Off.held_alone(mods(true, false, false, false)));
+        assert!(!FocusTrigger::Off.held_alone(Modifiers::default()));
     }
 }
 

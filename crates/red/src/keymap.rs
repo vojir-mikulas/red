@@ -158,8 +158,7 @@ actions!(
 #[action(namespace = red, no_json)]
 pub(crate) struct SwitchToConnectionSlot(pub usize);
 
-/// A focus-hint key pressed while the hint overlay is up; the payload is the
-/// target's position in the frozen hint order.
+/// A focus-hint key pressed while the hint overlay is up.
 ///
 /// This has to be an *action* rather than a plain key listener on the hint layer,
 /// because gpui dispatches keymap bindings before key listeners and returns as
@@ -168,9 +167,14 @@ pub(crate) struct SwitchToConnectionSlot(pub usize);
 /// `SwitchToConnectionSlot`, so pressing hint `1` would switch *connection*
 /// instead of moving focus. Bound in the `FocusHints` context, which only exists
 /// while the layer holds focus and sits deeper than `RedRoot`, so it wins.
+///
+/// Carries the *character*, not the target's position. The alphabet is a live
+/// setting, and characters keep the keymap out of it: the slot a character names
+/// is resolved against the active alphabet when the key arrives, so changing the
+/// setting needs no keymap reinstall and no restart.
 #[derive(Clone, PartialEq, Eq, Default, Debug, gpui::Action)]
 #[action(namespace = red, no_json)]
-pub(crate) struct FocusHintSlot(pub usize);
+pub(crate) struct FocusHintKey(pub char);
 
 /// The keyboard reference, grouped, for the shortcuts overlay (`⌘/`) and the
 /// docs. Kept beside the bindings above so the two don't drift; the overlay is
@@ -882,17 +886,33 @@ pub(crate) fn apply(cx: &mut App, overrides: &[KeymapBlock]) -> Vec<String> {
     // skipped on macOS, where ⌘Q is the convention and F4 isn't a close key.
     #[cfg(not(target_os = "macos"))]
     cx.bind_keys([KeyBinding::new("alt-f4", crate::Quit, None)]);
-    // Focus hints: one binding per hint key, in the `FocusHints` context the hint
-    // layer declares while it holds focus. Bound for every modifier a trigger
-    // could be, plus the bare key, because the trigger is a live setting and the
-    // keymap is installed once — and because the whole point is to out-rank the
-    // `RedRoot` bindings some of these keys collide with. Programmatic, like
-    // `SwitchToConnectionSlot`, so they stay out of the rebind editor.
-    for (slot, hint) in crate::focus::hint_keys().iter().enumerate() {
-        for prefix in ["", "alt-", "secondary-", "shift-", "ctrl-"] {
+    // Focus hints: one binding per hint character, in the `FocusHints` context
+    // the hint layer declares while it holds focus. Bound for every modifier a
+    // trigger could be, plus the bare key and the shifted forms, because the
+    // trigger is a live setting and the keymap is installed once — and because
+    // the whole point is to out-rank the `RedRoot` bindings some of these keys
+    // collide with. Programmatic, like `SwitchToConnectionSlot`, so they stay out
+    // of the rebind editor.
+    //
+    // The shifted forms are not padding. On a layout whose digits sit on the
+    // shifted level (Czech, French), the keystroke that types `1` is Shift plus
+    // that key, and gpui reports it as `alt-1` with the shift folded away — but
+    // only for keys whose unshifted character is not a lowercase letter. Binding
+    // both forms covers the two cases without having to know the layout.
+    for hint in crate::focus::all_hint_keys() {
+        for prefix in [
+            "",
+            "alt-",
+            "secondary-",
+            "shift-",
+            "ctrl-",
+            "alt-shift-",
+            "secondary-shift-",
+            "ctrl-shift-",
+        ] {
             cx.bind_keys([KeyBinding::new(
                 &format!("{prefix}{hint}"),
-                FocusHintSlot(slot),
+                FocusHintKey(hint),
                 Some("FocusHints"),
             )]);
         }

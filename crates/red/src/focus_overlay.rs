@@ -28,7 +28,7 @@ use gpui::{
 };
 
 use crate::app::AppState;
-use crate::focus::{FocusTargetId, hint_for};
+use crate::focus::{FocusTargetId, hint_alphabet};
 use crate::settings::FocusTrigger;
 
 /// Live hint state: the frozen target order and the focus to hand back.
@@ -38,6 +38,10 @@ pub(crate) struct FocusHints {
     /// and a badge that renumbered itself under the user's finger — because a
     /// query finished and a result grid appeared — would be worse than useless.
     order: Vec<FocusTargetId>,
+    /// The alphabet in force when the hints opened, frozen with the order for
+    /// the same reason: a settings reload mid-hold must not repaint a badge as
+    /// one character while the key the user is about to press means another.
+    alphabet: &'static [char],
     /// Focus at the moment the hints appeared, restored if they are dismissed
     /// without a choice.
     restore: Option<FocusHandle>,
@@ -47,7 +51,15 @@ impl FocusHints {
     /// The hint painted on `id`, or `None` if it had none when the hints opened.
     pub(crate) fn hint(&self, id: FocusTargetId) -> Option<char> {
         let at = self.order.iter().position(|&t| t == id)?;
-        hint_for(at)
+        self.alphabet.get(at).copied()
+    }
+
+    /// The target a hint character names, or `None` when the character has no
+    /// badge on screen — a key in the alphabet that ran past the target count.
+    fn target_for(&self, key: char) -> Option<FocusTargetId> {
+        let key = key.to_ascii_lowercase();
+        let at = self.alphabet.iter().position(|&c| c == key)?;
+        self.order.get(at).copied()
     }
 }
 
@@ -122,6 +134,7 @@ impl AppState {
         }
         self.focus_hints = Some(FocusHints {
             order,
+            alphabet: hint_alphabet(self.settings.keymap.focus_overlay_hints),
             restore: None,
         });
         // The layer takes focus on the next render, which is where a `Window` is
@@ -144,20 +157,19 @@ impl AppState {
 
     /// A hint key was pressed: jump to the target it names.
     ///
-    /// `slot` is a position in the alphabet, which is only a position in *this*
-    /// overlay's order if that many targets exist — an out-of-range hint is a key
-    /// the user pressed that happens to be in the alphabet but has no badge, so
-    /// it dismisses like any other stray key.
-    pub(crate) fn on_focus_hint_slot(
+    /// A character in the alphabet that ran past the target count has no badge on
+    /// screen, so it dismisses like any other stray key rather than jumping
+    /// somewhere the user was given no reason to expect.
+    pub(crate) fn on_focus_hint_key(
         &mut self,
-        slot: usize,
+        key: char,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(hints) = &self.focus_hints else {
             return;
         };
-        let target = hints.order.get(slot).copied();
+        let target = hints.target_for(key);
         // Drop the hints before focusing, so the layer is out of the tree by the
         // time the target takes focus and cannot bounce it back.
         self.focus_arm_pending = false;
@@ -201,8 +213,8 @@ impl AppState {
             .key_context("FocusHints")
             .track_focus(&self.focus_hints_focus)
             .on_action(
-                cx.listener(|this, action: &crate::keymap::FocusHintSlot, window, cx| {
-                    this.on_focus_hint_slot(action.0, window, cx);
+                cx.listener(|this, action: &crate::keymap::FocusHintKey, window, cx| {
+                    this.on_focus_hint_key(action.0, window, cx);
                 }),
             )
             // Anything that is not a hint is a decision not to jump. Runs only

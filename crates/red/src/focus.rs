@@ -25,10 +25,10 @@
 //!   no binding at all.
 //!
 //! **Order is the contract.** Targets run docks → sidebar → pane bodies →
-//! transient overlays → assistant. That keeps the low hint digits on the
-//! surfaces a user jumps to constantly: on a plain SQL shell `1` is the sidebar,
-//! `2` the editor and `3` the grid, which is what ⌥⌘1/2/3 meant before this
-//! existed. Hints are positional, so they only move when the layout does.
+//! transient overlays → assistant. That keeps the easiest hints on the surfaces
+//! a user jumps to constantly: on a plain SQL shell the sidebar, editor and grid
+//! take the first three keys of the alphabet. Hints are positional, so they only
+//! move when the layout does.
 //!
 //! Individual *tabs* are deliberately not targets yet. They are reachable by
 //! ⌃Tab and by click, and a four-pane split with full strips would put thirty
@@ -39,6 +39,7 @@ use gpui::{App, FocusHandle, Focusable, SharedString};
 use crate::app::{ActiveConn, AppState, Phase, TabWorkspace};
 use crate::i18n::tr;
 use crate::panes::PaneId;
+use crate::settings::HintAlphabet;
 
 /// A pane's primary work surface. Named for what the user sees rather than for
 /// the seam it belongs to, so the cycle order reads the same in all three shells.
@@ -93,32 +94,54 @@ impl FocusTarget {
     }
 }
 
-/// The hint alphabet, in the order hints are handed out.
+/// The default hint alphabet: letters, home row outward.
 ///
-/// Digits lead because the common case — one pane with a sidebar, an editor and
-/// a grid — is then labelled exactly `1`, `2`, `3`: what a user expects to see,
-/// and what the retired ⌥⌘1/2/3 jumps meant. The three letter rows extend the run
-/// to 36, comfortably more than can be on screen at once, so a hint is always a
-/// single keypress — no Vimium-style two-character prefixes and no paging.
+/// **Letters, not digits, because a hint has to be typable without Shift.** The
+/// digits are not on the base level of every keyboard: a Czech layout puts `+ ě
+/// š č ř ž ý á í é` on the number row and needs Shift for `1`–`0`, and French
+/// AZERTY is the same. gpui reports the *unshifted* character in
+/// `Keystroke::key` (see the layout table in its macOS `parse_keystroke`, which
+/// names Czech explicitly), so a digit hint there either cannot be typed at all
+/// or forces a second modifier onto a gesture defined by holding exactly one.
 ///
-/// Left to right along each row, so the hints a user reaches for most are also
-/// the ones nearest the home position.
-const HINTS: &[char] = &[
-    '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o',
-    'p', 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'z', 'x', 'c', 'v', 'b', 'n', 'm',
+/// Letters have no such problem. Every Latin layout types all 26 unshifted, and
+/// gpui normalizes a non-Latin layout to its ASCII equivalent in `key` (`q` for
+/// `ๆ`), so a letter hint resolves on Russian and Thai keyboards too. Where a
+/// layout moves a letter (QWERTZ swaps Y and Z, AZERTY moves A and Q) the badge
+/// still names the character to press, so it stays self-consistent.
+///
+/// Home row first, then the top row, then the bottom: the shortest reach goes to
+/// the surfaces that come first.
+const LETTER_HINTS: &[char] = &[
+    'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l', 'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p',
+    'z', 'x', 'c', 'v', 'b', 'n', 'm',
 ];
 
-/// The whole hint alphabet, for the keymap to bind one action per slot.
-pub(crate) fn hint_keys() -> &'static [char] {
-    HINTS
+/// The opt-in digit alphabet (`keymap.focus_overlay_hints = "digits"`), with the
+/// letters trailing as overflow.
+///
+/// Only sound on a layout whose digits sit on the base level — see
+/// [`LETTER_HINTS`] for why that is not a safe assumption to bake in.
+const DIGIT_HINTS: &[char] = &[
+    '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', 'a', 's', 'd', 'f', 'g', 'h', 'j', 'k', 'l',
+    'q', 'w', 'e', 'r', 't', 'y', 'u', 'i', 'o', 'p', 'z', 'x', 'c', 'v', 'b', 'n', 'm',
+];
+
+/// The alphabet `style` hands out.
+pub(crate) fn hint_alphabet(style: HintAlphabet) -> &'static [char] {
+    match style {
+        HintAlphabet::Letters => LETTER_HINTS,
+        HintAlphabet::Digits => DIGIT_HINTS,
+    }
 }
 
-/// The hint painted on the target at `index`, or `None` past the alphabet's end.
+/// Every character any alphabet can use, for the keymap to bind once.
 ///
-/// A target with no hint is not unreachable: it keeps its place in the F6 cycle
-/// and its palette entry. Only the one-keypress jump runs out.
-pub(crate) fn hint_for(index: usize) -> Option<char> {
-    HINTS.get(index).copied()
+/// The keymap binds *characters*, not positions, precisely so it does not have
+/// to be reinstalled when the alphabet setting changes: the slot a character
+/// names is resolved against the live alphabet when the key is pressed.
+pub(crate) fn all_hint_keys() -> impl Iterator<Item = char> {
+    DIGIT_HINTS.iter().copied()
 }
 
 impl AppState {
@@ -304,38 +327,73 @@ impl AppState {
 mod tests {
     use super::*;
 
-    /// The digits lead, so the surfaces a user jumps to constantly keep the keys
-    /// the retired ⌥⌘1/2/3 jumps used to mean.
+    /// The default alphabet must be typable without Shift on every layout, which
+    /// is the whole reason it is letters: Czech and French put the digits on the
+    /// shifted level, so a digit hint there needs a second modifier or cannot be
+    /// reached at all.
     #[test]
-    fn hints_start_with_digits() {
-        assert_eq!(hint_for(0), Some('1'));
-        assert_eq!(hint_for(1), Some('2'));
-        assert_eq!(hint_for(2), Some('3'));
-        assert_eq!(hint_for(9), Some('0'));
+    fn the_default_alphabet_is_all_letters() {
+        assert!(
+            hint_alphabet(HintAlphabet::Letters)
+                .iter()
+                .all(char::is_ascii_lowercase),
+            "a non-letter in the default alphabet is unreachable on a Czech keyboard"
+        );
     }
 
-    /// Every hint is a single character. The keymap builds a binding string by
-    /// concatenating a modifier prefix with the hint (`alt-` + `q`), which only
-    /// parses for a one-character key.
+    /// Home row first, so the surfaces that come first are the shortest reach.
     #[test]
-    fn hints_are_single_characters() {
-        for &h in hint_keys() {
-            assert_eq!(h.len_utf8(), 1, "{h:?} is not a single-byte key");
-            assert!(h.is_ascii_alphanumeric(), "{h:?} is not a bindable key");
+    fn letters_start_on_the_home_row() {
+        assert_eq!(
+            &hint_alphabet(HintAlphabet::Letters)[..4],
+            &['a', 's', 'd', 'f']
+        );
+    }
+
+    /// Digits are opt-in and run out into the letters rather than stopping at ten.
+    #[test]
+    fn the_digit_alphabet_leads_with_digits_then_overflows() {
+        let digits = hint_alphabet(HintAlphabet::Digits);
+        assert_eq!(&digits[..3], &['1', '2', '3']);
+        assert_eq!(digits[9], '0');
+        assert!(digits[10].is_ascii_lowercase());
+    }
+
+    /// Both alphabets are single ASCII characters. The keymap builds a binding
+    /// string by concatenating a modifier prefix with the hint (`alt-` + `q`),
+    /// which only parses for a one-character ASCII key.
+    #[test]
+    fn every_hint_is_one_bindable_character() {
+        for style in [HintAlphabet::Letters, HintAlphabet::Digits] {
+            for &h in hint_alphabet(style) {
+                assert!(h.is_ascii_alphanumeric(), "{h:?} is not a bindable key");
+                assert_eq!(h.len_utf8(), 1);
+            }
         }
     }
 
-    /// Past the digits the alphabet keeps going rather than repeating, so two
-    /// surfaces can never be labelled the same key.
+    /// No alphabet may label two surfaces with the same key.
     #[test]
-    fn hints_are_unique_and_run_out_cleanly() {
-        let all: Vec<char> = (0..HINTS.len()).filter_map(hint_for).collect();
-        assert_eq!(all.len(), HINTS.len());
-        let mut sorted = all.clone();
-        sorted.sort_unstable();
-        sorted.dedup();
-        assert_eq!(sorted.len(), all.len(), "hint alphabet has a duplicate");
-        assert_eq!(hint_for(HINTS.len()), None);
-        assert_eq!(hint_for(usize::MAX), None);
+    fn alphabets_have_no_duplicates() {
+        for style in [HintAlphabet::Letters, HintAlphabet::Digits] {
+            let mut seen: Vec<char> = hint_alphabet(style).to_vec();
+            let total = seen.len();
+            seen.sort_unstable();
+            seen.dedup();
+            assert_eq!(seen.len(), total, "{style:?} alphabet has a duplicate");
+        }
+    }
+
+    /// The keymap binds one action per character across *both* alphabets, so
+    /// switching the setting never needs a keymap reinstall. If a letter were
+    /// missing from the bound set, that hint would silently do nothing.
+    #[test]
+    fn the_bound_key_set_covers_every_alphabet() {
+        let bound: Vec<char> = all_hint_keys().collect();
+        for style in [HintAlphabet::Letters, HintAlphabet::Digits] {
+            for &h in hint_alphabet(style) {
+                assert!(bound.contains(&h), "{h:?} is never bound");
+            }
+        }
     }
 }

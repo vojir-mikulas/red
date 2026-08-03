@@ -101,6 +101,13 @@ jobs:
       - name: Cache cargo + build artifacts
         uses: Swatinem/rust-cache@v2
 
+      # `red-service` pulls in `red-config`, whose keyring backend on Linux is the
+      # D-Bus secret service — so even this GPUI-free job needs the dbus headers.
+      - name: Install Linux deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends pkg-config libdbus-1-dev
+
       # Only the engine-facing crates — no GPUI build on Linux. `--nocapture` so a
       # missing service surfaces the `SKIP …` line instead of a silent pass.
       - name: Test (red-driver · red-service, live engines)

@@ -1219,7 +1219,7 @@ const TEMPLATE_MAX_DEPTH: usize = 8;
 /// This is the structural grounding the SQL seam gets free from
 /// `information_schema` and Redis has to derive, so it is deliberately
 /// conservative: a position is only collapsed to `*` when enumerating it would
-/// produce roughly one branch per key ([`TEMPLATE_MAX_FANOUT`], or a distinct
+/// produce roughly one branch per key (`TEMPLATE_MAX_FANOUT`, or a distinct
 /// count that is most of the rows). A keyspace of flat, delimiter-less keys
 /// therefore rolls into a single `*` bucket rather than one template per key.
 ///

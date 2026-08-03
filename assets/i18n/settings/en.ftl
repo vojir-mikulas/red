@@ -109,6 +109,14 @@ settings-keymap-focus_overlay_delay_ms-seg-250_ms = 250 ms
 
 settings-keymap-focus_overlay_delay_ms-seg-500_ms = 500 ms
 
+settings-keymap-focus_overlay_hints =
+    .label = Focus hint keys
+    .help = Which keys the focus hints use. Letters work on every keyboard; digits need a layout that types 1-9 without Shift, which a Czech or French one does not.
+
+settings-keymap-focus_overlay_hints-seg-letters = Letters
+
+settings-keymap-focus_overlay_hints-seg-digits = Digits
+
 settings-group-startup = Startup
 
 settings-behavior-restore_last_session =

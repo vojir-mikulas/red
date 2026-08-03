@@ -28,7 +28,7 @@ use std::borrow::Cow;
 use gpui::SharedString;
 
 use crate::settings::{
-    ConfirmThreshold, Density, DocView, FocusTrigger, KvQueryMode, MAX_DOC_COLUMNS,
+    ConfirmThreshold, Density, DocView, FocusTrigger, HintAlphabet, KvQueryMode, MAX_DOC_COLUMNS,
     MAX_PREVIEW_COUNT, MAX_RESIDENT_KEYS, Settings,
 };
 
@@ -524,6 +524,32 @@ static DEFS: &[SettingDef] = &[
         ]),
         get: |s| Value::Int(s.keymap.focus_overlay_delay_ms as i64),
         set: |s, v| s.keymap.focus_overlay_delay_ms = v.as_int().clamp(0, 2000) as u64,
+        warn: None,
+    },
+    SettingDef {
+        key: "keymap.focus_overlay_hints",
+        tab: SettingsTab::Keymap,
+        group: "Navigation",
+        en_label: "Focus hint keys",
+        en_help: "Which keys the focus hints use. Letters work on every keyboard; digits need a \
+               layout that types 1-9 without Shift, which a Czech or French one does not.",
+        applies: Applies::All,
+        control: Control::Segments(&[
+            seg("Letters", text("letters")),
+            seg("Digits", text("digits")),
+        ]),
+        get: |s| {
+            Value::Text(Cow::Borrowed(match s.keymap.focus_overlay_hints {
+                HintAlphabet::Letters => "letters",
+                HintAlphabet::Digits => "digits",
+            }))
+        },
+        set: |s, v| {
+            s.keymap.focus_overlay_hints = match v.as_text() {
+                "digits" => HintAlphabet::Digits,
+                _ => HintAlphabet::Letters,
+            }
+        },
         warn: None,
     },
     // --- behavior ---

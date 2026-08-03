@@ -251,9 +251,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   collection tree, each pane's editor and result grid, the Redis key list, the
   history dock, the filter and find bars, the assistant — and works the same in
   the SQL, Redis and MongoDB shells, which is new: Redis previously had no way
-  to move focus by keyboard at all. The digits come first, so a plain window
-  labels the sidebar `1`, the editor `2` and the grid `3`. The trigger and the
-  hold delay are settings (`keymap.focus_overlay`), including turning it off.
+  to move focus by keyboard at all. The hints are letters from the home row out,
+  because those are the only keys typable without Shift on every layout - a Czech
+  or French number row needs Shift for its digits, which would put a digit hint
+  out of reach of a gesture defined by holding one modifier. Digits are available
+  for layouts that type them directly. The trigger, the hold delay and the hint
+  keys are all settings (`keymap.focus_overlay`), including turning it off.
 
 ### Changed
 - The AI assistant's composer settings now read as a set: model, thinking level

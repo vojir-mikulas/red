@@ -684,14 +684,16 @@ impl AppState {
                 // the digit the hold-to-reveal overlay paints on that surface,
                 // which is positional — so the palette and the overlay always
                 // agree on what "3" means.
+                let alphabet =
+                    crate::focus::hint_alphabet(self.settings.keymap.focus_overlay_hints);
                 for (i, target) in self.focus_targets(cx).into_iter().enumerate() {
                     let label = format!("focus: {}", target.label);
                     let mut entry = PaletteItem::new(
                         SharedString::from(format!("cmd:focus-{i}")),
                         SharedString::from(label),
                     );
-                    if let Some(hint) = crate::focus::hint_for(i) {
-                        entry = entry.hint(SharedString::from(hint.to_string()));
+                    if let Some(hint) = alphabet.get(i) {
+                        entry = entry.hint(SharedString::from(hint.to_uppercase().to_string()));
                     }
                     out.push((entry, Cmd::FocusTarget(target.id)));
                 }

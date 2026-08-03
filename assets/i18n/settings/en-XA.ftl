@@ -109,6 +109,14 @@ settings-keymap-focus_overlay_delay_ms-seg-250_ms = [250 ms]
 
 settings-keymap-focus_overlay_delay_ms-seg-500_ms = [500 ms]
 
+settings-keymap-focus_overlay_hints =
+    .label = [Föçús híñt kéys]
+    .help = [Whíçh kéys thé föçús híñts úsé. Léttérs wörk öñ évéry kéyböárd; dígíts ñééd á láyöút thát typés 1-9 wíthöút Shíft, whíçh á Çzéçh ör Fréñçh öñé döés ñöt.]
+
+settings-keymap-focus_overlay_hints-seg-letters = [Léttérs]
+
+settings-keymap-focus_overlay_hints-seg-digits = [Dígíts]
+
 settings-group-startup = [Stártúp]
 
 settings-behavior-restore_last_session =

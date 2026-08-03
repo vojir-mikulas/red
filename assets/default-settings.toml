@@ -93,6 +93,15 @@ focus_overlay = "alt"
 # it elapses.
 focus_overlay_delay_ms = 250
 
+# Which keys the hints use: "letters" or "digits".
+#
+# Letters by default because they are the only ones typable without Shift on
+# every keyboard. Several Latin layouts put the digits on the shifted level - a
+# Czech number row is "+ e s c r z y a i e" unshifted - so a digit hint there
+# needs a second modifier, or cannot be typed at all. Pick "digits" only if your
+# layout types 1-9 directly.
+focus_overlay_hints = "letters"
+
 [data]
 # Data-view defaults, shared by EVERY grid: the SQL result grid, the Redis key
 # list, and the MongoDB document grid. A few knobs only one seam can honour; those
