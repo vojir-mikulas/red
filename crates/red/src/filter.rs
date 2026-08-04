@@ -450,7 +450,7 @@ impl AppState {
             // Remember what was applied, so the same table offers it again later
             // (recorded on apply, not on success: like the query history, what the
             // user asked for is what's worth recalling).
-            if let Some((conn_id, scope)) = self.filter_scope() {
+            if let Some((conn_id, scope)) = self.filter_scope(cx) {
                 self.filter_history
                     .record(&conn_id, scope.as_deref(), mode, &text);
             }
@@ -478,7 +478,10 @@ impl AppState {
 
     /// The active result's columns, in order: what `Column` mode's column picker
     /// offers and what a built predicate can name.
-    pub(crate) fn filter_columns(&self) -> Vec<ResultColumn> {
+    pub(crate) fn filter_columns(&self, cx: &App) -> Vec<ResultColumn> {
+        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
+        // change so that change stays local instead of cascading.
+        let _ = &cx;
         match &self.phase {
             Phase::Connected(active) => active
                 .active_result()
@@ -510,7 +513,7 @@ impl AppState {
     /// value). Never partially applied: an incomplete row is simply not a term.
     fn pending_filter_term(&self, cx: &gpui::App) -> Option<ColumnPredicate> {
         let bar = self.filter_bar.as_ref()?;
-        let columns = self.filter_columns();
+        let columns = self.filter_columns(cx);
         let column = columns.get(bar.col_ix)?;
         if !bar.op.takes_value() {
             return Some(ColumnPredicate {
@@ -544,7 +547,7 @@ impl AppState {
     /// Pick the builder row's column. The operator is re-checked against the new
     /// column's type, so switching to a numeric column can't leave `LIKE` selected.
     pub(crate) fn set_filter_column(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let columns = self.filter_columns();
+        let columns = self.filter_columns(cx);
         let ops = self.filter_ops(columns.get(ix));
         if let Some(bar) = &mut self.filter_bar {
             bar.col_ix = ix;
@@ -607,7 +610,10 @@ impl AppState {
 
     /// The focused cell as a filter target: its column and its value. `None` when
     /// no cell is focused or its row has been evicted from the resident window.
-    pub(crate) fn cell_filter_target(&self) -> Option<(ResultColumn, Value)> {
+    pub(crate) fn cell_filter_target(&self, cx: &App) -> Option<(ResultColumn, Value)> {
+        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
+        // change so that change stays local instead of cascading.
+        let _ = &cx;
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
@@ -624,7 +630,7 @@ impl AppState {
     /// The predicate is built as *structure*, never as SQL: the driver renders and
     /// escapes it, so a value taken from a result cell can't inject.
     pub(crate) fn filter_by_cell(&mut self, op: CmpOp, and_join: bool, cx: &mut Context<Self>) {
-        let Some((column, value)) = self.cell_filter_target() else {
+        let Some((column, value)) = self.cell_filter_target(cx) else {
             return;
         };
         let term = ColumnPredicate {
@@ -656,14 +662,17 @@ impl AppState {
         // See the note on `row_edit_mode`: `cx` is taken ahead of the
         // `Entity<ResultGrid>` change so that change does not cascade.
         let _ = &cx;
-        self.cell_filter_target().is_some()
+        self.cell_filter_target(cx).is_some()
             && matches!(self.active_result_filter(cx), Some(ResultFilter::Cmp(_)))
     }
 
     /// Which bucket of the recent-filters store the active result reads and
     /// writes: `(conn_id, browsed table)`. `None` before a connection is up; a
     /// `None` table is the editor-results bucket (see `filters.rs`).
-    fn filter_scope(&self) -> Option<(String, Option<String>)> {
+    fn filter_scope(&self, cx: &App) -> Option<(String, Option<String>)> {
+        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
+        // change so that change stays local instead of cascading.
+        let _ = &cx;
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
@@ -672,8 +681,11 @@ impl AppState {
     }
 
     /// This result's recent filters, newest-first (the recall dropdown's rows).
-    pub(crate) fn recent_filters(&self) -> Vec<crate::filters::RecentFilter> {
-        let Some((conn_id, scope)) = self.filter_scope() else {
+    pub(crate) fn recent_filters(&self, cx: &App) -> Vec<crate::filters::RecentFilter> {
+        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
+        // change so that change stays local instead of cascading.
+        let _ = &cx;
+        let Some((conn_id, scope)) = self.filter_scope(cx) else {
             return Vec::new();
         };
         self.filter_history.for_scope(&conn_id, scope.as_deref())
@@ -692,7 +704,7 @@ impl AppState {
     /// expensive and is often a starting point to edit; Enter/Apply runs it, the
     /// same seed-don't-run contract the history panel and console recall keep.
     pub(crate) fn seed_recent_filter(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(entry) = self.recent_filters().get(ix).cloned() else {
+        let Some(entry) = self.recent_filters(cx).get(ix).cloned() else {
             return;
         };
         let Some(mode) = entry.mode() else { return };
@@ -707,10 +719,10 @@ impl AppState {
 
     /// Forget one remembered filter (the dropdown row's ✕).
     pub(crate) fn forget_recent_filter(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(entry) = self.recent_filters().get(ix).cloned() else {
+        let Some(entry) = self.recent_filters(cx).get(ix).cloned() else {
             return;
         };
-        let Some((conn_id, scope)) = self.filter_scope() else {
+        let Some((conn_id, scope)) = self.filter_scope(cx) else {
             return;
         };
         self.filter_history
@@ -731,7 +743,7 @@ impl AppState {
             return;
         };
         let entries: Vec<String> = self
-            .recent_filters()
+            .recent_filters(cx)
             .into_iter()
             .filter(|e| e.mode() == Some(mode))
             .map(|e| e.text)
@@ -921,7 +933,7 @@ impl AppState {
         let measured = *clock_bounds.read(cx);
         // Built up front: it needs `cx` mutably, which the borrow of `cx.theme()`
         // below rules out for the rest of this function.
-        let recent = self.recent_filters();
+        let recent = self.recent_filters(cx);
         let recall_panel = bar
             .history_open
             .then(|| measured.map(|b| self.render_filter_recall(&recent, b, cx)))
@@ -999,7 +1011,7 @@ impl AppState {
             // `Column` mode replaces the single box with the term builder:
             // `column ▾ │ op ▾ │ value`, plus a "+" that banks the term as a chip.
             FilterMode::Column => {
-                let columns = self.filter_columns();
+                let columns = self.filter_columns(cx);
                 let ops = self.filter_ops(columns.get(bar.col_ix));
 
                 let mut col_select = Select::new("filter-column").accent(false).seamless();

@@ -1520,7 +1520,7 @@ impl AppState {
         // without writing SQL. Each item builds a `ResultFilter::Cmp` term, which
         // the driver renders and escapes, so the cell's value never reaches the
         // query as text. Hidden when no cell is focused (or its row was evicted).
-        if let Some((column, value)) = self.cell_filter_target() {
+        if let Some((column, value)) = self.cell_filter_target(cx) {
             let name = column.name.clone();
             let shown = crate::filter::value_label(&value);
             let null = matches!(value, Value::Null);

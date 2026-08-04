@@ -306,7 +306,7 @@ impl AppState {
     /// and any loaded bytes / open edit — while the grid cursor roams), or unpin it
     /// back to following the cursor. No-op when the pane is closed.
     pub(crate) fn toggle_inspector_pin(&mut self, cx: &mut Context<Self>) {
-        let target = self.target_cell();
+        let target = self.target_cell(cx);
         if let Some(insp) = &mut self.inspector {
             insp.pinned = match insp.pinned {
                 Some(_) => None,
@@ -362,7 +362,10 @@ impl AppState {
     /// The `(epoch, row, data-col)` of the cell under the grid cursor, mapping the
     /// selection focus through the gutter and clamping to the data columns. `None`
     /// when nothing is selected or no result is open.
-    fn focused_cell(&self) -> Option<(red_service::Epoch, usize, usize)> {
+    fn focused_cell(&self, cx: &App) -> Option<(red_service::Epoch, usize, usize)> {
+        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
+        // change so that change stays local instead of cascading.
+        let _ = &cx;
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
@@ -375,10 +378,13 @@ impl AppState {
     /// otherwise the one under the grid cursor. Everything the pane resolves (its
     /// value, preview, load, edit gate) goes through this, so a pin holds the view
     /// steady while the cursor roams the grid.
-    fn target_cell(&self) -> Option<(red_service::Epoch, usize, usize)> {
+    fn target_cell(&self, cx: &App) -> Option<(red_service::Epoch, usize, usize)> {
+        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
+        // change so that change stays local instead of cascading.
+        let _ = &cx;
         match self.inspector.as_ref().and_then(|i| i.pinned) {
             Some(pinned) => Some(pinned),
-            None => self.focused_cell(),
+            None => self.focused_cell(cx),
         }
     }
 
@@ -398,7 +404,7 @@ impl AppState {
     pub(crate) fn reconcile_inspector(&mut self, cx: &mut Context<Self>) {
         // A pin to a since-replaced result (a re-run/sort/filter bumped the epoch)
         // can't be honored, so drop it and fall back to following the cursor.
-        let live_epoch = self.focused_cell().map(|(e, _, _)| e);
+        let live_epoch = self.focused_cell(cx).map(|(e, _, _)| e);
         if let Some(insp) = &mut self.inspector
             && let Some((pe, _, _)) = insp.pinned
             && live_epoch != Some(pe)
@@ -407,7 +413,7 @@ impl AppState {
         }
         // Resolve against the *target* (pinned cell, else cursor): a pinned pane keeps
         // its loaded bytes / open edit even as the cursor roams.
-        let cur = self.target_cell();
+        let cur = self.target_cell(cx);
         let fmt = self.inspector_format();
         if let Some(insp) = &mut self.inspector {
             let matches = |epoch, row, col| cur == Some((epoch, row, col));
@@ -447,7 +453,7 @@ impl AppState {
         if self.inspector.is_none() {
             return; // nothing to mirror while the pane is closed
         }
-        let desired = self.preview_target();
+        let desired = self.preview_target(cx);
         let editing = self.inspector.as_ref().is_some_and(|i| i.editing.is_some());
         let Some(insp) = &mut self.inspector else {
             return;
@@ -486,12 +492,15 @@ impl AppState {
     /// The body is a `SharedString` (cheap-clone), not a materialized `String`:
     /// [`reconcile_preview`](Self::reconcile_preview) copies it only on a genuine
     /// rebuild, so the unchanged-frame path never memcpys a multi-megabyte cell.
-    fn preview_target(&self) -> Option<(PreviewKey, SharedString, bool)> {
+    fn preview_target(&self, cx: &App) -> Option<(PreviewKey, SharedString, bool)> {
+        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
+        // change so that change stays local instead of cascading.
+        let _ = &cx;
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
         let grid = active.active_result()?;
-        let (epoch, row, col) = self.target_cell()?;
+        let (epoch, row, col) = self.target_cell(cx)?;
         if epoch != grid.epoch {
             return None; // a pin to a since-replaced result (cleared next reconcile)
         }
@@ -535,7 +544,7 @@ impl AppState {
     /// clipboard's `CopyRows` path, `PageCap::Full`) so a capped or evicted cell
     /// can show its whole value. One row, on demand, behind an explicit click.
     pub(crate) fn load_inspector_full(&mut self, cx: &mut Context<Self>) {
-        let Some((epoch, row, col)) = self.target_cell() else {
+        let Some((epoch, row, col)) = self.target_cell(cx) else {
             return;
         };
         if self.inspector.is_none() {
@@ -601,12 +610,12 @@ impl AppState {
         }
         // Editing resolves through the grid *cursor* (`active_edit_target`), so a pane
         // pinned to a different cell is view-only; move the cursor back to edit it.
-        if self.target_cell() != self.focused_cell() {
+        if self.target_cell(cx) != self.focused_cell(cx) {
             return None;
         }
         if let (Some(full), Some((epoch, row, col))) = (
             self.inspector.as_ref().and_then(|i| i.full.as_ref()),
-            self.focused_cell(),
+            self.focused_cell(cx),
         ) && full.epoch == epoch
             && full.row == row
             && full.col == col
@@ -632,12 +641,12 @@ impl AppState {
             return false;
         }
         // A pane pinned away from the cursor is view-only (see `inspector_edit_context`).
-        if self.target_cell() != self.focused_cell() {
+        if self.target_cell(cx) != self.focused_cell(cx) {
             return false;
         }
         if let (Some(full), Some((epoch, row, col))) = (
             self.inspector.as_ref().and_then(|i| i.full.as_ref()),
-            self.focused_cell(),
+            self.focused_cell(cx),
         ) && full.epoch == epoch
             && full.row == row
             && full.col == col
@@ -781,9 +790,12 @@ impl AppState {
     /// Resolve the cell under the cursor into something renderable: a loaded full
     /// value, a small resident value formatted on the spot, a capped stand-in, or
     /// an evicted (off-window) cell.
-    fn inspector_cell(&self, active: &ActiveConn) -> Option<InspectorView> {
+    fn inspector_cell(&self, active: &ActiveConn, cx: &App) -> Option<InspectorView> {
+        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
+        // change so that change stays local instead of cascading.
+        let _ = &cx;
         let grid = active.active_result()?;
-        let (epoch, row, col) = self.target_cell()?;
+        let (epoch, row, col) = self.target_cell(cx)?;
         if epoch != grid.epoch {
             return None; // a pin to a since-replaced result (cleared next reconcile)
         }
@@ -842,7 +854,7 @@ impl AppState {
 
         // Header: column name + type, a pin toggle, a close ✕.
         let pinned = self.inspector.as_ref().is_some_and(|i| i.pinned.is_some());
-        let resolved = self.inspector_cell(active);
+        let resolved = self.inspector_cell(active, cx);
         let (title, subtitle) = match &resolved {
             Some(v) => {
                 let ty = v
