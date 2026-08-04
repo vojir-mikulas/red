@@ -880,7 +880,14 @@ impl AppState {
                 }
             }))
             .child(strip)
-            .child(div().flex_1().min_h(px(0.)).flex().child(panel))
+            // A *column* wrapper, not a row: as a row item the panel's automatic
+            // minimum width is its min-content width, so a panel whose toolbar
+            // outgrows the pane (a split half, a narrow window) is sized past the
+            // pane — and its percentage-sized descendants, the key table's
+            // `size_full`, then resolve to auto and collapse to a bare header row.
+            // Down a column the panel's width is the cross axis, which stretches to
+            // the pane and never exceeds it.
+            .child(div().flex_1().min_h(px(0.)).flex().flex_col().child(panel))
             .children(target.map(|t| drop_overlay(t.zone, t.allowed, accent, muted)))
             .into_any_element()
     }

@@ -15,8 +15,8 @@ use gpui::{AsyncApp, Context, SharedString, WeakEntity, Window, prelude::*};
 use crate::app::{ActiveConn, AppState, Phase};
 
 use super::text::{
-    default_config_changes, derive_title, expand_slash_report, render_transcript, report_theme,
-    slash_candidates, summarize_schema,
+    config_changes_needed, derive_title, desired_config, expand_slash_report, render_transcript,
+    report_theme, slash_candidates, summarize_schema, to_stored,
 };
 use super::{
     AssistantState, ChatMessage, ChatRole, ChatSession, PendingPermission, PendingSandbox,
@@ -450,6 +450,7 @@ impl AppState {
         // Resolved here rather than at drop time: a tab's SQL can change between
         // the two, and what the model should get is what is there now.
         context.references = self.resolve_references(&pointed_at, cx);
+        let session_config = self.session_config_for(conversation_id, &agent);
         let command = move |attachments| red_service::Command::AiTurn {
             sandbox: sandbox_mode,
             conversation_id,
@@ -457,6 +458,7 @@ impl AppState {
             message,
             attachments,
             context,
+            session_config,
         };
         if staged.is_empty() {
             self.service.send_to(session, command(Vec::new()));
@@ -490,6 +492,46 @@ impl AppState {
         // Make the just-recorded user turn selectable right away (its text is final).
         self.build_chat_selectables(conversation_id, cx);
         cx.notify();
+    }
+
+    /// What the agent's session should open on, sent with the turn that starts it:
+    /// the model / thinking / mode this agent's composer is showing and any switch
+    /// (fast mode) the user has flipped, so a pick made *before* the first message
+    /// is honoured by that message rather than by the one after it.
+    ///
+    /// Empty once the session is up (the composer sets config directly from then on)
+    /// and on the API-key path, which has no session config. Empty too before this
+    /// agent has ever advertised its controls: RED can't name an option it has never
+    /// been told about, which is exactly what the composer's inert placeholders say.
+    fn session_config_for(
+        &self,
+        conversation_id: red_service::ConversationId,
+        agent: &str,
+    ) -> Vec<red_service::AiConfigChange> {
+        if !self.agent_is_acp(agent) {
+            return Vec::new();
+        }
+        let Some(state) = self.assistant.as_ref() else {
+            return Vec::new();
+        };
+        let live_session = state
+            .chats
+            .iter()
+            .find(|c| c.conversation_id == conversation_id)
+            .is_some_and(|c| !c.config_options.is_empty());
+        if live_session {
+            return Vec::new();
+        }
+        let Some(cached) = state.provider_config_options.get(agent) else {
+            return Vec::new();
+        };
+        desired_config(
+            cached,
+            &self.settings.ai.subscription_model,
+            &self.settings.ai.subscription_reasoning,
+            &self.settings.ai.subscription_mode,
+            self.local_state.ai_switches(agent),
+        )
     }
 
     /// Stage `paths` on the active chat, refusing what cannot be sent.
@@ -791,6 +833,7 @@ impl AppState {
     fn go_to_draft(&mut self, provider: String, rebind: bool, cx: &mut Context<Self>) {
         self.stash_active_draft(cx);
         let id = red_service::ConversationId::new(self.next_conversation_id);
+        let acp = self.agent_is_acp(&provider);
         let existing = self
             .assistant
             .as_ref()
@@ -802,6 +845,12 @@ impl AppState {
                 Some(i) => {
                     if rebind {
                         state.chats[i].provider = provider.clone();
+                        // Review-transaction mode belongs to the API-key path (the
+                        // subscription agent gets no write tools), so a draft moved
+                        // onto an ACP agent must not keep claiming it in the header.
+                        if acp {
+                            state.chats[i].sandbox = false;
+                        }
                         bound = Some(provider.clone());
                     }
                     i
@@ -949,10 +998,16 @@ impl AppState {
     /// it). Drives the empty-chat provider picker.
     pub(crate) fn set_active_chat_provider(&mut self, provider: String, cx: &mut Context<Self>) {
         let mut picked = None;
+        let acp = self.agent_is_acp(&provider);
         if let Some(state) = self.assistant.as_mut() {
             let chat = state.active_mut();
             if chat.messages.is_empty() {
                 chat.provider = provider.clone();
+                // A subscription agent gets no write tools, so it has nothing to hold
+                // in a review transaction; drop a mode the previous agent could honour.
+                if acp {
+                    chat.sandbox = false;
+                }
                 picked = Some(provider);
             }
         }
@@ -1325,11 +1380,16 @@ impl AppState {
         cx.notify();
     }
 
-    /// Apply the central default model/reasoning (from settings) to a chat's fresh
-    /// session, once. For each defaulted selector whose stored value is advertised and
-    /// differs from the agent's current pick, send a set so the new chat lands on the
-    /// user's last choice. Guarded by `config_defaults_applied` so a later
-    /// `ConfigOptionUpdate` doesn't re-apply over a mid-chat manual change.
+    /// Apply the central defaults (model/reasoning/mode from settings, plus any
+    /// switch the user has explicitly flipped) to a chat's fresh session, once. For
+    /// each control whose wanted value is advertised and differs from the agent's
+    /// current pick, send a set so the new chat lands on the user's last choice.
+    /// Guarded by `config_defaults_applied` so a later `ConfigOptionUpdate` doesn't
+    /// re-apply over a mid-chat manual change.
+    ///
+    /// This is the *catch-up* path. The session's opening state is set before the
+    /// first prompt instead (`Command::AiTurn::session_config`), so by the time this
+    /// runs there is usually nothing left to change.
     fn apply_default_config(
         &mut self,
         conversation_id: red_service::ConversationId,
@@ -1338,6 +1398,16 @@ impl AppState {
         let model = self.settings.ai.subscription_model.clone();
         let reasoning = self.settings.ai.subscription_reasoning.clone();
         let mode = self.settings.ai.subscription_mode.clone();
+        let agent = self.assistant.as_ref().and_then(|s| {
+            s.chats
+                .iter()
+                .find(|c| c.conversation_id == conversation_id)
+                .map(|c| c.provider.clone())
+        });
+        let switches = agent
+            .as_deref()
+            .and_then(|a| self.local_state.ai_switches(a))
+            .cloned();
         let Some(chat) = self
             .assistant
             .as_mut()
@@ -1358,22 +1428,34 @@ impl AppState {
             return;
         }
         chat.config_defaults_applied = true;
-        let to_apply = default_config_changes(&chat.config_options, &model, &reasoning, &mode);
-        for (config_id, value) in to_apply {
-            // Only the three selector categories carry stored defaults, and none of
-            // them is a boolean switch — see `default_config_changes`.
-            self.send_set_config_option(conversation_id, config_id, value, false, cx);
+        let to_apply = config_changes_needed(
+            &chat.config_options,
+            &model,
+            &reasoning,
+            &mode,
+            switches.as_ref(),
+        );
+        for change in to_apply {
+            self.send_set_config_option(
+                conversation_id,
+                change.config_id,
+                change.value,
+                change.boolean,
+                cx,
+            );
         }
     }
 
     /// The composer changed a config control (a dropdown pick or a switch flip):
-    /// optimistically reflect it on the chat, persist a selector choice as the
-    /// central default for future chats (last choice wins; existing chats
-    /// untouched), and tell the backend to apply it to this session.
+    /// optimistically reflect it on the chat, persist the choice as the central
+    /// default for future chats (last choice wins; existing chats untouched), and
+    /// tell the backend to apply it to this session.
     ///
-    /// Switches (`boolean`) aren't persisted as a RED default: they're the agent's
-    /// own session state, and re-asserting one on every new chat would fight
-    /// whatever the agent itself remembers.
+    /// A pick made on a draft has no live session to change — the agent only starts
+    /// with the first turn — so persisting is what makes it real: it rides out with
+    /// that turn as `session_config` and is applied before the prompt. Switches are
+    /// remembered per agent rather than as one global default, and only once the
+    /// user has actually flipped one; an untouched switch is left to the agent.
     pub(crate) fn change_config_option(
         &mut self,
         config_id: String,
@@ -1411,9 +1493,24 @@ impl AppState {
                 }
             }
         }
-        // Persist as the central default for new chats (not retroactive). Switches
-        // are the agent's own state, so they're deliberately not stored here.
-        match category {
+        // Keep the on-disk cache in step with the pick, so the control redraws in the
+        // state the user left it in on the next launch rather than snapping back to
+        // whatever the agent last advertised.
+        let cached = state
+            .provider_config_options
+            .get(&agent)
+            .map(|opts| to_stored(opts));
+        if let Some(cached) = cached {
+            self.local_state.set_ai_config(&agent, cached);
+        }
+        // Persist as the default for new chats (not retroactive): selectors globally,
+        // switches per agent (they're that agent's own control, and only an explicit
+        // flip is ever re-asserted).
+        if boolean {
+            self.local_state
+                .set_ai_switch(&agent, &config_id, value == "true");
+        }
+        match category.filter(|_| !boolean) {
             Some(red_service::AiConfigCategory::Model) => {
                 self.settings.ai.subscription_model = value.clone();
                 self.save_settings();

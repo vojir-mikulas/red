@@ -29,8 +29,8 @@ mod update;
 
 pub use protocol::{
     AiAgentKind, AiAgentProfile, AiAuthStatus, AiCommand, AiConfig, AiConfigCategory,
-    AiConfigChoice, AiConfigOption, AiContext, AiDelta, AiUsage, AttachmentBody, Command,
-    ContextRefSpec, ConversationId, Epoch, Event, OpId, ReportTheme, RequestId, RunFetch,
+    AiConfigChange, AiConfigChoice, AiConfigOption, AiContext, AiDelta, AiUsage, AttachmentBody,
+    Command, ContextRefSpec, ConversationId, Epoch, Event, OpId, ReportTheme, RequestId, RunFetch,
     SandboxEntry, SessionId, SortKey, SqlReview, StatementPreview, TurnAttachment, UpdateConfig,
     WritePreview,
 };

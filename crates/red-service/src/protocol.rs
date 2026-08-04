@@ -1062,6 +1062,16 @@ pub enum Command {
         /// below `write`, another chat already holding this session's sandbox);
         /// the UI only offers it, it does not get to assert it.
         sandbox: bool,
+        /// What the subscription agent's session should open on: the model /
+        /// reasoning / mode the user picked in the composer, and any switch (fast
+        /// mode) they flipped, applied between `session/new` and this prompt.
+        ///
+        /// It rides with the turn because the session doesn't exist until the turn
+        /// starts it — a `AiSetConfigOption` sent before the first turn has no
+        /// session to change, so the first turn would otherwise always run on the
+        /// agent's own defaults. Ignored on later turns (the session is already up
+        /// and the UI sets config directly) and on the API-key path.
+        session_config: Vec<AiConfigChange>,
     },
     /// Commit or roll back the sandbox transaction this conversation opened.
     /// A conversation with no open sandbox is a no-op (it may have expired).
@@ -2392,6 +2402,18 @@ pub struct AiConfigOption {
     /// An on/off switch rather than a dropdown. The composer renders it as a
     /// toggle, and the flag rides back on `Command::AiSetConfigOption` so the
     /// agent gets a JSON boolean rather than a value id.
+    pub boolean: bool,
+}
+
+/// One config control to apply to a subscription agent's session, in the shape
+/// both [`Command::AiSetConfigOption`] (a live session) and
+/// [`Command::AiTurn::session_config`] (a session about to open) round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AiConfigChange {
+    pub config_id: String,
+    pub value: String,
+    /// The control is an on/off switch, so the agent wants a JSON boolean on the
+    /// wire rather than a choice's value id. See [`AiConfigOption::boolean`].
     pub boolean: bool,
 }
 

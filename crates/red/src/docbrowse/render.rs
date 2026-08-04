@@ -660,6 +660,12 @@ impl AppState {
                     .flex_1()
                     .min_h(px(0.))
                     .flex()
+                    // A column, not a row: as a row item the panel's automatic
+                    // minimum width is its min-content width, so a toolbar wider
+                    // than a narrow pane would push the panel past the pane and
+                    // collapse its percentage-sized descendants (see the same
+                    // wrapper in `AppState::render_kv_pane`).
+                    .flex_col()
                     .child(panel)
                     // On the body rather than on the document grid itself: the
                     // grid is rendered several `&self` helpers deep, none of

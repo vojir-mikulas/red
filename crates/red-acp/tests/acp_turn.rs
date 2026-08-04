@@ -59,6 +59,48 @@ async fn handshake_then_streamed_turn() {
     assert_eq!(result.stop, AcpStop::EndTurn);
 }
 
+/// Config set before a prompt is in force *for that prompt*.
+///
+/// This is what makes a setting picked in the composer before the first message
+/// (fast mode, the model) count for that message: RED applies it between
+/// `session/new` and the prompt, and both ride the same command channel, so the
+/// agent sees them in that order. The fake agent refuses a switch sent as a string,
+/// so this also pins the boolean wire encoding.
+#[tokio::test(flavor = "multi_thread")]
+async fn config_set_before_a_prompt_is_in_force_for_it() {
+    let conv = AcpConversation::start(fake_agent_config())
+        .await
+        .expect("agent comes up");
+
+    let options = conv
+        .set_config("fast-mode".to_string(), "true".to_string(), true)
+        .await
+        .expect("reply")
+        .expect("switch accepted as a JSON boolean");
+    assert!(
+        options
+            .iter()
+            .any(|o| o.id == "fast-mode" && o.current_value == "true" && o.boolean),
+        "the refreshed set should show the switch on: {options:?}"
+    );
+    conv.set_config("model".to_string(), "opus".to_string(), false)
+        .await
+        .expect("reply")
+        .expect("selector accepted as a value id");
+
+    let (sink, mut deltas) = mpsc::unbounded_channel();
+    let done = conv.prompt(
+        vec![red_acp::AcpPromptBlock::Text("CONFIG".to_string())],
+        sink,
+    );
+    let text = collect_text(&mut deltas).await;
+    let result = done.await.expect("reply").expect("turn ok");
+
+    // The agent reports what it held as the turn started, not what it ended on.
+    assert_eq!(text, "model=opus fast=true");
+    assert_eq!(result.stop, AcpStop::EndTurn);
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn cancel_stops_an_inflight_turn() {
     let conv = AcpConversation::start(fake_agent_config())

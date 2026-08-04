@@ -6,6 +6,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Assistant settings picked before the first message now apply to that message.
+  Fast mode, the model, the thinking level and the permission mode are sent to
+  the agent as its session opens, instead of only taking effect from the second
+  turn onwards; a fast-mode flip is also remembered per agent, so a new chat
+  starts the way you left it.
+- The review-transaction control is no longer shown on subscription chats. That
+  agent is never handed write tools, so there was nothing for it to hold and the
+  control could not be switched on.
+- Splitting the Redis or MongoDB browser no longer breaks the key/document list:
+  in a narrow half the list collapsed to its column headers with no rows under
+  them. The browse toolbar now wraps onto a second row in a narrow pane instead
+  of pushing its trailing controls (Actions, refresh) out of reach.
+
 ## [0.21.0] - 2026-08-03
 
 ### Added

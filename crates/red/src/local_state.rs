@@ -7,8 +7,10 @@
 //! one-shot "RED updated to X" toast (see `AppState::new`). The per-agent config
 //! cache lets the assistant show the model/reasoning dropdowns *before* a chat
 //! opens its session (the agent only advertises them once a session is live), so a
-//! returning user can preselect a model without sending a message first. The last
-//! agent is the new-chat default, so a fresh chat starts on whatever you last used.
+//! returning user can preselect a model without sending a message first, and the
+//! switches (fast mode) they explicitly flipped are re-applied to each new session
+//! so a pick made before the first message isn't lost. The last agent is the
+//! new-chat default, so a fresh chat starts on whatever you last used.
 //! The on-disk shape is a wrapper object so future app state can be added without
 //! breaking older files.
 //!
@@ -70,6 +72,11 @@ struct StateFile {
     /// detour). Absent until they've picked one.
     #[serde(default)]
     last_agent: Option<String>,
+    /// The on/off config switches (fast mode) the user has *explicitly* set, keyed
+    /// by agent id then option id. Only an explicit flip is recorded: an untouched
+    /// switch is left to the agent's own memory rather than re-asserted from here.
+    #[serde(default)]
+    ai_switches: HashMap<String, HashMap<String, bool>>,
 }
 
 /// The app-state store. Loaded once at startup; mutations persist immediately.
@@ -143,6 +150,22 @@ impl LocalState {
             return;
         }
         self.file.ai_config.insert(agent.to_string(), options);
+        self.persist();
+    }
+
+    /// The switches the user has explicitly set for `agent`, or an empty map when
+    /// they've never touched one. Applied to each fresh session of that agent.
+    pub(crate) fn ai_switches(&self, agent: &str) -> Option<&HashMap<String, bool>> {
+        self.file.ai_switches.get(agent)
+    }
+
+    /// Record an explicit switch flip, persisting only when it changed.
+    pub(crate) fn set_ai_switch(&mut self, agent: &str, config_id: &str, on: bool) {
+        let switches = self.file.ai_switches.entry(agent.to_string()).or_default();
+        if switches.get(config_id) == Some(&on) {
+            return;
+        }
+        switches.insert(config_id.to_string(), on);
         self.persist();
     }
 
@@ -237,6 +260,7 @@ mod tests {
             last_seen_version: Some("1.2.3".into()),
             ai_config: HashMap::new(),
             last_agent: Some("codex".into()),
+            ai_switches: HashMap::new(),
         })
         .unwrap();
         let back: StateFile = serde_json::from_str(&json).unwrap();
@@ -262,5 +286,26 @@ mod tests {
         assert_eq!(back.last_seen_version, None);
         assert!(back.ai_config.is_empty());
         assert_eq!(back.last_agent, None);
+        assert!(back.ai_switches.is_empty());
+    }
+
+    #[test]
+    fn ai_switches_record_per_agent() {
+        let mut s = in_memory();
+        assert!(s.ai_switches("subscription").is_none());
+        s.set_ai_switch("subscription", "fast-mode", true);
+        assert_eq!(
+            s.ai_switches("subscription")
+                .and_then(|m| m.get("fast-mode")),
+            Some(&true)
+        );
+        s.set_ai_switch("subscription", "fast-mode", false);
+        assert_eq!(
+            s.ai_switches("subscription")
+                .and_then(|m| m.get("fast-mode")),
+            Some(&false)
+        );
+        // Another agent's switches are its own.
+        assert!(s.ai_switches("codex").is_none());
     }
 }

@@ -746,6 +746,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 attachments,
                 context,
                 sandbox,
+                session_config,
             } => {
                 // The turn grounds in the connected session's driver, either the
                 // SQL `DatabaseDriver` or the Redis `KvDriver` seam (each has its
@@ -901,6 +902,7 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                             message,
                             attachments,
                             context,
+                            session_config,
                         ));
                     }
                 }

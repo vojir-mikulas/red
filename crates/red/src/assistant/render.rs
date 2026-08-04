@@ -1745,13 +1745,18 @@ impl AppState {
     /// earlier writes were run under, and shown *disabled with the reason* where
     /// the mode can't be honoured rather than hidden — "why isn't this here" is a
     /// worse question than "here's why not".
+    ///
+    /// The exception is a subscription chat, where it is hidden outright: that agent
+    /// is never handed write tools at all, so there are no writes to hold and the
+    /// control isn't blocked by something the user could go and change. A permanently
+    /// dead control on every chat teaches nothing; it just looks broken.
     fn render_sandbox_toggle(
         &self,
         chat: &ChatSession,
         theme: &flint::Theme,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        if !chat.is_draft() {
+        if !chat.is_draft() || self.agent_is_acp(&chat.provider) {
             return None;
         }
         let blocked = self.sandbox_available();

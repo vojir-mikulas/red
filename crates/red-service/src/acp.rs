@@ -361,6 +361,7 @@ pub(crate) async fn run_turn(
     user_message: String,
     attachments: Vec<crate::protocol::TurnAttachment>,
     context: AiContext,
+    session_config: Vec<crate::protocol::AiConfigChange>,
 ) {
     // Ensure the conversation exists, and learn whether this is its first turn.
     let (agent, first_turn) = match ensure_conversation(
@@ -392,6 +393,14 @@ pub(crate) async fn run_turn(
             return;
         }
     };
+
+    // The session was just created, so anything the user picked in the composer
+    // before starting the chat (model, thinking level, fast mode) has had nowhere
+    // to land until now. Apply it here, between `session/new` and the prompt, so
+    // the *first* turn already runs the way they asked rather than the turn after.
+    if first_turn && !session_config.is_empty() {
+        apply_session_config(&agent, &events, session, conversation_id, session_config).await;
+    }
 
     // Fold grounding into the prompt text: the full instruction once (ACP has no
     // system role), then just the volatile per-turn context on follow-ups.
@@ -904,6 +913,46 @@ async fn config_relay(
     while let Some(options) = cfg_rx.recv().await {
         emit(
             &events,
+            session,
+            Event::AiConfigOptionsAvailable {
+                conversation_id,
+                options: options.iter().map(map_config_option).collect(),
+            },
+        );
+    }
+}
+
+/// Apply the composer's pre-session picks to a session that has just opened, in
+/// order, then publish the resulting control set so the UI reconciles.
+///
+/// Best-effort by design: a control the agent no longer advertises (its options
+/// changed since RED last cached them) is logged and skipped, never turned into a
+/// user-facing error — the user asked for a turn, not for a config round trip, and
+/// failing the turn over a stale dropdown value would be the worse trade.
+async fn apply_session_config(
+    agent: &AcpConversation,
+    events: &Events,
+    session: Option<SessionId>,
+    conversation_id: ConversationId,
+    changes: Vec<crate::protocol::AiConfigChange>,
+) {
+    let mut latest = None;
+    for change in changes {
+        let id = change.config_id.clone();
+        match agent
+            .set_config(change.config_id, change.value, change.boolean)
+            .await
+        {
+            Ok(Ok(options)) => latest = Some(options),
+            Ok(Err(e)) => tracing::debug!("acp: could not preset config option {id}: {e}"),
+            // The agent connection ended before answering; the prompt that follows
+            // will report the real failure.
+            Err(_) => return,
+        }
+    }
+    if let Some(options) = latest {
+        emit(
+            events,
             session,
             Event::AiConfigOptionsAvailable {
                 conversation_id,

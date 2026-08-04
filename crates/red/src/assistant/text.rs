@@ -131,32 +131,77 @@ pub(super) fn from_stored(
         .collect()
 }
 
-/// Which config selectors a fresh session should switch to honor the central
-/// defaults: for each Model/Reasoning option whose stored default is non-empty, an
-/// advertised choice, and not already current, the `(config_id, value)` to apply.
-/// Options without a stored default (or already on it) are left as the agent set them.
-pub(super) fn default_config_changes(
+/// Every config control RED has an opinion about, as the change that would put a
+/// session into that state: each Model/Reasoning/Mode selector whose stored default
+/// is non-empty and advertised by the agent, plus each switch (fast mode) the user
+/// has explicitly flipped. A control nobody has touched is left to the agent.
+///
+/// Deliberately *not* filtered against `current_value`: this is what a **fresh**
+/// session should open on, and the only option set the caller has before that
+/// session exists is the last one this agent advertised — what it was set to last
+/// time says nothing about what a new agent process starts on.
+pub(super) fn desired_config(
     options: &[red_service::AiConfigOption],
     model_default: &str,
     reasoning_default: &str,
     mode_default: &str,
-) -> Vec<(String, String)> {
+    switches: Option<&std::collections::HashMap<String, bool>>,
+) -> Vec<red_service::AiConfigChange> {
     let mut out = Vec::new();
     for opt in options {
+        if opt.boolean {
+            // Only an explicit flip is re-asserted; see `LocalState::ai_switches`.
+            if let Some(on) = switches.and_then(|s| s.get(&opt.id)) {
+                out.push(red_service::AiConfigChange {
+                    config_id: opt.id.clone(),
+                    value: on.to_string(),
+                    boolean: true,
+                });
+            }
+            continue;
+        }
         let default = match opt.category {
             red_service::AiConfigCategory::Model => model_default,
             red_service::AiConfigCategory::Reasoning => reasoning_default,
             red_service::AiConfigCategory::Mode => mode_default,
             _ => continue,
         };
-        if default.is_empty() || default == opt.current_value {
-            continue;
-        }
-        if opt.choices.iter().any(|c| c.value == default) {
-            out.push((opt.id.clone(), default.to_string()));
+        if !default.is_empty() && opt.choices.iter().any(|c| c.value == default) {
+            out.push(red_service::AiConfigChange {
+                config_id: opt.id.clone(),
+                value: default.to_string(),
+                boolean: false,
+            });
         }
     }
     out
+}
+
+/// [`desired_config`] minus the controls already where they should be: what a
+/// **live** session still has to be told. Here `options` are the agent's own, so
+/// their `current_value` is the truth and a matching one is a wasted round trip.
+pub(super) fn config_changes_needed(
+    options: &[red_service::AiConfigOption],
+    model_default: &str,
+    reasoning_default: &str,
+    mode_default: &str,
+    switches: Option<&std::collections::HashMap<String, bool>>,
+) -> Vec<red_service::AiConfigChange> {
+    desired_config(
+        options,
+        model_default,
+        reasoning_default,
+        mode_default,
+        switches,
+    )
+    .into_iter()
+    .filter(|change| {
+        options
+            .iter()
+            .find(|o| o.id == change.config_id)
+            .is_some_and(|o| o.current_value != change.value)
+    })
+    .collect()
 }
 
 /// An `Hsla` as a CSS color string (`hsl(h s% l%)`, with `/ a` when translucent),
@@ -368,26 +413,81 @@ mod tests {
             choices: vec![choice("default"), choice("acceptEdits"), choice("bypass")],
             boolean: false,
         };
-        let opts = vec![model, reasoning, mode];
+        let fast = red_service::AiConfigOption {
+            id: "fast-mode".into(),
+            name: "Fast".into(),
+            category: red_service::AiConfigCategory::Other,
+            current_value: "false".into(),
+            choices: vec![choice("false"), choice("true")],
+            boolean: true,
+        };
+        let opts = vec![model, reasoning, mode, fast];
+        let ids = |changes: Vec<red_service::AiConfigChange>| -> Vec<(String, String, bool)> {
+            changes
+                .into_iter()
+                .map(|c| (c.config_id, c.value, c.boolean))
+                .collect()
+        };
 
         // A valid, different model default applies; empty reasoning/mode defaults are left.
         assert_eq!(
-            default_config_changes(&opts, "opus", "", ""),
-            vec![("model".to_string(), "opus".to_string())]
+            ids(config_changes_needed(&opts, "opus", "", "", None)),
+            vec![("model".to_string(), "opus".to_string(), false)]
         );
         // All three apply when each differs.
         assert_eq!(
-            default_config_changes(&opts, "haiku", "hard", "acceptEdits"),
+            ids(config_changes_needed(
+                &opts,
+                "haiku",
+                "hard",
+                "acceptEdits",
+                None
+            )),
             vec![
-                ("model".to_string(), "haiku".to_string()),
-                ("reasoning".to_string(), "hard".to_string()),
-                ("mode".to_string(), "acceptEdits".to_string()),
+                ("model".to_string(), "haiku".to_string(), false),
+                ("reasoning".to_string(), "hard".to_string(), false),
+                ("mode".to_string(), "acceptEdits".to_string(), false),
             ]
         );
         // A default equal to the current pick is a no-op; an unknown value is ignored.
-        assert!(default_config_changes(&opts, "auto", "nonexistent", "default").is_empty());
+        assert!(config_changes_needed(&opts, "auto", "nonexistent", "default", None).is_empty());
         // No stored defaults → nothing to apply.
-        assert!(default_config_changes(&opts, "", "", "").is_empty());
+        assert!(config_changes_needed(&opts, "", "", "", None).is_empty());
+    }
+
+    /// A switch is re-asserted only once the user has flipped it, and rides as a
+    /// boolean so the agent gets a JSON `true`/`false` rather than a value id.
+    #[test]
+    fn switches_apply_only_when_explicitly_set() {
+        let choice = |v: &str| red_service::AiConfigChoice {
+            value: v.into(),
+            name: v.into(),
+            description: None,
+        };
+        let opts = vec![red_service::AiConfigOption {
+            id: "fast-mode".into(),
+            name: "Fast".into(),
+            category: red_service::AiConfigCategory::Other,
+            current_value: "false".into(),
+            choices: vec![choice("false"), choice("true")],
+            boolean: true,
+        }];
+
+        // Never touched: left to whatever the agent itself remembers.
+        assert!(desired_config(&opts, "", "", "", None).is_empty());
+
+        let mut switches = std::collections::HashMap::new();
+        switches.insert("fast-mode".to_string(), true);
+        let on = desired_config(&opts, "", "", "", Some(&switches));
+        assert_eq!(on.len(), 1);
+        assert_eq!(on[0].value, "true");
+        assert!(on[0].boolean);
+
+        // A fresh session gets it regardless of the cached value; a live session
+        // already on it doesn't.
+        switches.insert("fast-mode".to_string(), false);
+        assert_eq!(desired_config(&opts, "", "", "", Some(&switches)).len(), 1);
+        assert!(config_changes_needed(&opts, "", "", "", Some(&switches)).is_empty());
     }
 
     #[test]

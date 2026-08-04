@@ -456,7 +456,15 @@ impl AppState {
                 .text_color(theme.text_muted)
                 .child(empty_msg)
         } else {
-            div().flex_1().min_w(px(0.)).child(table)
+            // A flex parent, so the table's `size_full` has a definite box to
+            // resolve against — a plain block would leave it at auto height, i.e.
+            // the header row with no list under it.
+            div()
+                .flex_1()
+                .min_w(px(0.))
+                .min_h(px(0.))
+                .flex()
+                .child(table)
         }
         .relative()
         .children(list_hint.map(|h| crate::focus_overlay::badge(h, cx)));
@@ -557,6 +565,11 @@ impl AppState {
                 div()
                     .flex_shrink_0()
                     .flex()
+                    // Wraps to a second row rather than clipping: in a split half
+                    // the controls no longer fit on one line, and a clipped
+                    // toolbar hides the ones on the end (Actions, refresh)
+                    // outright — there is no way to scroll to them.
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .px_2()
@@ -601,7 +614,10 @@ impl AppState {
                             .flex()
                             .flex_1()
                             .items_center()
-                            .min_w(px(180.))
+                            // Low enough to fit a pane squeezed to `MIN_KV_PANE_W`
+                            // once the toolbar has wrapped; `flex_1` still hands it
+                            // the whole leftover row when there is room.
+                            .min_w(px(140.))
                             .h(px(28.))
                             .rounded(theme.radius)
                             .bg(theme.bg_input)
