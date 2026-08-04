@@ -89,23 +89,14 @@ impl AppState {
 
         // Record this key in the connection's recently-viewed list (newest-first,
         // deduped, capped) — the History dock's Keys section reads it.
-        if let Some(view) = self
+        if let Some(keys) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|a| a.kv_view.as_ref())
+            .map(|v| v.recent_keys.clone())
         {
-            view.recent_keys.retain(|r| r.key != key);
-            view.recent_keys.insert(
-                0,
-                RecentKey {
-                    key: key.clone(),
-                    kv_type: kv_type.clone(),
-                    ttl,
-                    viewed_unix: crate::conversations::now_unix(),
-                },
-            );
-            view.recent_keys.truncate(MAX_RECENT_KEYS);
+            keys.update(cx, |keys, _| keys.record(key.clone(), kv_type.clone(), ttl));
         }
-        self.kv_persist_recent_keys(session);
+        self.kv_persist_recent_keys(session, cx);
 
         // A multiline surface (no gutter, no frame of its own) so it reads as
         // the value body becoming editable in place, exactly like the SQL cell
@@ -264,45 +255,28 @@ impl AppState {
         self.kv_open_inspector(session, key, ttl, kv_type, cx);
     }
 
-    /// Toggle the History dock's "Recently viewed keys" section collapsed/open
-    /// (in-memory, reset per session).
-    pub(crate) fn kv_toggle_recent_keys(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        if let Some(view) = self
-            .conn_mut(Some(session))
-            .and_then(|a| a.kv_view.as_mut())
-        {
-            view.recent_keys_collapsed = !view.recent_keys_collapsed;
-            cx.notify();
-        }
-    }
-
-    /// Toggle the History dock's "Commands" section collapsed/open (in-memory).
-    pub(crate) fn kv_toggle_commands(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        if let Some(view) = self
-            .conn_mut(Some(session))
-            .and_then(|a| a.kv_view.as_mut())
-        {
-            view.commands_collapsed = !view.commands_collapsed;
-            cx.notify();
-        }
-    }
-
     /// Clear the connection's recently-viewed keys (the History dock's trash).
     pub(crate) fn kv_clear_recent_keys(&mut self, session: SessionId, cx: &mut Context<Self>) {
-        if let Some(view) = self
+        if let Some(keys) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_view.as_mut())
-            && !view.recent_keys.is_empty()
+            .and_then(|a| a.kv_view.as_ref())
+            .map(|v| v.recent_keys.clone())
+            && !keys.read(cx).is_empty()
         {
-            view.recent_keys.clear();
-            self.kv_persist_recent_keys(session);
+            keys.update(cx, |keys, _| keys.clear());
+            self.kv_persist_recent_keys(session, cx);
             cx.notify();
         }
     }
 
     /// Seed a freshly-connected Redis view's recently-viewed list from the
     /// persisted store, so browsing history survives a restart.
-    pub(crate) fn kv_seed_recent_keys(&mut self, session: SessionId, conn_id: &str) {
+    pub(crate) fn kv_seed_recent_keys(
+        &mut self,
+        session: SessionId,
+        conn_id: &str,
+        cx: &mut Context<Self>,
+    ) {
         let seeded: Vec<RecentKey> = self
             .redis_recent_keys
             .get(conn_id)
@@ -311,17 +285,18 @@ impl AppState {
         if seeded.is_empty() {
             return;
         }
-        if let Some(view) = self
+        if let Some(keys) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|a| a.kv_view.as_ref())
+            .map(|v| v.recent_keys.clone())
         {
-            view.recent_keys = seeded;
+            keys.update(cx, |keys, _| keys.seed(seeded));
         }
     }
 
     /// Write the connection's current recently-viewed list to the persisted
     /// store (called after any change: record / clear / remove).
-    fn kv_persist_recent_keys(&mut self, session: SessionId) {
+    fn kv_persist_recent_keys(&mut self, session: SessionId, cx: &mut Context<Self>) {
         let Some(active) = self.conn_mut(Some(session)) else {
             return;
         };
@@ -329,10 +304,9 @@ impl AppState {
         if conn_id.is_empty() {
             return;
         }
-        let recs: Vec<red_config::recent_keys::RecentKeyRec> = active
-            .kv_view
-            .as_ref()
-            .map(|v| v.recent_keys.iter().map(RecentKey::to_rec).collect())
+        let keys = active.kv_view.as_ref().map(|v| v.recent_keys.clone());
+        let recs: Vec<red_config::recent_keys::RecentKeyRec> = keys
+            .map(|k| k.read(cx).items().iter().map(RecentKey::to_rec).collect())
             .unwrap_or_default();
         self.redis_recent_keys.set(&conn_id, recs);
     }
@@ -345,16 +319,14 @@ impl AppState {
         key: String,
         cx: &mut Context<Self>,
     ) {
-        if let Some(view) = self
+        if let Some(keys) = self
             .conn_mut(Some(session))
-            .and_then(|a| a.kv_view.as_mut())
+            .and_then(|a| a.kv_view.as_ref())
+            .map(|v| v.recent_keys.clone())
+            && keys.update(cx, |keys, _| keys.remove(&key))
         {
-            let before = view.recent_keys.len();
-            view.recent_keys.retain(|r| r.key != key);
-            if view.recent_keys.len() != before {
-                self.kv_persist_recent_keys(session);
-                cx.notify();
-            }
+            self.kv_persist_recent_keys(session, cx);
+            cx.notify();
         }
     }
 

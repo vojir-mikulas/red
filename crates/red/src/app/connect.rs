@@ -150,14 +150,18 @@ impl AppState {
             let conn_id = conn.conn_id.clone();
             // Read here, not inside `ActiveConn::new`: that runs with `AppState`
             // leased (see its doc comment), so it cannot read settings itself.
-            let kv_mode = self.settings.kv.default_query_mode.into();
+            let deps = crate::app::ConnDeps {
+                kv_mode: self.settings.kv.default_query_mode.into(),
+                history_store: self.query_history.clone(),
+                sender: self.service.command_sender(id),
+            };
             let server_refresh = self.settings.behavior.server_refresh_interval();
             self.phase = Phase::Connected(Box::new(ActiveConn::new(
                 id,
                 conn.conn_id,
                 conn.config,
                 version,
-                kv_mode,
+                deps,
                 cx,
             )));
             // Same reason `kv_mode` is read out here: `ActiveConn::new` runs with
@@ -169,7 +173,7 @@ impl AppState {
             if is_redis {
                 // Restore the persisted recently-viewed keys for this
                 // connection before the first render reads them.
-                self.kv_seed_recent_keys(id, &conn_id);
+                self.kv_seed_recent_keys(id, &conn_id, cx);
                 // Redis has no schema/FK concept; kick off the keyspace browser's first
                 // scan + header stat instead.
                 self.kv_start_browse(id, cx);

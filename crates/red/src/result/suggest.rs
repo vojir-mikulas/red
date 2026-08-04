@@ -11,7 +11,7 @@
 
 use flint::prelude::*;
 use gpui::{
-    Anchor, AnyElement, Bounds, Context, Entity, Pixels, ScrollHandle, SharedString, Window,
+    Anchor, AnyElement, App, Bounds, Context, Entity, Pixels, ScrollHandle, SharedString, Window,
     canvas, div, point, prelude::*, px,
 };
 use red_core::{ColumnMeta, LookupRow, TableRef, Value};
@@ -103,14 +103,14 @@ impl AppState {
     /// Resolve the FK lookup target for the editor's `data_col`, or `None` when the
     /// column isn't a single-column foreign key of the browse's base table. Independent
     /// of the cursor (works for a draft row's cell too), mirroring `reference_menu`.
-    fn fk_lookup_spec(&self, data_col: usize) -> Option<LookupSpec> {
+    fn fk_lookup_spec(&self, data_col: usize, cx: &App) -> Option<LookupSpec> {
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
         let grid = active.active_result()?;
         let (schema, table) = grid.table.as_ref()?;
         let cname = grid.columns().get(data_col)?.name.clone();
-        let edge = active.fk_graph.iter().find(|e| {
+        let edge = active.schema.read(cx).fk_graph.iter().find(|e| {
             e.columns.len() == 1
                 && e.from_table == *table
                 && e.from_schema.as_deref() == Some(schema.as_str())
@@ -123,6 +123,7 @@ impl AppState {
         // otherwise the picker shows bare ids (still selectable/searchable).
         let label_column = active
             .schema
+            .read(cx)
             .details
             .get(&(ref_schema.clone(), ref_table.clone()))
             .and_then(|d| pick_label_column(&d.columns, &id_column));
@@ -153,9 +154,14 @@ impl AppState {
             .unwrap_or_default();
 
         // 1) Foreign key: a searchable id/label list, fetched + cached per target.
-        if let Some(spec) = self.fk_lookup_spec(data_col) {
+        if let Some(spec) = self.fk_lookup_spec(data_col, cx) {
             let cached = match &self.phase {
-                Phase::Connected(active) => active.lookup_cache.get(&spec.target).cloned(),
+                Phase::Connected(active) => active
+                    .schema
+                    .read(cx)
+                    .lookup_cache
+                    .get(&spec.target)
+                    .cloned(),
                 _ => None,
             };
             let loading = cached.is_none();
@@ -181,7 +187,7 @@ impl AppState {
         }
 
         // 2) Enum: the column's allowed values, straight from the per-table cache.
-        if let Some(values) = self.enum_values_for(data_col) {
+        if let Some(values) = self.enum_values_for(data_col, cx) {
             let items = values
                 .into_iter()
                 .map(|v| LookupRow {
@@ -210,13 +216,13 @@ impl AppState {
         // 3) Neither (yet): no picker, but make sure the table's enums are loading so a
         // re-check on `EnumsLoaded` can surface an enum column's values.
         self.cell_suggest = None;
-        self.ensure_enums_requested();
+        self.ensure_enums_requested(cx);
         cx.notify();
     }
 
     /// The enum values for the editor's `data_col`, if the browse's base table has them
     /// cached and that column is an enum. `None` otherwise (not an enum, or not loaded).
-    fn enum_values_for(&self, data_col: usize) -> Option<Vec<String>> {
+    fn enum_values_for(&self, data_col: usize, cx: &App) -> Option<Vec<String>> {
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
@@ -224,6 +230,8 @@ impl AppState {
         let (schema, table) = grid.table.as_ref()?;
         let cname = grid.columns().get(data_col)?.name.clone();
         let values = active
+            .schema
+            .read(cx)
             .enum_cache
             .get(&(schema.clone(), table.clone()))?
             .get(&cname)?;
@@ -232,7 +240,7 @@ impl AppState {
 
     /// Request the browse's base-table enum columns once (idempotent per table), so a
     /// later edit of an enum cell can show the value picker.
-    fn ensure_enums_requested(&mut self) {
+    fn ensure_enums_requested(&mut self, cx: &mut Context<Self>) {
         let table = match &self.phase {
             Phase::Connected(active) => active.active_result().and_then(|g| g.table.clone()),
             _ => None,
@@ -241,10 +249,13 @@ impl AppState {
             return;
         };
         let key = (schema.clone(), name.clone());
-        let need = if let Phase::Connected(active) = &mut self.phase {
-            !active.enum_cache.contains_key(&key) && active.enum_requested.insert(key)
-        } else {
-            false
+        let need = match &self.phase {
+            Phase::Connected(active) => {
+                let tree = active.schema.clone();
+                let cached = tree.read(cx).enum_cache.contains_key(&key);
+                !cached && tree.update(cx, |s, _| s.enum_requested.insert(key))
+            }
+            _ => false,
         };
         if need {
             self.send_active(Command::LoadEnums {
@@ -266,17 +277,19 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let key = (table.schema.unwrap_or_default(), table.name);
-        if let Some(active) = self.conn_mut(session) {
-            if active.enum_cache.len() >= FK_ENUM_CACHE_CAP
-                && !active.enum_cache.contains_key(&key)
-                && let Some(victim) = active.enum_cache.keys().next().cloned()
-            {
-                active.enum_cache.remove(&victim);
-                // Keep the "already requested" guard in sync, or the evicted
-                // table's enums could never be re-fetched.
-                active.enum_requested.remove(&victim);
-            }
-            active.enum_cache.insert(key, columns);
+        if let Some(tree) = self.conn_for(session).map(|a| a.schema.clone()) {
+            tree.update(cx, |s, _| {
+                if s.enum_cache.len() >= FK_ENUM_CACHE_CAP
+                    && !s.enum_cache.contains_key(&key)
+                    && let Some(victim) = s.enum_cache.keys().next().cloned()
+                {
+                    s.enum_cache.remove(&victim);
+                    // Keep the "already requested" guard in sync, or the evicted
+                    // table's enums could never be re-fetched.
+                    s.enum_requested.remove(&victim);
+                }
+                s.enum_cache.insert(key, columns);
+            });
         }
         if self.cell_suggest.is_none()
             && let Some((epoch, data_col)) = self.grid_edit.as_ref().map(|e| {
@@ -319,14 +332,17 @@ impl AppState {
     ) {
         let key = (target.schema.unwrap_or_default(), target.name);
         // Cache on the reply's own connection (it may be a background session).
-        if let Some(active) = self.conn_mut(session) {
-            if active.lookup_cache.len() >= FK_ENUM_CACHE_CAP
-                && !active.lookup_cache.contains_key(&key)
-                && let Some(victim) = active.lookup_cache.keys().next().cloned()
-            {
-                active.lookup_cache.remove(&victim);
-            }
-            active.lookup_cache.insert(key.clone(), rows.clone());
+        if let Some(tree) = self.conn_for(session).map(|a| a.schema.clone()) {
+            let (key, rows) = (key.clone(), rows.clone());
+            tree.update(cx, |s, _| {
+                if s.lookup_cache.len() >= FK_ENUM_CACHE_CAP
+                    && !s.lookup_cache.contains_key(&key)
+                    && let Some(victim) = s.lookup_cache.keys().next().cloned()
+                {
+                    s.lookup_cache.remove(&victim);
+                }
+                s.lookup_cache.insert(key, rows);
+            });
         }
         // The epoch is process-unique, so an epoch+target match is unambiguously this
         // editor's picker regardless of which session replied.

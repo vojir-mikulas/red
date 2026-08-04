@@ -11,9 +11,12 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use flint::prelude::*;
-use gpui::{App, Context, Entity, UniformListScrollHandle, Window, div, prelude::*, px};
+use gpui::{
+    App, Context, Entity, EventEmitter, FocusHandle, Focusable, UniformListScrollHandle, Window,
+    div, prelude::*, px,
+};
 use red_core::{ColumnMeta, DbKind, ObjectKind, ResultFilter, SchemaMeta, TableDetail};
-use red_service::Command;
+use red_service::{Command, CommandSender};
 
 use crate::app::{ActiveConn, AppState, PaneId, Phase, TabWorkspace};
 
@@ -40,7 +43,39 @@ pub(crate) enum NodeId {
     },
 }
 
-/// The schema explorer's state for one connection.
+/// What the schema tree needs the shell to do: open something in a tab.
+///
+/// Everything else the tree does itself — expand/collapse (including the catalog
+/// fetch an expand triggers, which it sends through its own `CommandSender`),
+/// selection, keyboard nav, and its filter.
+///
+/// The right-click menu's actions are deliberately **not** here. That menu
+/// renders from the shell root rather than from this view (`SchemaMenu.pos` is a
+/// window coordinate, and the narrow sidebar would clip it), so it is already
+/// holding `AppState` and calls it directly. Routing it through events would
+/// mean emitting from a surface this view does not draw.
+#[derive(Debug, Clone)]
+pub(crate) enum SchemaEvent {
+    /// Open `SELECT * FROM schema.table` in a query tab.
+    Preview { schema: String, name: String },
+    /// Show an object's DDL (routines, triggers, views).
+    Ddl {
+        schema: String,
+        name: String,
+        kind: ObjectKind,
+    },
+}
+
+/// The schema explorer for one connection: the sidebar tree of namespaces →
+/// tables/views → columns.
+///
+/// A view (`Entity<SchemaState>`), the fourth extracted under Tier 1 of
+/// `docs/plans/todo/zed-architecture-inspiration.md`. It holds both the schema
+/// *model* (namespaces, objects, per-object detail) and the tree's own UI state
+/// (expansion, selection, filter, menu), deliberately: several other modules
+/// (the ER canvas, the palette, editor completion, assistant grounding) read the
+/// model through `active.schema.read(cx)`, but only this view mutates it, so
+/// splitting model from view would buy nothing today.
 pub(crate) struct SchemaState {
     /// The tree skeleton (namespaces + object names), from `ObjectsLoaded`.
     /// Relations only: the columnless kinds live in [`Self::groups`].
@@ -70,6 +105,27 @@ pub(crate) struct SchemaState {
     seeded: HashSet<String>,
     /// Per-object detail (columns / FKs / indexes), filled lazily on expand.
     pub details: HashMap<(String, String), TableDetail>,
+    /// The connection-wide foreign-key graph, prefetched once after connect.
+    /// Empty until it lands (or when the engine has no FKs); drives the in-grid
+    /// FK click-through. See `Command::LoadForeignKeys`.
+    ///
+    /// This and the two caches below moved here from `ActiveConn`: they are all
+    /// "what we know about this connection's data model", which is what this
+    /// type already is. Keeping them together is what lets the result grid hold
+    /// **one** handle instead of a reference to the whole connection.
+    pub fk_graph: Vec<red_core::FkEdge>,
+    /// Cached FK lookup lists for the in-cell picker, keyed by referenced
+    /// `(schema, table)`. Populated lazily the first time an FK cell of that
+    /// target is edited (`Command::FetchLookup` → `Event::LookupReady`); reused
+    /// across edits and results on this connection.
+    pub lookup_cache: HashMap<(String, String), Vec<red_core::LookupRow>>,
+    /// Cached enum columns per `(schema, table)` for the in-cell enum picker:
+    /// `{ column → [variant, …] }`, loaded once per table the first time one of
+    /// its cells is edited. An absent table means "not loaded yet"; a
+    /// present-but-column-absent means "not an enum".
+    pub enum_cache: HashMap<(String, String), HashMap<String, Vec<String>>>,
+    /// Tables whose `LoadEnums` is in flight, so the load fires at most once.
+    pub enum_requested: HashSet<(String, String)>,
     pub expanded: HashSet<NodeId>,
     pub selected: Option<NodeId>,
     pub filter: Entity<TextInput>,
@@ -80,6 +136,21 @@ pub(crate) struct SchemaState {
     pub loading: bool,
     /// The open right-click menu (which node, and where to draw it), or `None`.
     pub menu: Option<SchemaMenu>,
+    /// Keyboard focus for the tree (its ↑/↓/←/→/Enter navigation). Owned here
+    /// rather than on `ActiveConn`: the surface that handles the keys owns the
+    /// handle.
+    pub focus: FocusHandle,
+    /// Session-bound command channel, so expanding a node can fetch its detail
+    /// without routing the request back through `AppState`.
+    sender: CommandSender,
+}
+
+impl EventEmitter<SchemaEvent> for SchemaState {}
+
+impl Focusable for SchemaState {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
+        self.focus.clone()
+    }
 }
 
 /// An open schema-tree context menu: the node it acts on and the screen position
@@ -93,7 +164,7 @@ impl SchemaState {
     /// `kind` fixes which object groups this tree can ever draw
     /// (`DbKind::object_kinds`), read once at connect because a connection's
     /// engine never changes under it.
-    pub fn new(kind: DbKind, cx: &mut Context<AppState>) -> Self {
+    pub fn new(kind: DbKind, sender: CommandSender, cx: &mut Context<Self>) -> Self {
         let filter = cx.new(|cx| {
             TextInput::new(cx).with_placeholder(crate::i18n::tr!("schema.filter", "Filter schema…"))
         });
@@ -103,6 +174,8 @@ impl SchemaState {
         })
         .detach();
         Self {
+            focus: cx.focus_handle(),
+            sender,
             schemas: Vec::new(),
             kinds: kind.object_kinds(),
             groups: HashMap::new(),
@@ -111,6 +184,10 @@ impl SchemaState {
             counts_loaded: false,
             seeded: HashSet::new(),
             details: HashMap::new(),
+            fk_graph: Vec::new(),
+            lookup_cache: HashMap::new(),
+            enum_cache: HashMap::new(),
+            enum_requested: HashSet::new(),
             expanded: HashSet::new(),
             selected: None,
             filter,
@@ -715,20 +792,15 @@ pub(crate) fn quote_ident(ident: &str, kind: DbKind) -> String {
     }
 }
 
-impl AppState {
-    /// The left-sidebar schema explorer: connection pill · filter · tree · footer.
-    pub(crate) fn render_schema(
-        &self,
-        active: &ActiveConn,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+impl Render for SchemaState {
+    /// The left-sidebar schema explorer: filter · tree · footer.
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (bg_panel, faint) = (theme.bg_panel, theme.text_faint);
         let footer_size = theme.scale(10.);
         let footer_family = theme.font_family.clone();
         let view = cx.entity().downgrade();
-        let s = &active.schema;
+        let s = &*self;
         let filter_text = s.filter.read(cx).content().to_string();
 
         let flat = flatten(s, &filter_text);
@@ -773,10 +845,11 @@ impl AppState {
             .track_scroll(&s.tree_scroll)
             // Keyboard navigation: the sidebar's focus handle lives on the tree,
             // and ↑/↓ / ←/→ / Enter intents drive selection, expansion, and preview.
-            .focus_handle(active.schema_focus.clone())
-            .vim_nav(self.vim_mode())
+            .focus_handle(s.focus.clone())
+            // Straight off the published settings global; no plumbing.
+            .vim_nav(crate::settings::Settings::global(cx).keymap.vim_mode)
             .on_nav(move |nav, _window, cx| {
-                nv.update(cx, |this, cx| this.schema_nav(nav, cx)).ok();
+                nv.update(cx, |this, cx| this.nav(nav, cx)).ok();
             })
             .selected(selected_ix)
             .disclosure(|expanded, _window, cx| {
@@ -809,7 +882,7 @@ impl AppState {
             })
             .on_toggle(move |ix, _window, cx| {
                 if let Some(node) = rows_toggle[ix].node.clone() {
-                    tv.update(cx, |this, cx| this.schema_toggle(node, cx)).ok();
+                    tv.update(cx, |this, cx| this.toggle(node, cx)).ok();
                 }
             })
             // A single body click acts on the row: a table/view opens in a query
@@ -823,32 +896,30 @@ impl AppState {
                 sv.update(cx, |this, cx| match node {
                     Some(NodeId::Object { .. }) => {
                         if let Some(open) = open {
-                            this.schema_open_row(open, cx);
+                            this.open_row(open, cx);
                         }
                     }
                     // A folder row (namespace or object group) has nothing to
                     // open, so a body click is the expand it looks like.
                     Some(node @ (NodeId::Schema(_) | NodeId::Group { .. })) => {
-                        this.schema_select(node.clone(), cx);
-                        this.schema_toggle(node, cx);
+                        this.select_node(node.clone(), cx);
+                        this.toggle(node, cx);
                     }
-                    Some(node) => this.schema_select(node, cx),
+                    Some(node) => this.select_node(node, cx),
                     None => {}
                 })
                 .ok();
             })
             .on_activate(move |ix, _window, cx| {
                 if let Some(open) = rows_activate[ix].open.clone() {
-                    av.update(cx, |this, cx| this.schema_open_row(open, cx))
-                        .ok();
+                    av.update(cx, |this, cx| this.open_row(open, cx)).ok();
                 }
             })
             // Right-click opens the node's action menu. A column row has no
             // actions of its own, so it falls through and opens nothing.
             .on_secondary(move |ix, pos, _window, cx| {
                 if let Some(node) = rows_secondary[ix].node.clone() {
-                    cv.update(cx, |this, cx| this.schema_open_menu(node, pos, cx))
-                        .ok();
+                    cv.update(cx, |this, cx| this.open_menu(node, pos, cx)).ok();
                 }
             });
 
@@ -879,15 +950,14 @@ impl AppState {
             .child(filter_row)
             .child(div().flex_1().min_h(px(0.)).child(tree))
             .child(footer)
-            .children(
-                self.focus_hint(crate::focus::FocusTargetId::Sidebar)
-                    .map(|h| crate::focus_overlay::badge(h, cx)),
-            )
         // The right-click menu is deliberately NOT a child here: it renders at
-        // the shell root (see `render_schema_menu`), because this pane is the
-        // narrow sidebar and would both clip the menu and offset its position.
+        // the shell root (see `AppState::render_schema_menu`), because this pane
+        // is the narrow sidebar and would both clip the menu and offset its
+        // position. The hold-Alt focus badge is likewise drawn by the shell.
     }
+}
 
+impl AppState {
     /// The right-click menu for one tree node. A namespace row offers the
     /// namespace actions (the reason this menu exists: pointing a query at a
     /// database without hand-qualifying every name); an object row offers the
@@ -915,7 +985,7 @@ impl AppState {
                 .item(
                     ContextMenuItem::new("schema-ask-ai", "Ask AI about this").on_click(
                         cx.listener(move |this, _, _, cx| {
-                            this.schema_close_menu(cx);
+                            this.close_menu(cx);
                             this.add_reference(reference.clone(), cx);
                         }),
                     ),
@@ -930,9 +1000,9 @@ impl AppState {
                     ContextMenuItem::new("schema-new-query", "New query here").on_click(
                         cx.listener({
                             let ns = ns.clone();
-                            move |this, _, window, cx| {
-                                this.schema_close_menu(cx);
-                                this.schema_new_query_in(ns.clone(), window, cx);
+                            move |this, _, _window, cx| {
+                                this.close_menu(cx);
+                                this.schema_new_query_in(ns.clone(), cx);
                             }
                         }),
                     ),
@@ -951,7 +1021,7 @@ impl AppState {
                             {
                                 let ns = ns.clone();
                                 move |this, _, _, cx| {
-                                    this.schema_close_menu(cx);
+                                    this.close_menu(cx);
                                     this.set_active_namespace(Some(ns.clone()), cx);
                                 }
                             },
@@ -965,7 +1035,7 @@ impl AppState {
                         {
                             let ns = ns.clone();
                             move |this, _, _, cx| {
-                                this.schema_close_menu(cx);
+                                this.close_menu(cx);
                                 this.open_er_diagram(Some(ns.clone()), cx);
                             }
                         },
@@ -975,7 +1045,7 @@ impl AppState {
                     ContextMenuItem::new("schema-copy-name", "Copy name").on_click(cx.listener({
                         let ns = ns.clone();
                         move |this, _, _, cx| {
-                            this.schema_close_menu(cx);
+                            this.close_menu(cx);
                             this.copy_to_clipboard(ns.clone(), "Name copied", cx);
                         }
                     })),
@@ -987,15 +1057,21 @@ impl AppState {
                 // browsed, and its definition is the only thing there is to see.
                 let kind = active
                     .schema
+                    .read(cx)
                     .schemas
                     .iter()
                     .find(|ns| ns.name == *schema)
                     .and_then(|ns| ns.objects.iter().find(|o| o.name == *name))
                     .map(|o| o.kind)
                     .or_else(|| {
-                        active.schema.groups.iter().find_map(|((ns, k), objs)| {
-                            (ns == schema && objs.iter().any(|o| o.name == *name)).then_some(*k)
-                        })
+                        active
+                            .schema
+                            .read(cx)
+                            .groups
+                            .iter()
+                            .find_map(|((ns, k), objs)| {
+                                (ns == schema && objs.iter().any(|o| o.name == *name)).then_some(*k)
+                            })
                     })
                     .unwrap_or(ObjectKind::Table);
                 if kind.is_relation() {
@@ -1003,7 +1079,7 @@ impl AppState {
                         cx.listener({
                             let (sc, nm) = (sc.clone(), nm.clone());
                             move |this, _, _, cx| {
-                                this.schema_close_menu(cx);
+                                this.close_menu(cx);
                                 this.schema_preview(sc.clone(), nm.clone(), cx);
                             }
                         }),
@@ -1013,7 +1089,7 @@ impl AppState {
                     cx.listener({
                         let (sc, nm) = (sc.clone(), nm.clone());
                         move |this, _, _, cx| {
-                            this.schema_close_menu(cx);
+                            this.close_menu(cx);
                             this.open_object_ddl(sc.clone(), nm.clone(), kind, cx);
                         }
                     }),
@@ -1028,9 +1104,9 @@ impl AppState {
                         ContextMenuItem::new("schema-obj-new-query", "New query here").on_click(
                             cx.listener({
                                 let sc = sc.clone();
-                                move |this, _, window, cx| {
-                                    this.schema_close_menu(cx);
-                                    this.schema_new_query_in(sc.clone(), window, cx);
+                                move |this, _, _window, cx| {
+                                    this.close_menu(cx);
+                                    this.schema_new_query_in(sc.clone(), cx);
                                 }
                             }),
                         ),
@@ -1041,7 +1117,7 @@ impl AppState {
                         cx.listener({
                             let (sc, nm) = (sc.clone(), nm.clone());
                             move |this, _, _, cx| {
-                                this.schema_close_menu(cx);
+                                this.close_menu(cx);
                                 let qualified = format!("{sc}.{nm}");
                                 this.copy_to_clipboard(qualified, "Name copied", cx);
                             }
@@ -1058,7 +1134,7 @@ impl AppState {
                     items = items.item(
                         ContextMenuItem::new("schema-group-refresh", "Refresh").on_click(
                             cx.listener(move |this, _, _, cx| {
-                                this.schema_close_menu(cx);
+                                this.close_menu(cx);
                                 this.schema_reload_group(sc.clone(), k, cx);
                             }),
                         ),
@@ -1067,9 +1143,9 @@ impl AppState {
                     let ns = sc.clone();
                     items = items.item(
                         ContextMenuItem::new("schema-group-new-query", "New query here").on_click(
-                            cx.listener(move |this, _, window, cx| {
-                                this.schema_close_menu(cx);
-                                this.schema_new_query_in(ns.clone(), window, cx);
+                            cx.listener(move |this, _, _window, cx| {
+                                this.close_menu(cx);
+                                this.schema_new_query_in(ns.clone(), cx);
                             }),
                         ),
                     );
@@ -1086,24 +1162,26 @@ impl AppState {
             .inset_0()
             .on_mouse_down(
                 gpui::MouseButton::Left,
-                cx.listener(|this, _, _, cx| this.schema_close_menu(cx)),
+                cx.listener(|this, _, _, cx| this.close_menu(cx)),
             )
             .on_mouse_down(
                 gpui::MouseButton::Right,
-                cx.listener(|this, _, _, cx| this.schema_close_menu(cx)),
+                cx.listener(|this, _, _, cx| this.close_menu(cx)),
             )
             .child(floating(div().occlude().child(items)).at(pos))
     }
+}
 
-    // --- tree interactions ---
+// --- tree interactions ---
 
+impl SchemaState {
     /// Toggle a node's expansion. Expanding an object whose detail isn't cached
     /// fires a lazy `DescribeTable`.
-    pub(crate) fn schema_toggle(&mut self, node: NodeId, cx: &mut Context<Self>) {
+    pub(crate) fn toggle(&mut self, node: NodeId, cx: &mut Context<Self>) {
         let mut describe = None;
         let mut load_group = None;
-        if let Phase::Connected(active) = &mut self.phase {
-            let s = &mut active.schema;
+        {
+            let s = &mut *self;
             if !s.expanded.remove(&node) {
                 match &node {
                     NodeId::Object { schema, name }
@@ -1128,63 +1206,100 @@ impl AppState {
             }
         }
         if let Some((schema, table)) = describe {
-            self.send_active(Command::DescribeTable { schema, table });
+            self.sender.send(Command::DescribeTable { schema, table });
         }
         if let Some((namespace, kind)) = load_group {
-            self.send_active(Command::LoadObjectGroup { namespace, kind });
+            self.sender
+                .send(Command::LoadObjectGroup { namespace, kind });
         }
         cx.notify();
     }
 
     /// Drop one lazy group's cache and re-fetch it, keeping the node expanded so
     /// the refresh reads as a reload rather than a collapse.
+    pub(crate) fn reload_group(
+        &mut self,
+        namespace: String,
+        kind: ObjectKind,
+        cx: &mut Context<Self>,
+    ) {
+        self.groups.remove(&(namespace.clone(), kind));
+        self.groups_loading.insert((namespace.clone(), kind));
+        self.expanded.insert(NodeId::Group {
+            schema: namespace.clone(),
+            kind,
+        });
+        self.sender
+            .send(Command::LoadObjectGroup { namespace, kind });
+        cx.notify();
+    }
+
+    pub(crate) fn select_node(&mut self, node: NodeId, cx: &mut Context<Self>) {
+        self.selected = Some(node);
+        cx.notify();
+    }
+
+    /// Open the right-click menu on `node`, anchored at the click position. Also
+    /// selects the row, so the menu visibly belongs to what was clicked.
+    pub(crate) fn open_menu(
+        &mut self,
+        node: NodeId,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.selected = Some(node.clone());
+        self.menu = Some(SchemaMenu { node, pos });
+        cx.notify();
+    }
+
+    pub(crate) fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            cx.notify();
+        }
+    }
+}
+
+impl AppState {
+    /// Close the tree's context menu. A shim: the menu renders from the shell
+    /// root (see [`Self::render_schema_menu`]) but its state lives on the tree.
+    pub(crate) fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &self.phase {
+            active
+                .schema
+                .clone()
+                .update(cx, |tree, cx| tree.close_menu(cx));
+        }
+    }
+
+    /// Re-fetch one lazy object group (the menu's "Refresh").
     pub(crate) fn schema_reload_group(
         &mut self,
         namespace: String,
         kind: ObjectKind,
         cx: &mut Context<Self>,
     ) {
-        if let Phase::Connected(active) = &mut self.phase {
-            let s = &mut active.schema;
-            s.groups.remove(&(namespace.clone(), kind));
-            s.groups_loading.insert((namespace.clone(), kind));
-            s.expanded.insert(NodeId::Group {
-                schema: namespace.clone(),
-                kind,
-            });
+        if let Phase::Connected(active) = &self.phase {
+            active
+                .schema
+                .clone()
+                .update(cx, |tree, cx| tree.reload_group(namespace, kind, cx));
         }
-        self.send_active(Command::LoadObjectGroup { namespace, kind });
-        cx.notify();
     }
 
-    pub(crate) fn schema_select(&mut self, node: NodeId, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase {
-            active.schema.selected = Some(node);
-        }
-        cx.notify();
-    }
-
-    /// Open the right-click menu on `node`, anchored at the click position. Also
-    /// selects the row, so the menu visibly belongs to what was clicked.
-    pub(crate) fn schema_open_menu(
+    /// React to the schema tree. Expansion, selection, keyboard nav, the filter
+    /// and the catalog fetches are all the tree's own; what reaches here needs
+    /// tabs, results or panels.
+    pub(crate) fn on_schema_event(
         &mut self,
-        node: NodeId,
-        pos: gpui::Point<gpui::Pixels>,
+        _tree: gpui::Entity<SchemaState>,
+        event: &SchemaEvent,
         cx: &mut Context<Self>,
     ) {
-        if let Phase::Connected(active) = &mut self.phase {
-            active.schema.selected = Some(node.clone());
-            active.schema.menu = Some(SchemaMenu { node, pos });
+        match event.clone() {
+            SchemaEvent::Preview { schema, name } => self.open_table_browse(schema, name, None, cx),
+            SchemaEvent::Ddl { schema, name, kind } => self.open_object_ddl(schema, name, kind, cx),
         }
         cx.notify();
-    }
-
-    pub(crate) fn schema_close_menu(&mut self, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase
-            && active.schema.menu.take().is_some()
-        {
-            cx.notify();
-        }
     }
 
     /// Set the connection-level namespace every new tab (and any tab without its
@@ -1262,12 +1377,7 @@ impl AppState {
 
     /// Open a blank query tab bound to `namespace` — the tree's "New query here".
     /// The tab carries its own override, so two tabs can sit on two databases.
-    pub(crate) fn schema_new_query_in(
-        &mut self,
-        namespace: String,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn schema_new_query_in(&mut self, namespace: String, cx: &mut Context<Self>) {
         self.new_query(cx);
         if let Phase::Connected(active) = &mut self.phase
             && active.config.kind.namespace_caps().settable
@@ -1288,26 +1398,24 @@ impl AppState {
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
         self.notify(ToastVariant::Success, message, cx);
     }
+}
 
+impl SchemaState {
     /// Drive the schema tree from the keyboard (the focused sidebar's arrows +
     /// Enter). Recomputes the same flattened, filtered visible list the render
     /// uses, then moves the selection, toggles expansion, or previews, reusing
     /// the existing click/double-click handlers so keyboard and mouse stay in step.
-    fn schema_nav(&mut self, nav: TreeNav, cx: &mut Context<Self>) {
+    fn nav(&mut self, nav: TreeNav, cx: &mut Context<Self>) {
         // Snapshot the visible rows (owned, so no borrow of `self` is held while
         // the mutating handlers below run) and the selected row's position.
-        let (flat, sel) = match &self.phase {
-            Phase::Connected(active) => {
-                let s = &active.schema;
-                let filter = s.filter.read(cx).content().to_string();
-                let flat = flatten(s, &filter);
-                let sel = s
-                    .selected
-                    .as_ref()
-                    .and_then(|n| flat.iter().position(|r| r.node.as_ref() == Some(n)));
-                (flat, sel)
-            }
-            _ => return,
+        let (flat, sel) = {
+            let filter = self.filter.read(cx).content().to_string();
+            let flat = flatten(self, &filter);
+            let sel = self
+                .selected
+                .as_ref()
+                .and_then(|n| flat.iter().position(|r| r.node.as_ref() == Some(n)));
+            (flat, sel)
         };
         if flat.is_empty() {
             return;
@@ -1316,12 +1424,12 @@ impl AppState {
         match nav {
             TreeNav::Up => {
                 if let Some(ix) = next_navigable(&flat, sel, false) {
-                    self.schema_focus_row(&flat, ix, cx);
+                    self.focus_row(&flat, ix, cx);
                 }
             }
             TreeNav::Down => {
                 if let Some(ix) = next_navigable(&flat, sel, true) {
-                    self.schema_focus_row(&flat, ix, cx);
+                    self.focus_row(&flat, ix, cx);
                 }
             }
             TreeNav::Expand => {
@@ -1329,12 +1437,12 @@ impl AppState {
                 let row = &flat[i];
                 if row.item.has_children && !row.item.expanded {
                     if let Some(node) = row.node.clone() {
-                        self.schema_toggle(node, cx);
+                        self.toggle(node, cx);
                     }
                 } else if row.item.expanded {
                     // Already open: descend to the first child (next row down).
                     if let Some(ix) = next_navigable(&flat, sel, true) {
-                        self.schema_focus_row(&flat, ix, cx);
+                        self.focus_row(&flat, ix, cx);
                     }
                 }
             }
@@ -1343,13 +1451,13 @@ impl AppState {
                 let row = &flat[i];
                 if row.item.has_children && row.item.expanded {
                     if let Some(node) = row.node.clone() {
-                        self.schema_toggle(node, cx);
+                        self.toggle(node, cx);
                     }
                 } else if row.item.depth > 0 {
                     // A leaf or collapsed node: jump to the parent (nearest row
                     // above at a shallower depth).
                     if let Some(p) = (0..i).rev().find(|&j| flat[j].item.depth < row.item.depth) {
-                        self.schema_focus_row(&flat, p, cx);
+                        self.focus_row(&flat, p, cx);
                     }
                 }
             }
@@ -1357,27 +1465,25 @@ impl AppState {
                 let Some(i) = sel else { return };
                 let row = &flat[i];
                 if let Some(open) = row.open.clone() {
-                    self.schema_open_row(open, cx);
+                    self.open_row(open, cx);
                 } else if row.item.has_children
                     && let Some(node) = row.node.clone()
                 {
-                    self.schema_toggle(node, cx);
+                    self.toggle(node, cx);
                 }
             }
         }
     }
 
     /// Select the row at flat index `ix` and scroll it into view.
-    fn schema_focus_row(&mut self, flat: &[VisibleRow], ix: usize, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase {
+    fn focus_row(&mut self, flat: &[VisibleRow], ix: usize, cx: &mut Context<Self>) {
+        {
             if let Some(node) = flat[ix].node.clone() {
-                active.schema.selected = Some(node);
+                self.selected = Some(node);
             }
             // Non-strict: only scrolls when the row is off-screen, so stepping
             // through visible rows doesn't yank the list on every keypress.
-            active
-                .schema
-                .tree_scroll
+            self.tree_scroll
                 .scroll_to_item(ix, gpui::ScrollStrategy::Top);
         }
         cx.notify();
@@ -1386,32 +1492,41 @@ impl AppState {
     /// Open a tree row, whichever of the two that means for it (see [`RowOpen`]).
     /// The one place a click, an Enter, and a double-click agree on what opening a
     /// row does.
-    fn schema_open_row(&mut self, open: RowOpen, cx: &mut Context<Self>) {
+    fn open_row(&mut self, open: RowOpen, cx: &mut Context<Self>) {
         match open {
-            RowOpen::Browse { schema, name } => self.schema_preview(schema, name, cx),
+            RowOpen::Browse { schema, name } => {
+                // Highlight what was opened, so the tree agrees with the tab.
+                self.selected = Some(NodeId::Object {
+                    schema: schema.clone(),
+                    name: name.clone(),
+                });
+                cx.emit(SchemaEvent::Preview { schema, name });
+            }
             RowOpen::Ddl { schema, name, kind } => {
-                // Highlight it like a browse does, so the tree agrees with the tab
-                // that just opened.
-                if let Phase::Connected(active) = &mut self.phase {
-                    active.schema.selected = Some(NodeId::Object {
-                        schema: schema.clone(),
-                        name: name.clone(),
-                    });
-                }
-                self.open_object_ddl(schema, name, kind, cx);
+                self.selected = Some(NodeId::Object {
+                    schema: schema.clone(),
+                    name: name.clone(),
+                });
+                cx.emit(SchemaEvent::Ddl { schema, name, kind });
             }
         }
     }
+}
 
+impl AppState {
     /// Preview a table/view: open `SELECT * FROM schema.table` in a **new** query
     /// tab so the user's current query and result are preserved. No `LIMIT`; the
     /// grid pages through it with flat memory. The new tab's editor is pre-filled.
     pub(crate) fn schema_preview(&mut self, schema: String, table: String, cx: &mut Context<Self>) {
         // Highlight the previewed object in the sidebar tree, then open it.
-        if let Phase::Connected(active) = &mut self.phase {
-            active.schema.selected = Some(NodeId::Object {
+        if let Phase::Connected(active) = &self.phase {
+            let node = NodeId::Object {
                 schema: schema.clone(),
                 name: table.clone(),
+            };
+            active.schema.clone().update(cx, |tree, cx| {
+                tree.selected = Some(node);
+                cx.notify();
             });
         }
         self.open_table_browse(schema, table, None, cx);

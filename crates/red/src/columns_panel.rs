@@ -74,6 +74,7 @@ impl AppState {
                 opened
                     && !active
                         .schema
+                        .read(cx)
                         .details
                         .contains_key(&(ref_schema.clone(), ref_table.clone()))
             }
@@ -240,10 +241,14 @@ impl AppState {
         let Some(grid) = active.active_result() else {
             return;
         };
+        // Cloned out of the tree entity: the recursion below needs `&mut cx`,
+        // which a live `read(cx)` borrow would forbid.
         let Some(detail) = active
             .schema
+            .read(cx)
             .details
             .get(&(schema.to_string(), table.to_string()))
+            .cloned()
         else {
             // Expanded but not yet described (large-schema lazy fetch in flight).
             out.push(
@@ -261,7 +266,7 @@ impl AppState {
         for col in &detail.columns {
             let mut col_path = prefix.to_vec();
             col_path.push(col.name.clone());
-            let target = fk_target(&active.fk_graph, schema, table, &col.name);
+            let target = fk_target(&active.schema.read(cx).fk_graph, schema, table, &col.name);
             let is_fk = target.is_some();
             let expanded = is_fk && grid.is_tree_expanded(&col_path);
             // A reference column (depth >= 1) carries a checkbox to add it; base

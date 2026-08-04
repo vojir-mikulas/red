@@ -15,8 +15,6 @@ pub(crate) const TITLEBAR_LEFT_INSET: f32 = 88.;
 #[cfg(not(target_os = "macos"))]
 pub(crate) const TITLEBAR_LEFT_INSET: f32 = 12.;
 
-use std::rc::Rc;
-
 use crate::app::{ActiveConn, AppState, Phase, TabWorkspace};
 use crate::editor::TabDrag;
 use crate::panes::{MIN_PANE_WEIGHT, drop_overlay, path_id};
@@ -107,7 +105,14 @@ impl AppState {
 
         // Innermost column boundary: Schema | (columns | editor / results).
         let with_schema = if show_schema {
-            let schema_pane = self.render_schema(active, window, cx);
+            let schema_pane = div()
+                .relative()
+                .size_full()
+                .child(active.schema.clone())
+                .children(
+                    self.focus_hint(crate::focus::FocusTargetId::Sidebar)
+                        .map(|h| crate::focus_overlay::badge(h, cx)),
+                );
             let start = view.clone();
             let resize = view.clone();
             let end = view.clone();
@@ -159,7 +164,18 @@ impl AppState {
 
         // Outermost column boundary: History | (server | schema | editor / results).
         let workspace = if show_history {
-            let history_pane = self.render_history(active, cx);
+            // The dock renders itself; the hold-Alt hint badge stays here
+            // because only `AppState` knows whether hints are showing and which
+            // key this surface drew. The wrapper is the badge's positioning
+            // context (it is `absolute`), so it must be `relative` + full size.
+            let history_pane = div()
+                .relative()
+                .size_full()
+                .child(active.history_panel.clone())
+                .children(
+                    self.focus_hint(crate::focus::FocusTargetId::History)
+                        .map(|h| crate::focus_overlay::badge(h, cx)),
+                );
             let start = view.clone();
             let resize = view.clone();
             let end = view.clone();
@@ -537,9 +553,16 @@ impl AppState {
         // The schema tree's right-click menu renders here, at the root, so its
         // full-window dismiss catcher covers the whole shell and its
         // window-coordinate anchor isn't offset by the sidebar's origin.
-        let schema_menu = active
+        let open_menu = active
             .schema
+            .read(cx)
             .menu
+            .as_ref()
+            .map(|m| crate::schema::SchemaMenu {
+                node: m.node.clone(),
+                pos: m.pos,
+            });
+        let schema_menu = open_menu
             .as_ref()
             .map(|m| self.render_schema_menu(active, m, cx));
 
@@ -1048,120 +1071,29 @@ impl AppState {
     /// (past console commands), with a search box on top. Keys re-open the
     /// inspector; commands seed the console. Pure adapter over the shared
     /// [`crate::history_panel`] renderer, sharing the `query_history` store.
-    fn render_kv_history(
-        &self,
-        active: &ActiveConn,
+    /// React to the Redis History dock. Search, collapse and command-row
+    /// deletes it does itself; what reaches here needs the tab machinery or the
+    /// persisted recent-keys store, both of which live on `AppState`.
+    pub(crate) fn on_kv_history_event(
+        &mut self,
+        session: red_service::SessionId,
+        event: &crate::kvhistory::KvHistoryPanelEvent,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        use crate::history_panel::{HistoryPanelSpec, HistoryRow, HistorySection};
-
-        let session = active.session;
-        let commands = self.query_history.for_conn(&active.conn_id);
-        let keys: Vec<crate::kvbrowse::RecentKey> = active
-            .kv_view
-            .as_ref()
-            .map(|v| v.recent_keys.clone())
-            .unwrap_or_default();
-        let (keys_collapsed, cmds_collapsed) = active
-            .kv_view
-            .as_ref()
-            .map(|v| (v.recent_keys_collapsed, v.commands_collapsed))
-            .unwrap_or((false, false));
-        let has_any = !keys.is_empty() || !commands.is_empty();
-
-        let query = active
-            .history_search
-            .read(cx)
-            .content()
-            .trim()
-            .to_lowercase();
-        let searching = !query.is_empty();
-
-        // Recently-viewed keys → rows (badged with the value type).
-        let key_rows: Vec<HistoryRow> = keys
-            .into_iter()
-            .filter(|r| !searching || r.key.to_lowercase().contains(&query))
-            .map(|r| {
-                let (key, kv_type, ttl) = (r.key.clone(), r.kv_type.clone(), r.ttl);
-                let remove_key = r.key.clone();
-                HistoryRow {
-                    primary: r.key.into(),
-                    secondary: red_config::history::relative_time(r.viewed_unix).into(),
-                    badge: Some(kv_type.label().to_string().into()),
-                    nav_index: None,
-                    activate: Rc::new(move |this: &mut AppState, _replace, cx| {
-                        this.kv_open_recent_key(session, key.clone(), kv_type.clone(), ttl, cx);
-                    }),
-                    delete: Some(Rc::new(move |this: &mut AppState, cx| {
-                        this.kv_remove_recent_key(session, remove_key.clone(), cx);
-                    })),
-                }
-            })
-            .collect();
-
-        // Past console commands → rows.
-        let cmd_rows: Vec<HistoryRow> = commands
-            .into_iter()
-            .filter(|e| !searching || e.sql.to_lowercase().contains(&query))
-            .map(|entry| {
-                let cmd = entry.sql.clone();
-                let id = entry.id;
-                HistoryRow {
-                    primary: crate::editor::history_label(&entry.sql).into(),
-                    secondary: red_config::history::relative_time(entry.ran_unix).into(),
-                    badge: None,
-                    nav_index: None,
-                    activate: Rc::new(move |this: &mut AppState, _replace, cx| {
-                        this.kv_seed_console(session, cmd.clone(), cx);
-                    }),
-                    delete: Some(Rc::new(move |this: &mut AppState, cx| {
-                        this.delete_history(id, cx)
-                    })),
-                }
-            })
-            .collect();
-
-        let mut sections: Vec<HistorySection> = Vec::new();
-        if !key_rows.is_empty() {
-            sections.push(HistorySection {
-                key: "recent-keys",
-                title: Some("Recently viewed keys".into()),
-                collapsed: !searching && keys_collapsed,
-                toggle: Some(Rc::new(move |this: &mut AppState, cx| {
-                    this.kv_toggle_recent_keys(session, cx)
-                })),
-                rows: key_rows,
-            });
+    ) {
+        use crate::kvhistory::KvHistoryPanelEvent as E;
+        match event {
+            E::OpenKey { key, kv_type, ttl } => {
+                self.kv_open_recent_key(session, key.clone(), kv_type.clone(), *ttl, cx)
+            }
+            E::RemoveKey { key } => self.kv_remove_recent_key(session, key.clone(), cx),
+            E::SeedConsole { command } => self.kv_seed_console(session, command.clone(), cx),
+            E::ClearAll => {
+                self.clear_history(cx);
+                self.kv_clear_recent_keys(session, cx);
+            }
+            E::Close => self.toggle_history(cx),
         }
-        if !cmd_rows.is_empty() {
-            sections.push(HistorySection {
-                key: "commands",
-                title: Some("Commands".into()),
-                collapsed: !searching && cmds_collapsed,
-                toggle: Some(Rc::new(move |this: &mut AppState, cx| {
-                    this.kv_toggle_commands(session, cx)
-                })),
-                rows: cmd_rows,
-            });
-        }
-
-        let spec = HistoryPanelSpec {
-            sections,
-            empty_text: if searching {
-                "No matches".into()
-            } else {
-                "Nothing yet".into()
-            },
-            show_clear: has_any,
-            on_clear: Rc::new(move |this: &mut AppState, cx| {
-                this.clear_history(cx);
-                this.kv_clear_recent_keys(session, cx);
-            }),
-            search: Some(active.history_search.clone()),
-            nav: None,
-            selected: None,
-        };
-        self.render_history_panel(spec, cx)
+        cx.notify();
     }
 
     /// The tab right-click context menu (Pin/Unpin · Close · Move to other pane).
@@ -1579,7 +1511,21 @@ impl AppState {
         // Optional left History dock (⌘Y), mirroring the SQL shell's history
         // dock: a leading resizable SplitPane over the work area.
         let workspace = if active.history_open {
-            let history_pane = self.render_kv_history(active, cx);
+            // The dock renders itself; the hold-Alt hint badge stays here (see
+            // the SQL side for why the wrapper must be `relative` + full size).
+            let history_pane = div()
+                .relative()
+                .size_full()
+                .children(
+                    active
+                        .kv_view
+                        .as_ref()
+                        .map(|v| v.history_panel.clone().into_any_element()),
+                )
+                .children(
+                    self.focus_hint(crate::focus::FocusTargetId::History)
+                        .map(|h| crate::focus_overlay::badge(h, cx)),
+                );
             let start = view.clone();
             let resize = view.clone();
             let end = view.clone();

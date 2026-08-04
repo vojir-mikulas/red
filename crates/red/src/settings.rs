@@ -61,7 +61,50 @@ pub struct Settings {
     pub keymap: KeymapSettings,
 }
 
+/// The published copy of [`Settings`], readable by any view from an `&App`.
+///
+/// [`AppState`](crate::app::AppState) remains the owner and the only writer;
+/// this is a mirror it republishes from the two paths every settings change
+/// already funnels through (see [`Settings::publish`]). It exists because RED's
+/// surfaces are becoming their own views, and a view that needs a setting
+/// should not have to be handed it at construction and told again on every
+/// change — that plumbing is per-view, per-setting, and easy to forget.
+///
+/// Mirrors Zed's `SettingsStore` global, minus the layered sources and the
+/// per-setting registration RED does not need: `settings_reg.rs` already covers
+/// what those buy.
+struct GlobalSettings(Settings);
+
+impl gpui::Global for GlobalSettings {}
+
 impl Settings {
+    /// The current settings, from anywhere with an `&App`.
+    ///
+    /// # Panics
+    ///
+    /// If called before the first [`publish`](Self::publish). `AppState::new`
+    /// publishes before it builds anything, so every view is safe; a test that
+    /// renders a view in isolation has to publish first.
+    pub(crate) fn global(cx: &gpui::App) -> &Settings {
+        &cx.global::<GlobalSettings>().0
+    }
+
+    /// Republish these settings to every reader.
+    ///
+    /// **Call this from anywhere that changes `AppState::settings`.** Today that
+    /// is `AppState::new` (startup), `apply_settings_effects` (which both the
+    /// in-app edit funnel and the file watcher run through), and the ACP
+    /// subscription defaults, which write and save without a full effects pass.
+    /// Publishing is idempotent, so overlapping call sites are fine and belt-
+    /// and-braces is the right default: a missed one means a view silently reads
+    /// a stale value.
+    ///
+    /// `cx.set_global` notifies `cx.observe_global::<GlobalSettings>` watchers,
+    /// so a view that must *re-render* on a change observes rather than polls.
+    pub(crate) fn publish(&self, cx: &mut gpui::App) {
+        cx.set_global(GlobalSettings(self.clone()));
+    }
+
     /// Clamp every bounded knob into the range the app will accept, so a stray
     /// hand-edit (`0`, negative, NaN, absurdly large) can't break layout, thrash
     /// memory, or spin a scanner.
@@ -1568,6 +1611,44 @@ fn lift<T: Default + DeserializeOwned>(
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// The invariant the whole published-global design rests on: `publish`
+    /// replaces what `global` returns, and `set_global` wakes `observe_global`
+    /// watchers so a view re-renders rather than reading a stale value.
+    ///
+    /// If this breaks, views silently render yesterday's settings. The three
+    /// call sites that must publish are listed on [`Settings::publish`].
+    #[gpui::test]
+    fn publishing_replaces_the_global_and_notifies_observers(cx: &mut gpui::TestAppContext) {
+        use std::cell::Cell;
+        use std::rc::Rc;
+
+        let woke = Rc::new(Cell::new(0usize));
+        let _sub = cx.update(|cx| {
+            let mut settings = Settings::default();
+            settings.keymap.vim_mode = false;
+            settings.publish(cx);
+            assert!(!Settings::global(cx).keymap.vim_mode);
+
+            let woke = woke.clone();
+            cx.observe_global::<GlobalSettings>(move |_| woke.set(woke.get() + 1))
+        });
+
+        cx.update(|cx| {
+            let mut settings = Settings::default();
+            settings.keymap.vim_mode = true;
+            settings.publish(cx);
+        });
+        cx.run_until_parked();
+
+        cx.update(|cx| {
+            assert!(
+                Settings::global(cx).keymap.vim_mode,
+                "the reader sees the new value"
+            );
+        });
+        assert_eq!(woke.get(), 1, "and an observer was woken exactly once");
+    }
 
     /// A throwaway store under a unique temp dir, dropped via [`TempStore`] which
     /// cleans up the directory on `Drop` (no `tempfile` dependency in the tree).

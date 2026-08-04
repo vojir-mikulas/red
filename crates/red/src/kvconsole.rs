@@ -346,8 +346,9 @@ impl AppState {
             .map(|a| a.conn_id.clone())
             .unwrap_or_default();
         if !conn_id.is_empty() {
-            self.query_history
-                .record(&conn_id, &crate::kvbrowse::join_redis_argv(&argv));
+            self.query_history.update(cx, |store, _| {
+                store.record(&conn_id, &crate::kvbrowse::join_redis_argv(&argv))
+            });
         }
         let Some(console) = self
             .conn_mut(Some(session))
@@ -461,10 +462,11 @@ impl AppState {
             .map(|a| a.conn_id.clone())
             .unwrap_or_default();
         if !conn_id.is_empty() {
-            for argv in &commands {
-                self.query_history
-                    .record(&conn_id, &crate::kvbrowse::join_redis_argv(argv));
-            }
+            self.query_history.update(cx, |store, _| {
+                for argv in &commands {
+                    store.record(&conn_id, &crate::kvbrowse::join_redis_argv(argv));
+                }
+            });
         }
         let Some(console) = self
             .conn_mut(Some(session))

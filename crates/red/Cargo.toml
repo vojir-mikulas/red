@@ -69,6 +69,13 @@ hex.workspace = true
 # macOS uses font-kit (CoreText) for font loading; Windows/Linux use GPUI's own
 # backend. Features are additive, so this only adds to the base workspace deps.
 # The per-OS keychain backend now lives in `red-config` (shared with the CLI).
+# The gpui view harness: `#[gpui::test]` plus `TestAppContext`, which builds a
+# real window on a deterministic executor (no sleeps, no flakes). Test-only, so a
+# release build carries none of it. See docs/plans/todo/zed-architecture-inspiration.md
+# (Tier 4) — this is what lets an extracted view be tested as a view.
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 gpui = { workspace = true, features = ["font-kit"] }
 gpui_platform = { workspace = true, features = ["font-kit"] }

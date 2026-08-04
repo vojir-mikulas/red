@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use flint::prelude::*;
 use flint::{CodeEditor, CodeEditorEvent, TextInput, TextInputEvent};
-use gpui::{AsyncApp, Context, SharedString, WeakEntity, Window, prelude::*};
+use gpui::{App, AsyncApp, Context, SharedString, WeakEntity, Window, prelude::*};
 
 use crate::app::{ActiveConn, AppState, Phase};
 
@@ -249,7 +249,7 @@ impl AppState {
     /// and every foreign key touching it, in both directions. The connection-wide
     /// FK graph is loaded once at connect, so the inbound references are always
     /// available even for a table that was never expanded.
-    pub(crate) fn review_schema_context(&self, table: Option<&str>) -> String {
+    pub(crate) fn review_schema_context(&self, table: Option<&str>, cx: &App) -> String {
         let Phase::Connected(active) = &self.phase else {
             return String::new();
         };
@@ -261,12 +261,13 @@ impl AppState {
                 .unwrap_or(t)
                 .trim_matches(['"', '`', '[', ']'].as_slice())
         }) else {
-            return summarize_schema(&active.schema.schemas);
+            return summarize_schema(&active.schema.read(cx).schemas);
         };
 
         let mut out = String::new();
         if let Some((_, detail)) = active
             .schema
+            .read(cx)
             .details
             .iter()
             .find(|((_, name), _)| name.eq_ignore_ascii_case(bare))
@@ -284,7 +285,7 @@ impl AppState {
         // what this table depends on, inbound keys say what breaks if it goes.
         let mut inbound = Vec::new();
         let mut outbound = Vec::new();
-        for e in &active.fk_graph {
+        for e in &active.schema.read(cx).fk_graph {
             let cols = |pairs: &[(String, String)]| {
                 pairs
                     .iter()
@@ -319,7 +320,7 @@ impl AppState {
         // Nothing focused to say (an unexpanded table on a connection whose FK graph
         // failed to load): fall back to the catalog so the model has *something*.
         if out.is_empty() {
-            return summarize_schema(&active.schema.schemas);
+            return summarize_schema(&active.schema.read(cx).schemas);
         }
         out
     }
@@ -1525,6 +1526,9 @@ impl AppState {
             }
             _ => {}
         }
+        // These three write and save without a full effects pass, so they have to
+        // republish themselves; see `Settings::publish`.
+        self.settings.publish(cx);
         self.send_set_config_option(conversation_id, config_id, value, boolean, cx);
         cx.notify();
     }
@@ -2264,7 +2268,7 @@ impl AppState {
             s
         });
         red_service::AiContext {
-            schema_summary: summarize_schema(&active.schema.schemas),
+            schema_summary: summarize_schema(&active.schema.read(cx).schemas),
             // The key the query history and the recent-keys store are filed under;
             // the service has no other way to know which saved connection this is.
             conn_id: active.conn_id.clone(),

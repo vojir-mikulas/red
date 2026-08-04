@@ -622,6 +622,62 @@ impl RecentKey {
 /// How many recently-viewed keys to retain per connection.
 const MAX_RECENT_KEYS: usize = 50;
 
+/// The connection's recently-viewed keys, newest-first: browser history for the
+/// keyspace, shown in the History dock's Keys section.
+///
+/// A model entity ([`RedisView::recent_keys`] holds the handle, and so does the
+/// History dock view) for the same reason `AppState::query_history` is one: the
+/// dock re-derives its rows from this every frame and `cx.observe`s it, so
+/// viewing a key redraws the dock without anything having to push into it.
+/// Persistence stays on `AppState`, which owns the on-disk store.
+#[derive(Default)]
+pub(crate) struct RecentKeys {
+    items: Vec<RecentKey>,
+}
+
+impl RecentKeys {
+    pub(crate) fn items(&self) -> &[RecentKey] {
+        &self.items
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    /// Push `key` to the front, deduped against an earlier view of the same key
+    /// and capped at [`MAX_RECENT_KEYS`].
+    pub(crate) fn record(&mut self, key: String, kv_type: KvType, ttl: Option<Duration>) {
+        self.items.retain(|r| r.key != key);
+        self.items.insert(
+            0,
+            RecentKey {
+                key,
+                kv_type,
+                ttl,
+                viewed_unix: crate::conversations::now_unix(),
+            },
+        );
+        self.items.truncate(MAX_RECENT_KEYS);
+    }
+
+    /// Drop one key. Returns whether anything was removed, so the caller only
+    /// persists on a real change.
+    pub(crate) fn remove(&mut self, key: &str) -> bool {
+        let before = self.items.len();
+        self.items.retain(|r| r.key != key);
+        self.items.len() != before
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.items.clear();
+    }
+
+    /// Replace the whole list (restoring the persisted list at connect).
+    pub(crate) fn seed(&mut self, items: Vec<RecentKey>) {
+        self.items = items;
+    }
+}
+
 /// The per-kind state a Redis tab holds. Heterogeneous, unlike the SQL side's
 /// homogeneous `QueryTab` — a Browse tab and a Monitor tab are structurally
 /// different, so the tab wraps this enum.
@@ -683,8 +739,9 @@ pub(crate) struct RedisView {
     /// before it knows rather than more.
     pub(crate) modules: KvModules,
     /// Recently-viewed keys, newest-first (browser-history for the keyspace),
-    /// shown in the History dock's Keys section.
-    pub(crate) recent_keys: Vec<RecentKey>,
+    /// shown in the History dock's Keys section. A model entity; see
+    /// [`RecentKeys`].
+    pub(crate) recent_keys: gpui::Entity<RecentKeys>,
     /// How the work area is divided, which pane has focus, and the per-pane
     /// state (active tab, strip scroll). Shared with the SQL and MongoDB sides.
     pub(crate) layout: PaneLayout,
@@ -715,10 +772,10 @@ pub(crate) struct RedisView {
     /// focused half's chooser binds it (see `render_kv_new_tab`).
     pub(crate) new_tab_focus: FocusHandle,
     pub(crate) new_tab_sel: usize,
-    /// History-dock section collapse (in-memory, reset per session). Default
-    /// expanded. See [`crate::history_panel`].
-    pub(crate) recent_keys_collapsed: bool,
-    pub(crate) commands_collapsed: bool,
+    /// The Redis History dock, as a view: it owns its own search box, focus and
+    /// section collapse, and holds the two stores it draws from. See
+    /// [`crate::kvhistory::KvHistoryPanel`].
+    pub(crate) history_panel: gpui::Entity<crate::kvhistory::KvHistoryPanel>,
 }
 
 /// The open key context menu: which key it targets (with the type/TTL captured
@@ -1529,7 +1586,24 @@ impl SplitWorkspace for RedisView {
 
 impl RedisView {
     /// `mode` is `kv.default_query_mode`, for the first Browse tab.
-    pub(crate) fn new(session: SessionId, mode: QueryMode, cx: &mut Context<AppState>) -> Self {
+    /// `commands` is the shared query-history log, which the History dock's
+    /// Commands section reads (see [`crate::kvhistory`]).
+    pub(crate) fn new(
+        session: SessionId,
+        conn_id: String,
+        mode: QueryMode,
+        commands: gpui::Entity<red_config::history::QueryHistory>,
+        cx: &mut Context<AppState>,
+    ) -> Self {
+        let recent_keys = cx.new(|_| RecentKeys::default());
+        let history_panel = {
+            let recent_keys = recent_keys.clone();
+            cx.new(|cx| crate::kvhistory::KvHistoryPanel::new(conn_id, commands, recent_keys, cx))
+        };
+        cx.subscribe(&history_panel, move |this, _panel, event, cx| {
+            this.on_kv_history_event(session, event, cx)
+        })
+        .detach();
         let browse = RedisTabState::Browse(Box::new(BrowseState::new(session, mode, cx)));
         Self {
             tabs: vec![RedisTab {
@@ -1542,7 +1616,8 @@ impl RedisView {
             tab_seq: 1,
             db_size: None,
             modules: KvModules::NONE,
-            recent_keys: Vec::new(),
+            recent_keys,
+            history_panel,
             layout: PaneLayout::new(),
             tab_menu: None,
             key_menu: None,
@@ -1553,8 +1628,6 @@ impl RedisView {
             export: None,
             new_tab_focus: cx.focus_handle(),
             new_tab_sel: 0,
-            recent_keys_collapsed: false,
-            commands_collapsed: false,
         }
     }
 

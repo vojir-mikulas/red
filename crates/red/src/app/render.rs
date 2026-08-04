@@ -223,7 +223,7 @@ impl Render for AppState {
         if self.focus_history {
             self.focus_history = false;
             if let Phase::Connected(active) = &self.phase {
-                window.focus(&active.history_focus.clone(), cx);
+                window.focus(&active.history_panel.focus_handle(cx), cx);
             }
         }
 
@@ -346,7 +346,11 @@ impl Render for AppState {
                 .confirm_input
                 .as_ref()
                 .map(|typed| typed.input.focus_handle(cx))
-                .or_else(|| self.knowledge_editor.as_ref().map(|k| k.focus_handle(cx)));
+                .or_else(|| {
+                    self.knowledge_editor
+                        .as_ref()
+                        .map(|(view, _)| view.focus_handle(cx))
+                });
             match inner {
                 Some(handle) => window.focus(&handle, cx),
                 None => window.focus(&self.modal_focus.clone(), cx),
@@ -636,7 +640,7 @@ impl Render for AppState {
             .on_action(cx.listener(|this, _: &ShowShortcuts, _, cx| this.toggle_shortcuts(cx)))
             .on_action(cx.listener(|this, _: &ShowChangelog, _, cx| this.toggle_whats_new(cx)))
             .on_action(cx.listener(|this, _: &ShowErDiagram, _, cx| {
-                let ns = this.er_target_namespace();
+                let ns = this.er_target_namespace(cx);
                 this.open_er_diagram(ns, cx)
             }))
             // Settings panel: ⌘, and the RED → Settings… / About RED menu items.
@@ -775,8 +779,9 @@ impl Render for AppState {
             // the switcher's "New connection…").
             .children(self.form.as_ref().map(|f| self.render_form(f, cx)))
             // The "Database knowledge" editor, root-mounted so it overlays the
-            // whole shell like the other modals.
-            .children(self.render_knowledge_modal(cx))
+            // whole shell like the other modals. A view: it renders itself, and
+            // its own `cx.notify()` repaints it without touching this frame.
+            .children(self.knowledge_editor.as_ref().map(|(view, _)| view.clone()))
             // The Redis "New key" modal, rooted here so it overlays the whole
             // shell (not just the browse pane) like the other modals.
             .children(self.render_kv_create_modal(cx))

@@ -15,9 +15,9 @@
 //! play. Drawing every database of a MySQL server at once was both wrong (unrelated
 //! databases share no FK edges, so the layering interleaves disconnected components
 //! into one column stack) and ruinously slow. All the data is already resident after
-//! connect: table names live in `active.schema.schemas`, columns in
-//! `active.schema.details` (eagerly prefetched), and the relation graph in
-//! `active.fk_graph`. So opening the diagram costs no new backend round-trip beyond
+//! connect: table names live in `active.schema.read(cx).schemas`, columns in
+//! `active.schema.read(cx).details` (eagerly prefetched), and the relation graph in
+//! `active.schema.read(cx).fk_graph`. So opening the diagram costs no new backend round-trip beyond
 //! topping up any missing table details. Boxes are absolutely-positioned divs; the
 //! connectors are painted into a single `canvas` beneath them with `paint_path`. They
 //! started out as axis-aligned divs (three per edge), which a dense schema turned into
@@ -39,7 +39,7 @@ use std::rc::Rc;
 use flint::prelude::*;
 use flint::{Button, ButtonSize, ButtonVariant};
 use gpui::{
-    AnyElement, Context, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
+    AnyElement, App, Context, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
     PathBuilder, Pixels, Point, ScrollDelta, ScrollWheelEvent, Window, canvas, div, prelude::*, px,
 };
 use red_core::ObjectKind;
@@ -172,9 +172,9 @@ impl ErView {
     /// Build the diagram from the connection's resident schema + FK graph: create a
     /// box per table in `namespace` (or in every schema when `None`), resolve FK
     /// edges to node indices, and lay it out.
-    fn build(active: &ActiveConn, namespace: Option<String>) -> Self {
+    fn build(active: &ActiveConn, namespace: Option<String>, cx: &App) -> Self {
         let mut nodes: Vec<ErNode> = Vec::new();
-        for sc in &active.schema.schemas {
+        for sc in &active.schema.read(cx).schemas {
             if !in_namespace(&sc.name, namespace.as_deref()) {
                 continue;
             }
@@ -187,6 +187,7 @@ impl ErView {
                 }
                 let ncols = active
                     .schema
+                    .read(cx)
                     .details
                     .get(&(sc.name.clone(), obj.name.clone()))
                     .map(|d| d.columns.len());
@@ -227,7 +228,7 @@ impl ErView {
         // left→right layering (referenced tables sit to the left of their referrers).
         let mut parents: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
         let mut edges: Vec<ErEdge> = Vec::new();
-        for e in &active.fk_graph {
+        for e in &active.schema.read(cx).fk_graph {
             let (Some(a), Some(b)) = (
                 resolve(&e.from_schema, &e.from_table),
                 resolve(&e.to_schema, &e.to_table),
@@ -891,7 +892,9 @@ impl AppState {
         let Phase::Connected(active) = &self.phase else {
             return;
         };
-        tab.view = Some(crate::app::TabView::Er(ErView::build(active, namespace)));
+        tab.view = Some(crate::app::TabView::Er(ErView::build(
+            active, namespace, cx,
+        )));
         self.push_tab(tab, cx);
         cx.notify();
     }
@@ -905,18 +908,23 @@ impl AppState {
     /// anyway) and for a Postgres connection where the user hasn't singled one out.
     /// Unlike the tree's right-click item, these entry points carry no database with
     /// them, so they have to infer one or draw everything.
-    pub(crate) fn er_target_namespace(&self) -> Option<String> {
+    pub(crate) fn er_target_namespace(&self, cx: &App) -> Option<String> {
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
-        let from_tree = active.schema.selected.as_ref().map(|node| match node {
-            crate::schema::NodeId::Schema(s) => s.clone(),
-            crate::schema::NodeId::Group { schema, .. } => schema.clone(),
-            crate::schema::NodeId::Object { schema, .. } => schema.clone(),
-            crate::schema::NodeId::Column { schema, .. } => schema.clone(),
-        });
+        let from_tree = active
+            .schema
+            .read(cx)
+            .selected
+            .as_ref()
+            .map(|node| match node {
+                crate::schema::NodeId::Schema(s) => s.clone(),
+                crate::schema::NodeId::Group { schema, .. } => schema.clone(),
+                crate::schema::NodeId::Object { schema, .. } => schema.clone(),
+                crate::schema::NodeId::Column { schema, .. } => schema.clone(),
+            });
         from_tree.or_else(|| active.namespace.clone()).or_else(|| {
-            match active.schema.schemas.as_slice() {
+            match active.schema.read(cx).schemas.as_slice() {
                 [only] => Some(only.name.clone()),
                 _ => None,
             }
@@ -1077,8 +1085,8 @@ impl AppState {
                 let key_a = (a.schema.clone(), a.table.clone());
                 let key_b = (b.schema.clone(), b.table.clone());
                 (
-                    anchor_offset(a, &e.from_col, active.schema.details.get(&key_a)),
-                    anchor_offset(b, &e.to_col, active.schema.details.get(&key_b)),
+                    anchor_offset(a, &e.from_col, active.schema.read(cx).details.get(&key_a)),
+                    anchor_offset(b, &e.to_col, active.schema.read(cx).details.get(&key_b)),
                 )
             } else {
                 (a.h / 2., b.h / 2.)
@@ -1137,6 +1145,7 @@ impl AppState {
             let selected = er.selected == Some(i);
             let detail = active
                 .schema
+                .read(cx)
                 .details
                 .get(&(node.schema.clone(), node.table.clone()));
 
@@ -1410,7 +1419,7 @@ impl AppState {
         let Some(er) = active.tabs.get(tab_idx).and_then(|t| t.er()) else {
             return;
         };
-        let wanted = er.missing_details(&active.schema.details);
+        let wanted = er.missing_details(&active.schema.read(cx).details);
         if wanted.is_empty() {
             return;
         }

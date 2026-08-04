@@ -161,7 +161,7 @@ impl AppState {
             out.push(FocusTarget::new(
                 FocusTargetId::History,
                 tr!("focus.history", "History"),
-                active.history_focus.clone(),
+                active.history_panel.focus_handle(cx),
             ));
         }
 
@@ -214,7 +214,7 @@ impl AppState {
             out.push(FocusTarget::new(
                 FocusTargetId::Sidebar,
                 tr!("focus.schema", "Schema"),
-                active.schema_focus.clone(),
+                active.schema.read(cx).focus.clone(),
             ));
         }
         for pane in active.layout.panes() {

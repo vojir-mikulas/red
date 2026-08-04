@@ -145,6 +145,9 @@ impl AppState {
     /// in-app edit path and the file watcher, which is the whole point: there is
     /// no way to change a setting and skip its consequence.
     fn apply_settings_effects(&mut self, before: &Settings, cx: &mut Context<Self>) {
+        // First, before any arm below can early-return: republish so every view
+        // reading `Settings::global` sees the new values this same frame.
+        self.settings.publish(cx);
         // Before the theme arm: the locale feeds every string the next render
         // resolves, so switching it after a re-render would leave one frame in
         // the old language.

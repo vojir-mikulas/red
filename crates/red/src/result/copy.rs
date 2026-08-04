@@ -11,6 +11,7 @@
 //! [`crate::palette`] so it reuses the command-palette plumbing.
 
 use flint::prelude::*;
+use gpui::App;
 use gpui::Context;
 use red_core::{Column, ColumnMap, ConnectionConfig, CopyMode, ObjectKind, TableRef};
 use red_service::{Command, OpId, SessionId};
@@ -99,13 +100,18 @@ impl AppState {
     /// The candidate copy *target* tables across every open, writable connection
     /// (foreground + parked live sessions). The "Copy to…" picker offers only these,
     /// so a target the copy can't write into (read-only / ClickHouse) is never shown.
-    pub(crate) fn copy_target_candidates(&self) -> Vec<CopyTargetCandidate> {
+    pub(crate) fn copy_target_candidates(&self, cx: &App) -> Vec<CopyTargetCandidate> {
         let mut out = Vec::new();
         if let Phase::Connected(active) = &self.phase {
-            collect_targets(&mut out, active.session, &active.config, &active.schema);
+            collect_targets(
+                &mut out,
+                active.session,
+                &active.config,
+                active.schema.read(cx),
+            );
         }
         for (id, conn) in &self.parked {
-            collect_targets(&mut out, *id, &conn.config, &conn.schema);
+            collect_targets(&mut out, *id, &conn.config, conn.schema.read(cx));
         }
         out
     }
@@ -114,13 +120,18 @@ impl AppState {
     /// connection: the "✦ New table…" rows of the "Copy to…" picker. Selecting one
     /// then prompts for a name and *creates* the table from the source's column shape,
     /// so this covers "migrate into a different / same-connection database".
-    pub(crate) fn copy_namespace_candidates(&self) -> Vec<CopyNamespace> {
+    pub(crate) fn copy_namespace_candidates(&self, cx: &App) -> Vec<CopyNamespace> {
         let mut out = Vec::new();
         if let Phase::Connected(active) = &self.phase {
-            collect_namespaces(&mut out, active.session, &active.config, &active.schema);
+            collect_namespaces(
+                &mut out,
+                active.session,
+                &active.config,
+                active.schema.read(cx),
+            );
         }
         for (id, conn) in &self.parked {
-            collect_namespaces(&mut out, *id, &conn.config, &conn.schema);
+            collect_namespaces(&mut out, *id, &conn.config, conn.schema.read(cx));
         }
         out
     }
@@ -128,7 +139,13 @@ impl AppState {
     /// Whether `session` already has a table/view named `name` in `schema`: the
     /// collision guard for "new table" copies, so the create path never silently
     /// appends into a pre-existing (possibly mismatched) table.
-    pub(crate) fn namespace_has_table(&self, session: SessionId, schema: &str, name: &str) -> bool {
+    pub(crate) fn namespace_has_table(
+        &self,
+        session: SessionId,
+        schema: &str,
+        name: &str,
+        cx: &App,
+    ) -> bool {
         let has = |st: &SchemaState| {
             st.schemas.iter().any(|ns| {
                 ns.name == schema && ns.objects.iter().any(|o| o.name.eq_ignore_ascii_case(name))
@@ -137,9 +154,11 @@ impl AppState {
         if let Phase::Connected(active) = &self.phase
             && active.session == session
         {
-            return has(&active.schema);
+            return has(active.schema.read(cx));
         }
-        self.parked.get(&session).is_some_and(|c| has(&c.schema))
+        self.parked
+            .get(&session)
+            .is_some_and(|c| has(c.schema.read(cx)))
     }
 
     /// `CopyTargetColumns`: the picked target's columns arrived, so auto-map the source
@@ -446,11 +465,11 @@ impl AppState {
     /// The source of a "Migrate schema to…": the foreground connection's selected
     /// schema (or its only schema) and the **table** names in it. `None` when there's
     /// no connection, no determinable schema, or the schema has no tables.
-    pub(crate) fn migrate_source(&self) -> Option<(SessionId, String, Vec<String>)> {
+    pub(crate) fn migrate_source(&self, cx: &App) -> Option<(SessionId, String, Vec<String>)> {
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
-        let s = &active.schema;
+        let s = active.schema.read(cx);
         let schema_name = match &s.selected {
             Some(crate::schema::NodeId::Schema(name)) => Some(name.clone()),
             Some(crate::schema::NodeId::Group { schema, .. }) => Some(schema.clone()),

@@ -98,6 +98,17 @@ impl QueryHistory {
         }
     }
 
+    /// A store with no file behind it: nothing it records is persisted. For
+    /// tests (in this crate and in the UI crate's dock tests), which must never
+    /// touch the user's real `history.json`.
+    pub fn in_memory() -> Self {
+        Self {
+            entries: Vec::new(),
+            next_id: 1,
+            path: None,
+        }
+    }
+
     /// Record a freshly-run statement for `conn_id`. De-dupes against that
     /// connection's most-recent entry (so holding ⌘↵ doesn't spam the log),
     /// prunes to the caps, and persists.
@@ -273,11 +284,7 @@ mod tests {
     /// An in-memory store (no disk) for exercising the pure record/prune/delete
     /// logic.
     fn in_memory() -> QueryHistory {
-        QueryHistory {
-            entries: Vec::new(),
-            next_id: 1,
-            path: None,
-        }
+        QueryHistory::in_memory()
     }
 
     #[test]

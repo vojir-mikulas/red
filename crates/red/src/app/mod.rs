@@ -433,7 +433,13 @@ pub struct AppState {
     /// The persistent query-history log, centralized across all connections and
     /// loaded once at startup. Each entry is connection-scoped; the run-bar
     /// popover filters to the active connection's `conn_id`.
-    pub(crate) query_history: red_config::history::QueryHistory,
+    ///
+    /// A model entity, not a plain field: the History dock is its own view
+    /// ([`crate::history::HistoryPanel`]) and holds this handle directly, so it
+    /// re-derives its rows from the store every frame and can delete/clear
+    /// without routing back through `AppState`. Mirrors how a Zed view holds
+    /// `Entity<Buffer>`.
+    pub(crate) query_history: gpui::Entity<red_config::history::QueryHistory>,
     /// Persisted per-connection Redis keyspace-analysis reports (see
     /// `redis_analysis.rs`), loaded once at startup. Keyed by `conn_id`, so a
     /// saved report survives a restart and is shown when the Analysis panel
@@ -516,7 +522,15 @@ pub struct AppState {
     /// The "Database knowledge" editor while it's open: the connection's
     /// `knowledge/<id>.md` in a markdown editor. `None` when it's closed. See
     /// [`crate::knowledge_panel`].
-    pub(crate) knowledge_editor: Option<crate::knowledge_panel::KnowledgeEditor>,
+    ///
+    /// A real view, paired with the subscription that carries its
+    /// `KnowledgeEditorEvent`s back here (the `palette` field does the same). The
+    /// subscription is RAII: dropping the pair closes the editor and unsubscribes
+    /// in one move.
+    pub(crate) knowledge_editor: Option<(
+        gpui::Entity<crate::knowledge_panel::KnowledgeEditor>,
+        gpui::Subscription,
+    )>,
     /// Set in [`Self::new`] when this build's version differs from the last one
     /// recorded: the version to announce in a one-shot "RED updated to X" toast,
     /// raised on the first render. `None` on a first-ever launch or an unchanged
@@ -738,6 +752,10 @@ impl AppState {
             .map(FileSettingsStore::load_report)
             .unwrap_or_default();
         let settings = report.settings;
+        // Publish before anything downstream is built: every view constructed
+        // below (and every one built later) reads settings through
+        // `Settings::global`, which panics if nothing has published yet.
+        settings.publish(cx);
         if report.migrated
             && let Some(store) = &settings_store
             && let Err(e) = store.save(&settings)
@@ -1328,7 +1346,7 @@ impl AppState {
             palette_prompt: PromptKind::GoToRow,
             saved_queries: Vec::new(),
             loaded_conversations: Vec::new(),
-            query_history: red_config::history::QueryHistory::load(),
+            query_history: cx.new(|_| red_config::history::QueryHistory::load()),
             redis_analysis: crate::redis_analysis::AnalysisStore::load(),
             health_store: crate::health_store::HealthStore::load(),
             compare_schemas: Vec::new(),
@@ -1703,18 +1721,24 @@ impl AppState {
 
             // --- schema explorer ---
             Event::ObjectsLoaded { schemas } => {
-                if let Some(active) = self.conn_mut(session) {
-                    active.schema.apply_objects(schemas);
+                if let Some(tree) = self.conn_for(session).map(|a| a.schema.clone()) {
+                    tree.update(cx, |s, cx| {
+                        s.apply_objects(schemas);
+                        cx.notify();
+                    });
                 }
                 // Completions / prefetch only matter for the on-screen connection.
                 if session == self.foreground_session {
-                    self.prefetch_table_details();
+                    self.prefetch_table_details(cx);
                     self.refresh_completions(cx);
                 }
             }
             Event::ObjectCountsReady { counts } => {
-                if let Some(active) = self.conn_mut(session) {
-                    active.schema.apply_object_counts(counts);
+                if let Some(tree) = self.conn_for(session).map(|a| a.schema.clone()) {
+                    tree.update(cx, |s, cx| {
+                        s.apply_object_counts(counts);
+                        cx.notify();
+                    });
                 }
                 cx.notify();
             }
@@ -1723,8 +1747,11 @@ impl AppState {
                 kind,
                 objects,
             } => {
-                if let Some(active) = self.conn_mut(session) {
-                    active.schema.apply_object_group(namespace, kind, objects);
+                if let Some(tree) = self.conn_for(session).map(|a| a.schema.clone()) {
+                    tree.update(cx, |s, cx| {
+                        s.apply_object_group(namespace, kind, objects);
+                        cx.notify();
+                    });
                 }
             }
             Event::SchemaDiffFinished {
@@ -1763,11 +1790,11 @@ impl AppState {
                 detail,
             } => {
                 let ncols = detail.columns.len();
-                if let Some(active) = self.conn_mut(session) {
-                    active
-                        .schema
-                        .details
-                        .insert((schema.clone(), table.clone()), detail);
+                if let Some(tree) = self.conn_for(session).map(|a| a.schema.clone()) {
+                    tree.update(cx, |s, cx| {
+                        s.details.insert((schema.clone(), table.clone()), detail);
+                        cx.notify();
+                    });
                 }
                 if session == self.foreground_session {
                     // Any open diagram sized this table's box from what was resident
@@ -1784,14 +1811,20 @@ impl AppState {
             Event::ForeignKeysLoaded { graph } => {
                 // Cache the graph and (re)mark FK columns on any already-open grids,
                 // a result may have opened before the prefetch landed.
+                if let Some(tree) = self.conn_for(session).map(|a| a.schema.clone()) {
+                    tree.update(cx, |s, cx| {
+                        s.fk_graph = graph;
+                        cx.notify();
+                    });
+                }
                 if let Some(active) = self.conn_mut(session) {
-                    active.fk_graph = graph;
+                    let graph = active.schema.read(cx).fk_graph.clone();
                     for tab in &mut active.tabs {
                         if let Some(grid) = tab.result.as_mut() {
-                            grid.set_fk_cols(&active.fk_graph);
+                            grid.set_fk_cols(&graph);
                             // A browse may carry an expansion from before the graph
                             // landed; (re)resolve its joins now they're available.
-                            grid.rebuild_joins(&active.fk_graph);
+                            grid.rebuild_joins(&active.schema.read(cx).fk_graph);
                         }
                     }
                 }
@@ -2126,7 +2159,7 @@ impl AppState {
                 // refresh reaches into the *foreground* connection's tree state, so
                 // aiming it at a background session would clear the wrong tree.
                 if session.is_some() && session == self.foreground_session {
-                    self.refresh_schema();
+                    self.refresh_schema(cx);
                     // An Apply from a DDL tab: re-read the definition so the tab
                     // shows what the server stored, not what was typed.
                     self.ddl_on_write_settled(true, cx);
@@ -2718,7 +2751,7 @@ impl AppState {
         }
         let handle = match &self.phase {
             Phase::Connected(active) => match pane {
-                Pane::Schema => Some(active.schema_focus.clone()),
+                Pane::Schema => Some(active.schema.read(cx).focus.clone()),
                 // The focused half's grid: the second half has its own handle so
                 // the cell cursor never lands on both grids at once.
                 Pane::Grid => active.grid_focus_for(active.focused_pane()).cloned(),
@@ -2742,7 +2775,7 @@ impl AppState {
             Phase::Connected(active) => {
                 active.sidebar_collapsed = false;
                 active.active_pane = Pane::Schema;
-                active.schema.filter.clone()
+                active.schema.read(cx).filter.clone()
             }
             _ => return,
         };

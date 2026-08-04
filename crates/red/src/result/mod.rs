@@ -28,7 +28,7 @@ use std::time::{Duration, Instant};
 
 use flint::prelude::*;
 use gpui::{
-    ClipboardItem, Context, PathPromptOptions, Pixels, ScrollHandle, UniformListScrollHandle,
+    App, ClipboardItem, Context, PathPromptOptions, Pixels, ScrollHandle, UniformListScrollHandle,
     point, px,
 };
 use red_core::{
@@ -1478,7 +1478,7 @@ impl AppState {
         // not this, but the columns panel reads the base table's columns from here).
         if let Some((schema, tbl)) = &table {
             let missing = matches!(&self.phase, Phase::Connected(active)
-                if !active.schema.details.contains_key(&(schema.clone(), tbl.clone())));
+                if !active.schema.read(cx).details.contains_key(&(schema.clone(), tbl.clone())));
             if missing {
                 self.send_active(Command::DescribeTable {
                     schema: schema.clone(),
@@ -1531,7 +1531,7 @@ impl AppState {
         if let Some(active) = self.conn_mut(session) {
             // Clone the small FK graph so the grid's mutable borrow doesn't collide
             // with the shared one; mark FK columns now that the column set is known.
-            let graph = active.fk_graph.clone();
+            let graph = active.schema.read(cx).fk_graph.clone();
             if let Some(grid) = active.result_by_epoch(epoch) {
                 grid.on_ready(columns, total, key, edit);
                 grid.set_fk_cols(&graph);
@@ -1752,7 +1752,7 @@ impl AppState {
     pub(crate) fn toggle_reference_column(&mut self, path: Vec<String>, cx: &mut Context<Self>) {
         let reopen = match &mut self.phase {
             Phase::Connected(active) => {
-                let graph = active.fk_graph.clone();
+                let graph = active.schema.read(cx).fk_graph.clone();
                 match active.active_result_mut() {
                     Some(grid) if grid.table.is_some() => {
                         grid.toggle_expansion(path);
@@ -1789,7 +1789,7 @@ impl AppState {
     /// described, list the target's columns with their current shown state. `None`
     /// for a non-FK cell, an undescribed target, editor SQL, or before the graph
     /// loads; the cell menu then omits the section.
-    pub(in crate::result) fn reference_menu(&self) -> Option<ReferenceMenu> {
+    pub(in crate::result) fn reference_menu(&self, cx: &App) -> Option<ReferenceMenu> {
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
@@ -1797,7 +1797,7 @@ impl AppState {
         let (schema, table) = grid.table.as_ref()?;
         let (_, col) = grid.cursor_cell(self.gutter())?;
         let cname = grid.columns.get(col)?.name.clone();
-        let edge = active.fk_graph.iter().find(|e| {
+        let edge = active.schema.read(cx).fk_graph.iter().find(|e| {
             e.columns.len() == 1
                 && e.from_table == *table
                 && e.from_schema.as_deref() == Some(schema.as_str())
@@ -1807,6 +1807,7 @@ impl AppState {
         let ref_table = edge.to_table.clone();
         let detail = active
             .schema
+            .read(cx)
             .details
             .get(&(ref_schema, ref_table.clone()))?;
         let shown = grid.shown_under(&cname);
@@ -2744,7 +2745,7 @@ impl AppState {
     /// the reverse edges (tables referencing this grid's table) as
     /// `(child_schema, child_table, from_column, to_column)`. Empty without a base
     /// table or a loaded graph. Drives the result cell context menu.
-    pub(crate) fn fk_menu(&self) -> (Option<String>, Vec<FkReverse>) {
+    pub(crate) fn fk_menu(&self, cx: &App) -> (Option<String>, Vec<FkReverse>) {
         let empty = (None, Vec::new());
         let Phase::Connected(active) = &self.phase else {
             return empty;
@@ -2758,6 +2759,8 @@ impl AppState {
         let forward = grid.cursor_cell(self.gutter()).and_then(|(_, col)| {
             let cname = grid.columns.get(col)?.name.clone();
             active
+                .schema
+                .read(cx)
                 .fk_graph
                 .iter()
                 .find(|e| {
@@ -2769,6 +2772,8 @@ impl AppState {
                 .map(|e| e.to_table.clone())
         });
         let reverse = active
+            .schema
+            .read(cx)
             .fk_graph
             .iter()
             .filter(|e| {
@@ -2805,7 +2810,7 @@ impl AppState {
         let Some(cname) = grid.columns.get(col).map(|c| c.name.clone()) else {
             return;
         };
-        let Some(edge) = active.fk_graph.iter().find(|e| {
+        let Some(edge) = active.schema.read(cx).fk_graph.iter().find(|e| {
             e.columns.len() == 1
                 && e.from_table == *table
                 && e.from_schema.as_deref() == Some(schema.as_str())

@@ -8,7 +8,9 @@ use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use flint::prelude::*;
-use gpui::{Context, Hsla, MouseButton, Pixels, Point, SharedString, Window, div, prelude::*, px};
+use gpui::{
+    App, Context, Hsla, MouseButton, Pixels, Point, SharedString, Window, div, prelude::*, px,
+};
 use red_core::{DbKind, FkEdge, ObjectKind, SchemaMeta, TableDetail};
 use red_service::Command;
 
@@ -1059,6 +1061,7 @@ impl AppState {
         let current = active.namespace_for_tab(tab_idx);
         let names: Vec<String> = active
             .schema
+            .read(cx)
             .schemas
             .iter()
             .map(|s| s.name.clone())
@@ -1174,14 +1177,18 @@ impl AppState {
     /// qualifier must name a real object. An ambiguous bare name (same table in two
     /// namespaces) stays `None`: the engine picks by search-path, which we don't
     /// track, so guessing could tag the wrong table.
-    fn resolve_browse_table(&self, sql: &str) -> Option<(String, String)> {
+    fn resolve_browse_table(&self, sql: &str, cx: &App) -> Option<(String, String)> {
         let (schema_hint, table) = crate::sql::single_table_star(sql)?;
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
-        let resolved = resolve_in_catalog(&active.schema.schemas, schema_hint.as_deref(), &table);
+        let resolved = resolve_in_catalog(
+            &active.schema.read(cx).schemas,
+            schema_hint.as_deref(),
+            &table,
+        );
         tracing::debug!(
-            ?schema_hint, %table, ns = active.schema.schemas.len(), ?resolved,
+            ?schema_hint, %table, ns = active.schema.read(cx).schemas.len(), ?resolved,
             "resolve_browse_table for FK affordances"
         );
         resolved
@@ -1302,7 +1309,8 @@ impl AppState {
             _ => None,
         };
         if let Some(conn_id) = conn_id {
-            self.query_history.record(&conn_id, &sql);
+            self.query_history
+                .update(cx, |store, _| store.record(&conn_id, &sql));
         }
 
         // Grade the statement: `Safe` streams into the grid, everything else executes
@@ -1346,7 +1354,7 @@ impl AppState {
             // click-through, reference-column tree) and keyset paging as a browse
             // opened from the schema tree. Resolve before the auto-limit shadows
             // `sql` (the sniffer accepts a trailing LIMIT either way).
-            let table = self.resolve_browse_table(&sql);
+            let table = self.resolve_browse_table(&sql, cx);
             // Guard a bare `SELECT *` against flooding the grid: append the
             // configured `LIMIT` unless the user wrote their own.
             let sql = crate::sql::auto_limit(&sql, self.settings.sql.auto_limit).unwrap_or(sql);
@@ -1407,7 +1415,7 @@ impl AppState {
                 self.send_active(Command::AssessSql {
                     sql: sql.clone(),
                     agent,
-                    schema_summary: self.review_schema_context(assessment.table.as_deref()),
+                    schema_summary: self.review_schema_context(assessment.table.as_deref(), cx),
                     token: self.confirm_count_token,
                 });
                 AiReview {
@@ -1500,14 +1508,19 @@ impl AppState {
     pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {
         let opened = if let Phase::Connected(active) = &mut self.phase {
             active.history_open = !active.history_open;
-            // Reset the keyboard highlight to the top whenever it opens.
-            if active.history_open {
-                active.history_sel = 0;
-            }
             Some(active.history_open)
         } else {
             None
         };
+        // Reset the keyboard highlight to the top whenever it opens. Done
+        // outside the borrow above so the panel can be updated through `cx`.
+        if opened == Some(true)
+            && let Phase::Connected(active) = &self.phase
+        {
+            active
+                .history_panel
+                .update(cx, |panel, cx| panel.reset_selection(cx));
+        }
         match opened {
             // Focus the panel's list so its arrow keys work; closing returns focus
             // to the editor.
@@ -1518,62 +1531,27 @@ impl AppState {
         cx.notify();
     }
 
-    /// Toggle a SQL history time-bucket (Today/Yesterday/Earlier) between
-    /// collapsed and expanded. In-memory only (reset per session).
-    pub(crate) fn history_toggle_bucket(&mut self, key: &'static str, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase {
-            if !active.history_bucket_collapsed.remove(key) {
-                active.history_bucket_collapsed.insert(key);
+    /// React to the SQL History dock. Bucket collapse, keyboard selection,
+    /// per-row delete and clear all live on the panel now (it owns that state
+    /// and holds the store), so what reaches here is only what needs the shell:
+    /// seeding an editor, and moving focus.
+    pub(crate) fn on_history_event(
+        &mut self,
+        _panel: gpui::Entity<crate::history::HistoryPanel>,
+        event: &crate::history::HistoryPanelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::history::HistoryPanelEvent as E;
+        match event {
+            E::Open { sql, replace } => self.open_history(sql.clone(), *replace, cx),
+            E::Accept { sql } => {
+                // Fill the editor; the panel stays open so the user can keep
+                // browsing.
+                self.load_history(sql.clone(), cx);
+                self.pending_focus = Some(crate::app::Pane::Editor);
             }
-            cx.notify();
-        }
-    }
-
-    /// Move the History panel's keyboard highlight (↑/↓). No-op with empty history.
-    pub(crate) fn history_move(&mut self, delta: isize, cx: &mut Context<Self>) {
-        let len = match &self.phase {
-            Phase::Connected(active) => self.query_history.count_for_conn(&active.conn_id),
-            _ => return,
-        };
-        if len == 0 {
-            return;
-        }
-        if let Phase::Connected(active) = &mut self.phase {
-            let sel = active.history_sel as isize + delta;
-            active.history_sel = sel.clamp(0, len as isize - 1) as usize;
-            cx.notify();
-        }
-    }
-
-    /// Load the highlighted history entry into the editor (Enter in the panel).
-    pub(crate) fn history_accept(&mut self, cx: &mut Context<Self>) {
-        let sql = match &self.phase {
-            Phase::Connected(active) => self
-                .query_history
-                .for_conn(&active.conn_id)
-                .get(active.history_sel)
-                .map(|e| e.sql.clone()),
-            _ => None,
-        };
-        if let Some(sql) = sql {
-            // Fill the editor; the panel stays open so the user can keep browsing.
-            self.load_history(sql, cx);
-        }
-        self.pending_focus = Some(crate::app::Pane::Editor);
-    }
-
-    /// Remove one history entry by id (the panel's per-row ✕), keeping the
-    /// keyboard highlight in range after the row vanishes.
-    pub(crate) fn delete_history(&mut self, id: u64, cx: &mut Context<Self>) {
-        self.query_history.delete(id);
-        let len = match &self.phase {
-            Phase::Connected(active) => self.query_history.count_for_conn(&active.conn_id),
-            _ => 0,
-        };
-        if let Phase::Connected(active) = &mut self.phase
-            && active.history_sel >= len
-        {
-            active.history_sel = len.saturating_sub(1);
+            E::Close => self.toggle_history(cx),
+            E::LeaveToEditor => self.pending_focus = Some(crate::app::Pane::Editor),
         }
         cx.notify();
     }
@@ -1585,10 +1563,13 @@ impl AppState {
             _ => None,
         };
         if let Some(conn_id) = conn_id {
-            self.query_history.clear_conn(&conn_id);
+            self.query_history
+                .update(cx, |store, _| store.clear_conn(&conn_id));
         }
-        if let Phase::Connected(active) = &mut self.phase {
-            active.history_sel = 0;
+        if let Phase::Connected(active) = &self.phase {
+            active
+                .history_panel
+                .update(cx, |panel, cx| panel.reset_selection(cx));
         }
         cx.notify();
     }
@@ -1638,9 +1619,9 @@ impl AppState {
                     .map(|t| t.editor.clone())
                     .collect::<Vec<_>>(),
                 Rc::new(build_index(
-                    &active.schema.schemas,
-                    &active.schema.details,
-                    &active.fk_graph,
+                    &active.schema.read(cx).schemas,
+                    &active.schema.read(cx).details,
+                    &active.schema.read(cx).fk_graph,
                     active.config.kind,
                 )),
             ),
@@ -1669,9 +1650,9 @@ impl AppState {
             return;
         };
         let index = Rc::new(build_index(
-            &active.schema.schemas,
-            &active.schema.details,
-            &active.fk_graph,
+            &active.schema.read(cx).schemas,
+            &active.schema.read(cx).details,
+            &active.schema.read(cx).fk_graph,
             active.config.kind,
         ));
         let (table, columns) = match active.active_result() {

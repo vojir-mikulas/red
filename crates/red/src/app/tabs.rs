@@ -161,11 +161,11 @@ impl AppState {
     /// each node first. Details arrive as `TableDescribed` events that refresh the
     /// completion index. Capped so a pathological schema can't flood the backend;
     /// past the cap, tables still load lazily on tree expansion.
-    pub(crate) fn prefetch_table_details(&mut self) {
+    pub(crate) fn prefetch_table_details(&mut self, cx: &mut Context<Self>) {
         const MAX_PREFETCH: usize = 200;
         let pending: Vec<(String, String)> = match &self.phase {
             Phase::Connected(active) => {
-                let s = &active.schema;
+                let s = active.schema.read(cx);
                 s.schemas
                     .iter()
                     .flat_map(|sc| {
@@ -345,20 +345,22 @@ impl AppState {
     /// Also drops the lazily-loaded object groups, so a refresh means the whole
     /// tree and not just its skeleton. They re-fetch on the next expand; any
     /// group currently open re-requests itself through `flatten`'s loading path.
-    pub(crate) fn refresh_schema(&mut self) {
+    pub(crate) fn refresh_schema(&mut self, cx: &mut Context<Self>) {
         let mut reload: Vec<(String, red_core::ObjectKind)> = Vec::new();
-        if let Phase::Connected(active) = &mut self.phase {
-            let s = &mut active.schema;
-            s.groups.clear();
-            s.groups_loading.clear();
-            for node in &s.expanded {
-                if let crate::schema::NodeId::Group { schema, kind } = node
-                    && kind.is_lazy()
-                {
-                    reload.push((schema.clone(), *kind));
+        if let Phase::Connected(active) = &self.phase {
+            let tree = active.schema.clone();
+            tree.update(cx, |s, _| {
+                s.groups.clear();
+                s.groups_loading.clear();
+                for node in &s.expanded {
+                    if let crate::schema::NodeId::Group { schema, kind } = node
+                        && kind.is_lazy()
+                    {
+                        reload.push((schema.clone(), *kind));
+                    }
                 }
-            }
-            s.groups_loading.extend(reload.iter().cloned());
+                s.groups_loading.extend(reload.iter().cloned());
+            });
         }
         self.send_active(Command::LoadObjects);
         self.send_active(Command::LoadObjectCounts);
@@ -384,7 +386,7 @@ impl AppState {
             self.doc_refresh(session, cx);
             return;
         }
-        self.refresh_schema();
+        self.refresh_schema(cx);
     }
 
     /// Open a blank query tab (the tab-strip "＋" action).

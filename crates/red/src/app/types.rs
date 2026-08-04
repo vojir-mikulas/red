@@ -12,8 +12,8 @@ use flint::{CodeEditor, CodeEditorEvent};
 use gpui::{Context, Entity, FocusHandle, Pixels, SharedString, prelude::*, px};
 use red_core::kv::RecycledKey;
 use red_core::{
-    Column, ColumnMap, ColumnMeta, ConnectionConfig, CopyMode, DbKind, EditOp, FkEdge,
-    ImportFormat, ProxyKind, TableRef,
+    Column, ColumnMap, ColumnMeta, ConnectionConfig, CopyMode, DbKind, EditOp, ImportFormat,
+    ProxyKind, TableRef,
 };
 use red_service::{OpId, SessionId};
 
@@ -1575,7 +1575,7 @@ pub(crate) struct ActiveConn {
     /// grid; retained while the inspector is closed so reopening restores it.
     pub inspector_w: Pixels,
     pub inspector_drag: Option<DragAnchor>,
-    pub schema: SchemaState,
+    pub schema: Entity<SchemaState>,
     /// This connection's knowledge file (see [`crate::knowledge`]), or `None` when
     /// the user hasn't written one.
     ///
@@ -1585,23 +1585,6 @@ pub(crate) struct ActiveConn {
     /// another editor still lands on the next message — which is the same freshness
     /// the agent gets, from the same value.
     pub knowledge: Option<String>,
-    /// The connection-wide foreign-key graph, prefetched once after
-    /// connect. Empty until it lands (or when the engine has no FKs); drives the
-    /// in-grid FK click-through. See `Command::LoadForeignKeys`.
-    pub fk_graph: Vec<FkEdge>,
-    /// Cached FK lookup lists for the in-cell picker, keyed by referenced
-    /// `(schema, table)`. Populated lazily the first time an FK cell of that target is
-    /// edited (`Command::FetchLookup` → `Event::LookupReady`); reused across edits and
-    /// results on this connection. Bounded by the number of distinct FK targets touched.
-    pub lookup_cache: std::collections::HashMap<(String, String), Vec<red_core::LookupRow>>,
-    /// Cached enum columns per `(schema, table)` for the in-cell enum picker:
-    /// `{ column → [variant, …] }`, loaded once per table the first time one of its cells
-    /// is edited (`Command::LoadEnums` → `Event::EnumsLoaded`). An absent table means "not
-    /// loaded yet"; a present-but-column-absent means "not an enum".
-    pub enum_cache:
-        std::collections::HashMap<(String, String), std::collections::HashMap<String, Vec<String>>>,
-    /// Tables whose `LoadEnums` is in flight, so the load fires at most once per table.
-    pub enum_requested: std::collections::HashSet<(String, String)>,
     /// The connection-level namespace new tabs inherit and the toolbar chip shows
     /// (see [`QueryTab::namespace`] for why the override is per tab). Seeded from
     /// `config.database` at connect, so nothing changes for a connection that
@@ -1630,24 +1613,24 @@ pub(crate) struct ActiveConn {
     /// docks and each can receive its own navigation keys. The editor focuses its
     /// own `CodeEditor` and each pane's grid its own handle (see
     /// `PaneUi`).
-    pub schema_focus: FocusHandle,
     /// Which of the shell's three areas holds focus; drives focus cycling and the
     /// focus ring.
     pub active_pane: Pane,
     /// Whether the History panel is shown in the left dock. Entries live in the
     /// centralized [`AppState::query_history`]; this is per-connection UI state.
     pub history_open: bool,
-    /// Focus anchor for the History panel's list (its ↑/↓/Enter navigation), and
-    /// the keyboard-highlighted entry within it.
-    pub history_focus: FocusHandle,
-    pub history_sel: usize,
-    /// Live search box for the History dock (both SQL and Redis shells). Owned
-    /// here so it survives re-renders; the adapter reads its text to narrow the
-    /// list. See [`crate::history_panel`].
-    pub history_search: Entity<TextInput>,
-    /// Which SQL history time-buckets ("today"/"yesterday"/"earlier") are
-    /// collapsed. In-memory (reset per session); empty means all expanded.
-    pub history_bucket_collapsed: std::collections::HashSet<&'static str>,
+    /// The SQL History dock, as a view. Owns its own search box, focus handle,
+    /// keyboard selection and per-bucket collapse state, and holds
+    /// [`AppState::query_history`] directly — so what used to be five fields
+    /// here plus five `AppState` methods is now one entity. The Redis shell's
+    /// equivalent lives on its `RedisView` (see [`crate::kvhistory`]). See
+    /// [`crate::history::HistoryPanel`].
+    pub history_panel: Entity<crate::history::HistoryPanel>,
+    /// RAII: keeps the History dock's event subscription alive for as long as
+    /// this connection is up. Never read.
+    pub _history_sub: gpui::Subscription,
+    /// RAII: keeps the schema tree's event subscription alive.
+    pub _schema_sub: gpui::Subscription,
     /// Width of the History side-panel (the leftmost left-dock column, sitting to
     /// the left of the schema). Retained while it's closed so toggling it back
     /// restores the previous width.
@@ -1725,22 +1708,38 @@ pub(crate) struct ActiveConn {
     pub doc_view: Option<crate::docbrowse::MongoView>,
 }
 
+/// The pieces [`ActiveConn::new`] needs that it cannot fetch itself.
+///
+/// `ActiveConn::new` runs inside `on_connected`, which the backend-event pump
+/// calls through `Entity::update`, so `AppState` is **leased** for the whole
+/// call. Reaching back through `cx.entity().read(cx)` for a setting is a
+/// double-lease panic ("cannot read AppState while it is already being
+/// updated") on every single connect. The caller has `&mut self` and reads all
+/// of this directly; grouping it here keeps that constraint in one named place
+/// instead of a growing argument list.
+pub(crate) struct ConnDeps {
+    /// The Redis browser's initial query mode.
+    pub kv_mode: crate::kvbrowse::QueryMode,
+    /// The shared query-history store, handed to the History dock view.
+    pub history_store: Entity<red_config::history::QueryHistory>,
+    /// Session-bound command channel for the schema tree's own catalog fetches.
+    pub sender: red_service::CommandSender,
+}
+
 impl ActiveConn {
-    /// `kv_mode` is passed in rather than read from settings here, and must stay
-    /// that way: this runs inside `on_connected`, which the backend-event pump
-    /// calls through `Entity::update`, so `AppState` is **leased** for the whole
-    /// call. Reaching back through `cx.entity().read(cx)` to fetch a setting is a
-    /// double-lease panic ("cannot read AppState while it is already being
-    /// updated") on every single connect. The caller has `&mut self` and can read
-    /// its own settings directly.
     pub(crate) fn new(
         session: SessionId,
         conn_id: String,
         config: ConnectionConfig,
         version: String,
-        kv_mode: crate::kvbrowse::QueryMode,
+        deps: ConnDeps,
         cx: &mut Context<AppState>,
     ) -> Self {
+        let ConnDeps {
+            kv_mode,
+            history_store,
+            sender,
+        } = deps;
         let layout = PaneLayout::new();
         let tab = QueryTab::new(
             "query 1".to_string(),
@@ -1749,20 +1748,26 @@ impl ActiveConn {
         );
         // Read before `config` is moved into the struct below.
         let kind = config.kind;
-        let kv_view = (config.kind == DbKind::Redis)
-            .then(|| crate::kvbrowse::RedisView::new(session, kv_mode, cx));
+        let kv_view = (config.kind == DbKind::Redis).then(|| {
+            crate::kvbrowse::RedisView::new(
+                session,
+                conn_id.clone(),
+                kv_mode,
+                history_store.clone(),
+                cx,
+            )
+        });
         let doc_view = (config.kind == DbKind::Mongo)
             .then(|| crate::docbrowse::MongoView::new(session, config.read_only, cx));
-        let history_search = cx.new(|cx| {
-            TextInput::new(cx)
-                .with_placeholder(crate::i18n::tr!("history.search", "Search history…"))
-        });
-        // Re-render so the search narrows the dock live as the user types.
-        cx.subscribe(
-            &history_search,
-            |_this, _input, _evt: &TextInputEvent, cx| cx.notify(),
-        )
-        .detach();
+        let schema_tree = cx.new(|cx| SchemaState::new(kind, sender, cx));
+        let schema_sub = cx.subscribe(&schema_tree, AppState::on_schema_event);
+        let history_panel = {
+            let conn_id = conn_id.clone();
+            cx.new(|cx| crate::history::HistoryPanel::new(conn_id, history_store, cx))
+        };
+        // The dock asks the shell to seed an editor / move focus / close; the
+        // rest (search, collapse, selection, delete, clear) it does itself.
+        let history_sub = cx.subscribe(&history_panel, AppState::on_history_event);
         Self {
             // Seeded from what the connection dialled, so a config that named a
             // database keeps resolving exactly as before; `None` only on an engine
@@ -1781,21 +1786,15 @@ impl ActiveConn {
             sidebar_collapsed: false,
             inspector_w: px(360.),
             inspector_drag: None,
-            schema: SchemaState::new(kind, cx),
-            fk_graph: Vec::new(),
-            lookup_cache: std::collections::HashMap::new(),
-            enum_cache: std::collections::HashMap::new(),
-            enum_requested: std::collections::HashSet::new(),
+            schema: schema_tree,
             tabs: vec![tab],
             query_seq: 1,
             layout,
-            schema_focus: cx.focus_handle(),
             active_pane: Pane::Editor,
             history_open: false,
-            history_focus: cx.focus_handle(),
-            history_sel: 0,
-            history_search,
-            history_bucket_collapsed: std::collections::HashSet::new(),
+            history_panel,
+            _history_sub: history_sub,
+            _schema_sub: schema_sub,
             history_w: px(240.),
             history_drag: None,
             server_open: false,

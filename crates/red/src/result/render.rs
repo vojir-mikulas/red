@@ -154,6 +154,7 @@ impl AppState {
     ) -> Option<impl IntoElement + use<>> {
         let names: Vec<String> = active
             .schema
+            .read(cx)
             .schemas
             .iter()
             .map(|s| s.name.clone())
@@ -1589,7 +1590,7 @@ impl AppState {
         // FK navigation: jump to the referenced row or list the tables that
         // reference this one. Both need the FK graph to have edges for the focused
         // column/table.
-        let (fk_forward, fk_reverse) = self.fk_menu();
+        let (fk_forward, fk_reverse) = self.fk_menu(cx);
         if fk_forward.is_some() || !fk_reverse.is_empty() {
             menu = menu.separator();
         }
@@ -1624,7 +1625,7 @@ impl AppState {
         // columns into the grid (a ✓ marks ones already shown), hide a joined
         // column, or clear them all. The per-column list comes from the referenced
         // table's prefetched detail; the Columns panel is the fuller, recursive UI.
-        let ref_menu = self.reference_menu();
+        let ref_menu = self.reference_menu(cx);
         let joined_path = self.focused_joined_path();
         let has_expansion = self.active_has_expansion();
         if ref_menu.as_ref().is_some_and(|m| !m.columns.is_empty())

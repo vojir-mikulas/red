@@ -10,7 +10,7 @@
 //! button calls.
 
 use flint::{Palette, PaletteEvent, PaletteItem, ToastVariant};
-use gpui::{Context, ElementId, Entity, SharedString, actions, prelude::*};
+use gpui::{App, Context, ElementId, Entity, SharedString, actions, prelude::*};
 use red_core::{ColumnMap, ColumnMeta, CopyMode, TableRef};
 use red_service::{Command, SessionId};
 
@@ -346,7 +346,7 @@ impl AppState {
             Cmd::ToggleSidebar => self.toggle_sidebar(cx),
             Cmd::ToggleColumnsPanel => self.toggle_columns_panel(cx),
             Cmd::ToggleServerPanel => self.toggle_server_panel(cx),
-            Cmd::RefreshSchema => self.refresh_schema(),
+            Cmd::RefreshSchema => self.refresh_schema(cx),
             Cmd::Disconnect => self.disconnect(cx),
             // Pane focus needs a `Window`; defer it to the next render (drained
             // there) the same way the editor's Esc-to-grid does.
@@ -373,7 +373,7 @@ impl AppState {
             Cmd::CompareTable => self.open_compare_picker(cx),
             Cmd::CompareLeft(index) => self.pick_compare_left(index, cx),
             Cmd::CompareRight(index) => self.pick_compare_right(index, cx),
-            Cmd::ErDiagram => self.open_er_diagram(self.er_target_namespace(), cx),
+            Cmd::ErDiagram => self.open_er_diagram(self.er_target_namespace(cx), cx),
             Cmd::HealthReport => self.open_health_report(cx),
             Cmd::CompareSchema => self.open_schema_compare_picker(cx),
             Cmd::CompareSchemaTarget(index) => self.pick_schema_compare_target(index, cx),
@@ -578,7 +578,7 @@ impl AppState {
                 }
                 // Whole-schema migration, offered only when the selected/only schema
                 // has tables to move (the handler picks the target database).
-                if self.migrate_source().is_some() {
+                if self.migrate_source(cx).is_some() {
                     out.push((
                         item("cmd:migrate-schema", "schema: migrate to…"),
                         Cmd::MigrateSchema,
@@ -586,7 +586,7 @@ impl AppState {
                 }
                 // Data-compare (table diff), offered when the connection has at least
                 // two tables to compare (the handler picks left then right).
-                if self.compare_candidates().len() >= 2 {
+                if self.compare_candidates(cx).len() >= 2 {
                     out.push((
                         item("cmd:compare-table", "table: compare against…"),
                         Cmd::CompareTable,
@@ -721,7 +721,7 @@ impl AppState {
                     item("cmd:knowledge", "connection: database knowledge…"),
                     Cmd::EditKnowledge,
                 ));
-                if active.schema.schemas.len() > 1 {
+                if active.schema.read(cx).schemas.len() > 1 {
                     out.push((
                         item("cmd:compare-schema", "schema: compare against…"),
                         Cmd::CompareSchema,
@@ -1011,8 +1011,8 @@ impl AppState {
             self.notify(ToastVariant::Info, "Open a result to copy from", cx);
             return;
         }
-        let candidates = self.copy_target_candidates();
-        let namespaces = self.copy_namespace_candidates();
+        let candidates = self.copy_target_candidates(cx);
+        let namespaces = self.copy_namespace_candidates(cx);
         if candidates.is_empty() && namespaces.is_empty() {
             self.notify(
                 ToastVariant::Info,
@@ -1158,7 +1158,7 @@ impl AppState {
             self.notify(ToastVariant::Error, "Enter a name for the new table", cx);
             return;
         }
-        if self.namespace_has_table(pending.session, &pending.schema, name) {
+        if self.namespace_has_table(pending.session, &pending.schema, name, cx) {
             self.notify(
                 ToastVariant::Error,
                 format!(
@@ -1225,7 +1225,7 @@ impl AppState {
     /// database). On pick, `pick_migrate_target` fires the whole-schema migration.
     /// No-op (with a hint) when nothing is migratable / no target is open.
     pub(crate) fn open_migrate_picker(&mut self, cx: &mut Context<Self>) {
-        let Some((session, schema, tables)) = self.migrate_source() else {
+        let Some((session, schema, tables)) = self.migrate_source(cx) else {
             self.notify(
                 ToastVariant::Info,
                 "Select a schema with tables to migrate",
@@ -1235,7 +1235,7 @@ impl AppState {
         };
         // Targets: every writable namespace except the source schema itself.
         let targets: Vec<_> = self
-            .copy_namespace_candidates()
+            .copy_namespace_candidates(cx)
             .into_iter()
             .filter(|ns| !(ns.session == session && ns.schema == schema))
             .collect();
@@ -1303,12 +1303,12 @@ impl AppState {
     /// The foreground connection's tables (`(session, schema, name)`): the pool the
     /// "Compare table against…" picker draws both sides from. Same-connection only
     /// for the shipped scope (D0–D2); cross-connection diff is a later phase.
-    pub(crate) fn compare_candidates(&self) -> Vec<(SessionId, Option<String>, String)> {
+    pub(crate) fn compare_candidates(&self, cx: &App) -> Vec<(SessionId, Option<String>, String)> {
         let Phase::Connected(active) = &self.phase else {
             return Vec::new();
         };
         let mut out = Vec::new();
-        for ns in &active.schema.schemas {
+        for ns in &active.schema.read(cx).schemas {
             for o in &ns.objects {
                 // Any relation can be browsed, including a view or a matview;
                 // only the columnless programmatic kinds are excluded.
@@ -1332,12 +1332,13 @@ impl AppState {
         let Phase::Connected(active) = &self.phase else {
             return;
         };
-        let Some(current) = self.er_target_namespace() else {
+        let Some(current) = self.er_target_namespace(cx) else {
             self.notify(ToastVariant::Info, "Select a schema in the tree first", cx);
             return;
         };
         let others: Vec<String> = active
             .schema
+            .read(cx)
             .schemas
             .iter()
             .map(|s| s.name.clone())
@@ -1371,7 +1372,7 @@ impl AppState {
         let Some(right) = self.compare_schemas.get(index).cloned() else {
             return;
         };
-        let Some(left) = self.er_target_namespace() else {
+        let Some(left) = self.er_target_namespace(cx) else {
             return;
         };
         let Phase::Connected(active) = &self.phase else {
@@ -1393,7 +1394,7 @@ impl AppState {
     /// "table: compare against…": open a picker over the connection's tables to
     /// choose the **left** side of a data-diff.
     pub(crate) fn open_compare_picker(&mut self, cx: &mut Context<Self>) {
-        let tables = self.compare_candidates();
+        let tables = self.compare_candidates(cx);
         if tables.len() < 2 {
             self.notify(
                 ToastVariant::Info,

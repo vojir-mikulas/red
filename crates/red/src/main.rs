@@ -43,6 +43,7 @@ mod knowledge;
 mod knowledge_panel;
 mod kvbrowse;
 mod kvconsole;
+mod kvhistory;
 mod kvkeyspace;
 mod kvmonitor;
 mod kvpubsub;
