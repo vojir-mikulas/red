@@ -36,8 +36,8 @@ use flint::prelude::*;
 use futures::StreamExt;
 use futures::channel::mpsc::UnboundedReceiver;
 use gpui::{
-    AsyncApp, Context, ElementId, Entity, FocusHandle, Focusable, Hsla, PathPromptOptions, Pixels,
-    ScrollHandle, SharedString, WeakEntity, Window, WindowAppearance, prelude::*, px,
+    App, AsyncApp, Context, ElementId, Entity, FocusHandle, Focusable, Hsla, PathPromptOptions,
+    Pixels, ScrollHandle, SharedString, WeakEntity, Window, WindowAppearance, prelude::*, px,
 };
 use red_core::{ConnectionConfig, CopyMode, UpdateState};
 use red_service::{AiAuthStatus, Command, Event, OpId, ServiceHandle, SessionId, UpdateConfig};
@@ -1402,7 +1402,10 @@ impl AppState {
     }
 
     /// True while any open result grid is still running its query.
-    fn any_query_running(&self) -> bool {
+    fn any_query_running(&self, cx: &App) -> bool {
+        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
+        // change so that change stays local instead of cascading.
+        let _ = &cx;
         matches!(&self.phase, Phase::Connected(active)
             if active
                 .tabs
@@ -1414,7 +1417,7 @@ impl AppState {
     /// Self-terminating: the loop stops once no grid is running, and the guard
     /// prevents a second ticker stacking on top of a live one.
     pub(crate) fn start_query_ticker(&mut self, cx: &mut Context<Self>) {
-        if self.query_ticking || !self.any_query_running() {
+        if self.query_ticking || !self.any_query_running(cx) {
             return;
         }
         self.query_ticking = true;
@@ -1424,7 +1427,7 @@ impl AppState {
                     .timer(std::time::Duration::from_millis(100))
                     .await;
                 let running = this.update(cx, |this, cx| {
-                    let running = this.any_query_running();
+                    let running = this.any_query_running(cx);
                     if running {
                         cx.notify();
                     } else {
@@ -2070,7 +2073,7 @@ impl AppState {
                 self.on_result_run(session, epoch, fetch, rows, estimated, seq, cx);
                 // A watched result's rows landing is what closes a tick: it clears
                 // the in-flight flag and computes the change flashes + row delta.
-                self.watch_rows_landed(session, epoch);
+                self.watch_rows_landed(session, epoch, cx);
             }
             Event::ResultRunFailed { epoch, seq } => {
                 self.on_result_run_failed(session, epoch, seq);

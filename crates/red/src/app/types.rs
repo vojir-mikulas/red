@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use flint::prelude::*;
 use flint::{CodeEditor, CodeEditorEvent};
-use gpui::{Context, Entity, FocusHandle, Pixels, SharedString, prelude::*, px};
+use gpui::{App, Context, Entity, FocusHandle, Pixels, SharedString, prelude::*, px};
 use red_core::kv::RecycledKey;
 use red_core::{
     Column, ColumnMap, ColumnMeta, ConnectionConfig, CopyMode, DbKind, EditOp, ImportFormat,
@@ -1885,7 +1885,14 @@ impl ActiveConn {
     /// which case the caller falls back to [`namespace_for_send`](Self::namespace_for_send).
     /// Reading the *focused* tab's namespace instead reopens the owning tab bound to
     /// someone else's database.
-    pub(crate) fn namespace_for_epoch(&self, epoch: red_service::Epoch) -> Option<String> {
+    pub(crate) fn namespace_for_epoch(
+        &self,
+        epoch: red_service::Epoch,
+        cx: &App,
+    ) -> Option<String> {
+        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
+        // change so that change stays local instead of cascading.
+        let _ = &cx;
         if !self.config.kind.namespace_caps().settable {
             return None;
         }

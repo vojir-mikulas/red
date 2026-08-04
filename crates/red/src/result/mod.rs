@@ -1878,7 +1878,7 @@ impl AppState {
             return;
         };
         let namespace = self.conn_for(Some(id)).and_then(|c| {
-            c.namespace_for_epoch(epoch)
+            c.namespace_for_epoch(epoch, cx)
                 .or_else(|| c.namespace_for_send())
         });
         self.service

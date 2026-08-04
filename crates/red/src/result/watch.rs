@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use gpui::{AsyncApp, Context, WeakEntity};
+use gpui::{App, AsyncApp, Context, WeakEntity};
 use red_core::Value;
 use red_service::Command;
 
@@ -300,7 +300,7 @@ impl AppState {
                 .unwrap_or(false)
         });
 
-        let Some((tab_ix, session)) = self.watch_tab_for(epoch) else {
+        let Some((tab_ix, session)) = self.watch_tab_for(epoch, cx) else {
             return;
         };
         let Phase::Connected(active) = &mut self.phase else {
@@ -378,7 +378,14 @@ impl AppState {
 
     /// Find the tab holding the result `epoch`, across every connection, as
     /// `(tab index, session)`.
-    fn watch_tab_for(&self, epoch: red_service::Epoch) -> Option<(usize, red_service::SessionId)> {
+    fn watch_tab_for(
+        &self,
+        epoch: red_service::Epoch,
+        cx: &App,
+    ) -> Option<(usize, red_service::SessionId)> {
+        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
+        // change so that change stays local instead of cascading.
+        let _ = &cx;
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
@@ -395,7 +402,10 @@ impl AppState {
         &mut self,
         session: Option<red_service::SessionId>,
         epoch: red_service::Epoch,
+        cx: &mut Context<Self>,
     ) {
+        // See `row_edit_mode`: taken ahead of the `Entity<ResultGrid>` change.
+        let _ = &cx;
         let Some(active) = self.conn_mut(session) else {
             return;
         };
