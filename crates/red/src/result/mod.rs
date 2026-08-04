@@ -1828,7 +1828,10 @@ impl AppState {
 
     /// The expansion path of the focused cell when it sits in an inline-expanded
     /// reference column, for the cell menu's "hide this column" action.
-    pub(in crate::result) fn focused_joined_path(&self) -> Option<Vec<String>> {
+    pub(in crate::result) fn focused_joined_path(&self, cx: &App) -> Option<Vec<String>> {
+        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
+        // taking it now means that change does not cascade through every caller.
+        let _ = &cx;
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
@@ -1839,7 +1842,10 @@ impl AppState {
 
     /// Whether the active result currently has any inline-expanded reference columns
     /// (drives the cell menu's "Hide all reference columns" item).
-    pub(in crate::result) fn active_has_expansion(&self) -> bool {
+    pub(in crate::result) fn active_has_expansion(&self, cx: &App) -> bool {
+        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
+        // taking it now means that change does not cascade through every caller.
+        let _ = &cx;
         matches!(&self.phase, Phase::Connected(a) if a.active_result().is_some_and(|g| g.has_expansion()))
     }
 
@@ -1896,7 +1902,10 @@ impl AppState {
     /// The active result's error *while a filter is applied*: a rejected predicate
     /// is by far the likeliest cause, so the filter bar shows the engine's message
     /// inline and offers a revert instead of leaving the user with a dead grid.
-    pub(crate) fn filter_error(&self) -> Option<String> {
+    pub(crate) fn filter_error(&self, cx: &App) -> Option<String> {
+        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
+        // taking it now means that change does not cascade through every caller.
+        let _ = &cx;
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
@@ -1919,7 +1928,10 @@ impl AppState {
     }
 
     /// The active result's current filter, for the toolbar chip / filter-bar seed.
-    pub(crate) fn active_result_filter(&self) -> Option<ResultFilter> {
+    pub(crate) fn active_result_filter(&self, cx: &App) -> Option<ResultFilter> {
+        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
+        // taking it now means that change does not cascade through every caller.
+        let _ = &cx;
         match &self.phase {
             Phase::Connected(active) => active.active_result().and_then(|g| g.filter.clone()),
             _ => None,

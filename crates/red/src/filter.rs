@@ -26,7 +26,7 @@
 //! (`filters.rs`); ↑/↓ in either text box walk the same list.
 
 use flint::prelude::*;
-use gpui::{AnyElement, Context, Entity, Focusable, Window, div, prelude::*, px};
+use gpui::{AnyElement, App, Context, Entity, Focusable, Window, div, prelude::*, px};
 use red_core::{CmpOp, Column as ResultColumn, ColumnPredicate, ColumnValue, ResultFilter, Value};
 
 use crate::app::{AppState, Phase};
@@ -183,7 +183,8 @@ impl AppState {
             }
             return;
         }
-        let (mode, text, terms) = bar_seed(self.active_result_filter().as_ref(), self.filter_mode);
+        let (mode, text, terms) =
+            bar_seed(self.active_result_filter(cx).as_ref(), self.filter_mode);
         self.open_filter_bar_with(mode, text, terms, cx);
     }
 
@@ -316,7 +317,7 @@ impl AppState {
     /// when Esc undoes an edit). An `Eq` filter seeds the `WHERE` box with its
     /// equivalent expression, since it has no text form of its own.
     pub(crate) fn seed_filter_bar(&mut self, cx: &mut Context<Self>) {
-        let applied = self.active_result_filter();
+        let applied = self.active_result_filter(cx);
         let Some(bar) = &self.filter_bar else { return };
         let (input, expr, value) = (bar.input.clone(), bar.expr.clone(), bar.value.clone());
         let (mode, text, terms) = bar_seed(applied.as_ref(), bar.mode);
@@ -355,7 +356,7 @@ impl AppState {
             cx.notify();
             return;
         }
-        let applied = self.active_result_filter();
+        let applied = self.active_result_filter(cx);
         let Some(bar) = &self.filter_bar else { return };
         let (mode, text, terms) = bar_seed(applied.as_ref(), bar.mode);
         // Unedited (the box, and in `Column` mode the chips, already match what's
@@ -631,7 +632,7 @@ impl AppState {
             op,
             value: op.takes_value().then_some(value),
         };
-        let mut terms = match (and_join, self.active_result_filter()) {
+        let mut terms = match (and_join, self.active_result_filter(cx)) {
             (true, Some(ResultFilter::Cmp(existing))) => existing,
             _ => Vec::new(),
         };
@@ -651,9 +652,12 @@ impl AppState {
 
     /// Whether the cell menu's "Add to filter" item applies: there is a focused
     /// cell *and* an applied built filter to add to.
-    pub(crate) fn can_add_cell_filter_term(&self) -> bool {
+    pub(crate) fn can_add_cell_filter_term(&self, cx: &App) -> bool {
+        // See the note on `row_edit_mode`: `cx` is taken ahead of the
+        // `Entity<ResultGrid>` change so that change does not cascade.
+        let _ = &cx;
         self.cell_filter_target().is_some()
-            && matches!(self.active_result_filter(), Some(ResultFilter::Cmp(_)))
+            && matches!(self.active_result_filter(cx), Some(ResultFilter::Cmp(_)))
     }
 
     /// Which bucket of the recent-filters store the active result reads and
@@ -933,7 +937,7 @@ impl AppState {
         );
         let radius = theme.radius;
         let ui_family = theme.font_family.clone();
-        let has_filter = self.active_result_filter().is_some();
+        let has_filter = self.active_result_filter(cx).is_some();
 
         // The combined field: `[ mode ▾ │ filter… ]` as one bordered unit, so the
         // active mode is always legible and obviously switchable (the old pair of
@@ -1214,7 +1218,7 @@ impl AppState {
         // A rejected predicate (bad SQL, unknown column) leaves the grid showing
         // its "Query failed" panel; the bar owns the recovery, so the engine's
         // message lands here next to a one-click way back to the last good filter.
-        let error_strip = self.filter_error().map(|message| {
+        let error_strip = self.filter_error(cx).map(|message| {
             div()
                 .flex()
                 .items_center()

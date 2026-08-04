@@ -16,8 +16,8 @@
 
 use flint::prelude::*;
 use gpui::{
-    AnyElement, ClipboardItem, Context, Entity, FocusHandle, Focusable, ScrollHandle, SharedString,
-    div, prelude::*, px,
+    AnyElement, App, ClipboardItem, Context, Entity, FocusHandle, Focusable, ScrollHandle,
+    SharedString, div, prelude::*, px,
 };
 use red_core::{CappedCell, Value};
 
@@ -592,8 +592,11 @@ impl AppState {
     /// which [`AppState::active_edit_target`] refuses). Falls back to the resident
     /// target. Clones the full value, so call it only when actually opening an edit;
     /// the per-frame "is it editable?" check uses [`Self::inspector_can_edit`].
-    fn inspector_edit_context(&self) -> Option<EditContext> {
-        if !self.row_edit_enabled() {
+    fn inspector_edit_context(&self, cx: &App) -> Option<EditContext> {
+        // See the note on `row_edit_mode`: `cx` is taken ahead of the
+        // `Entity<ResultGrid>` change so that change does not cascade.
+        let _ = &cx;
+        if !self.row_edit_enabled(cx) {
             return None;
         }
         // Editing resolves through the grid *cursor* (`active_edit_target`), so a pane
@@ -615,14 +618,17 @@ impl AppState {
                 .active_result()?
                 .edit_target_full(self.gutter(), full.value.clone());
         }
-        self.active_edit_target()
+        self.active_edit_target(cx)
     }
 
     /// Whether the inspected cell can be edited: the cheap predicate behind the
     /// footer "Edit" button, evaluated every frame. Unlike `inspector_edit_context`
     /// it never clones the (possibly large) full value.
-    fn inspector_can_edit(&self) -> bool {
-        if !self.row_edit_enabled() {
+    fn inspector_can_edit(&self, cx: &App) -> bool {
+        // See the note on `row_edit_mode`: `cx` is taken ahead of the
+        // `Entity<ResultGrid>` change so that change does not cascade.
+        let _ = &cx;
+        if !self.row_edit_enabled(cx) {
             return false;
         }
         // A pane pinned away from the cursor is view-only (see `inspector_edit_context`).
@@ -642,7 +648,7 @@ impl AppState {
             return matches!(&self.phase, Phase::Connected(active)
                     if active.active_result().and_then(|g| g.edit_identity(self.gutter())).is_some());
         }
-        self.active_edit_target().is_some()
+        self.active_edit_target(cx).is_some()
     }
 
     /// Begin an inline edit of the focused cell in the inspector. No-op
@@ -653,7 +659,7 @@ impl AppState {
     /// seeded with the value *as it was being shown* (pretty JSON stays pretty), so
     /// editing it is in-place and WYSIWYG; ⌘↵ saves, Esc cancels, Enter adds a line.
     pub(crate) fn begin_inspector_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(ctx) = self.inspector_edit_context() else {
+        let Some(ctx) = self.inspector_edit_context(cx) else {
             return;
         };
         if self.inspector.is_none() {
@@ -960,7 +966,7 @@ impl AppState {
         // Whether the focused cell is editable; drives the footer "Edit" button.
         // (A large/capped text loaded in full is editable too, see
         // `inspector_can_edit`.)
-        let editable = self.inspector_can_edit();
+        let editable = self.inspector_can_edit(cx);
         // The lens toggle only makes sense once there's a value to re-render; a capped
         // or evicted cell must be loaded first.
         let is_ready = matches!(&resolved, Some(v) if matches!(v.state, CellState::Ready(_)));

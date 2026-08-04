@@ -667,7 +667,7 @@ impl Render for AppState {
                 if !this.globals_enabled() {
                     return;
                 }
-                if this.has_pending_changes() {
+                if this.has_pending_changes(cx) {
                     this.submit_changes(cx);
                 } else {
                     this.run_editor_query(cx);

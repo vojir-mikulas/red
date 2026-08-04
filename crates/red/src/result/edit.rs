@@ -19,7 +19,7 @@
 use std::collections::{HashMap, HashSet};
 
 use flint::{CellRange, TextInput, TextInputEvent, ToastVariant};
-use gpui::{Context, Entity, Focusable, Subscription, prelude::*};
+use gpui::{App, Context, Entity, Focusable, Subscription, prelude::*};
 use red_core::{BatchMode, ColumnValue, EditMode, EditOp, TableRef, Value, coerce_edit_value};
 use red_service::Command;
 
@@ -470,7 +470,7 @@ impl AppState {
     /// cell's *effective* current value (a prior staged edit if there is one) so a
     /// tweak is one keystroke; Enter stages it, Esc abandons.
     pub(crate) fn begin_grid_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(ctx) = self.active_edit_target() else {
+        let Some(ctx) = self.active_edit_target(cx) else {
             return;
         };
         let Some(key) = RowKey::from_values(&ctx.key_values) else {
@@ -761,7 +761,7 @@ impl AppState {
             }
             // `begin_grid_edit` re-resolves the edit target for the moved cursor and
             // no-ops on a non-editable cell; only open when it will actually take.
-            if self.active_edit_target().is_some() {
+            if self.active_edit_target(cx).is_some() {
                 self.begin_grid_edit(cx);
                 return;
             }
@@ -906,7 +906,7 @@ impl AppState {
     /// Set the focused cell to NULL and stage it (⌘⌥0 / context menu). No-op when
     /// the cell isn't editable.
     pub(crate) fn set_cell_null(&mut self, cx: &mut Context<Self>) {
-        let Some(ctx) = self.active_edit_target() else {
+        let Some(ctx) = self.active_edit_target(cx) else {
             return;
         };
         self.stage_existing_value(
@@ -963,7 +963,7 @@ impl AppState {
     /// in the selection flips between marked-for-deletion and not. No-op when row
     /// editing isn't enabled or no usable PK is resident for a row.
     pub(crate) fn toggle_delete_rows(&mut self, cx: &mut Context<Self>) {
-        if !self.row_edit_enabled() {
+        if !self.row_edit_enabled(cx) {
             return;
         }
         if let Phase::Connected(active) = &mut self.phase
@@ -1020,7 +1020,7 @@ impl AppState {
         if batch.ops.is_empty() {
             return;
         }
-        match self.batch_mode() {
+        match self.batch_mode(cx) {
             BatchMode::Atomic => {
                 self.confirm_exec = self.pending_confirm(PendingWrite::Batch {
                     ops: batch.ops,
@@ -1052,8 +1052,11 @@ impl AppState {
     /// engine with transactions gets the guarded one, ClickHouse the best-effort one.
     /// The "apply to all matching rows" acknowledgement starts off -- the user grants
     /// it in the confirm dialog, if at all.
-    pub(crate) fn batch_mode(&self) -> BatchMode {
-        match self.row_edit_mode() {
+    pub(crate) fn batch_mode(&self, cx: &App) -> BatchMode {
+        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
+        // taking it now means that change does not cascade through every caller.
+        let _ = &cx;
+        match self.row_edit_mode(cx) {
             EditMode::BestEffort => BatchMode::BestEffort {
                 allow_multi_match: false,
             },
@@ -1107,7 +1110,10 @@ impl AppState {
 
     /// Whether the active result has staged changes (for ⌘↵'s submit-vs-run choice
     /// and the footer controls).
-    pub(crate) fn has_pending_changes(&self) -> bool {
+    pub(crate) fn has_pending_changes(&self, cx: &App) -> bool {
+        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
+        // taking it now means that change does not cascade through every caller.
+        let _ = &cx;
         match &self.phase {
             Phase::Connected(active) => active
                 .active_result()

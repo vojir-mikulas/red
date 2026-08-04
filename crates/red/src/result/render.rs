@@ -922,7 +922,7 @@ impl AppState {
             // engine's own reason ("the Memory engine has no UPDATE/DELETE") is the
             // difference between a dead end and an explanation.
             .when_some(
-                self.row_edit_enabled()
+                self.row_edit_enabled(cx)
                     .then(|| grid.not_editable_note())
                     .flatten(),
                 |f, note| {
@@ -1481,10 +1481,10 @@ impl AppState {
     ) -> impl IntoElement + use<> {
         // Editing entries appear only when the focused cell / row is
         // editable on a writable connection's keyed browse.
-        let editable_cell = self.active_edit_target().is_some();
+        let editable_cell = self.active_edit_target(cx).is_some();
         // `row_edit_enabled` already resolves against the active result's reported
         // edit contract, which is what "can this browse's rows change" means.
-        let editable_browse = self.row_edit_enabled();
+        let editable_browse = self.row_edit_enabled(cx);
         let mut menu = ContextMenu::new("result-cell-menu")
             .item(
                 ContextMenuItem::new("cell-inspect", "Inspect")
@@ -1575,7 +1575,7 @@ impl AppState {
             // Narrow *further* rather than replacing, the multi-term flow the bar's
             // Column mode also builds. Only offered when there's a built filter to
             // add to; against a Contains/WHERE filter there is no structure to join.
-            if self.can_add_cell_filter_term() && !null {
+            if self.can_add_cell_filter_term(cx) && !null {
                 sub = sub.item(
                     ContextMenuItem::new("cell-filter-and", format!("Add: = {shown}")).on_click(
                         cx.listener(|this, _, _, cx| {
@@ -1626,8 +1626,8 @@ impl AppState {
         // column, or clear them all. The per-column list comes from the referenced
         // table's prefetched detail; the Columns panel is the fuller, recursive UI.
         let ref_menu = self.reference_menu(cx);
-        let joined_path = self.focused_joined_path();
-        let has_expansion = self.active_has_expansion();
+        let joined_path = self.focused_joined_path(cx);
+        let has_expansion = self.active_has_expansion(cx);
         if ref_menu.as_ref().is_some_and(|m| !m.columns.is_empty())
             || joined_path.is_some()
             || has_expansion

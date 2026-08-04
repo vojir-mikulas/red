@@ -231,7 +231,7 @@ impl AppState {
     /// ⌃G (or the "go to row…" command): open a prompt for a row number. No-op
     /// when no result is open, since there's nothing to navigate.
     pub(crate) fn open_goto_prompt(&mut self, cx: &mut Context<Self>) {
-        let Some(total) = self.active_result_total() else {
+        let Some(total) = self.active_result_total(cx) else {
             return;
         };
         let placeholder = format!("Go to row 1–{}", total.max(1));
@@ -248,7 +248,10 @@ impl AppState {
     }
 
     /// Total rows of the active tab's open result, if any.
-    fn active_result_total(&self) -> Option<usize> {
+    fn active_result_total(&self, cx: &App) -> Option<usize> {
+        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
+        // taking it now means that change does not cascade through every caller.
+        let _ = &cx;
         match &self.phase {
             Phase::Connected(active) => active.active_result().map(|g| g.total_rows()),
             _ => None,
@@ -431,7 +434,10 @@ impl AppState {
     ///
     /// [`EditMode::None`](red_core::EditMode::None) means no update/delete affordances at all -- read-only is
     /// the safe default at every level.
-    pub(crate) fn row_edit_mode(&self) -> red_core::EditMode {
+    pub(crate) fn row_edit_mode(&self, cx: &App) -> red_core::EditMode {
+        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
+        // taking it now means that change does not cascade through every caller.
+        let _ = &cx;
         let Phase::Connected(active) = &self.phase else {
             return red_core::EditMode::None;
         };
@@ -446,8 +452,11 @@ impl AppState {
     }
 
     /// Whether the active result's existing rows can be edited at all.
-    pub(crate) fn row_edit_enabled(&self) -> bool {
-        !matches!(self.row_edit_mode(), red_core::EditMode::None)
+    pub(crate) fn row_edit_enabled(&self, cx: &App) -> bool {
+        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
+        // taking it now means that change does not cascade through every caller.
+        let _ = &cx;
+        !matches!(self.row_edit_mode(cx), red_core::EditMode::None)
     }
 
     /// Whether in-grid **inserting** (the draft-row zone, "+ Row", file import) is
@@ -468,8 +477,11 @@ impl AppState {
     /// The focused result cell's edit target, when editing is enabled and the cell
     /// is editable (a single-table keyed browse, non-PK, non-clipped). `None`
     /// otherwise; the entry point and palette gate both consult this.
-    pub(crate) fn active_edit_target(&self) -> Option<crate::app::EditContext> {
-        if !self.row_edit_enabled() {
+    pub(crate) fn active_edit_target(&self, cx: &App) -> Option<crate::app::EditContext> {
+        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
+        // taking it now means that change does not cascade through every caller.
+        let _ = &cx;
+        if !self.row_edit_enabled(cx) {
             return None;
         }
         let gutter = self.gutter();
@@ -618,7 +630,7 @@ impl AppState {
                         Cmd::AddRow,
                     ));
                 }
-                if self.has_pending_changes() {
+                if self.has_pending_changes(cx) {
                     out.push((
                         item("cmd:submit-changes", "data: submit changes").hint("⌘↵"),
                         Cmd::SubmitChanges,
