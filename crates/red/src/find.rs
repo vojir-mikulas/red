@@ -198,9 +198,10 @@ impl AppState {
                 let target = bar.grid_matches.get(bar.current).copied();
                 if let Some((ord, dcol)) = target
                     && let Phase::Connected(active) = &mut self.phase
-                    && let Some(grid) = active.active_result_mut()
                 {
-                    grid.reveal_cell(ord, dcol + gutter, row_height);
+                    active.with_active_result(cx, |grid| {
+                        grid.reveal_cell(ord, dcol + gutter, row_height)
+                    });
                 }
             }
             FindTarget::Editor => {

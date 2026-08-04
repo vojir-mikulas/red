@@ -1909,8 +1909,27 @@ impl ActiveConn {
         self.active().and_then(|t| t.result.as_ref())
     }
 
-    pub(crate) fn active_result_mut(&mut self) -> Option<&mut ResultGrid> {
+    /// Private on purpose: the inline `&mut` it hands out is exactly the shape
+    /// that cannot survive `result` becoming an entity. Go through
+    /// [`with_active_result`](Self::with_active_result).
+    fn active_result_mut(&mut self) -> Option<&mut ResultGrid> {
         self.active_mut().and_then(|t| t.result.as_mut())
+    }
+
+    /// Mutate the focused tab's grid through a closure.
+    ///
+    /// The closure shape is the point: it is what `Entity::update` requires, so
+    /// reshaping the call sites while `result` is still a plain struct means the
+    /// eventual type change is a change of *this one body*. See
+    /// `docs/plans/todo/zed-architecture-inspiration.md` (Stage A.5).
+    pub(crate) fn with_active_result<R>(
+        &mut self,
+        cx: &mut App,
+        f: impl FnOnce(&mut ResultGrid) -> R,
+    ) -> Option<R> {
+        // Unused until `result` is an entity, when this becomes `update(cx, …)`.
+        let _ = &cx;
+        self.active_result_mut().map(f)
     }
 
     /// Find the open result whose grid carries `epoch`, across all tabs; result

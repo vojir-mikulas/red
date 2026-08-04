@@ -1600,13 +1600,18 @@ impl AppState {
 
     /// Record a result error against the session's focused tab grid (also surfaced
     /// as a toast). Errors aren't epoch-tagged, so they attach to the focused tab.
-    pub(crate) fn on_result_error(&mut self, session: Option<SessionId>, message: &str) {
-        if let Some(active) = self.conn_mut(session)
-            && let Some(grid) = active.active_result_mut()
-        {
-            grid.error = Some(message.to_string());
-            grid.ready = true;
-            grid.stop_timer();
+    pub(crate) fn on_result_error(
+        &mut self,
+        session: Option<SessionId>,
+        message: &str,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(active) = self.conn_mut(session) {
+            active.with_active_result(cx, |grid| {
+                grid.error = Some(message.to_string());
+                grid.ready = true;
+                grid.stop_timer();
+            });
         }
     }
 
@@ -1625,15 +1630,13 @@ impl AppState {
         }
         let dcol = table_col - gutter;
         let reopen = match &mut self.phase {
-            Phase::Connected(active) => match active.active_result_mut() {
-                Some(grid) => {
+            Phase::Connected(active) => active
+                .with_active_result(cx, |grid| {
                     // A header click can arrive a frame after a re-open delivered a
                     // narrower column set; ignore a click whose data column no longer
-                    // exists rather than indexing past `columns` (and before mutating
-                    // any sort state, so a stale click is a clean no-op).
-                    let Some(col_name) = grid.columns.get(dcol).map(|c| c.name.clone()) else {
-                        return;
-                    };
+                    // exists rather than indexing past `columns`. `?` leaves `reopen`
+                    // `None`, skipping the re-open exactly as the early `return` did.
+                    let col_name = grid.columns.get(dcol).map(|c| c.name.clone())?;
                     let old_epoch = grid.epoch;
                     let asc = match grid.sort {
                         Some((c, asc)) if c == dcol => !asc,
@@ -1663,9 +1666,8 @@ impl AppState {
                         grid.epoch,
                         old_epoch,
                     ))
-                }
-                None => None,
-            },
+                })
+                .flatten(),
             _ => None,
         };
         if let Some((sql, table, sort, filter, joins, epoch, old_epoch)) = reopen {
@@ -1695,8 +1697,11 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let reopen = match &mut self.phase {
-            Phase::Connected(active) => match active.active_result_mut() {
-                Some(grid) if grid.filter != filter => {
+            Phase::Connected(active) => active
+                .with_active_result(cx, |grid| {
+                    if !(grid.filter != filter) {
+                        return None;
+                    }
                     let old_epoch = grid.epoch;
                     grid.filter = filter;
                     grid.selection = None;
@@ -1723,9 +1728,8 @@ impl AppState {
                         grid.epoch,
                         old_epoch,
                     ))
-                }
-                _ => None,
-            },
+                })
+                .flatten(),
             _ => None,
         };
         if let Some((sql, table, sort, filter, joins, epoch, old_epoch)) = reopen {
@@ -1753,14 +1757,14 @@ impl AppState {
         let reopen = match &mut self.phase {
             Phase::Connected(active) => {
                 let graph = active.schema.read(cx).fk_graph.clone();
-                match active.active_result_mut() {
-                    Some(grid) if grid.table.is_some() => {
+                active
+                    .with_active_result(cx, |grid| {
+                        grid.table.as_ref()?;
                         grid.toggle_expansion(path);
                         grid.rebuild_joins(&graph);
                         Some(grid.reopen_spec())
-                    }
-                    _ => None,
-                }
+                    })
+                    .flatten()
             }
             _ => None,
         };
@@ -1771,14 +1775,16 @@ impl AppState {
     /// it unexpanded. No-op when nothing is expanded.
     pub(crate) fn clear_reference_columns(&mut self, cx: &mut Context<Self>) {
         let reopen = match &mut self.phase {
-            Phase::Connected(active) => match active.active_result_mut() {
-                Some(grid) if grid.has_expansion() => {
+            Phase::Connected(active) => active
+                .with_active_result(cx, |grid| {
+                    if !(grid.has_expansion()) {
+                        return None;
+                    }
                     grid.expansion.clear();
                     grid.joins.clear();
                     Some(grid.reopen_spec())
-                }
-                _ => None,
-            },
+                })
+                .flatten(),
             _ => None,
         };
         self.apply_reopen(reopen, cx);
@@ -1968,32 +1974,32 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let gutter = self.gutter();
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(grid) = active.active_result_mut()
-        {
-            let ncols = grid.columns.len();
-            grid.selection = if gutter == 1 && table_col == 0 {
-                // Gutter click: span every data column (table cols
-                // `gutter..=ncols`); an empty result has no columns to select.
-                (ncols > 0).then(|| match (extend, grid.selection) {
-                    (true, Some(mut range)) => {
-                        range.focus = (row, ncols);
-                        range
-                    }
-                    _ => CellRange {
-                        anchor: (row, 1),
-                        focus: (row, ncols),
-                    },
-                })
-            } else {
-                Some(match (extend, grid.selection) {
-                    (true, Some(mut range)) => {
-                        range.focus = (row, table_col);
-                        range
-                    }
-                    _ => CellRange::single(row, table_col),
-                })
-            };
+        if let Phase::Connected(active) = &mut self.phase {
+            active.with_active_result(cx, |grid| {
+                let ncols = grid.columns.len();
+                grid.selection = if gutter == 1 && table_col == 0 {
+                    // Gutter click: span every data column (table cols
+                    // `gutter..=ncols`); an empty result has no columns to select.
+                    (ncols > 0).then(|| match (extend, grid.selection) {
+                        (true, Some(mut range)) => {
+                            range.focus = (row, ncols);
+                            range
+                        }
+                        _ => CellRange {
+                            anchor: (row, 1),
+                            focus: (row, ncols),
+                        },
+                    })
+                } else {
+                    Some(match (extend, grid.selection) {
+                        (true, Some(mut range)) => {
+                            range.focus = (row, table_col);
+                            range
+                        }
+                        _ => CellRange::single(row, table_col),
+                    })
+                };
+            });
         }
         // A new cell selection; refresh the stats bar to its column.
         self.refresh_column_stats(cx);
@@ -2014,45 +2020,45 @@ impl AppState {
     ) {
         let row_height = f32::from(self.settings.data.density.row_height());
         let gutter = self.gutter();
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(grid) = active.active_result_mut()
-        {
-            if !grid.ready || grid.error.is_some() || grid.columns.is_empty() {
-                return;
-            }
-            let ncols = grid.columns.len();
-            let last_row = grid.total.saturating_sub(1);
-            let page = grid.viewport_rows(row_height).max(1);
-            // Data columns occupy table indices `gutter..=ncols-1+gutter`.
-            let (first_col, last_col) = (gutter, ncols + gutter - 1);
-            // The cursor is the selection's focus; with nothing selected yet
-            // it starts at the first visible row's first data column.
-            let (row, col) = match grid.selection {
-                Some(r) => r.focus,
-                None => (grid.first_visible_row(row_height), first_col),
-            };
-            let col = col.clamp(first_col, last_col);
-            let (new_row, new_col) = match mv {
-                TableNav::Up => (row.saturating_sub(1), col),
-                TableNav::Down => ((row + 1).min(last_row), col),
-                TableNav::Left => (row, col.saturating_sub(1).max(first_col)),
-                TableNav::Right => (row, (col + 1).min(last_col)),
-                TableNav::RowStart => (row, first_col),
-                TableNav::RowEnd => (row, last_col),
-                TableNav::PageUp => (row.saturating_sub(page), col),
-                TableNav::PageDown => ((row + page).min(last_row), col),
-                TableNav::First => (0, col),
-                TableNav::Last => (last_row, col),
-            };
-            grid.selection = Some(match (extend, grid.selection) {
-                (true, Some(mut range)) => {
-                    range.focus = (new_row, new_col);
-                    range
+        if let Phase::Connected(active) = &mut self.phase {
+            active.with_active_result(cx, |grid| {
+                if !grid.ready || grid.error.is_some() || grid.columns.is_empty() {
+                    return;
                 }
-                _ => CellRange::single(new_row, new_col),
+                let ncols = grid.columns.len();
+                let last_row = grid.total.saturating_sub(1);
+                let page = grid.viewport_rows(row_height).max(1);
+                // Data columns occupy table indices `gutter..=ncols-1+gutter`.
+                let (first_col, last_col) = (gutter, ncols + gutter - 1);
+                // The cursor is the selection's focus; with nothing selected yet
+                // it starts at the first visible row's first data column.
+                let (row, col) = match grid.selection {
+                    Some(r) => r.focus,
+                    None => (grid.first_visible_row(row_height), first_col),
+                };
+                let col = col.clamp(first_col, last_col);
+                let (new_row, new_col) = match mv {
+                    TableNav::Up => (row.saturating_sub(1), col),
+                    TableNav::Down => ((row + 1).min(last_row), col),
+                    TableNav::Left => (row, col.saturating_sub(1).max(first_col)),
+                    TableNav::Right => (row, (col + 1).min(last_col)),
+                    TableNav::RowStart => (row, first_col),
+                    TableNav::RowEnd => (row, last_col),
+                    TableNav::PageUp => (row.saturating_sub(page), col),
+                    TableNav::PageDown => ((row + page).min(last_row), col),
+                    TableNav::First => (0, col),
+                    TableNav::Last => (last_row, col),
+                };
+                grid.selection = Some(match (extend, grid.selection) {
+                    (true, Some(mut range)) => {
+                        range.focus = (new_row, new_col);
+                        range
+                    }
+                    _ => CellRange::single(new_row, new_col),
+                });
+                grid.scroll_cursor_into_view(new_row, row_height);
+                grid.scroll_col_into_view(new_col, gutter);
             });
-            grid.scroll_cursor_into_view(new_row, row_height);
-            grid.scroll_col_into_view(new_col, gutter);
         }
         // The keyboard cursor moved; update the stats bar to the focused column.
         self.refresh_column_stats(cx);
@@ -2075,23 +2081,23 @@ impl AppState {
         if table_col < gutter {
             return;
         }
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(grid) = active.active_result_mut()
-        {
-            let last = grid.total.saturating_sub(1);
-            grid.selection = match (extend, grid.selection) {
-                // Keep the anchor column, pull the focus to this one, and force
-                // full height so the block stays a clean column span.
-                (true, Some(mut range)) => {
-                    range.anchor = (0, range.anchor.1.max(gutter));
-                    range.focus = (last, table_col);
-                    Some(range)
-                }
-                _ => Some(CellRange {
-                    anchor: (0, table_col),
-                    focus: (last, table_col),
-                }),
-            };
+        if let Phase::Connected(active) = &mut self.phase {
+            active.with_active_result(cx, |grid| {
+                let last = grid.total.saturating_sub(1);
+                grid.selection = match (extend, grid.selection) {
+                    // Keep the anchor column, pull the focus to this one, and force
+                    // full height so the block stays a clean column span.
+                    (true, Some(mut range)) => {
+                        range.anchor = (0, range.anchor.1.max(gutter));
+                        range.focus = (last, table_col);
+                        Some(range)
+                    }
+                    _ => Some(CellRange {
+                        anchor: (0, table_col),
+                        focus: (last, table_col),
+                    }),
+                };
+            });
         }
         // Header ⌘/Ctrl-click selected this whole column, its natural stats target.
         self.refresh_column_stats(cx);
@@ -2106,17 +2112,17 @@ impl AppState {
     /// ready and has columns.
     pub(crate) fn result_select_all(&mut self, cx: &mut Context<Self>) {
         let gutter = self.gutter();
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(grid) = active.active_result_mut()
-        {
-            if !grid.ready || grid.error.is_some() || grid.columns.is_empty() {
-                return;
-            }
-            let last = grid.total.saturating_sub(1);
-            let last_col = grid.columns.len() + gutter - 1;
-            grid.selection = Some(CellRange {
-                anchor: (0, gutter),
-                focus: (last, last_col),
+        if let Phase::Connected(active) = &mut self.phase {
+            active.with_active_result(cx, |grid| {
+                if !grid.ready || grid.error.is_some() || grid.columns.is_empty() {
+                    return;
+                }
+                let last = grid.total.saturating_sub(1);
+                let last_col = grid.columns.len() + gutter - 1;
+                grid.selection = Some(CellRange {
+                    anchor: (0, gutter),
+                    focus: (last, last_col),
+                });
             });
         }
         cx.notify();
@@ -2129,10 +2135,8 @@ impl AppState {
         self.stats_bar = !self.stats_bar;
         if self.stats_bar {
             self.refresh_column_stats(cx);
-        } else if let Phase::Connected(active) = &mut self.phase
-            && let Some(grid) = active.active_result_mut()
-        {
-            grid.stats = None;
+        } else if let Phase::Connected(active) = &mut self.phase {
+            active.with_active_result(cx, |grid| grid.stats = None);
         }
         cx.notify();
     }
@@ -2147,12 +2151,14 @@ impl AppState {
         let gutter = self.gutter();
         let distinct_max = self.settings.data.stats_distinct_max_rows;
         let req = match &mut self.phase {
-            Phase::Connected(active) => match active.active_result_mut() {
-                Some(grid) if grid.ready && grid.error.is_none() => {
+            Phase::Connected(active) => active
+                .with_active_result(cx, |grid| {
+                    if !(grid.ready && grid.error.is_none()) {
+                        return None;
+                    }
                     grid.prepare_stats(gutter, distinct_max)
-                }
-                _ => None,
-            },
+                })
+                .flatten(),
             _ => None,
         };
         if let Some((epoch, column, numeric, distinct)) = req {
@@ -2171,8 +2177,8 @@ impl AppState {
     pub(crate) fn compute_column_distinct(&mut self, cx: &mut Context<Self>) {
         let req = match &mut self.phase {
             Phase::Connected(active) => active
-                .active_result_mut()
-                .and_then(|grid| grid.force_distinct_request()),
+                .with_active_result(cx, |grid| grid.force_distinct_request())
+                .flatten(),
             _ => None,
         };
         if let Some((epoch, column, numeric)) = req {

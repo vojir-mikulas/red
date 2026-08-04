@@ -1712,7 +1712,7 @@ impl AppState {
                 if let Some(conn) = self.conn_mut(session) {
                     conn.write_in_flight = false;
                 }
-                self.on_result_error(session, &message);
+                self.on_result_error(session, &message, cx);
                 self.notify_detail(ToastVariant::Error, "Error", message, cx);
                 // A DDL Apply that the engine rejected: stay in edit mode with the
                 // buffer intact, so the user fixes the statement rather than

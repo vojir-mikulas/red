@@ -190,10 +190,10 @@ impl AppState {
             // The gutter is column `0` in the grid's coordinate system, so flipping
             // it shifts the data-column offset; clear the selection (stored in
             // table-column coords) so it can't point off by one.
-            if let Phase::Connected(active) = &mut self.phase
-                && let Some(grid) = active.active_result_mut()
-            {
-                grid.clear_selection();
+            if let Phase::Connected(active) = &mut self.phase {
+                active.with_active_result(cx, |grid| {
+                    grid.clear_selection();
+                });
             }
         }
     }

@@ -620,10 +620,10 @@ impl AppState {
                 original,
                 foreign,
             } => self.stage_existing_value(
-                edit.epoch, row, data_col, key_values, original, value, foreign,
+                edit.epoch, row, data_col, key_values, original, value, foreign, cx,
             ),
             EditSlot::Draft { index, data_col } => {
-                self.stage_draft_value(edit.epoch, index, data_col, value)
+                self.stage_draft_value(edit.epoch, index, data_col, value, cx)
             }
         }
         // Hand focus back to the grid so the cell cursor (arrows, next edit) is live.
@@ -681,12 +681,12 @@ impl AppState {
                 foreign,
             } => {
                 self.stage_existing_value(
-                    edit.epoch, row, data_col, key_values, original, value, foreign,
+                    edit.epoch, row, data_col, key_values, original, value, foreign, cx,
                 );
                 self.advance_row_edit(row, data_col, forward, cx);
             }
             EditSlot::Draft { index, data_col } => {
-                self.stage_draft_value(edit.epoch, index, data_col, value);
+                self.stage_draft_value(edit.epoch, index, data_col, value, cx);
                 self.advance_draft_edit(index, data_col, forward, cx);
             }
         }
@@ -752,12 +752,12 @@ impl AppState {
             if locked.get(c).copied().unwrap_or(true) {
                 continue; // identity / engine-computed column; skip without a probe
             }
-            if let Phase::Connected(active) = &mut self.phase
-                && let Some(grid) = active.active_result_mut()
-            {
-                grid.selection = Some(CellRange::single(r, c + gutter));
-                grid.scroll_cursor_into_view(r, row_height);
-                grid.scroll_col_into_view(c + gutter, gutter);
+            if let Phase::Connected(active) = &mut self.phase {
+                active.with_active_result(cx, |grid| {
+                    grid.selection = Some(CellRange::single(r, c + gutter));
+                    grid.scroll_cursor_into_view(r, row_height);
+                    grid.scroll_col_into_view(c + gutter, gutter);
+                });
             }
             // `begin_grid_edit` re-resolves the edit target for the moved cursor and
             // no-ops on a non-editable cell; only open when it will actually take.
@@ -842,36 +842,37 @@ impl AppState {
         original: Value,
         value: Value,
         foreign: Option<ForeignEdit>,
+        cx: &mut Context<Self>,
     ) {
         let Some(key) = RowKey::from_values(&key_values) else {
             return;
         };
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(grid) = active.active_result_mut()
-        {
-            if grid.epoch != epoch {
-                return; // the result was replaced under the in-flight edit
-            }
-            if value == original {
-                if let Some(u) = grid.pending.updates.get_mut(&key) {
-                    u.cells.remove(&data_col);
-                    if u.cells.is_empty() {
-                        grid.pending.updates.remove(&key);
-                    }
+        if let Phase::Connected(active) = &mut self.phase {
+            active.with_active_result(cx, |grid| {
+                if grid.epoch != epoch {
+                    return; // the result was replaced under the in-flight edit
                 }
-            } else {
-                let entry = grid
-                    .pending
-                    .updates
-                    .entry(key)
-                    .or_insert_with(|| UpdatedRow {
-                        key_values,
-                        row,
-                        cells: HashMap::new(),
-                    });
-                entry.row = row;
-                entry.cells.insert(data_col, StagedCell { value, foreign });
-            }
+                if value == original {
+                    if let Some(u) = grid.pending.updates.get_mut(&key) {
+                        u.cells.remove(&data_col);
+                        if u.cells.is_empty() {
+                            grid.pending.updates.remove(&key);
+                        }
+                    }
+                } else {
+                    let entry = grid
+                        .pending
+                        .updates
+                        .entry(key)
+                        .or_insert_with(|| UpdatedRow {
+                            key_values,
+                            row,
+                            cells: HashMap::new(),
+                        });
+                    entry.row = row;
+                    entry.cells.insert(data_col, StagedCell { value, foreign });
+                }
+            });
         }
     }
 
@@ -886,20 +887,25 @@ impl AppState {
         index: usize,
         data_col: usize,
         value: Value,
+        cx: &mut Context<Self>,
     ) {
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(grid) = active.active_result_mut()
-            && grid.epoch == epoch
-            && let Some(draft) = grid.pending.inserts.get_mut(index)
-        {
-            match value {
-                Value::Null => {
-                    draft.cells.remove(&data_col);
+        if let Phase::Connected(active) = &mut self.phase {
+            active.with_active_result(cx, |grid| {
+                if grid.epoch != epoch {
+                    return;
                 }
-                v => {
-                    draft.cells.insert(data_col, v);
+                let Some(draft) = grid.pending.inserts.get_mut(index) else {
+                    return;
+                };
+                match value {
+                    Value::Null => {
+                        draft.cells.remove(&data_col);
+                    }
+                    v => {
+                        draft.cells.insert(data_col, v);
+                    }
                 }
-            }
+            });
         }
     }
 
@@ -917,6 +923,7 @@ impl AppState {
             ctx.original,
             Value::Null,
             ctx.foreign,
+            cx,
         );
         cx.notify();
     }
@@ -929,18 +936,18 @@ impl AppState {
         if !self.insert_enabled() {
             return;
         }
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(grid) = active.active_result_mut()
-        {
-            // A draft row names no existing row, so it needs a target table but no
-            // resolved key (unlike an update or a delete).
-            if grid.insertable_browse() {
-                grid.pending.inserts.push(DraftRow::default());
-                // Past the zone's visible rows the new draft lands below the fold,
-                // which reads as "+ Row did nothing" — so bring it into view.
-                grid.draft_scroll
-                    .scroll_to_item(grid.pending.inserts.len() - 1);
-            }
+        if let Phase::Connected(active) = &mut self.phase {
+            active.with_active_result(cx, |grid| {
+                // A draft row names no existing row, so it needs a target table but no
+                // resolved key (unlike an update or a delete).
+                if grid.insertable_browse() {
+                    grid.pending.inserts.push(DraftRow::default());
+                    // Past the zone's visible rows the new draft lands below the fold,
+                    // which reads as "+ Row did nothing" — so bring it into view.
+                    grid.draft_scroll
+                        .scroll_to_item(grid.pending.inserts.len() - 1);
+                }
+            });
         }
         cx.notify();
     }
@@ -950,11 +957,12 @@ impl AppState {
     pub(crate) fn remove_draft_row(&mut self, index: usize, cx: &mut Context<Self>) {
         self.grid_edit = None;
         self.cell_suggest = None;
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(grid) = active.active_result_mut()
-            && index < grid.pending.inserts.len()
-        {
-            grid.pending.inserts.remove(index);
+        if let Phase::Connected(active) = &mut self.phase {
+            active.with_active_result(cx, |grid| {
+                if index < grid.pending.inserts.len() {
+                    grid.pending.inserts.remove(index);
+                }
+            });
         }
         cx.notify();
     }
@@ -966,23 +974,32 @@ impl AppState {
         if !self.row_edit_enabled(cx) {
             return;
         }
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(grid) = active.active_result_mut()
-        {
-            let Some(sel) = grid.selection else { return };
-            let (r0, _, r1, _) = sel.bounds();
-            for row in r0..=r1 {
-                let Some(key_values) = grid.identity_values(row) else {
-                    continue;
+        if let Phase::Connected(active) = &mut self.phase {
+            // The closure reports whether there was a selection, so the
+            // no-selection case still skips the repaint below exactly as the
+            // early `return` used to.
+            let acted = active.with_active_result(cx, |grid| {
+                let Some(sel) = grid.selection else {
+                    return false;
                 };
-                let Some(key) = RowKey::from_values(&key_values) else {
-                    continue;
-                };
-                if grid.pending.deletes.remove(&key).is_none() {
-                    grid.pending
-                        .deletes
-                        .insert(key, DeletedRow { key_values, row });
+                let (r0, _, r1, _) = sel.bounds();
+                for row in r0..=r1 {
+                    let Some(key_values) = grid.identity_values(row) else {
+                        continue;
+                    };
+                    let Some(key) = RowKey::from_values(&key_values) else {
+                        continue;
+                    };
+                    if grid.pending.deletes.remove(&key).is_none() {
+                        grid.pending
+                            .deletes
+                            .insert(key, DeletedRow { key_values, row });
+                    }
                 }
+                true
+            });
+            if acted == Some(false) {
+                return;
             }
         }
         cx.notify();
@@ -1126,10 +1143,10 @@ impl AppState {
     pub(crate) fn revert_changes(&mut self, cx: &mut Context<Self>) {
         self.grid_edit = None;
         self.cell_suggest = None;
-        if let Phase::Connected(active) = &mut self.phase
-            && let Some(grid) = active.active_result_mut()
-        {
-            grid.pending = PendingChanges::default();
+        if let Phase::Connected(active) = &mut self.phase {
+            active.with_active_result(cx, |grid| {
+                grid.pending = PendingChanges::default();
+            });
         }
         cx.notify();
     }

@@ -68,8 +68,7 @@ impl AppState {
         let need_describe = match &mut self.phase {
             Phase::Connected(active) => {
                 let opened = active
-                    .active_result_mut()
-                    .map(|g| g.toggle_tree_node(path))
+                    .with_active_result(cx, |g| g.toggle_tree_node(path))
                     .unwrap_or(false);
                 opened
                     && !active
