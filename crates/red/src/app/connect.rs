@@ -4,7 +4,7 @@
 //! delete actions. Split out of `mod.rs` to keep the root state machine lean.
 
 use super::*;
-use red_core::SshAuth;
+use red_core::{ConnEnv, DbKind, SshAuth};
 
 impl AppState {
     // --- sessions (keep-alive workspaces) ---
@@ -218,6 +218,76 @@ impl AppState {
             }
         }
         self.rebuild_switcher(cx);
+    }
+
+    // --- welcome-list arrangement (sort + facet filters) ---
+
+    /// Record the current sort and facets in `state.json`, so the roster opens
+    /// the way it was left. Called by every arrangement change; the store itself
+    /// skips the write when nothing actually changed.
+    fn persist_connect_view(&mut self) {
+        self.local_state
+            .set_connect_view(crate::local_state::StoredConnectView {
+                sort: self.connect_sort.field.key().to_string(),
+                ascending: self.connect_sort.ascending,
+                kinds: self.connect_filter.kind_keys(),
+                envs: self.connect_filter.env_keys(),
+            });
+    }
+
+    /// Sort by `field`, or flip the direction when it's already the active key.
+    pub(crate) fn set_connect_sort(&mut self, field: ConnectSortField, cx: &mut Context<Self>) {
+        self.connect_sort.toggle(field);
+        // The highlight indexes the *display* order, so a reorder must reset it
+        // rather than leave it pointing at a different connection.
+        self.connect_sel = 0;
+        self.persist_connect_view();
+        cx.notify();
+    }
+
+    /// Add or remove an engine from the engine facet (a row of its dropdown).
+    pub(crate) fn toggle_connect_kind(&mut self, kind: DbKind, cx: &mut Context<Self>) {
+        self.connect_filter.toggle_kind(kind);
+        self.after_filter_change(cx);
+    }
+
+    /// Add or remove an environment from the environment facet.
+    pub(crate) fn toggle_connect_env(&mut self, env: ConnEnv, cx: &mut Context<Self>) {
+        self.connect_filter.toggle_env(env);
+        self.after_filter_change(cx);
+    }
+
+    /// Drop the engine facet alone (its dropdown's own Clear), leaving the
+    /// environment facet and the search query as they were.
+    pub(crate) fn clear_connect_kinds(&mut self, cx: &mut Context<Self>) {
+        self.connect_filter.kinds.clear();
+        self.after_filter_change(cx);
+    }
+
+    /// Drop the environment facet alone (its dropdown's own Clear).
+    pub(crate) fn clear_connect_envs(&mut self, cx: &mut Context<Self>) {
+        self.connect_filter.envs.clear();
+        self.after_filter_change(cx);
+    }
+
+    /// Show the whole roster again: drop both facets *and* the search query. The
+    /// count line's "Clear" is the one-click way back from any narrowing, so it
+    /// undoes every part of it rather than half.
+    pub(crate) fn clear_connect_filters(&mut self, cx: &mut Context<Self>) {
+        self.connect_filter.clear();
+        self.connect_search
+            .update(cx, |input, cx| input.set_content("", cx));
+        self.after_filter_change(cx);
+    }
+
+    /// The tail every narrowing change shares: re-home the keyboard highlight
+    /// (it indexes the *visible* list, which just moved), push the new counts and
+    /// selection into the two dropdowns, and remember the arrangement.
+    fn after_filter_change(&mut self, cx: &mut Context<Self>) {
+        self.connect_sel = 0;
+        self.refresh_connect_filters(cx);
+        self.persist_connect_view();
+        cx.notify();
     }
 
     // --- connection-manager actions ---

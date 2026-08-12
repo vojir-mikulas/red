@@ -379,11 +379,18 @@ static SHORTCUTS: &[ShortcutGroup] = &[
                 "↑ / ↓",
                 "Move between saved connections",
             ),
+            ("page_the_connection_list", "← / →", "Page the list"),
+            (
+                "jump_to_the_first_last_connection",
+                "Home / End",
+                "Jump to the first / last connection",
+            ),
             (
                 "connect_to_the_highlighted_one",
                 "↵",
                 "Connect to the highlighted one",
             ),
+            ("search_connections", "/", "Search connections"),
             (
                 "edit_the_highlighted_connection",
                 "E",

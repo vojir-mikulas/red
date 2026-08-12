@@ -721,6 +721,13 @@ impl Render for AppState {
                 // While the search box has focus, letters/backspace must edit the
                 // query; only the navigation keys act as card shortcuts there.
                 let search_focused = this.connect_search.focus_handle(cx).is_focused(window);
+                // A bare keystroke. Shift is allowed (the hints spell these as
+                // capitals), but a ⌘/⌥/⌃ combination belongs to a real binding —
+                // ⌘/ opens the shortcut reference — and must not be swallowed
+                // here as a card shortcut.
+                let m = &event.keystroke.modifiers;
+                let bare = !m.platform && !m.control && !m.alt && !m.function;
+                let plain = bare && !search_focused;
                 let sel = this.connect_sel.min(n - 1);
                 match event.keystroke.key.as_str() {
                     "up" => {
@@ -737,15 +744,32 @@ impl Render for AppState {
                         cx.stop_propagation();
                         this.connect(visible[sel], cx);
                     }
+                    // ←/→ page the list, Home/End jump to its ends. Gated on the
+                    // search box not having focus: there these keys move the
+                    // caret, which is what a user typing expects them to do.
+                    "left" | "right" if plain => {
+                        cx.stop_propagation();
+                        this.connect_page_step(event.keystroke.key == "right", cx);
+                    }
+                    "home" | "end" if plain => {
+                        cx.stop_propagation();
+                        this.connect_jump(event.keystroke.key == "end", cx);
+                    }
                     // E edits the highlighted connection, ⌫/⌦ asks to remove it;
                     // the keyboard mirrors the hover edit/trash buttons on each card.
-                    "e" if !search_focused => {
+                    "e" if plain => {
                         cx.stop_propagation();
                         this.open_edit_form(visible[sel], cx);
                     }
-                    "backspace" | "delete" if !search_focused => {
+                    "backspace" | "delete" if plain => {
                         cx.stop_propagation();
                         this.request_delete_connection(visible[sel], cx);
+                    }
+                    // "/" drops into the search box from anywhere on the screen,
+                    // the shortcut every list-with-a-filter trains people to try.
+                    "/" if plain => {
+                        cx.stop_propagation();
+                        window.focus(&this.connect_search.focus_handle(cx), cx);
                     }
                     _ => {}
                 }

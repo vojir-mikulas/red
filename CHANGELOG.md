@@ -6,6 +6,24 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Filter the welcome screen's saved connections by engine and by deployment
+  environment. Two dropdowns under the search box offer only the engines and
+  environments your roster actually contains, each row carrying the number of
+  connections that pick would leave; both take several values at once, so
+  picking two engines widens and adding an environment narrows. The heading
+  shows "3 of 12" with a Clear whenever anything is hiding a connection, and the
+  sort and filters are remembered between launches.
+- Dropdowns can be multi-select: a pick toggles and the list stays open so
+  choosing three values costs one visit, the closed control summarises the set,
+  and a Clear beside its search resets that dropdown alone.
+
+### Changed
+- The welcome screen's search box also matches the engine and the environment,
+  so typing "postgres" or "prod" narrows the list without opening a dropdown,
+  and it now carries a clear button. `/` jumps into it from anywhere on the
+  screen, `←`/`→` page a long roster and `Home`/`End` jump to its ends.
+
 ### Fixed
 - Assistant settings picked before the first message now apply to that message.
   Fast mode, the model, the thinking level and the permission mode are sent to

@@ -693,6 +693,28 @@ pub(crate) enum ConnectSortField {
     Recent,
 }
 
+impl ConnectSortField {
+    /// The stable key this field persists under, kept apart from the visible
+    /// label so renaming a button never invalidates a saved preference.
+    pub(crate) fn key(self) -> &'static str {
+        match self {
+            ConnectSortField::Name => "name",
+            ConnectSortField::Recent => "recent",
+        }
+    }
+
+    /// Parse a persisted [`Self::key`]. `None` for anything unrecognised, so a
+    /// value written by a newer build falls back to the default sort instead of
+    /// invalidating the whole state file.
+    pub(crate) fn from_key(key: &str) -> Option<Self> {
+        match key {
+            "name" => Some(ConnectSortField::Name),
+            "recent" => Some(ConnectSortField::Recent),
+            _ => None,
+        }
+    }
+}
+
 /// How the welcome screen's saved-connection list is ordered: a key plus a
 /// direction. `ascending` is the key's natural order: A→Z for `Name`, oldest
 /// (and never-used) first for `Recent`. Each toolbar button selects its field;
@@ -720,6 +742,188 @@ impl ConnectSort {
             self.field = field;
             self.ascending = Self::default_ascending(field);
         }
+    }
+}
+
+/// The welcome screen's facet filters: which engines and which deployment
+/// environments the saved-connection list is narrowed to.
+///
+/// An empty facet is *no constraint*, so the default shows everything. The two
+/// facets are ANDed and each is ORed within itself: Postgres + MySQL together
+/// with Prod means "the production Postgres and MySQL connections", which is the
+/// reading a row of toggle chips leads a user to expect.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ConnectFilter {
+    pub kinds: Vec<DbKind>,
+    pub envs: Vec<ConnEnv>,
+}
+
+impl ConnectFilter {
+    /// Whether any facet narrows the list. Drives the "N of M" count line and
+    /// the Clear affordance, which exist so a filter can never silently hide a
+    /// connection the user is looking for.
+    pub(crate) fn is_active(&self) -> bool {
+        !self.kinds.is_empty() || !self.envs.is_empty()
+    }
+
+    /// Whether a connection survives both facets.
+    pub(crate) fn matches(&self, config: &ConnectionConfig) -> bool {
+        (self.kinds.is_empty() || self.kinds.contains(&config.kind))
+            && (self.envs.is_empty() || self.envs.contains(&config.env))
+    }
+
+    /// Add or remove an engine from the engine facet (a chip click).
+    pub(crate) fn toggle_kind(&mut self, kind: DbKind) {
+        toggle_in(&mut self.kinds, kind);
+    }
+
+    /// Add or remove an environment from the environment facet (a chip click).
+    pub(crate) fn toggle_env(&mut self, env: ConnEnv) {
+        toggle_in(&mut self.envs, env);
+    }
+
+    pub(crate) fn clear(&mut self) {
+        self.kinds.clear();
+        self.envs.clear();
+    }
+
+    /// Rebuild from persisted keys, skipping anything unrecognised: a facet
+    /// written by a newer build degrades to "not selected" rather than being an
+    /// error (see [`crate::local_state`]).
+    pub(crate) fn from_keys(kinds: &[String], envs: &[String]) -> Self {
+        Self {
+            kinds: kinds
+                .iter()
+                .filter_map(|k| DbKind::from_scheme(k))
+                .collect(),
+            envs: envs.iter().filter_map(|e| env_from_key(e)).collect(),
+        }
+    }
+
+    /// The engine facet as persistable keys.
+    pub(crate) fn kind_keys(&self) -> Vec<String> {
+        self.kinds
+            .iter()
+            .map(|k| k.url_scheme().to_string())
+            .collect()
+    }
+
+    /// The environment facet as persistable keys.
+    pub(crate) fn env_keys(&self) -> Vec<String> {
+        self.envs.iter().map(|e| env_key(*e).to_string()).collect()
+    }
+}
+
+/// Add `value` to `set`, or remove it when it's already there. Selection order
+/// is preserved, which keeps a chip row from reshuffling under the cursor.
+fn toggle_in<T: PartialEq>(set: &mut Vec<T>, value: T) {
+    match set.iter().position(|v| *v == value) {
+        Some(ix) => {
+            set.remove(ix);
+        }
+        None => set.push(value),
+    }
+}
+
+/// The stable persistence key for an environment. `ConnEnv::label` is a *display*
+/// string (and empty for `Unset`), so the two are deliberately separate.
+pub(crate) fn env_key(env: ConnEnv) -> &'static str {
+    match env {
+        ConnEnv::Unset => "unset",
+        ConnEnv::Local => "local",
+        ConnEnv::Dev => "dev",
+        ConnEnv::Staging => "staging",
+        ConnEnv::Prod => "prod",
+    }
+}
+
+/// Parse a persisted [`env_key`]; `None` for anything unrecognised.
+pub(crate) fn env_from_key(key: &str) -> Option<ConnEnv> {
+    match key {
+        "unset" => Some(ConnEnv::Unset),
+        "local" => Some(ConnEnv::Local),
+        "dev" => Some(ConnEnv::Dev),
+        "staging" => Some(ConnEnv::Staging),
+        "prod" => Some(ConnEnv::Prod),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod connect_filter_tests {
+    use super::*;
+
+    fn conn(kind: DbKind, env: ConnEnv) -> ConnectionConfig {
+        ConnectionConfig {
+            kind,
+            env,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn an_empty_filter_matches_everything() {
+        let filter = ConnectFilter::default();
+        assert!(!filter.is_active());
+        assert!(filter.matches(&conn(DbKind::Postgres, ConnEnv::Prod)));
+        assert!(filter.matches(&conn(DbKind::Redis, ConnEnv::Unset)));
+    }
+
+    #[test]
+    fn facets_and_together_and_or_within() {
+        let mut filter = ConnectFilter::default();
+        filter.toggle_kind(DbKind::Postgres);
+        filter.toggle_kind(DbKind::Mysql);
+        filter.toggle_env(ConnEnv::Prod);
+        assert!(filter.is_active());
+        assert!(filter.matches(&conn(DbKind::Postgres, ConnEnv::Prod)));
+        assert!(filter.matches(&conn(DbKind::Mysql, ConnEnv::Prod)));
+        // Right engine, wrong environment.
+        assert!(!filter.matches(&conn(DbKind::Postgres, ConnEnv::Local)));
+        // Right environment, wrong engine.
+        assert!(!filter.matches(&conn(DbKind::Redis, ConnEnv::Prod)));
+    }
+
+    #[test]
+    fn toggling_the_same_facet_twice_clears_it() {
+        let mut filter = ConnectFilter::default();
+        filter.toggle_kind(DbKind::Redis);
+        filter.toggle_kind(DbKind::Redis);
+        assert!(!filter.is_active());
+    }
+
+    #[test]
+    fn clear_drops_both_facets() {
+        let mut filter = ConnectFilter::default();
+        filter.toggle_kind(DbKind::Redis);
+        filter.toggle_env(ConnEnv::Local);
+        filter.clear();
+        assert!(!filter.is_active());
+    }
+
+    #[test]
+    fn keys_round_trip_and_skip_unknown() {
+        let mut filter = ConnectFilter::default();
+        filter.toggle_kind(DbKind::Mongo);
+        filter.toggle_env(ConnEnv::Staging);
+        let back = ConnectFilter::from_keys(&filter.kind_keys(), &filter.env_keys());
+        assert_eq!(back, filter);
+
+        // A key from a hypothetical newer build is dropped, not fatal.
+        let partial = ConnectFilter::from_keys(
+            &["postgres".into(), "duckdb".into()],
+            &["prod".into(), "canary".into()],
+        );
+        assert_eq!(partial.kinds, vec![DbKind::Postgres]);
+        assert_eq!(partial.envs, vec![ConnEnv::Prod]);
+    }
+
+    #[test]
+    fn sort_field_keys_round_trip() {
+        for field in [ConnectSortField::Name, ConnectSortField::Recent] {
+            assert_eq!(ConnectSortField::from_key(field.key()), Some(field));
+        }
+        assert_eq!(ConnectSortField::from_key("size"), None);
     }
 }
 

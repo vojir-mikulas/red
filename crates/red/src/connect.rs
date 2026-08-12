@@ -6,11 +6,15 @@
 use flint::Theme;
 use flint::prelude::*;
 use gpui::{
-    AnyElement, Context, FontWeight, Hsla, Pixels, Role, SharedString, Window, div, prelude::*, px,
+    AnyElement, App, Context, Entity, FontWeight, Hsla, Pixels, Role, SharedString, Window, div,
+    prelude::*, px,
 };
 use red_core::{DbKind, ProxyKind};
 
-use crate::app::{AppState, ConnectSortField, FormField, FormState, SshAuthMode, TestState};
+use crate::app::{
+    AppState, ConnectFilter, ConnectSortField, FormField, FormState, SshAuthMode, TestState,
+};
+use crate::config::StoredConnection;
 use red_core::ConnEnv;
 
 /// How many saved-connection cards the welcome screen shows per page. Kept small
@@ -41,6 +45,53 @@ pub(crate) fn env_badge(env: ConnEnv) -> BadgeVariant {
         ConnEnv::Dev => BadgeVariant::Info,
         ConnEnv::Staging => BadgeVariant::Warning,
         ConnEnv::Prod => BadgeVariant::Danger,
+    }
+}
+
+/// The raw colour behind [`env_badge`]'s variant, for the places that draw a dot
+/// rather than a badge (the environment filter chips).
+fn env_color(env: ConnEnv, theme: &Theme) -> Hsla {
+    match env {
+        ConnEnv::Unset => theme.text_faint,
+        ConnEnv::Local => theme.green,
+        ConnEnv::Dev => theme.blue,
+        ConnEnv::Staging => theme.yellow,
+        ConnEnv::Prod => theme.red,
+    }
+}
+
+/// The filter dropdown's caption for an environment. `ConnEnv::label` is empty
+/// for `Unset` (a card draws no badge at all there), but a filter row still needs
+/// a name for the connections nobody has marked.
+pub(crate) fn env_chip_label(env: ConnEnv) -> &'static str {
+    match env {
+        ConnEnv::Unset => "Unmarked",
+        marked => marked.label(),
+    }
+}
+
+/// The environment a filter row's caption stands for; the inverse of
+/// [`env_chip_label`], used to map a dropdown's toggle back to a value.
+pub(crate) fn env_from_chip_label(label: &str) -> Option<ConnEnv> {
+    FILTER_ENVS
+        .iter()
+        .copied()
+        .find(|e| env_chip_label(*e) == label)
+}
+
+/// The badge colour and short name for an engine, shared by the connection cards
+/// and the engine filter chips. Deliberately shorter than `DbKind`'s `Display`
+/// (which spells out "MySQL/MariaDB"): both callers are tight rows.
+pub(crate) fn engine_badge(kind: DbKind) -> (BadgeVariant, &'static str) {
+    match kind {
+        DbKind::Sqlite => (BadgeVariant::Info, "SQLite"),
+        DbKind::Postgres => (BadgeVariant::Special, "Postgres"),
+        DbKind::Mysql => (BadgeVariant::Warning, "MySQL"),
+        DbKind::Clickhouse => (BadgeVariant::Accent, "ClickHouse"),
+        // Redis gets a red badge (leaning into the app's accent) but keeps its
+        // own name; `Danger` here is used for its colour, not a status meaning.
+        DbKind::Redis => (BadgeVariant::Danger, "Redis"),
+        DbKind::Mongo => (BadgeVariant::Success, "MongoDB"),
     }
 }
 
@@ -107,11 +158,49 @@ pub(crate) fn fmt_ago(secs: Option<u64>) -> String {
 }
 
 impl AppState {
-    /// The "Saved connections" heading: the label, a hairline rule that fills the
-    /// row, and a subtle "Edit file" affordance on the right: the file-first escape
-    /// hatch that opens `connections.toml` (mirrors the settings panel's "Open
-    /// settings file"). Edits to the file re-read live via the connections watcher.
-    fn connections_header(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+    /// The "Saved connections" heading: the label, a "showing N of M" count while
+    /// anything is narrowing the list (with a one-click Clear), a hairline rule
+    /// that fills the row, and a subtle "Edit file" affordance on the right: the
+    /// file-first escape hatch that opens `connections.toml` (mirrors the settings
+    /// panel's "Open settings file"). Edits to the file re-read live via the
+    /// connections watcher.
+    fn connections_header(
+        &self,
+        visible: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        // A filter that hides connections must say so: without this line a search
+        // left in the box (or a facet restored from the last session) looks like a
+        // roster that lost entries.
+        let narrowed = visible < self.connections.len();
+        let count = narrowed.then(|| {
+            let total = self.connections.len();
+            // Cloned so the theme doesn't hold an immutable borrow of `cx` across
+            // the `cx.listener` on the Clear button below.
+            let theme = cx.theme().clone();
+            div()
+                .flex()
+                .items_center()
+                .gap_1p5()
+                .flex_none()
+                .text_size(theme.scale(11.5))
+                .text_color(theme.text_faint)
+                .child(crate::i18n::tr!(
+                    "connect.showing_n_of_m",
+                    "{visible} of {total}",
+                    visible = visible,
+                    total = total,
+                ))
+                .child(
+                    Button::new(
+                        "connect-clear-filters",
+                        crate::i18n::tr!("connect.clear", "Clear"),
+                    )
+                    .variant(ButtonVariant::Ghost)
+                    .size(ButtonSize::Sm)
+                    .on_click(cx.listener(|this, _, _, cx| this.clear_connect_filters(cx))),
+                )
+        });
         let theme = cx.theme();
         let edit_file = div()
             .id("connect-edit-file")
@@ -151,6 +240,7 @@ impl AppState {
                         "Saved connections"
                     )),
             )
+            .children(count)
             .child(div().flex_1().h(px(1.)).bg(theme.border_soft))
             .child(edit_file)
     }
@@ -200,8 +290,24 @@ impl AppState {
         let pagination =
             (page_count > 1).then(|| self.connect_pagination(page, page_count, total, cx));
         let toolbar = (!self.connections.is_empty()).then(|| self.connect_toolbar(cx));
+        let facets = self.connect_facets();
         let new_button = self.new_button(cx);
-        let connections_header = self.connections_header(cx);
+        let connections_header = self.connections_header(total, cx);
+        // Offered only in the empty state a filter caused, where it is the way
+        // out; a genuinely empty roster has nothing to clear. It names whichever
+        // narrowing is in play, so it never reads as "clear filters" to someone
+        // who only typed in the search box.
+        let clear_filters = Button::new(
+            "connect-empty-clear",
+            if self.connect_filter.is_active() {
+                crate::i18n::tr!("connect.clear_filters", "Clear filters")
+            } else {
+                crate::i18n::tr!("connect.clear_search", "Clear search")
+            },
+        )
+        .variant(ButtonVariant::Secondary)
+        .size(ButtonSize::Sm)
+        .on_click(cx.listener(|this, _, _, cx| this.clear_connect_filters(cx)));
         let settings_gear = IconButton::new(
             "connect-settings",
             crate::icons::icon("settings", cx.theme().scale(16.), cx.theme().text_muted),
@@ -297,13 +403,21 @@ impl AppState {
                 theme,
             )
         } else if cards.is_empty() {
-            empty_note(
-                crate::i18n::tr!(
-                    "connect.no_connections_match_your_search",
-                    "No connections match your search."
-                ),
-                theme,
-            )
+            // The dead end a filter creates carries its own way out, so the user
+            // never has to work out which of search + two facets emptied the list.
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .child(empty_note(
+                    crate::i18n::tr!(
+                        "connect.no_connections_match_your_search",
+                        "No connections match your search."
+                    ),
+                    theme,
+                ))
+                .child(clear_filters)
+                .into_any_element()
         } else {
             div()
                 .flex()
@@ -322,6 +436,7 @@ impl AppState {
             .child(header)
             .child(connections_header)
             .children(toolbar)
+            .children(facets)
             .child(saved)
             .children(pagination)
             .child(new_button)
@@ -380,24 +495,24 @@ impl AppState {
             .child(gear)
     }
 
-    /// The saved-connection indices to show, in display order: filtered by the
-    /// welcome-screen search box, then ordered by the active sort mode. Returns
-    /// indices into `self.connections` so the cards and keyboard actions still
-    /// address the stored connection regardless of display order.
+    /// The welcome-screen search box's current query, trimmed and lowercased.
+    fn connect_query(&self, cx: &Context<Self>) -> String {
+        self.connect_search.read(cx).content().trim().to_lowercase()
+    }
+
+    /// The saved-connection indices to show, in display order: narrowed by the
+    /// search box and the engine / environment facets, then ordered by the active
+    /// sort mode. Returns indices into `self.connections` so the cards and
+    /// keyboard actions still address the stored connection regardless of display
+    /// order.
     pub(crate) fn visible_connections(&self, cx: &Context<Self>) -> Vec<usize> {
-        let query = self.connect_search.read(cx).content().trim().to_lowercase();
+        let query = self.connect_query(cx);
         let mut indices: Vec<usize> = self
             .connections
             .iter()
             .enumerate()
             .filter(|(_, stored)| {
-                query.is_empty()
-                    || stored.config.name.to_lowercase().contains(&query)
-                    || stored
-                        .config
-                        .display_target()
-                        .to_lowercase()
-                        .contains(&query)
+                self.connect_filter.matches(&stored.config) && matches_query(&stored.config, &query)
             })
             .map(|(ix, _)| ix)
             .collect();
@@ -426,6 +541,109 @@ impl AppState {
             if asc { ord } else { ord.reverse() }
         });
         indices
+    }
+
+    /// Move the keyboard highlight a page at a time (←/→ on the welcome screen).
+    /// The highlight is what drives the shown page, so landing on the first card
+    /// of the target page is what turns it; on the last page it clamps rather
+    /// than wrapping, matching the Previous/Next buttons.
+    pub(crate) fn connect_page_step(&mut self, forward: bool, cx: &mut Context<Self>) {
+        let total = self.visible_connections(cx).len();
+        if total == 0 {
+            return;
+        }
+        let page = self.connect_sel.min(total - 1) / CONNECTIONS_PER_PAGE;
+        let last_page = (total - 1) / CONNECTIONS_PER_PAGE;
+        let target = if forward {
+            (page + 1).min(last_page)
+        } else {
+            page.saturating_sub(1)
+        };
+        self.connect_sel = (target * CONNECTIONS_PER_PAGE).min(total - 1);
+        cx.notify();
+    }
+
+    /// Jump the keyboard highlight to the first or last visible card (Home/End).
+    pub(crate) fn connect_jump(&mut self, to_end: bool, cx: &mut Context<Self>) {
+        let total = self.visible_connections(cx).len();
+        if total == 0 {
+            return;
+        }
+        self.connect_sel = if to_end { total - 1 } else { 0 };
+        cx.notify();
+    }
+
+    /// The facet filter row: an Engine dropdown beside an Environment dropdown,
+    /// each shown only when that facet can narrow this roster (a list that is all
+    /// Postgres has nothing to choose between). `None` when neither can.
+    ///
+    /// Two multi-select dropdowns rather than a row of toggle chips: chips grow
+    /// with the roster and already wrapped onto a third line at ten connections,
+    /// while a pair of dropdowns is one fixed row however many engines you
+    /// collect, and each dropdown brings its own search for free.
+    fn connect_facets(&self) -> Option<impl IntoElement + use<>> {
+        let (offer_engines, offer_envs) = self.facets_worth_offering();
+        if !offer_engines && !offer_envs {
+            return None;
+        }
+        // Equal halves under the full-width search box, so the toolbar reads as
+        // two tiers of one control rather than a scattering of pills. The column
+        // wrapper is what makes the combo's `full_width` trigger actually stretch
+        // (a flex row would size it to its label instead), matching how the
+        // connection form mounts its engine picker.
+        let half = |combo: &Entity<ComboBox>| {
+            div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(combo.clone())
+        };
+        Some(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .mb_2()
+                .when(offer_engines, |row| {
+                    row.child(half(&self.engine_filter_combo))
+                })
+                .when(offer_envs, |row| row.child(half(&self.env_filter_combo))),
+        )
+    }
+
+    /// Which facets can actually narrow this roster: a facet whose every
+    /// connection shares one value has nothing to choose between.
+    fn facets_worth_offering(&self) -> (bool, bool) {
+        let mut kinds: Vec<DbKind> = Vec::new();
+        let mut envs: Vec<ConnEnv> = Vec::new();
+        for stored in &self.connections {
+            if !kinds.contains(&stored.config.kind) {
+                kinds.push(stored.config.kind);
+            }
+            if !envs.contains(&stored.config.env) {
+                envs.push(stored.config.env);
+            }
+        }
+        (kinds.len() > 1, envs.len() > 1)
+    }
+
+    /// Push the current facet values, their counts and the live selection into
+    /// the two filter dropdowns. Call after anything that moves one of those:
+    /// the roster, the search query, or a facet itself. The startup seed in
+    /// `AppState::new` runs the same two functions over the freshly-loaded list,
+    /// so the two paths cannot drift.
+    pub(crate) fn refresh_connect_filters(&mut self, cx: &mut Context<Self>) {
+        let query = self.connect_query(cx);
+        let engines = engine_filter_values(&self.connections, &query, &self.connect_filter);
+        let envs = env_filter_values(&self.connections, &query, &self.connect_filter);
+        seed_engine_filter(
+            &self.engine_filter_combo,
+            &engines,
+            &self.connect_filter.kinds,
+            cx,
+        );
+        seed_env_filter(&self.env_filter_combo, &envs, &self.connect_filter.envs, cx);
     }
 
     /// The page controls beneath the saved-connection list: Previous / Next around
@@ -484,10 +702,27 @@ impl AppState {
     /// The toolbar above the saved-connection list: a search box that filters the
     /// list as you type, and the Name / Recent sort toggle.
     fn connect_toolbar(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
-        // Build the sort cells first (they reborrow `cx` for their listeners), then
-        // read the theme for the search box's chrome.
+        // Build the sort cells and the clear button first (they reborrow `cx` for
+        // their listeners), then read the theme for the search box's chrome.
         let sort_name = self.sort_cell("Name", ConnectSortField::Name, cx);
         let sort_recent = self.sort_cell("Recent", ConnectSortField::Recent, cx);
+        // Only while there is something to clear: an always-on ✕ next to an empty
+        // box is a control that does nothing.
+        let clear = (!self.connect_query(cx).is_empty()).then(|| {
+            IconButton::new(
+                "connect-search-clear",
+                crate::icons::icon("x", cx.theme().scale(13.), cx.theme().text_faint),
+            )
+            .size(IconButtonSize::Sm)
+            .tooltip(crate::keymap::localize_hint("Clear search  Esc"))
+            .a11y_label(crate::i18n::tr!("connect.clear_search", "Clear search"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.connect_search
+                    .update(cx, |input, cx| input.set_content("", cx));
+                this.connect_sel = 0;
+                cx.notify();
+            }))
+        });
         let theme = cx.theme();
 
         let search = div()
@@ -508,7 +743,8 @@ impl AppState {
                 theme.scale(14.),
                 theme.text_faint,
             ))
-            .child(div().flex_1().min_w_0().child(self.connect_search.clone()));
+            .child(div().flex_1().min_w_0().child(self.connect_search.clone()))
+            .children(clear);
 
         div()
             .flex()
@@ -569,11 +805,7 @@ impl AppState {
             })
             .child(crate::icons::icon(icon_name, theme.scale(13.), icon_tint))
             .child(label)
-            .on_click(cx.listener(move |this, _, _, cx| {
-                this.connect_sort.toggle(field);
-                this.connect_sel = 0;
-                cx.notify();
-            }))
+            .on_click(cx.listener(move |this, _, _, cx| this.set_connect_sort(field, cx)))
     }
 
     fn new_button(&self, cx: &mut Context<Self>) -> impl IntoElement + use<> {
@@ -635,16 +867,7 @@ impl AppState {
         // track the connection's own label color; the engine is conveyed by the
         // *shape* of the brand glyph, not by its color.
         let accent = label_color(config.color, theme);
-        let (badge_variant, badge_label) = match config.kind {
-            DbKind::Sqlite => (BadgeVariant::Info, "SQLite"),
-            DbKind::Postgres => (BadgeVariant::Special, "Postgres"),
-            DbKind::Mysql => (BadgeVariant::Warning, "MySQL"),
-            DbKind::Clickhouse => (BadgeVariant::Accent, "ClickHouse"),
-            // Redis gets a red badge (leaning into the app's accent) but keeps its
-            // own name; `Danger` here is used for its colour, not a status meaning.
-            DbKind::Redis => (BadgeVariant::Danger, "Redis"),
-            DbKind::Mongo => (BadgeVariant::Success, "MongoDB"),
-        };
+        let (badge_variant, badge_label) = engine_badge(config.kind);
         let group = SharedString::from(format!("connect-card-{orig_ix}"));
         // Accessible name: the connection's name, engine, and read-only state;
         // the card is the welcome screen's primary action, announced as a button.
@@ -1698,6 +1921,177 @@ impl AppState {
                 .on_click(cx.listener(|this, _, _, cx| this.save_form(true, cx))),
             )
     }
+}
+
+/// The environments the filter offers, ordered least to most dangerous like the
+/// connection form's picker, with the unmarked connections last.
+const FILTER_ENVS: [ConnEnv; 5] = [
+    ConnEnv::Local,
+    ConnEnv::Dev,
+    ConnEnv::Staging,
+    ConnEnv::Prod,
+    ConnEnv::Unset,
+];
+
+/// The engine values the welcome-screen filter offers, each with the number of
+/// connections picking it would leave.
+///
+/// The *values* come from the roster alone, so the dropdown's contents don't
+/// shift under the user while they type in the welcome search; the *counts* apply
+/// the search and the other facet, so a row's number is the size of the list one
+/// pick away rather than a roster-wide tally that goes stale as soon as a second
+/// facet is chosen.
+pub(crate) fn engine_filter_values(
+    connections: &[StoredConnection],
+    query: &str,
+    filter: &ConnectFilter,
+) -> Vec<(DbKind, usize)> {
+    DbKind::all()
+        .iter()
+        .copied()
+        .filter(|kind| connections.iter().any(|s| s.config.kind == *kind))
+        .map(|kind| {
+            let count = connections
+                .iter()
+                .filter(|s| {
+                    s.config.kind == kind
+                        && matches_query(&s.config, query)
+                        && (filter.envs.is_empty() || filter.envs.contains(&s.config.env))
+                })
+                .count();
+            (kind, count)
+        })
+        .collect()
+}
+
+/// The environment values the filter offers. The twin of
+/// [`engine_filter_values`], counting against the engine facet instead.
+pub(crate) fn env_filter_values(
+    connections: &[StoredConnection],
+    query: &str,
+    filter: &ConnectFilter,
+) -> Vec<(ConnEnv, usize)> {
+    FILTER_ENVS
+        .iter()
+        .copied()
+        .filter(|env| connections.iter().any(|s| s.config.env == *env))
+        .map(|env| {
+            let count = connections
+                .iter()
+                .filter(|s| {
+                    s.config.env == env
+                        && matches_query(&s.config, query)
+                        && (filter.kinds.is_empty() || filter.kinds.contains(&s.config.kind))
+                })
+                .count();
+            (env, count)
+        })
+        .collect()
+}
+
+/// Feed the engine dropdown: the labels, each row's brand glyph and match count,
+/// and which rows are on. Shared by `AppState::new`'s seed and every later
+/// refresh (see [`AppState::refresh_connect_filters`]).
+pub(crate) fn seed_engine_filter(
+    combo: &Entity<ComboBox>,
+    values: &[(DbKind, usize)],
+    selected: &[DbKind],
+    cx: &mut App,
+) {
+    let kinds: Vec<DbKind> = values.iter().map(|(k, _)| *k).collect();
+    let labels = kinds
+        .iter()
+        .map(|k| SharedString::from(engine_badge(*k).1))
+        .collect();
+    let on = selected_indices(&kinds, selected);
+    let counts: Vec<usize> = values.iter().map(|(_, n)| *n).collect();
+    let glyphs = kinds.clone();
+    combo.update(cx, |c, cx| {
+        c.set_options_selected(labels, on, cx);
+        c.set_trailing(count_trailing(counts), cx);
+        c.set_leading(
+            move |ix, app| match glyphs.get(ix) {
+                Some(&kind) => {
+                    engine_glyph(kind, app.theme().scale(13.), app.theme()).into_any_element()
+                }
+                None => div().into_any_element(),
+            },
+            cx,
+        );
+    });
+}
+
+/// Feed the environment dropdown: the twin of [`seed_engine_filter`], drawing
+/// the deployment colour as a dot where the engine list draws a brand glyph.
+pub(crate) fn seed_env_filter(
+    combo: &Entity<ComboBox>,
+    values: &[(ConnEnv, usize)],
+    selected: &[ConnEnv],
+    cx: &mut App,
+) {
+    let envs: Vec<ConnEnv> = values.iter().map(|(e, _)| *e).collect();
+    let labels = envs
+        .iter()
+        .map(|e| SharedString::from(env_chip_label(*e)))
+        .collect();
+    let on = selected_indices(&envs, selected);
+    let counts: Vec<usize> = values.iter().map(|(_, n)| *n).collect();
+    let dots = envs.clone();
+    combo.update(cx, |c, cx| {
+        c.set_options_selected(labels, on, cx);
+        c.set_trailing(count_trailing(counts), cx);
+        c.set_leading(
+            move |ix, app| match dots.get(ix) {
+                Some(&env) => div()
+                    .size(px(8.))
+                    .flex_none()
+                    .rounded_full()
+                    .bg(env_color(env, app.theme()))
+                    .into_any_element(),
+                None => div().into_any_element(),
+            },
+            cx,
+        );
+    });
+}
+
+/// The positions in `values` that are currently selected, which is the shape
+/// `ComboBox::set_options_selected` wants.
+fn selected_indices<T: PartialEq>(values: &[T], selected: &[T]) -> Vec<usize> {
+    values
+        .iter()
+        .enumerate()
+        .filter(|(_, v)| selected.contains(v))
+        .map(|(ix, _)| ix)
+        .collect()
+}
+
+/// A dropdown row's trailing match count, dimmed so it reads as an annotation on
+/// the label rather than part of it.
+fn count_trailing(counts: Vec<usize>) -> impl Fn(usize, &App) -> AnyElement + 'static {
+    move |ix, app| {
+        let theme = app.theme();
+        div()
+            .flex_none()
+            .text_size(theme.scale(11.))
+            .text_color(theme.text_faint)
+            .child(counts.get(ix).copied().unwrap_or(0).to_string())
+            .into_any_element()
+    }
+}
+
+/// Whether a connection matches the welcome screen's search box. The engine and
+/// the deployment marker are searched as well as the name and target, so typing
+/// "postgres" or "prod" narrows the list without reaching for a chip. An empty
+/// query matches everything.
+fn matches_query(config: &red_core::ConnectionConfig, query: &str) -> bool {
+    if query.is_empty() {
+        return true;
+    }
+    config.name.to_lowercase().contains(query)
+        || config.display_target().to_lowercase().contains(query)
+        || engine_badge(config.kind).1.to_lowercase().contains(query)
+        || (config.env != ConnEnv::Unset && config.env.label().to_lowercase().contains(query))
 }
 
 /// The first validation message tagged for `field`, if any; the per-input lookup

@@ -144,7 +144,13 @@ shortcuts-welcome_screen-title = [Wélçömé sçrééñ]
 
 shortcuts-welcome_screen-move_between_saved_connections = [Mövé bétwééñ sávéd çöññéçtíöñs]
 
+shortcuts-welcome_screen-page_the_connection_list = [Págé thé líst]
+
+shortcuts-welcome_screen-jump_to_the_first_last_connection = [Júmp tö thé fírst / lást çöññéçtíöñ]
+
 shortcuts-welcome_screen-connect_to_the_highlighted_one = [Çöññéçt tö thé híghlíghtéd öñé]
+
+shortcuts-welcome_screen-search_connections = [Séárçh çöññéçtíöñs]
 
 shortcuts-welcome_screen-edit_the_highlighted_connection = [Édít thé híghlíghtéd çöññéçtíöñ]
 

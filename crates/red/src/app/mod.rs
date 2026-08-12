@@ -544,6 +544,16 @@ pub struct AppState {
     pub(crate) connect_search: Entity<TextInput>,
     /// The active sort order for the welcome screen's connection list.
     pub(crate) connect_sort: ConnectSort,
+    /// The welcome screen's engine / environment facet filters. Empty facets
+    /// show everything (see [`ConnectFilter`]); both are persisted alongside the
+    /// sort in `state.json`, so a roster opens the way it was left.
+    pub(crate) connect_filter: ConnectFilter,
+    /// The welcome screen's two facet dropdowns (multi-select combo boxes over
+    /// the engines and the environments the roster contains). Their options,
+    /// per-row counts and selection are pushed in by
+    /// [`Self::refresh_connect_filters`]; the state of record is `connect_filter`.
+    pub(crate) engine_filter_combo: Entity<ComboBox>,
+    pub(crate) env_filter_combo: Entity<ComboBox>,
     /// A pane to focus on the next render, when the focus move originates from a
     /// place without a `Window` (e.g. an editor `Escape` event). Drained in
     /// `render`, which has the `Window` `focus` needs.
@@ -954,8 +964,11 @@ impl AppState {
         cx.subscribe(
             &connect_search,
             |this, _, event: &TextInputEvent, cx| match event {
+                // The query moves the facet dropdowns' per-row counts too: each
+                // reports what its pick would leave *within the current search*.
                 TextInputEvent::Change => {
                     this.connect_sel = 0;
+                    this.refresh_connect_filters(cx);
                     cx.notify();
                 }
                 TextInputEvent::Submit => {
@@ -970,6 +983,7 @@ impl AppState {
                     this.connect_search
                         .update(cx, |i, cx| i.set_content("", cx));
                     this.connect_sel = 0;
+                    this.refresh_connect_filters(cx);
                     cx.notify();
                 }
                 TextInputEvent::Tab
@@ -1215,6 +1229,86 @@ impl AppState {
         // Kept in the struct so the assistant can persist each agent's advertised
         // config selectors as they arrive (used to pre-fill the model dropdowns).
 
+        // Restore how the welcome list was last arranged. Unrecognised keys fall
+        // back to the defaults (recency, newest first, no facets) rather than
+        // being an error, so a state file from a newer build still opens.
+        let stored_view = local_state.connect_view().cloned();
+        let connect_sort = stored_view
+            .as_ref()
+            .and_then(|v| ConnectSortField::from_key(&v.sort).map(|field| (field, v.ascending)))
+            .map(|(field, ascending)| ConnectSort { field, ascending })
+            .unwrap_or(ConnectSort {
+                field: ConnectSortField::Recent,
+                ascending: false,
+            });
+        let connect_filter = stored_view
+            .as_ref()
+            .map(|v| ConnectFilter::from_keys(&v.kinds, &v.envs))
+            .unwrap_or_default();
+
+        // The welcome screen's two facet dropdowns. Multi-select: a pick toggles
+        // and the popover stays open, so narrowing to three engines is three
+        // clicks in one visit. Seeded here from the freshly-loaded roster (with
+        // no search query yet) through the same functions every later refresh
+        // uses, so the first frame is already correct.
+        let engine_filter_combo = new_combo(cx, "filter-engine", "Search engines…");
+        let env_filter_combo = new_combo(cx, "filter-env", "Search environments…");
+        for (combo, placeholder) in [
+            (&engine_filter_combo, "All engines"),
+            (&env_filter_combo, "All environments"),
+        ] {
+            combo.update(cx, |c, cx| {
+                c.set_multi(true, cx);
+                c.set_full_width(true, cx);
+                c.set_placeholder(placeholder, cx);
+                // Matches the search box and the sort cells beside it; the
+                // default 24px trigger is a settings-row height.
+                c.set_trigger_height(px(34.), cx);
+            });
+        }
+        crate::connect::seed_engine_filter(
+            &engine_filter_combo,
+            &crate::connect::engine_filter_values(&connections, "", &connect_filter),
+            &connect_filter.kinds,
+            cx,
+        );
+        crate::connect::seed_env_filter(
+            &env_filter_combo,
+            &crate::connect::env_filter_values(&connections, "", &connect_filter),
+            &connect_filter.envs,
+            cx,
+        );
+        cx.subscribe(
+            &engine_filter_combo,
+            |this, _, e: &ComboBoxEvent, cx| match e {
+                ComboBoxEvent::Toggle { label, .. } => {
+                    if let Some(kind) = red_core::DbKind::all()
+                        .iter()
+                        .copied()
+                        .find(|k| crate::connect::engine_badge(*k).1 == label.as_ref())
+                    {
+                        this.toggle_connect_kind(kind, cx);
+                    }
+                }
+                ComboBoxEvent::Clear => this.clear_connect_kinds(cx),
+                _ => {}
+            },
+        )
+        .detach();
+        cx.subscribe(
+            &env_filter_combo,
+            |this, _, e: &ComboBoxEvent, cx| match e {
+                ComboBoxEvent::Toggle { label, .. } => {
+                    if let Some(env) = crate::connect::env_from_chip_label(label.as_ref()) {
+                        this.toggle_connect_env(env, cx);
+                    }
+                }
+                ComboBoxEvent::Clear => this.clear_connect_envs(cx),
+                _ => {}
+            },
+        )
+        .detach();
+
         Self {
             service,
             connections,
@@ -1374,10 +1468,10 @@ impl AppState {
             pending_update,
             connect_sel: 0,
             connect_search,
-            connect_sort: ConnectSort {
-                field: ConnectSortField::Recent,
-                ascending: false,
-            },
+            connect_sort,
+            connect_filter,
+            engine_filter_combo,
+            env_filter_combo,
             pending_focus: None,
             pending_focus_target: None,
             focus_name_field: false,

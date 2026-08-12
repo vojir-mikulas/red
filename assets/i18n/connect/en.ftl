@@ -30,9 +30,17 @@ connect-trust_host_body = Verify the fingerprint, then trust this host to add it
 
 connect-confirm_delete = Delete connection
 
+connect-showing_n_of_m = { $visible } of { $total }
+
+connect-clear = Clear
+
 connect-edit_file = Edit file
 
 connect-saved_connections = Saved connections
+
+connect-clear_filters = Clear filters
+
+connect-clear_search = Clear search
 
 connect-import_from_other_database_tools = Import from other database tools
 

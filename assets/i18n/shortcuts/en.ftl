@@ -144,7 +144,13 @@ shortcuts-welcome_screen-title = Welcome screen
 
 shortcuts-welcome_screen-move_between_saved_connections = Move between saved connections
 
+shortcuts-welcome_screen-page_the_connection_list = Page the list
+
+shortcuts-welcome_screen-jump_to_the_first_last_connection = Jump to the first / last connection
+
 shortcuts-welcome_screen-connect_to_the_highlighted_one = Connect to the highlighted one
+
+shortcuts-welcome_screen-search_connections = Search connections
 
 shortcuts-welcome_screen-edit_the_highlighted_connection = Edit the highlighted connection
 

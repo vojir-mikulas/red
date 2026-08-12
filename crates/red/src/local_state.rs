@@ -56,6 +56,28 @@ pub(crate) struct StoredConfigChoice {
     pub description: Option<String>,
 }
 
+/// How the welcome screen's saved-connection list was last arranged: the sort
+/// key and direction plus the engine / environment facets.
+///
+/// Every field is a *string* key rather than the domain enum. A facet written by
+/// a newer build then degrades to "not selected" on load (see
+/// `ConnectFilter::from_keys`) instead of failing the whole file and taking the
+/// unrelated state down with it.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct StoredConnectView {
+    /// `ConnectSortField::key`: `"name"` or `"recent"`.
+    #[serde(default)]
+    pub sort: String,
+    #[serde(default)]
+    pub ascending: bool,
+    /// Engine keys (`DbKind::url_scheme`).
+    #[serde(default)]
+    pub kinds: Vec<String>,
+    /// Environment keys (`app::env_key`).
+    #[serde(default)]
+    pub envs: Vec<String>,
+}
+
 /// The on-disk shape: a wrapper object (not a bare value) so new fields can be
 /// added later without breaking older files.
 #[derive(Default, Serialize, Deserialize)]
@@ -77,6 +99,10 @@ struct StateFile {
     /// switch is left to the agent's own memory rather than re-asserted from here.
     #[serde(default)]
     ai_switches: HashMap<String, HashMap<String, bool>>,
+    /// How the welcome screen's connection list was last sorted and filtered, so
+    /// a roster opens the way it was left. Absent until the user changes either.
+    #[serde(default)]
+    connect_view: Option<StoredConnectView>,
 }
 
 /// The app-state store. Loaded once at startup; mutations persist immediately.
@@ -166,6 +192,22 @@ impl LocalState {
             return;
         }
         switches.insert(config_id.to_string(), on);
+        self.persist();
+    }
+
+    /// How the welcome screen's connection list was last arranged, or `None`
+    /// before the user has touched the sort or the filters.
+    pub(crate) fn connect_view(&self) -> Option<&StoredConnectView> {
+        self.file.connect_view.as_ref()
+    }
+
+    /// Record the welcome screen's list arrangement, persisting only when it
+    /// changed (so re-selecting the active sort does no disk write).
+    pub(crate) fn set_connect_view(&mut self, view: StoredConnectView) {
+        if self.file.connect_view.as_ref() == Some(&view) {
+            return;
+        }
+        self.file.connect_view = Some(view);
         self.persist();
     }
 
@@ -261,11 +303,39 @@ mod tests {
             ai_config: HashMap::new(),
             last_agent: Some("codex".into()),
             ai_switches: HashMap::new(),
+            connect_view: Some(StoredConnectView {
+                sort: "name".into(),
+                ascending: true,
+                kinds: vec!["postgres".into()],
+                envs: vec!["prod".into()],
+            }),
         })
         .unwrap();
         let back: StateFile = serde_json::from_str(&json).unwrap();
         assert_eq!(back.last_seen_version.as_deref(), Some("1.2.3"));
         assert_eq!(back.last_agent.as_deref(), Some("codex"));
+        let view = back.connect_view.expect("the connect view round-trips");
+        assert_eq!(view.sort, "name");
+        assert_eq!(view.kinds, vec!["postgres".to_string()]);
+    }
+
+    #[test]
+    fn connect_view_records_and_updates() {
+        let mut s = in_memory();
+        assert!(s.connect_view().is_none());
+        let view = StoredConnectView {
+            sort: "recent".into(),
+            ascending: false,
+            kinds: vec!["redis".into()],
+            envs: Vec::new(),
+        };
+        s.set_connect_view(view.clone());
+        assert_eq!(s.connect_view(), Some(&view));
+        s.set_connect_view(StoredConnectView {
+            sort: "name".into(),
+            ..view
+        });
+        assert_eq!(s.connect_view().map(|v| v.sort.as_str()), Some("name"));
     }
 
     #[test]
@@ -287,6 +357,7 @@ mod tests {
         assert!(back.ai_config.is_empty());
         assert_eq!(back.last_agent, None);
         assert!(back.ai_switches.is_empty());
+        assert_eq!(back.connect_view, None);
     }
 
     #[test]

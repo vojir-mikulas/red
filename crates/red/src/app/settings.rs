@@ -246,6 +246,10 @@ impl AppState {
         self.connections = config::load();
         let max = self.connections.len().saturating_sub(1);
         self.connect_sel = self.connect_sel.min(max);
+        // A hand-edited file can add or remove an engine outright, so the facet
+        // dropdowns are re-derived from the new roster like they are after a
+        // UI-driven save.
+        self.refresh_connect_filters(cx);
         cx.notify();
     }
 
@@ -1184,6 +1188,10 @@ impl AppState {
                 cx,
             );
         }
+        // Every roster mutation lands here, so it's the one place the welcome
+        // screen's facet dropdowns need re-deriving: a new engine appears as an
+        // option, a deleted connection drops out of the counts.
+        self.refresh_connect_filters(cx);
     }
 
     // --- remove all RED data (factory reset) ---

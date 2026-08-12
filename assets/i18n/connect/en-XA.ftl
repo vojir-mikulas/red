@@ -30,9 +30,17 @@ connect-trust_host_body = [Vérífy thé fíñgérpríñt, théñ trúst thís h
 
 connect-confirm_delete = [Délété çöññéçtíöñ]
 
+connect-showing_n_of_m = [{ $visible } öf { $total }]
+
+connect-clear = [Çléár]
+
 connect-edit_file = [Édít fílé]
 
 connect-saved_connections = [Sávéd çöññéçtíöñs]
+
+connect-clear_filters = [Çléár fíltérs]
+
+connect-clear_search = [Çléár séárçh]
 
 connect-import_from_other_database_tools = [Ímpört fröm öthér dátábásé tööls]
 
