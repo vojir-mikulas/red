@@ -14,10 +14,6 @@ knowledge-empty_state = This connection has no knowledge file. The agent will in
 
 knowledge-placeholder = What would you tell a new colleague about this database?
 
-knowledge-saved = Saved what the agent knows about { $name }.
-
-knowledge-cleared = Cleared the knowledge file for { $name }.
-
 knowledge-draft_title = Draft written by the agent
 
 knowledge-draft_hint = Review it: it inferred this from structure and sampling, and it will be wrong about intent. Nothing is saved until you save.
@@ -27,3 +23,7 @@ knowledge-hint = Plain markdown, folded into the agent's prompt for every chat o
 knowledge-save_hint = ⌘↵ to save
 
 knowledge-title = Database knowledge - { $name }
+
+knowledge-cleared = Cleared the knowledge file for { $name }.
+
+knowledge-saved = Saved what the agent knows about { $name }.

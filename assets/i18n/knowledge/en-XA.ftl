@@ -14,10 +14,6 @@ knowledge-empty_state = [Thís çöññéçtíöñ hás ñö kñöwlédgé fíl�
 
 knowledge-placeholder = [Whát wöúld yöú téll á ñéw çölléágúé áböút thís dátábásé?]
 
-knowledge-saved = [Sávéd whát thé ágéñt kñöws áböút { $name }.]
-
-knowledge-cleared = [Çléáréd thé kñöwlédgé fílé för { $name }.]
-
 knowledge-draft_title = [Dráft wríttéñ by thé ágéñt]
 
 knowledge-draft_hint = [Révíéw ít: ít íñférréd thís fröm strúçtúré áñd sámplíñg, áñd ít wíll bé wröñg áböút íñtéñt. Ñöthíñg ís sávéd úñtíl yöú sávé.]
@@ -27,3 +23,7 @@ knowledge-hint = [Pláíñ márkdöwñ, földéd íñtö thé ágéñt's prömpt
 knowledge-save_hint = [⌘↵ tö sávé]
 
 knowledge-title = [Dátábásé kñöwlédgé - { $name }]
+
+knowledge-cleared = [Çléáréd thé kñöwlédgé fílé för { $name }.]
+
+knowledge-saved = [Sávéd whát thé ágéñt kñöws áböút { $name }.]
