@@ -16,7 +16,7 @@ use red_service::{Command, SessionId};
 
 use crate::app::{AppState, PendingCopyNewTable, PendingCopyPeek, Phase};
 
-actions!(red, [ToggleCommandPalette, GoToRow, CopyResult]);
+actions!(red, [ToggleCommandPalette, GoToRow, GoToObject, CopyResult]);
 
 /// A command the palette can run. Each maps to one existing `AppState` action.
 #[derive(Clone, Copy)]
@@ -67,6 +67,11 @@ pub(crate) enum Cmd {
     ImportConnections,
     /// Open the "go to row…" prompt (only when a result is open).
     GoToRow,
+    /// Open the schema-object picker (jump straight to a table).
+    GoToObject,
+    /// Open the object the picker listed at this index (see
+    /// [`AppState::goto_objects`]).
+    OpenObject(usize),
     /// Open the keyboard-shortcuts reference overlay.
     ShowShortcuts,
     /// Save the active tab's query as a named snippet (opens the name prompt).
@@ -200,6 +205,31 @@ fn item_key(id: &str) -> String {
     key
 }
 
+/// One candidate in the schema-object picker.
+///
+/// Carries the resolved `(schema, name, kind)` rather than an index into the
+/// live schema tree: the tree can be refreshed while the picker is open, and a
+/// stale index would open whichever object slid into that slot.
+#[derive(Clone)]
+pub(crate) struct GotoObject {
+    schema: String,
+    name: String,
+    kind: red_core::ObjectKind,
+    /// `schema.name`, the string the picker both shows and matches on.
+    qualified: SharedString,
+}
+
+impl GotoObject {
+    fn new(schema: &str, name: &str, kind: red_core::ObjectKind) -> Self {
+        Self {
+            schema: schema.to_string(),
+            name: name.to_string(),
+            kind,
+            qualified: SharedString::from(format!("{schema}.{name}")),
+        }
+    }
+}
+
 impl AppState {
     /// ⌘K: open the command palette, or close it if it's already open. The
     /// palette focuses its own field on first paint, so no `Window` is needed.
@@ -226,6 +256,113 @@ impl AppState {
         let sub = cx.subscribe(&palette, Self::on_palette_event);
         self.palette = Some((palette, sub));
         cx.notify();
+    }
+
+    /// ⌘O (or the "go to table…" command): open a picker over every schema object
+    /// the tree knows, and jump straight to the chosen one.
+    ///
+    /// Distinct from ⌘F, which narrows the sidebar tree in place and still leaves
+    /// the user to walk to the row and activate it. This is the one-gesture form:
+    /// type, Enter, the table is open. It also matches on the *qualified* name, so
+    /// `public.users` and `users` both find the table, and the palette's fuzzy
+    /// filter means `usrpref` reaches `user_preferences` where the tree's
+    /// substring filter cannot.
+    pub(crate) fn open_object_picker(&mut self, cx: &mut Context<Self>) {
+        let objects = self.schema_objects(cx);
+        if objects.is_empty() {
+            self.notify(
+                ToastVariant::Info,
+                crate::i18n::tr!(
+                    "palette.no_objects",
+                    "No schema objects loaded yet. Connect, or refresh with ⌘R."
+                ),
+                cx,
+            );
+            return;
+        }
+        let entries: Vec<(PaletteItem, Cmd)> = objects
+            .iter()
+            .enumerate()
+            .map(|(i, obj)| {
+                let id = ElementId::from(SharedString::from(format!("object:{i}")));
+                let item = PaletteItem::new(id, obj.qualified.clone()).hint(obj.kind.as_str());
+                (item, Cmd::OpenObject(i))
+            })
+            .collect();
+        self.goto_objects = objects;
+        self.palette_cmds = entries
+            .iter()
+            .map(|(item, cmd)| (item.id.clone(), *cmd))
+            .collect();
+        let items: Vec<PaletteItem> = entries.into_iter().map(|(item, _)| item).collect();
+
+        let palette = cx.new(|cx| {
+            let mut p = Palette::new(cx);
+            p.set_placeholder(
+                crate::i18n::tr!("palette.goto_object_placeholder", "Go to table…"),
+                cx,
+            );
+            p.set_items(items, cx);
+            p
+        });
+        let sub = cx.subscribe(&palette, Self::on_palette_event);
+        self.palette = Some((palette, sub));
+        cx.notify();
+    }
+
+    /// Whether the schema tree holds anything the picker could list, without
+    /// paying to build the candidate list.
+    fn has_schema_objects(&self, cx: &App) -> bool {
+        match &self.phase {
+            Phase::Connected(active) => {
+                let schema = active.schema.read(cx);
+                schema.schemas.iter().any(|ns| !ns.objects.is_empty())
+                    || schema.groups.values().any(|objects| !objects.is_empty())
+            }
+            _ => false,
+        }
+    }
+
+    /// Every object the schema tree currently knows, as picker candidates:
+    /// the eagerly-loaded relations plus whichever lazy groups have been
+    /// expanded (an unexpanded group was never fetched, so it has nothing to
+    /// offer and is silently absent rather than shown as an empty promise).
+    ///
+    /// Relations lead, so a `users` table outranks a `users_audit` trigger of the
+    /// same name: browsing a table is overwhelmingly what this picker is for.
+    fn schema_objects(&self, cx: &App) -> Vec<GotoObject> {
+        let Phase::Connected(active) = &self.phase else {
+            return Vec::new();
+        };
+        let schema = active.schema.read(cx);
+        let mut relations = Vec::new();
+        let mut others = Vec::new();
+        for ns in &schema.schemas {
+            for object in &ns.objects {
+                relations.push(GotoObject::new(&ns.name, &object.name, object.kind));
+            }
+        }
+        for ((ns, kind), objects) in &schema.groups {
+            for object in objects {
+                others.push(GotoObject::new(ns, &object.name, *kind));
+            }
+        }
+        relations.append(&mut others);
+        relations
+    }
+
+    /// Open the object the picker listed at `index`: a relation opens as a
+    /// browse, everything else as its definition, matching what activating the
+    /// same row in the schema tree does.
+    fn open_picked_object(&mut self, index: usize, cx: &mut Context<Self>) {
+        let Some(object) = self.goto_objects.get(index).cloned() else {
+            return;
+        };
+        if object.kind.is_relation() {
+            self.schema_preview(object.schema, object.name, cx);
+        } else {
+            self.open_object_ddl(object.schema, object.name, object.kind, cx);
+        }
     }
 
     /// ⌃G (or the "go to row…" command): open a prompt for a row number. No-op
@@ -363,6 +500,8 @@ impl AppState {
             Cmd::NewConnection => self.open_new_form(cx),
             Cmd::ImportConnections => self.open_import_wizard(cx),
             Cmd::GoToRow => self.open_goto_prompt(cx),
+            Cmd::GoToObject => self.open_object_picker(cx),
+            Cmd::OpenObject(index) => self.open_picked_object(index, cx),
             Cmd::ShowShortcuts => self.toggle_shortcuts(cx),
             Cmd::ShowChangelog => self.toggle_whats_new(cx),
             Cmd::SaveQuery => self.open_save_prompt(cx),
@@ -602,6 +741,14 @@ impl AppState {
                     out.push((
                         item("cmd:compare-table", "table: compare against…"),
                         Cmd::CompareTable,
+                    ));
+                }
+                // Withheld until the tree has something to list: an empty picker
+                // reads as a bug rather than as a schema still in flight.
+                if self.has_schema_objects(cx) {
+                    out.push((
+                        item("cmd:goto-object", "go to table…").hint("⌘O"),
+                        Cmd::GoToObject,
                     ));
                 }
                 // Only meaningful with rows on screen to navigate / copy.

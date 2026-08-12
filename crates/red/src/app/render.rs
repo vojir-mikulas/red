@@ -18,7 +18,7 @@ use crate::keymap::{
     SwitchToConnectionSlot, SwitchToPreviousConnection, ToggleAssistant, ToggleColumnsPanel,
     ToggleFilter, ToggleHistory, ToggleInspector, ToggleSidebar, ToggleSplit,
 };
-use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
+use crate::palette::{CopyResult, GoToObject, GoToRow, ToggleCommandPalette};
 use red_core::sql::RiskLevel;
 
 impl AppState {
@@ -529,6 +529,7 @@ impl Render for AppState {
                 }
             }))
             .on_action(cx.listener(|this, _: &GoToRow, _, cx| this.open_goto_prompt(cx)))
+            .on_action(cx.listener(|this, _: &GoToObject, _, cx| this.open_object_picker(cx)))
             .on_action(cx.listener(|this, _: &CopyResult, _, cx| this.copy_result_selection(cx)))
             // ⌘I toggles the cell detail inspector; Esc dismisses the topmost
             // transient overlay: an open dropdown / cell menu first, then the

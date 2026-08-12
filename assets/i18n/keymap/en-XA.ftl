@@ -22,6 +22,9 @@ keymap-SwitchToPreviousConnection =
 keymap-GoToRow =
     .label = [Gö tö röw]
 
+keymap-GoToObject =
+    .label = [Gö tö táblé]
+
 keymap-Quit =
     .label = [Qúít]
 

@@ -22,6 +22,9 @@ keymap-SwitchToPreviousConnection =
 keymap-GoToRow =
     .label = Go to row
 
+keymap-GoToObject =
+    .label = Go to table
+
 keymap-Quit =
     .label = Quit
 

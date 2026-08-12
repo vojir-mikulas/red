@@ -36,7 +36,7 @@ use gpui::{
 
 use crate::Quit;
 use crate::keymap_config::KeymapBlock;
-use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
+use crate::palette::{CopyResult, GoToObject, GoToRow, ToggleCommandPalette};
 
 // App-chrome actions reachable by keyboard. Editing actions come from Flint's
 // `TextInput` / `CodeEditor`; the grid/tree navigation actions live with their
@@ -539,6 +539,10 @@ const DEFAULTS: &[ActionDef] = &[
         None,
     ),
     def("ctrl-g", "GoToRow", "Go to row", None),
+    // ⌘O jumps to a schema object. `RedRoot`-scoped rather than a true global so
+    // a focused text field keeps any ⌘O of its own; nothing binds it today, and
+    // the editor's `CodeEditor` context does not, so it fires from the editor too.
+    def("cmd-o", "GoToObject", "Go to table", Some("RedRoot")),
     def("cmd-q", "Quit", "Quit", None),
     // --- RedRoot: app chrome, fires from any focus within the app ---
     // ⌘C copies the result grid's selection, scoped to `RedRoot` so a focused text
@@ -1045,6 +1049,7 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
         "SwitchConnection" => kb!(SwitchConnection),
         "SwitchToPreviousConnection" => kb!(SwitchToPreviousConnection),
         "GoToRow" => kb!(GoToRow),
+        "GoToObject" => kb!(GoToObject),
         "Quit" => kb!(Quit),
         "CopyResult" => kb!(CopyResult),
         "ToggleInspector" => kb!(ToggleInspector),

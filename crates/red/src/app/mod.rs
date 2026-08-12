@@ -427,6 +427,10 @@ pub struct AppState {
     /// The saved queries shown by the open picker, held only while it's open so an
     /// activation can resolve its index. Loaded on demand, never at startup.
     pub(crate) saved_queries: Vec<red_config::queries::SavedQuery>,
+    /// The schema objects shown by the open jump-to-table picker, held only while
+    /// it's open so an activation can resolve its index. Rebuilt per open, so it
+    /// never goes stale against a refreshed tree.
+    pub(crate) goto_objects: Vec<crate::palette::GotoObject>,
     /// The saved conversations shown by the open history picker, held only
     /// while it's open so an activation can resolve its index. Loaded on demand.
     pub(crate) loaded_conversations: Vec<crate::conversations::Conversation>,
@@ -1439,6 +1443,7 @@ impl AppState {
             palette_cmds: Vec::new(),
             palette_prompt: PromptKind::GoToRow,
             saved_queries: Vec::new(),
+            goto_objects: Vec::new(),
             loaded_conversations: Vec::new(),
             query_history: cx.new(|_| red_config::history::QueryHistory::load()),
             redis_analysis: crate::redis_analysis::AnalysisStore::load(),
