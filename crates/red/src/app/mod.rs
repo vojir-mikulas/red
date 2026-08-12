@@ -220,6 +220,10 @@ pub struct AppState {
     /// when open. The right-click selects the cell first, so the menu's Inspect/
     /// Copy act on it; `None` keeps the menu closed.
     pub(crate) cell_menu: Option<gpui::Point<gpui::Pixels>>,
+    /// Window-coordinate anchor for a result *header*'s right-click menu, plus
+    /// the display slot it was opened on. Separate from `cell_menu` because it
+    /// acts on a column rather than a cell, and the two can never be open at once.
+    pub(crate) header_menu: Option<(gpui::Point<gpui::Pixels>, usize)>,
     /// Window-coordinate anchor for the result toolbar's "Export" dropdown, when
     /// open (CSV / JSON / HTML grouped into one menu); `None` keeps it closed.
     pub(crate) export_menu: Option<gpui::Point<gpui::Pixels>>,
@@ -1382,6 +1386,7 @@ impl AppState {
             autoscroll: None,
             autoscroll_epoch: 0,
             cell_menu: None,
+            header_menu: None,
             export_menu: None,
             more_menu: None,
             confirm_exec: None,

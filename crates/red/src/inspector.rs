@@ -342,6 +342,7 @@ impl AppState {
     pub(crate) fn dismiss_overlay(&mut self, cx: &mut Context<Self>) {
         let mut closed = false;
         closed |= self.cell_menu.take().is_some();
+        closed |= self.header_menu.take().is_some();
         closed |= self.export_menu.take().is_some();
         closed |= self.more_menu.take().is_some();
         if closed {

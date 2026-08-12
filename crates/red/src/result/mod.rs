@@ -254,7 +254,7 @@ pub(crate) struct ResultGrid {
     pub(in crate::result) sort: Option<(usize, bool)>,
     /// Per-data-column pixel widths, parallel to [`columns`](Self::columns).
     ///
-    /// Always the same length as `columns` (see [`sync_widths`](Self::sync_widths)):
+    /// Always the same length as `columns` (see [`sync_columns`](Self::sync_columns)):
     /// the renderer, the horizontal extent arithmetic, and the keyboard cursor's
     /// scroll-into-view all index it positionally, and a short vector would make
     /// them disagree about where a column starts.
@@ -262,6 +262,16 @@ pub(crate) struct ResultGrid {
     /// The column-resize drag in flight, held here rather than on `AppState` so
     /// two split panes can each drag their own grid without sharing an anchor.
     pub(in crate::result) column_drag: Option<flint::ColumnDrag>,
+    /// Data-column indices in **display order**, excluding hidden ones.
+    ///
+    /// The grid's other state (widths, stats, staged edits, the FK sets) is keyed
+    /// by *data* column, which is stable; only what the user sees is reordered.
+    /// So this is the one indirection: the renderer builds its columns from this
+    /// vector, and every handler Flint calls back with a position translates
+    /// through [`data_col_at`](Self::data_col_at) before touching anything else.
+    ///
+    /// Kept in step with `columns` by [`sync_columns`](Self::sync_columns).
+    pub(in crate::result) visible: Vec<usize>,
     /// Whether this result has had its one automatic fit.
     ///
     /// Fits once, on the first rows to arrive, and never again: a later page
@@ -397,6 +407,7 @@ impl ResultGrid {
             sort: None,
             widths: Vec::new(),
             column_drag: None,
+            visible: Vec::new(),
             fitted: false,
             filter: None,
             unfiltered_total: None,
@@ -466,14 +477,22 @@ impl ResultGrid {
         self.error.as_deref()
     }
 
-    /// The `(absolute row, data column)` of the cell under the keyboard cursor:
-    /// the selection's focus, mapped through the gutter and clamped to the data
-    /// columns. `None` when nothing is selected or the result has no columns. The
-    /// detail inspector resolves the focused cell through this.
+    /// The `(absolute row, data column)` of the cell under the keyboard cursor.
+    ///
+    /// The selection is stored in *display* coordinates (it is what Flint
+    /// highlights), so the focused slot maps through the display order to reach
+    /// the data column everything else is keyed by. `None` when nothing is
+    /// selected, when the result has no columns, or when the focused slot no
+    /// longer names a visible column. **The** accessor for the focused cell: the
+    /// inspector, the edit target, the cell filter and FK follow all resolve
+    /// through it, so the mapping is applied once rather than at each of them.
     pub(crate) fn cursor_cell(&self, gutter: usize) -> Option<(usize, usize)> {
         let focus = self.selection?.focus;
-        let ncols = self.columns.len();
-        (ncols > 0).then(|| (focus.0, focus.1.saturating_sub(gutter).min(ncols - 1)))
+        let slot = focus
+            .1
+            .saturating_sub(gutter)
+            .min(self.visible.len().checked_sub(1)?);
+        Some((focus.0, self.data_col_at(slot)?))
     }
 
     /// The `(schema, table)` this result browses; `Some` only for a single-table
@@ -921,14 +940,90 @@ impl ResultGrid {
         self.table.as_ref().map(|(_, t)| t.clone())
     }
 
-    /// Bring [`widths`](Self::widths) back into step with the column set, seeding
-    /// new columns at [`DATA_COL_WIDTH`] and dropping any past the end.
+    /// Bring the per-column vectors back into step with the column set: widths
+    /// gain defaults for new columns, and the display order drops anything past
+    /// the end and appends whatever is newly present.
     ///
     /// Called wherever the column set can change (a fresh result, an inline FK
-    /// expansion), because every consumer indexes the two together and a
-    /// mismatch would silently shift the grid's geometry against its headers.
-    pub(in crate::result) fn sync_widths(&mut self) {
-        self.widths.resize(self.columns.len(), DATA_COL_WIDTH);
+    /// expansion). Every consumer indexes these together, and a mismatch would
+    /// silently shift the grid's geometry against its headers.
+    pub(in crate::result) fn sync_columns(&mut self) {
+        let n = self.columns.len();
+        self.widths.resize(n, DATA_COL_WIDTH);
+        // Drop stale indices first, so a shrunk column set cannot leave the
+        // display order pointing past the end.
+        self.visible.retain(|&c| c < n);
+        // Anything the order does not mention is new (or was hidden by a build
+        // that did not know about it) and joins at the end, visible.
+        for c in 0..n {
+            if !self.visible.contains(&c) {
+                self.visible.push(c);
+            }
+        }
+    }
+
+    /// The data column drawn at display position `slot`, or `None` past the end.
+    ///
+    /// **The** translation between what Flint reports and what the rest of the
+    /// grid is keyed by. A handler that skips it will read or write the wrong
+    /// column the moment anything is hidden or reordered.
+    pub(in crate::result) fn data_col_at(&self, slot: usize) -> Option<usize> {
+        self.visible.get(slot).copied()
+    }
+
+    /// Where data column `data_col` is drawn, or `None` when it is hidden.
+    pub(in crate::result) fn slot_of(&self, data_col: usize) -> Option<usize> {
+        self.visible.iter().position(|&c| c == data_col)
+    }
+
+    /// How many columns are on screen.
+    pub(in crate::result) fn visible_len(&self) -> usize {
+        self.visible.len()
+    }
+
+    /// Hide the data column drawn at `slot`.
+    ///
+    /// Refuses to hide the last visible column: a grid with no columns has no
+    /// header to right-click, so the action would be unrecoverable from the grid
+    /// itself.
+    pub(in crate::result) fn hide_slot(&mut self, slot: usize) -> bool {
+        if self.visible.len() <= 1 || slot >= self.visible.len() {
+            return false;
+        }
+        self.visible.remove(slot);
+        true
+    }
+
+    /// Show every hidden column, restoring them to data order at the end of the
+    /// display order (after whatever the user has arranged).
+    pub(in crate::result) fn show_all_columns(&mut self) {
+        self.sync_columns();
+    }
+
+    /// Data columns that are currently hidden, in data order, for the menu that
+    /// offers them back individually.
+    pub(in crate::result) fn hidden_columns(&self) -> Vec<usize> {
+        (0..self.columns.len())
+            .filter(|c| !self.visible.contains(c))
+            .collect()
+    }
+
+    /// Show `data_col` again, appended at the end of the display order.
+    pub(in crate::result) fn show_column(&mut self, data_col: usize) {
+        if data_col < self.columns.len() && !self.visible.contains(&data_col) {
+            self.visible.push(data_col);
+        }
+    }
+
+    /// Move the column at `slot` to `to`, clamped into range.
+    ///
+    pub(in crate::result) fn move_column(&mut self, slot: usize, to: usize) {
+        if slot >= self.visible.len() || slot == to {
+            return;
+        }
+        let to = to.min(self.visible.len() - 1);
+        let col = self.visible.remove(slot);
+        self.visible.insert(to, col);
     }
 
     /// This column's current width, or the default when the vector has not caught
@@ -940,7 +1035,7 @@ impl ResultGrid {
     /// Set one column's width, floored at Flint's minimum so a column can never
     /// be dragged narrower than its own grab handle.
     pub(in crate::result) fn set_width(&mut self, data_col: usize, width: f32) {
-        self.sync_widths();
+        self.sync_columns();
         if let Some(w) = self.widths.get_mut(data_col) {
             *w = width.max(flint::MIN_COLUMN_WIDTH);
         }
@@ -979,6 +1074,12 @@ impl ResultGrid {
         self.auto_fit_all();
     }
 
+    /// Put every column back to the default width, undoing both drags and fits.
+    pub(in crate::result) fn reset_widths(&mut self) {
+        self.widths.clear();
+        self.sync_columns();
+    }
+
     /// Auto-fit every column at once (the header menu's "Fit all columns").
     pub(in crate::result) fn auto_fit_all(&mut self) {
         for col in 0..self.columns.len() {
@@ -986,16 +1087,32 @@ impl ResultGrid {
         }
     }
 
-    /// The x offset of data column `data_col`'s left edge, past the gutter.
-    /// Summed rather than multiplied now that columns differ in width.
-    pub(in crate::result) fn column_left(&self, data_col: usize, gutter_w: f32) -> f32 {
-        gutter_w + self.widths.iter().take(data_col).sum::<f32>()
+    /// The x offset of display slot `slot`'s left edge, past the gutter.
+    ///
+    /// Sums the *visible* columns' widths in display order: with a column hidden
+    /// or moved, multiplying an index by a fixed width would put the keyboard
+    /// cursor's scroll-into-view over the wrong cell.
+    pub(in crate::result) fn slot_left(&self, slot: usize, gutter_w: f32) -> f32 {
+        gutter_w
+            + self
+                .visible
+                .iter()
+                .take(slot)
+                .map(|&c| self.width_of(c))
+                .sum::<f32>()
     }
 
-    /// Total width of the gutter plus every data column: the fixed-width track
-    /// the header and rows share in wide mode.
+    /// The width of whatever is drawn at display slot `slot`.
+    pub(in crate::result) fn slot_width(&self, slot: usize) -> f32 {
+        self.data_col_at(slot)
+            .map(|c| self.width_of(c))
+            .unwrap_or(DATA_COL_WIDTH)
+    }
+
+    /// Total width of the gutter plus every *visible* column: the fixed-width
+    /// track the header and rows share in wide mode.
     pub(in crate::result) fn content_width(&self, gutter_w: f32) -> f32 {
-        gutter_w + self.widths.iter().sum::<f32>()
+        gutter_w + self.visible.iter().map(|&c| self.width_of(c)).sum::<f32>()
     }
 
     /// The `(schema, table)` this result browses, or `None` for editor SQL.
@@ -1047,7 +1164,7 @@ impl ResultGrid {
         // a filter change) keeps the widths the user set; a genuinely different
         // column set gains defaults for whatever is new and re-fits once its rows
         // land.
-        self.sync_widths();
+        self.sync_columns();
         if shape_changed {
             self.fitted = false;
         }
@@ -1331,9 +1448,9 @@ impl ResultGrid {
             return; // not laid out yet
         }
         let gutter_w = gutter as f32 * gutter_width(self.total);
-        let data_col = table_col.saturating_sub(gutter);
-        let col_left = self.column_left(data_col, gutter_w);
-        let col_right = col_left + self.width_of(data_col);
+        let slot = table_col.saturating_sub(gutter);
+        let col_left = self.slot_left(slot, gutter_w);
+        let col_right = col_left + self.slot_width(slot);
         // The handle's x offset is 0 at the left edge and grows negative as the
         // content scrolls left, so the visible window is `[-off.x, -off.x + w]`.
         let off = self.h_scroll.offset();
@@ -1396,8 +1513,18 @@ impl ResultGrid {
         if dc0 > c1 {
             return None;
         }
-        let dcol_lo = dc0 - gutter;
-        let dcol_hi = (c1 - gutter).min(ncol.saturating_sub(1));
+        // The selection spans *display* slots; the data columns behind them are
+        // whatever the display order maps to, which after a hide or a reorder is
+        // neither contiguous nor ascending. Carrying the resolved list (rather
+        // than a lo..=hi range) is what keeps copy correct in that case, and it
+        // preserves the on-screen left-to-right order the user selected.
+        let cols: Vec<usize> = (dc0 - gutter..=(c1 - gutter))
+            .filter_map(|slot| self.data_col_at(slot))
+            .collect();
+        if cols.is_empty() {
+            return None;
+        }
+        let _ = ncol;
         let buffer = self.buffer.borrow();
         // Any selected row that's off-window (not resident) or holds a clipped
         // display stand-in forces a full re-fetch; otherwise the buffer already
@@ -1405,28 +1532,27 @@ impl ResultGrid {
         // whole-column select doesn't scan the entire result here.
         let needs_full = (r0..=r1).any(|r| match buffer.row(r) {
             None => true,
-            Some(row) => (dcol_lo..=dcol_hi).any(|c| row.is_truncated(c)),
+            Some(row) => cols.iter().any(|&c| row.is_truncated(c)),
         });
         if needs_full {
             return Some(CopyPlan::Refetch {
                 epoch: self.epoch,
                 offset: r0,
                 limit: r1 - r0 + 1,
-                dcol_lo,
-                dcol_hi,
+                cols,
             });
         }
         let mut writer = ClipboardWriter::begin(
             format,
-            self.selected_column_names(dcol_lo, dcol_hi),
+            self.selected_column_names(&cols),
             self.copy_table_name(),
         );
         // Reused across rows so a wide selection doesn't allocate a fresh Vec per
         // row; the writer only borrows it for the duration of the call.
-        let mut cells: Vec<Value> = Vec::with_capacity(dcol_hi + 1 - dcol_lo);
+        let mut cells: Vec<Value> = Vec::with_capacity(cols.len());
         for r in r0..=r1 {
             cells.clear();
-            for dcol in dcol_lo..=dcol_hi {
+            for &dcol in &cols {
                 let value = buffer
                     .row(r)
                     .and_then(|row| row.values.get(dcol))
@@ -1439,17 +1565,13 @@ impl ResultGrid {
         Some(CopyPlan::Ready(writer.finish()))
     }
 
-    /// The names of data columns `dcol_lo..=dcol_hi`, for the clipboard formats
+    /// The names of data columns `cols`, in that order, for the clipboard formats
     /// that key their output by column ([`ClipboardFormat::uses_column_names`]).
     /// An out-of-range index (a selection outliving a column-set change) yields an
     /// empty name rather than dropping the column and shifting every later one.
-    pub(in crate::result) fn selected_column_names(
-        &self,
-        dcol_lo: usize,
-        dcol_hi: usize,
-    ) -> Vec<String> {
-        (dcol_lo..=dcol_hi)
-            .map(|c| {
+    pub(in crate::result) fn selected_column_names(&self, cols: &[usize]) -> Vec<String> {
+        cols.iter()
+            .map(|&c| {
                 self.columns
                     .get(c)
                     .map(|col| col.name.clone())
@@ -1472,8 +1594,8 @@ impl ResultGrid {
 /// [`Event::CopyRowsLoaded`]: red_service::Event::CopyRowsLoaded
 pub(crate) struct PendingCopy {
     pub(crate) id: OpId,
-    pub(crate) dcol_lo: usize,
-    pub(crate) dcol_hi: usize,
+    /// The selected data columns, in display order.
+    pub(crate) cols: Vec<usize>,
     /// The shape the reply is rendered in. Captured when the copy was raised, not
     /// read back off the grid on arrival: the user can re-sort or re-open between
     /// the request and the reply, and the copy they asked for is the one they get.
@@ -1521,14 +1643,14 @@ pub(crate) enum CopyPlan {
     /// Ready to copy now: the assembled clipboard text.
     Ready(String),
     /// The selection holds display-clipped cells; re-fetch the rows in full
-    /// (`CopyRows`) and assemble the clipboard text from the reply. `dcol_lo..=dcol_hi`
-    /// are the selected data columns (the re-fetched rows carry every column).
+    /// (`CopyRows`) and assemble the clipboard text from the reply. `cols` are the
+    /// selected data columns in display order (the re-fetched rows carry every
+    /// column, so the slice both selects and orders them).
     Refetch {
         epoch: red_service::Epoch,
         offset: usize,
         limit: usize,
-        dcol_lo: usize,
-        dcol_hi: usize,
+        cols: Vec<usize>,
     },
 }
 
@@ -1540,19 +1662,18 @@ pub(crate) enum CopyPlan {
 /// (which doubled the peak on a large select-all copy).
 pub(crate) fn rows_clipboard(
     rows: Vec<Vec<Value>>,
-    dcol_lo: usize,
-    dcol_hi: usize,
+    cols: &[usize],
     format: ClipboardFormat,
     names: Vec<String>,
     table: Option<&str>,
 ) -> String {
     let mut writer = ClipboardWriter::begin(format, names, table);
-    let mut cells: Vec<Value> = Vec::with_capacity(dcol_hi + 1 - dcol_lo);
+    let mut cells: Vec<Value> = Vec::with_capacity(cols.len());
     for row in rows {
         cells.clear();
-        // A re-fetched row carries every column, so the selected span is sliced
-        // out here rather than at the fetch.
-        for dcol in dcol_lo..=dcol_hi {
+        // A re-fetched row carries every column, so the selection is both picked
+        // out and put into display order here rather than at the fetch.
+        for &dcol in cols {
             cells.push(row.get(dcol).cloned().unwrap_or(Value::Null));
         }
         writer.write_row(&cells);
@@ -1792,13 +1913,28 @@ impl AppState {
         self.settings.data.row_numbers as usize
     }
 
+    /// Mutate the focused tab's grid, for the display-only changes the header
+    /// menu makes (widths, visibility, order). A thin wrapper over
+    /// [`ActiveConn::with_active_result`] so those call sites read as one line
+    /// and none of them has to re-match on `Phase`.
+    pub(crate) fn with_grid<R>(
+        &mut self,
+        cx: &mut App,
+        f: impl FnOnce(&mut ResultGrid) -> R,
+    ) -> Option<R> {
+        match &mut self.phase {
+            Phase::Connected(active) => active.with_active_result(cx, f),
+            _ => None,
+        }
+    }
+
     /// Header click on a data column: toggle / set sort and re-open the result.
     pub(crate) fn result_sort(&mut self, table_col: usize, cx: &mut Context<Self>) {
         let gutter = self.gutter();
         if table_col < gutter {
             return; // the row-number gutter isn't sortable
         }
-        let dcol = table_col - gutter;
+        let slot = table_col - gutter;
         let reopen = match &mut self.phase {
             Phase::Connected(active) => active
                 .with_active_result(cx, |grid| {
@@ -1806,6 +1942,7 @@ impl AppState {
                     // narrower column set; ignore a click whose data column no longer
                     // exists rather than indexing past `columns`. `?` leaves `reopen`
                     // `None`, skipping the re-open exactly as the early `return` did.
+                    let dcol = grid.data_col_at(slot)?;
                     let col_name = grid.columns.get(dcol).map(|c| c.name.clone())?;
                     let old_epoch = grid.epoch;
                     let asc = match grid.sort {
@@ -2288,7 +2425,7 @@ impl AppState {
                     return;
                 }
                 let last = grid.total.saturating_sub(1);
-                let last_col = grid.columns.len() + gutter - 1;
+                let last_col = grid.visible_len() + gutter - 1;
                 grid.selection = Some(CellRange {
                     anchor: (0, gutter),
                     focus: (last, last_col),
@@ -2901,8 +3038,7 @@ impl AppState {
                 epoch,
                 offset,
                 limit,
-                dcol_lo,
-                dcol_hi,
+                cols,
             }) => {
                 // Bound the clipboard re-fetch so a select-all can't pull an
                 // arbitrarily large selection into one Vec/String; warn the user
@@ -2920,7 +3056,7 @@ impl AppState {
                 let (names, table) = match &self.phase {
                     Phase::Connected(active) => match active.active_result() {
                         Some(grid) => (
-                            grid.selected_column_names(dcol_lo, dcol_hi),
+                            grid.selected_column_names(&cols),
                             grid.copy_table_name().map(str::to_string),
                         ),
                         None => (Vec::new(), None),
@@ -2929,8 +3065,7 @@ impl AppState {
                 };
                 self.pending_copy = Some(PendingCopy {
                     id,
-                    dcol_lo,
-                    dcol_hi,
+                    cols,
                     format,
                     names,
                     table,
@@ -2968,8 +3103,7 @@ impl AppState {
         };
         let text = rows_clipboard(
             rows,
-            pending.dcol_lo,
-            pending.dcol_hi,
+            &pending.cols,
             pending.format,
             pending.names,
             pending.table.as_deref(),
@@ -3574,7 +3708,7 @@ mod width_tests {
                 decl_type: None,
             })
             .collect();
-        grid.sync_widths();
+        grid.sync_columns();
         grid
     }
 
@@ -3594,9 +3728,9 @@ mod width_tests {
         grid.set_width(0, 100.0);
         grid.set_width(1, 50.0);
         grid.set_width(2, 200.0);
-        assert_eq!(grid.column_left(0, 56.0), 56.0);
-        assert_eq!(grid.column_left(1, 56.0), 156.0);
-        assert_eq!(grid.column_left(2, 56.0), 206.0);
+        assert_eq!(grid.slot_left(0, 56.0), 56.0);
+        assert_eq!(grid.slot_left(1, 56.0), 156.0);
+        assert_eq!(grid.slot_left(2, 56.0), 206.0);
         assert_eq!(grid.content_width(56.0), 406.0);
     }
 
@@ -3647,5 +3781,78 @@ mod width_tests {
     fn an_out_of_range_column_reads_the_default() {
         let grid = grid(2);
         assert_eq!(grid.width_of(99), DATA_COL_WIDTH);
+    }
+    /// Hiding a column removes it from the display order but leaves its width
+    /// and data index untouched, so showing it again restores what it had.
+    #[test]
+    fn hiding_a_column_leaves_its_state_alone() {
+        let mut g = grid(3);
+        g.set_width(1, 123.0);
+        assert!(g.hide_slot(1));
+        assert_eq!(g.visible, vec![0, 2]);
+        assert_eq!(g.hidden_columns(), vec![1]);
+        // Slot 1 now draws data column 2.
+        assert_eq!(g.data_col_at(1), Some(2));
+        g.show_column(1);
+        assert_eq!(g.width_of(1), 123.0);
+    }
+
+    /// The last visible column cannot be hidden: with no headers left there
+    /// would be nothing to right-click to get it back.
+    #[test]
+    fn the_last_column_cannot_be_hidden() {
+        let mut g = grid(1);
+        assert!(!g.hide_slot(0));
+        assert_eq!(g.visible_len(), 1);
+    }
+
+    /// Reordering moves a column in display space only; the data indices behind
+    /// each slot follow it.
+    #[test]
+    fn moving_a_column_reorders_display_slots_only() {
+        let mut g = grid(3);
+        g.move_column(2, 0);
+        assert_eq!(g.visible, vec![2, 0, 1]);
+        assert_eq!(g.data_col_at(0), Some(2));
+        assert_eq!(g.slot_of(2), Some(0));
+        assert_eq!(g.columns.len(), 3, "the data column set is untouched");
+    }
+
+    /// Geometry follows the display order, so a reordered grid's cursor
+    /// scroll-into-view lands on the right cell.
+    #[test]
+    fn slot_geometry_follows_the_display_order() {
+        let mut g = grid(3);
+        g.set_width(0, 100.0);
+        g.set_width(1, 50.0);
+        g.set_width(2, 200.0);
+        g.move_column(2, 0);
+        // Slot 0 now draws the 200px column, so slot 1 starts after it.
+        assert_eq!(g.slot_width(0), 200.0);
+        assert_eq!(g.slot_left(1, 0.0), 200.0);
+    }
+
+    /// A hidden column is not part of the content track, so the horizontal
+    /// extent shrinks with it.
+    #[test]
+    fn hiding_shrinks_the_content_width() {
+        let mut g = grid(3);
+        let full = g.content_width(0.0);
+        g.hide_slot(0);
+        assert_eq!(g.content_width(0.0), full - DATA_COL_WIDTH);
+    }
+
+    /// Re-syncing after the column set grows appends the newcomers and keeps the
+    /// user's arrangement of the ones that were already there.
+    #[test]
+    fn syncing_preserves_the_arrangement() {
+        let mut g = grid(2);
+        g.move_column(1, 0);
+        g.columns.push(red_core::Column {
+            name: "c2".into(),
+            decl_type: None,
+        });
+        g.sync_columns();
+        assert_eq!(g.visible, vec![1, 0, 2], "new column joins at the end");
     }
 }

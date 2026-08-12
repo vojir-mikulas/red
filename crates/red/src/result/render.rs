@@ -514,9 +514,17 @@ impl AppState {
                     .align_end(),
             );
         }
-        for (i, c) in grid.columns.iter().enumerate() {
+        // Columns are built from the *display* order, so a hidden column is
+        // simply absent and a reordered one moves. Everything the closures below
+        // capture is indexed by data column, so each maps back through
+        // `data_cols` rather than assuming display position == data column.
+        let data_cols: Vec<usize> = grid.visible.clone();
+        for &dc in &data_cols {
+            let Some(c) = grid.columns.get(dc) else {
+                continue;
+            };
             let mut col = Column::new(c.name.clone())
-                .width(px(grid.width_of(i)))
+                .width(px(grid.width_of(dc)))
                 .sortable()
                 .resizable();
             if let Some(t) = &c.decl_type
@@ -526,7 +534,11 @@ impl AppState {
             }
             columns.push(col);
         }
-        let sort = grid.sort.map(|(c, asc)| (c + gutter, asc));
+        // The sort marker sits on whichever slot draws the sorted data column;
+        // a sorted-then-hidden column simply shows no marker.
+        let sort = grid
+            .sort
+            .and_then(|(c, asc)| grid.slot_of(c).map(|slot| (slot + gutter, asc)));
         let total = grid.total;
         let ncols = grid.columns.len();
         let buffer_range = grid.buffer.clone();
@@ -538,12 +550,14 @@ impl AppState {
         // hook so a faint wash marks them as derived, not base-table, data.
         let joined_cols = grid.joined_cols.clone();
         let joined_tint = Hsla { a: 0.05, ..cyan };
+        let bg_cols = data_cols.clone();
         let sender = grid.sender.clone();
         let epoch = grid.epoch;
         let (sort_view, cell_view, nav_view) = (view.clone(), view.clone(), view.clone());
         let sec_view = view.clone();
         let (drag_start_view, resize_view) = (view.clone(), view.clone());
         let (drag_end_view, auto_fit_view) = (view.clone(), view.clone());
+        let header_menu_view = view.clone();
 
         // Resolve (and possibly re-center) the virtual-scroll window for this
         // frame; everything below works in list-local coordinates offset by
@@ -644,8 +658,9 @@ impl AppState {
         // name (a `Grid` landmark), so a screen reader announces "<column>:
         // <value>, row N of M" each time the cell cursor moves: the one piece of
         // state a blind user needs to read the data. `focus` is in absolute,
-        // table-column coordinates (gutter included); a data column's index is
-        // `table_col - gutter`. Falls back to the grid's name when there's no cursor.
+        // table-column coordinates (gutter included); the data column behind a
+        // display slot comes from the grid's display order. Falls back to the
+        // grid's name when there's no cursor.
         let a11y_label: SharedString = grid
             .selection
             .map(|sel| {
@@ -654,7 +669,9 @@ impl AppState {
                 if show_gutter && table_col == 0 {
                     return SharedString::from(format!("Row number, {pos}"));
                 }
-                let data_col = table_col - gutter;
+                let Some(data_col) = grid.data_col_at(table_col - gutter) else {
+                    return SharedString::from(grid.label.clone());
+                };
                 let col_name = grid
                     .columns
                     .get(data_col)
@@ -703,21 +720,23 @@ impl AppState {
                 if overlay_bg.deleted.contains(&abs) {
                     return Some(delete_tint);
                 }
-                if table_col >= gutter && overlay_bg.cells.contains_key(&(abs, table_col - gutter))
-                {
+                let data_col = table_col
+                    .checked_sub(gutter)
+                    .and_then(|slot| bg_cols.get(slot).copied())?;
+                if overlay_bg.cells.contains_key(&(abs, data_col)) {
                     return Some(dirty_tint);
                 }
-                if table_col >= gutter && find_hits.contains(&(abs, table_col - gutter)) {
+                if find_hits.contains(&(abs, data_col)) {
                     return Some(find_tint);
                 }
                 // Below find/edit (which are about what the *user* is doing) and
                 // above the joined-column wash (which is static structure).
-                if table_col >= gutter && watch_hits.contains(&(abs, table_col - gutter)) {
+                if watch_hits.contains(&(abs, data_col)) {
                     return Some(watch_tint);
                 }
                 // A joined reference column (derived from a referenced table) gets a
                 // faint wash: lowest priority, so a find/edit/delete tint wins on top.
-                if table_col >= gutter && joined_cols.contains(&(table_col - gutter)) {
+                if joined_cols.contains(&data_col) {
                     return Some(joined_tint);
                 }
                 None
@@ -755,12 +774,14 @@ impl AppState {
                         let gutter = this.gutter();
                         // The gutter is not resizable, so a handle only ever
                         // names a data column; the guard is for totality.
-                        let Some(data_col) = table_col.checked_sub(gutter) else {
+                        let Some(slot) = table_col.checked_sub(gutter) else {
                             return;
                         };
                         if let Phase::Connected(active) = &mut this.phase {
                             active.with_active_result(cx, |grid| {
-                                grid.set_width(data_col, f32::from(width))
+                                if let Some(dc) = grid.data_col_at(slot) {
+                                    grid.set_width(dc, f32::from(width));
+                                }
                             });
                         }
                         cx.notify();
@@ -781,11 +802,28 @@ impl AppState {
                 auto_fit_view
                     .update(cx, |this, cx| {
                         let gutter = this.gutter();
-                        let Some(data_col) = table_col.checked_sub(gutter) else {
+                        let Some(slot) = table_col.checked_sub(gutter) else {
                             return;
                         };
                         if let Phase::Connected(active) = &mut this.phase {
-                            active.with_active_result(cx, |grid| grid.auto_fit(data_col));
+                            active.with_active_result(cx, |grid| {
+                                if let Some(dc) = grid.data_col_at(slot) {
+                                    grid.auto_fit(dc);
+                                }
+                            });
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            })
+            .on_header_secondary(move |table_col, pos, window, cx| {
+                header_menu_view
+                    .update(cx, |this, cx| {
+                        this.set_split_focus(pane, cx);
+                        this.focus_pane(Pane::Grid, window, cx);
+                        // The gutter's header names no column, so it opens nothing.
+                        if let Some(slot) = table_col.checked_sub(gutter) {
+                            this.header_menu = Some((pos, slot));
                         }
                         cx.notify();
                     })
@@ -1825,6 +1863,159 @@ impl AppState {
                 MouseButton::Left,
                 cx.listener(|this, _, _, cx| {
                     this.cell_menu = None;
+                    cx.notify();
+                }),
+            )
+            .child(floating(div().occlude().child(menu)).at(pos))
+    }
+
+    /// The result header's right-click menu, acting on the column at display
+    /// `slot`: its width, its visibility, and where it sits among the others.
+    ///
+    /// Everything here is display-only. Nothing re-runs the query, so a user can
+    /// rearrange a 60-column result without paying for a round trip, and the
+    /// grid's data-keyed state (widths, staged edits, stats) is untouched.
+    pub(crate) fn render_header_menu(
+        &self,
+        pos: Point<Pixels>,
+        slot: usize,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let grid = match &self.phase {
+            Phase::Connected(active) => active.active_result(),
+            _ => None,
+        };
+        let (name, visible_len, hidden) = match grid {
+            Some(grid) => (
+                grid.data_col_at(slot)
+                    .and_then(|dc| grid.columns().get(dc))
+                    .map(|c| c.name.clone())
+                    .unwrap_or_default(),
+                grid.visible_len(),
+                grid.hidden_columns()
+                    .into_iter()
+                    .filter_map(|dc| grid.columns().get(dc).map(|c| (dc, c.name.clone())))
+                    .collect::<Vec<_>>(),
+            ),
+            None => (String::new(), 0, Vec::new()),
+        };
+
+        let mut menu = ContextMenu::new("result-header-menu")
+            .item(
+                ContextMenuItem::new("header-fit", "Fit this column").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.header_menu = None;
+                        this.with_grid(cx, |grid| {
+                            if let Some(dc) = grid.data_col_at(slot) {
+                                grid.auto_fit(dc);
+                            }
+                        });
+                        cx.notify();
+                    },
+                )),
+            )
+            .item(
+                ContextMenuItem::new("header-fit-all", "Fit all columns").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.header_menu = None;
+                        this.with_grid(cx, |grid| grid.auto_fit_all());
+                        cx.notify();
+                    },
+                )),
+            )
+            .item(
+                ContextMenuItem::new("header-reset-widths", "Reset column widths").on_click(
+                    cx.listener(|this, _, _, cx| {
+                        this.header_menu = None;
+                        this.with_grid(cx, |grid| grid.reset_widths());
+                        cx.notify();
+                    }),
+                ),
+            )
+            .separator();
+
+        // Reorder. Offered only where there is somewhere to go, so the menu never
+        // shows an item that would do nothing.
+        if slot > 0 {
+            menu = menu.item(
+                ContextMenuItem::new("header-move-left", "Move left").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.header_menu = None;
+                        this.with_grid(cx, |grid| grid.move_column(slot, slot - 1));
+                        cx.notify();
+                    },
+                )),
+            );
+        }
+        if slot + 1 < visible_len {
+            menu = menu.item(
+                ContextMenuItem::new("header-move-right", "Move right").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.header_menu = None;
+                        this.with_grid(cx, |grid| grid.move_column(slot, slot + 1));
+                        cx.notify();
+                    },
+                )),
+            );
+        }
+        if slot > 0 {
+            menu = menu.item(
+                ContextMenuItem::new("header-move-first", "Move to front").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.header_menu = None;
+                        this.with_grid(cx, |grid| grid.move_column(slot, 0));
+                        cx.notify();
+                    },
+                )),
+            );
+        }
+
+        // Hiding the last visible column would leave no header to right-click, so
+        // the grid refuses it and the item is withheld rather than offered dead.
+        if visible_len > 1 {
+            menu = menu.separator().item(
+                ContextMenuItem::new("header-hide", format!("Hide {name}")).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.header_menu = None;
+                        this.with_grid(cx, |grid| {
+                            grid.hide_slot(slot);
+                        });
+                        cx.notify();
+                    },
+                )),
+            );
+        }
+        if !hidden.is_empty() {
+            let mut sub = Submenu::new("header-show", format!("Show hidden ({})", hidden.len()));
+            for (dc, col_name) in hidden {
+                sub = sub.item(
+                    ContextMenuItem::new(format!("header-show-{dc}"), col_name).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.header_menu = None;
+                            this.with_grid(cx, |grid| grid.show_column(dc));
+                            cx.notify();
+                        }),
+                    ),
+                );
+            }
+            menu = menu.submenu(sub).item(
+                ContextMenuItem::new("header-show-all", "Show all columns").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.header_menu = None;
+                        this.with_grid(cx, |grid| grid.show_all_columns());
+                        cx.notify();
+                    },
+                )),
+            );
+        }
+
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.header_menu = None;
                     cx.notify();
                 }),
             )

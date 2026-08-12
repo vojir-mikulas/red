@@ -836,6 +836,10 @@ impl Render for AppState {
             // anywhere outside close them, and keeps them from lingering over a
             // modal — the backdrop's `inset_0` now spans the whole window.
             .children(self.cell_menu.map(|pos| self.render_cell_menu(pos, cx)))
+            .children(
+                self.header_menu
+                    .map(|(pos, slot)| self.render_header_menu(pos, slot, cx)),
+            )
             .children(self.export_menu.map(|pos| self.render_export_menu(pos, cx)))
             .children(self.more_menu.map(|pos| self.render_more_menu(pos, cx)))
             .children(
