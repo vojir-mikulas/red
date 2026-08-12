@@ -381,7 +381,28 @@ impl AppState {
                     } else {
                         "Read/Write"
                     }),
-            );
+            )
+            // An open transaction is the one piece of session state that changes
+            // what every later statement means, so it is stated permanently rather
+            // than toasted once: the count is what tells the user they have work
+            // that will vanish if they quit.
+            .when(active.tx_open, |row| {
+                row.child(
+                    div()
+                        .flex()
+                        .flex_shrink_0()
+                        .items_center()
+                        .gap_1()
+                        .px_2()
+                        .text_color(theme.orange)
+                        .child(crate::icons::icon("lock", theme.scale(11.), theme.orange))
+                        .child(match active.tx_writes {
+                            0 => "In transaction".to_string(),
+                            1 => "1 uncommitted change".to_string(),
+                            n => format!("{n} uncommitted changes"),
+                        }),
+                )
+            });
 
         let status_right = div()
             .flex()

@@ -2228,6 +2228,16 @@ impl AppState {
                     cx.notify();
                 }
             }
+            Event::TransactionState { open, writes } => {
+                if let Some(conn) = self.conn_mut(session) {
+                    conn.tx_open = open;
+                    conn.tx_writes = writes;
+                }
+                cx.notify();
+            }
+            Event::TransactionFailed(message) => {
+                self.notify(ToastVariant::Error, message, cx);
+            }
             Event::ScriptStep(step) => self.on_script_step(step, cx),
             Event::ScriptDone {
                 ran,

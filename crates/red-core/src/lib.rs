@@ -81,6 +81,17 @@ impl DbKind {
     }
 
     /// File-based engines (SQLite) take a single path, not host/port/user/pass.
+    /// Whether the engine has a multi-statement transaction the user can hold
+    /// open across several commands.
+    ///
+    /// ClickHouse does not: it has no `BEGIN`, so the driver's `begin_sandbox`
+    /// returns `None` and a manual transaction can never be opened on it. This
+    /// mirrors that so the UI can withhold the affordance rather than offer one
+    /// that always fails. Redis and MongoDB are not SQL sessions at all.
+    pub const fn supports_transactions(self) -> bool {
+        matches!(self, Self::Sqlite | Self::Postgres | Self::Mysql)
+    }
+
     pub const fn is_file(self) -> bool {
         matches!(self, DbKind::Sqlite)
     }
@@ -3338,6 +3349,30 @@ mod key_tests {
         assert!(!is_int_type("interval"));
         assert!(!is_int_type("point"));
         assert!(!is_int_type("text"));
+    }
+}
+
+#[cfg(test)]
+mod tx_tests {
+    use super::*;
+
+    /// Only the engines whose drivers implement `begin_sandbox` claim
+    /// transactions. ClickHouse has no `BEGIN`, so offering the affordance could
+    /// only ever produce a refusal.
+    #[test]
+    fn only_transactional_engines_claim_transactions() {
+        assert!(DbKind::Postgres.supports_transactions());
+        assert!(DbKind::Mysql.supports_transactions());
+        assert!(DbKind::Sqlite.supports_transactions());
+        assert!(!DbKind::Clickhouse.supports_transactions());
+    }
+
+    /// The non-SQL seams have no SQL session to hold a transaction on, so they
+    /// must never advertise one either.
+    #[test]
+    fn non_sql_seams_have_no_transactions() {
+        assert!(!DbKind::Redis.supports_transactions());
+        assert!(!DbKind::Mongo.supports_transactions());
     }
 }
 

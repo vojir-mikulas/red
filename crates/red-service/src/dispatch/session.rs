@@ -285,6 +285,15 @@ pub(crate) struct SessionState {
     /// The streaming `Query`/`FetchMore` cursor. Single-active per session; this
     /// path is legacy/test-only (the UI drives results via `OpenResult`).
     pub(crate) active: Option<ActiveQuery>,
+    /// The user's open manual transaction, or `None` in autocommit.
+    ///
+    /// A [`Sandbox`](red_driver::Sandbox) rather than a bespoke handle: it already
+    /// owns a connection checked out of the pool for its whole life, which is what
+    /// makes a transaction spanning several commands possible at all (a `BEGIN` on
+    /// one pooled connection and an `UPDATE` on another does nothing). Dropping it
+    /// rolls back, so session teardown and idle eviction cannot leave a
+    /// transaction open on the server.
+    pub(crate) tx: Option<Box<dyn red_driver::Sandbox>>,
     pub(crate) results: ResultMap,
     pub(crate) inflight: HashMap<crate::Epoch, InFlight>,
     pub(crate) exports: Arc<Mutex<HashMap<OpId, Arc<AtomicBool>>>>,
@@ -353,6 +362,7 @@ impl SessionState {
             read_only,
             _forward: forward,
             active: None,
+            tx: None,
             results: Arc::new(Mutex::new(HashMap::new())),
             inflight: HashMap::new(),
             exports: Arc::new(Mutex::new(HashMap::new())),

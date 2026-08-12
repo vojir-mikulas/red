@@ -513,6 +513,11 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
     // Monotonic id for the in-flight write registry (`SessionState::writes`);
     // loop-global so two sessions' writes can never collide on an id.
     let mut write_seq: u64 = 0;
+    // Statements applied inside each session's open transaction, so the UI can
+    // report "3 uncommitted changes". Lives beside the sessions rather than on
+    // `SessionState` because it is pure reporting: losing it would misreport a
+    // count, never leave a transaction in the wrong state.
+    let mut tx_writes: HashMap<SessionId, usize> = HashMap::new();
     // Bounds how many page fetches hit servers concurrently across *all* sessions
     // (see the const), a shared backstop, so a flung scrollbar on one connection
     // can't fan out dozens of deep scans. A busy session can briefly delay
@@ -4229,6 +4234,116 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
+            Command::BeginTransaction => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                if state.tx.is_some() {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::TransactionFailed("a transaction is already open".into()),
+                    );
+                    continue;
+                }
+                // A transaction on a read-only connection could only ever end in a
+                // rollback: every statement it could hold is one the read-only gate
+                // refuses. Refusing up front says so, instead of letting the user
+                // open one and discover it is useless a statement later.
+                if state.read_only {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::TransactionFailed(
+                            "this connection is read-only; there is nothing to commit".into(),
+                        ),
+                    );
+                    continue;
+                }
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
+                // Held on the pump rather than spawned: `BEGIN` is a single round
+                // trip, and the session must not accept an `Execute` between the
+                // request and the transaction actually existing, or that write
+                // would autocommit outside it.
+                match driver.begin_sandbox().await {
+                    Ok(Some(tx)) => {
+                        state.tx = Some(tx);
+                        tx_writes.insert(id, 0);
+                        emit(
+                            &events,
+                            session_id,
+                            Event::TransactionState {
+                                open: true,
+                                writes: 0,
+                            },
+                        );
+                    }
+                    // The engine has no multi-statement transaction (ClickHouse).
+                    Ok(None) => emit(
+                        &events,
+                        session_id,
+                        Event::TransactionFailed(
+                            "this engine has no multi-statement transactions".into(),
+                        ),
+                    ),
+                    Err(e) => emit(&events, session_id, Event::TransactionFailed(e.to_string())),
+                }
+            }
+
+            Command::CommitTransaction | Command::RollbackTransaction => {
+                let Some(id) = session_id else { continue };
+                let commit = matches!(command, Command::CommitTransaction);
+                let Some(state) = sessions.get_mut(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(tx) = state.tx.take() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::TransactionFailed("no transaction is open".into()),
+                    );
+                    continue;
+                };
+                tx_writes.remove(&id);
+                // Taken out of the session *before* awaiting, so a command arriving
+                // mid-commit sees autocommit rather than a transaction that is
+                // already resolving. Either outcome ends with no transaction held:
+                // a failed commit has been rolled back by the engine.
+                let outcome = if commit {
+                    tx.commit().await
+                } else {
+                    tx.rollback().await
+                };
+                if let Err(e) = outcome {
+                    emit(&events, session_id, Event::TransactionFailed(e.to_string()));
+                }
+                // A committed transaction may have moved rows under any open
+                // result, so drop the checkpoint indexes (as `Execute` does).
+                for spec in lock(&state.results).values() {
+                    let mut idx = lock(&spec.checkpoints);
+                    idx.points.clear();
+                    idx.status = BuildStatus::Idle;
+                }
+                emit(
+                    &events,
+                    session_id,
+                    Event::TransactionState {
+                        open: false,
+                        writes: 0,
+                    },
+                );
+            }
+
             Command::RunScript {
                 statements,
                 namespace,
@@ -4388,6 +4503,54 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     );
                     continue;
                 };
+                // Inside a manual transaction every write runs on the pinned
+                // connection instead, so it is held with the rest of the
+                // transaction rather than autocommitting beside it. Handled on
+                // the pump because the sandbox is not clonable out of the session.
+                if let Some(tx) = sessions.get(&id).and_then(|s| s.tx.as_ref()) {
+                    let statements = red_core::sql::split_statements(
+                        &sql,
+                        red_core::sql::Dialect::of(state.kind),
+                    );
+                    let abort = AbortSignal::new();
+                    let mut affected = 0u64;
+                    let mut failed = None;
+                    let ran = statements.len();
+                    for stmt in statements {
+                        match tx.execute(stmt, &abort).await {
+                            Ok(n) => affected += n,
+                            Err(e) => {
+                                failed = Some(e.to_string());
+                                break;
+                            }
+                        }
+                    }
+                    match failed {
+                        // The transaction stays open on a failed statement: the
+                        // user decides whether to fix and retry or roll back. That
+                        // is the whole reason to be in one.
+                        Some(e) => emit(&events, session_id, Event::Error(e)),
+                        None => {
+                            let count = tx_writes.entry(id).or_insert(0);
+                            *count += ran;
+                            let writes = *count;
+                            emit(
+                                &events,
+                                session_id,
+                                Event::Executed {
+                                    statements: ran,
+                                    affected: affected as usize,
+                                },
+                            );
+                            emit(
+                                &events,
+                                session_id,
+                                Event::TransactionState { open: true, writes },
+                            );
+                        }
+                    }
+                    continue;
+                }
                 // Bind the tab's database, same as `Command::Query`: a write and the
                 // read beside it must resolve unqualified names identically.
                 let driver = driver.scoped(namespace.as_deref());

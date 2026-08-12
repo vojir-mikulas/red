@@ -30,6 +30,12 @@ palette-cmd_run = query: run
 
 palette-cmd_run_script = query: run script
 
+palette-cmd_tx_commit = transaction: commit
+
+palette-cmd_tx_rollback = transaction: roll back
+
+palette-cmd_tx_begin = transaction: begin
+
 palette-cmd_new_tab = query: new tab
 
 palette-cmd_close_tab = query: close tab

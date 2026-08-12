@@ -1563,6 +1563,20 @@ impl AppState {
         cx.notify();
     }
 
+    /// Send a transaction verb to the foreground session.
+    ///
+    /// The three verbs share one path because they share one precondition (a live
+    /// SQL session) and one failure mode (the backend refuses and says why through
+    /// `Event::TransactionFailed`); the UI does not second-guess whether a
+    /// transaction is really open, since only the backend holds it.
+    pub(crate) fn send_tx(&mut self, command: Command, cx: &mut Context<Self>) {
+        let Some(session) = self.foreground_session else {
+            return;
+        };
+        self.service.send_to(session, command);
+        cx.notify();
+    }
+
     /// Show or hide the History panel in the left dock (status-bar toggle, ⌘Y, or
     /// palette). Opening focuses its list; closing returns focus to the editor.
     pub(crate) fn toggle_history(&mut self, cx: &mut Context<Self>) {

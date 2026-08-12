@@ -30,6 +30,12 @@ palette-cmd_run = [qúéry: rúñ]
 
 palette-cmd_run_script = [qúéry: rúñ sçrípt]
 
+palette-cmd_tx_commit = [tráñsáçtíöñ: çömmít]
+
+palette-cmd_tx_rollback = [tráñsáçtíöñ: röll báçk]
+
+palette-cmd_tx_begin = [tráñsáçtíöñ: bégíñ]
+
 palette-cmd_new_tab = [qúéry: ñéw táb]
 
 palette-cmd_close_tab = [qúéry: çlösé táb]

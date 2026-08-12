@@ -1790,6 +1790,12 @@ pub(crate) struct ActiveConn {
     /// Stop in front of the user, and the default `statement_timeout` is 0, so
     /// without it a wedged write has neither a timeout nor a way out.
     pub write_in_flight: bool,
+    /// Whether a manual transaction is open on this session, and how many
+    /// statements it holds. Mirrors the backend's `Event::TransactionState`
+    /// rather than being tracked here: the transaction lives on the pinned
+    /// connection, so the backend is the only thing that knows it is really open.
+    pub tx_open: bool,
+    pub tx_writes: usize,
     /// Width of the Schema side-panel (the second left-dock column). Retained while
     /// it's hidden so toggling it back restores the previous width.
     pub sidebar_w: Pixels,
@@ -2007,6 +2013,8 @@ impl ActiveConn {
             config,
             version,
             write_in_flight: false,
+            tx_open: false,
+            tx_writes: 0,
             sidebar_w: px(240.),
             sidebar_drag: None,
             sidebar_collapsed: false,

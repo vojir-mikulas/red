@@ -807,6 +807,18 @@ pub enum Command {
     /// batch, so a `CREATE TABLE` + `CREATE INDEX` + seed `INSERT` pasted into the
     /// editor commits together on every engine whose transactions cover DDL. Replied
     /// with `Executed`.
+    /// Open a manual transaction on this session, pinning a connection for its
+    /// lifetime. Every later `Execute` / `RunScript` / result open runs inside it
+    /// until `CommitTransaction` or `RollbackTransaction`.
+    ///
+    /// Refused on an engine without transactions (ClickHouse) and on a read-only
+    /// connection, where holding one could only ever end in a rollback.
+    BeginTransaction,
+    /// Commit the open transaction and return to autocommit.
+    CommitTransaction,
+    /// Discard the open transaction and return to autocommit.
+    RollbackTransaction,
+
     /// Run a multi-statement script in order, reporting each statement's outcome
     /// as it lands (`Event::ScriptStep`) and a summary at the end
     /// (`Event::ScriptDone`).
@@ -1779,6 +1791,16 @@ pub enum Event {
         statements: usize,
         affected: usize,
     },
+    /// The manual transaction's state changed. `open` is whether one is now held;
+    /// `writes` counts the statements applied inside it so far, so the UI can say
+    /// "3 uncommitted changes" rather than only "in a transaction".
+    TransactionState {
+        open: bool,
+        writes: usize,
+    },
+    /// A transaction verb failed (begin refused, commit rejected). The
+    /// transaction's state is reported separately by `TransactionState`.
+    TransactionFailed(String),
     /// One statement of a running script finished. Emitted as each lands, so a
     /// long script's log fills in live rather than arriving all at once.
     ScriptStep(red_core::ScriptStep),

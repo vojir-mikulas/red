@@ -39,6 +39,12 @@ pub(crate) enum Cmd {
     RunQuery,
     /// Run the whole buffer as a multi-statement script.
     RunScript,
+    /// Open a manual transaction (statements are held until committed).
+    BeginTransaction,
+    /// Commit the open transaction.
+    CommitTransaction,
+    /// Roll back the open transaction.
+    RollbackTransaction,
     NewTab,
     CloseTab,
     NextTab,
@@ -476,6 +482,9 @@ impl AppState {
             Cmd::SwitchConnection => self.open_switcher = true,
             Cmd::RunQuery => self.run_editor_query(cx),
             Cmd::RunScript => self.run_editor_script(cx),
+            Cmd::BeginTransaction => self.send_tx(Command::BeginTransaction, cx),
+            Cmd::CommitTransaction => self.send_tx(Command::CommitTransaction, cx),
+            Cmd::RollbackTransaction => self.send_tx(Command::RollbackTransaction, cx),
             Cmd::NewTab => self.new_query(cx),
             Cmd::CloseTab => self.close_active_tab(cx),
             Cmd::NextTab => {
@@ -685,6 +694,26 @@ impl AppState {
                     item("cmd:run-script", "query: run script").hint("⌥⌘↵"),
                     Cmd::RunScript,
                 ));
+                // Only where the engine actually has transactions, and shaped by
+                // whether one is already open: offering "commit" with nothing to
+                // commit teaches the wrong model of what the command does.
+                if active.config.kind.supports_transactions() && !active.config.read_only {
+                    if active.tx_open {
+                        out.push((
+                            item("cmd:tx-commit", "transaction: commit"),
+                            Cmd::CommitTransaction,
+                        ));
+                        out.push((
+                            item("cmd:tx-rollback", "transaction: roll back"),
+                            Cmd::RollbackTransaction,
+                        ));
+                    } else {
+                        out.push((
+                            item("cmd:tx-begin", "transaction: begin"),
+                            Cmd::BeginTransaction,
+                        ));
+                    }
+                }
                 out.push((
                     item("cmd:new-tab", "query: new tab").hint("⌘T"),
                     Cmd::NewTab,
