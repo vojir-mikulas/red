@@ -477,6 +477,22 @@ impl ResultGrid {
         self.error.as_deref()
     }
 
+    /// Decide what a right-click at `(row, table_col)` does to the selection,
+    /// returning whether the existing one was kept (so the caller knows a fresh
+    /// single-cell select is not needed).
+    ///
+    /// A click **inside** the selection leaves it entirely alone, which is the
+    /// grid convention (Excel, DataGrip) and what makes "Copy as CSV" over
+    /// twenty selected rows copy twenty rows rather than the one cell the cursor
+    /// was over. The focus deliberately does *not* follow the cursor: the range
+    /// is `anchor..focus`, so moving the focus to the clicked cell would shrink
+    /// the very selection this exists to preserve. The menu's per-cell items
+    /// therefore act on the focused cell, which is inside what is selected.
+    pub(in crate::result) fn select_for_menu(&self, row: usize, table_col: usize) -> bool {
+        self.selection
+            .is_some_and(|range| range.contains(row, table_col))
+    }
+
     /// The `(absolute row, data column)` of the cell under the keyboard cursor.
     ///
     /// The selection is stored in *display* coordinates (it is what Flint
@@ -2313,6 +2329,30 @@ impl AppState {
         cx.notify();
     }
 
+    /// Position the selection for a right-click at `(row, table_col)`.
+    ///
+    /// A right-click *inside* the existing selection leaves it untouched, so a
+    /// menu action spans everything selected; a right-click outside it selects
+    /// the clicked cell first, so the menu refers to what was clicked. Mirrors
+    /// the editor's right-click menu, where clicking inside a highlight keeps the
+    /// highlight and clicking elsewhere moves the caret there.
+    pub(crate) fn result_select_for_menu(
+        &mut self,
+        row: usize,
+        table_col: usize,
+        cx: &mut Context<Self>,
+    ) {
+        let keep = match &self.phase {
+            Phase::Connected(active) => active
+                .active_result()
+                .is_some_and(|grid| grid.select_for_menu(row, table_col)),
+            _ => false,
+        };
+        if !keep {
+            self.result_select(row, table_col, false, cx);
+        }
+    }
+
     /// Move the keyboard cell cursor over the active grid (arrows, Home/End,
     /// PageUp/Down, ⌘arrows). `extend` (Shift held) grows the selection from its
     /// anchor; otherwise the cursor becomes a fresh single-cell selection. The
@@ -3854,5 +3894,81 @@ mod width_tests {
         });
         g.sync_columns();
         assert_eq!(g.visible, vec![1, 0, 2], "new column joins at the end");
+    }
+}
+
+#[cfg(test)]
+mod menu_selection_tests {
+    use super::*;
+    use flint::CellRange;
+    use red_core::Column;
+    use red_service::{SessionId, spawn};
+
+    fn grid() -> ResultGrid {
+        let handle = spawn();
+        let sender = handle.command_sender(SessionId::new(1));
+        let mut grid = ResultGrid::new("t".into(), "SELECT * FROM t".into(), None, sender, 100);
+        grid.columns = (0..4)
+            .map(|i| Column {
+                name: format!("c{i}"),
+                decl_type: None,
+            })
+            .collect();
+        grid.sync_columns();
+        grid
+    }
+
+    /// Right-clicking inside a multi-cell selection keeps it, so a "Copy as"
+    /// over twenty selected rows copies twenty rows and not the one cell the
+    /// cursor happened to be over.
+    #[test]
+    fn a_right_click_inside_the_selection_keeps_it() {
+        let mut g = grid();
+        g.selection = Some(CellRange {
+            anchor: (2, 1),
+            focus: (8, 3),
+        });
+        assert!(g.select_for_menu(5, 2), "the click was inside the range");
+        let range = g.selection.expect("selection survives");
+        assert_eq!(
+            range.bounds(),
+            (2, 1, 8, 3),
+            "the range is untouched: moving the focus here would shrink it"
+        );
+        assert_eq!(range.focus, (8, 3), "focus does not follow the cursor");
+    }
+
+    /// Right-clicking outside the selection reports "not kept", so the caller
+    /// selects the clicked cell and the menu refers to what was clicked.
+    #[test]
+    fn a_right_click_outside_the_selection_releases_it() {
+        let mut g = grid();
+        g.selection = Some(CellRange {
+            anchor: (2, 1),
+            focus: (8, 3),
+        });
+        assert!(!g.select_for_menu(20, 2), "row is below the range");
+        assert!(!g.select_for_menu(5, 4), "column is right of the range");
+    }
+
+    /// A range drawn bottom-right to top-left still contains its own cells:
+    /// either corner may lead, so the check has to normalize.
+    #[test]
+    fn an_inverted_range_still_contains_its_cells() {
+        let mut g = grid();
+        g.selection = Some(CellRange {
+            anchor: (8, 3),
+            focus: (2, 1),
+        });
+        assert!(g.select_for_menu(5, 2));
+    }
+
+    /// With nothing selected there is nothing to keep, so the caller selects the
+    /// clicked cell.
+    #[test]
+    fn a_right_click_with_no_selection_selects_the_cell() {
+        let mut g = grid();
+        g.selection = None;
+        assert!(!g.select_for_menu(3, 1));
     }
 }

@@ -883,7 +883,7 @@ impl AppState {
                     .update(cx, |this, cx| {
                         this.set_split_focus(pane, cx);
                         this.focus_pane(Pane::Grid, window, cx);
-                        this.result_select(abs_row, table_col, false, cx);
+                        this.result_select_for_menu(abs_row, table_col, cx);
                         this.cell_menu = Some(pos);
                         cx.notify();
                     })

@@ -71,6 +71,10 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   screen, `←`/`→` page a long roster and `Home`/`End` jump to its ends.
 
 ### Fixed
+- Right-clicking inside a selection of several result cells keeps that
+  selection instead of collapsing it to the one cell under the cursor, so the
+  menu's Copy and "Copy as" act on everything you selected. Right-clicking
+  outside the selection still selects the cell you clicked.
 - Opening a PostgreSQL sequence from the schema explorer shows its definition
   instead of failing with "driver error: db error".
 - PostgreSQL failures now carry the server's own message and SQLSTATE wherever
