@@ -10,6 +10,7 @@ use gpui::{
     Axis, Entity, Hsla, MouseButton, Pixels, Point, SharedString, Window, div, point, prelude::*,
     px,
 };
+use red_core::valuefmt::ClipboardFormat;
 use red_core::{CmpOp, ExportFormat, Value};
 
 use super::buffer::{CellKind, DisplayCell};
@@ -1474,6 +1475,52 @@ impl AppState {
     /// · Copy) that used to sit in the toolbar, anchored at `pos` (the cursor).
     /// Both act on the cell the right-click just selected. A full-cover backdrop
     /// closes the menu on an outside click.
+    /// The "Copy as" submenu: the same selection in whichever text shape the user
+    /// is pasting into. Every entry routes through one
+    /// [`copy_result_selection_as`](AppState::copy_result_selection_as), so a
+    /// format is added here by naming it, not by growing a second copy path.
+    ///
+    /// The SQL form is offered only on a table browse: an `INSERT` needs a target
+    /// table, and editor SQL has no single one to name.
+    fn copy_as_submenu(&self, cx: &mut Context<Self>) -> Submenu {
+        let entries: &[(&'static str, &str, ClipboardFormat)] = &[
+            (
+                "tsv-headers",
+                "TSV with headers",
+                ClipboardFormat::TsvHeaders,
+            ),
+            ("csv", "CSV", ClipboardFormat::Csv),
+            ("json", "JSON", ClipboardFormat::Json),
+            ("markdown", "Markdown table", ClipboardFormat::Markdown),
+            ("in-list", "IN (…) list", ClipboardFormat::InList),
+        ];
+        let mut sub = Submenu::new("cell-copy-as", "Copy as");
+        for (id, label, format) in entries {
+            let format = *format;
+            sub = sub.item(
+                ContextMenuItem::new(format!("cell-copy-as-{id}"), *label).on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.cell_menu = None;
+                        this.copy_result_selection_as(format, cx);
+                        cx.notify();
+                    },
+                )),
+            );
+        }
+        if self.copy_as_sql_target(cx).is_some() {
+            sub = sub.item(
+                ContextMenuItem::new("cell-copy-as-sql", "SQL INSERT").on_click(cx.listener(
+                    |this, _, _, cx| {
+                        this.cell_menu = None;
+                        this.copy_result_selection_as(ClipboardFormat::Sql, cx);
+                        cx.notify();
+                    },
+                )),
+            );
+        }
+        sub
+    }
+
     pub(crate) fn render_cell_menu(
         &self,
         pos: Point<Pixels>,
@@ -1504,6 +1551,7 @@ impl AppState {
                         cx.notify();
                     })),
             )
+            .submenu(self.copy_as_submenu(cx))
             // Point the agent at what is selected instead of describing it. Row
             // data, so the tier ladder gates it — `add_reference` says so rather
             // than accepting a chip that would resolve to nothing.

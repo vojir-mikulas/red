@@ -37,7 +37,6 @@ mod sqlite;
 mod xlsx;
 pub use clickhouse::ClickhouseDriver;
 pub use doc::DocDriver;
-pub use format::html_escape;
 pub use import::ImportReader;
 pub use kv::{KvDriver, KvMonitorStream, KvSubscription, KvTopology};
 pub use mongo::MongoDriver;

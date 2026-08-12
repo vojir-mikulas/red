@@ -13,6 +13,7 @@ pub mod schema_diff;
 pub mod server;
 pub mod sql;
 pub mod typemap;
+pub mod valuefmt;
 
 /// How risky a database operation is, for the read-only gate and the
 /// destructive-operation confirm. Shared across seams: Redis console commands

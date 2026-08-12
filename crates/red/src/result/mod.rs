@@ -31,6 +31,7 @@ use gpui::{
     App, ClipboardItem, Context, PathPromptOptions, Pixels, ScrollHandle, UniformListScrollHandle,
     point, px,
 };
+use red_core::valuefmt::{ClipboardFormat, ClipboardWriter};
 use red_core::{
     BASE_ALIAS, Column as ResultColumn, ColumnMap, ColumnStats, ColumnValue, ExportFormat, FkEdge,
     FkJoin, ImportFormat, KeySpec, ResultFilter, RowEditCaps, TableRef, Value,
@@ -1232,29 +1233,32 @@ impl ResultGrid {
         }
     }
 
-    /// How to satisfy a copy of the current selection (NULL → empty, gutter
-    /// column skipped). When every selected cell is resident and untruncated the
-    /// clipboard text is built straight from the buffer ([`CopyPlan::Ready`]);
-    /// when the selection touches a cell the grid clipped for display, or reaches
-    /// rows scrolled out of the window (a whole-column select), those rows must be
-    /// re-fetched in full first ([`CopyPlan::Refetch`]). `None` when the selection
-    /// is empty or covers only the gutter. `gutter` is the data-column table offset
-    /// (`1` with the row-number gutter shown, else `0`).
     /// The current selection as a small text table, for handing to the agent as
     /// a reference.
+    ///
+    /// Headered, unlike the ⌘C default: the agent is being asked to reason about
+    /// these rows, and unlabelled columns are the one thing it cannot recover.
     ///
     /// Only the already-resident form: a selection whose cells are display-clipped
     /// or off-window would need the same backend re-fetch a copy does, and a
     /// reference is worth exactly as much as it is cheap. `None` then, and the
     /// chip resolves to nothing rather than to half the rows.
     pub(crate) fn selection_text(&self, gutter: usize) -> Option<String> {
-        match self.copy_plan(gutter)? {
+        match self.copy_plan(gutter, ClipboardFormat::TsvHeaders)? {
             CopyPlan::Ready(text) if !text.trim().is_empty() => Some(text),
             _ => None,
         }
     }
 
-    fn copy_plan(&self, gutter: usize) -> Option<CopyPlan> {
+    /// How to satisfy a copy of the current selection in `format` (gutter column
+    /// skipped). When every selected cell is resident and untruncated the
+    /// clipboard text is built straight from the buffer ([`CopyPlan::Ready`]);
+    /// when the selection touches a cell the grid clipped for display, or reaches
+    /// rows scrolled out of the window (a whole-column select), those rows must be
+    /// re-fetched in full first ([`CopyPlan::Refetch`]). `None` when the selection
+    /// is empty or covers only the gutter. `gutter` is the data-column table offset
+    /// (`1` with the row-number gutter shown, else `0`).
+    fn copy_plan(&self, gutter: usize, format: ClipboardFormat) -> Option<CopyPlan> {
         let (r0, c0, r1, c1) = self.selection?.bounds();
         let ncol = self.columns.len();
         let dc0 = c0.max(gutter);
@@ -1281,19 +1285,52 @@ impl ResultGrid {
                 dcol_hi,
             });
         }
-        let mut out = String::new();
+        let mut writer = ClipboardWriter::begin(
+            format,
+            self.selected_column_names(dcol_lo, dcol_hi),
+            self.copy_table_name(),
+        );
+        // Reused across rows so a wide selection doesn't allocate a fresh Vec per
+        // row; the writer only borrows it for the duration of the call.
+        let mut cells: Vec<Value> = Vec::with_capacity(dcol_hi + 1 - dcol_lo);
         for r in r0..=r1 {
-            for (i, dcol) in (dcol_lo..=dcol_hi).enumerate() {
-                if i > 0 {
-                    out.push('\t');
-                }
-                if let Some(value) = buffer.row(r).and_then(|row| row.values.get(dcol)) {
-                    out.push_str(&cell_string(value));
-                }
+            cells.clear();
+            for dcol in dcol_lo..=dcol_hi {
+                let value = buffer
+                    .row(r)
+                    .and_then(|row| row.values.get(dcol))
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                cells.push(value);
             }
-            out.push('\n');
+            writer.write_row(&cells);
         }
-        Some(CopyPlan::Ready(out))
+        Some(CopyPlan::Ready(writer.finish()))
+    }
+
+    /// The names of data columns `dcol_lo..=dcol_hi`, for the clipboard formats
+    /// that key their output by column ([`ClipboardFormat::uses_column_names`]).
+    /// An out-of-range index (a selection outliving a column-set change) yields an
+    /// empty name rather than dropping the column and shifting every later one.
+    pub(in crate::result) fn selected_column_names(
+        &self,
+        dcol_lo: usize,
+        dcol_hi: usize,
+    ) -> Vec<String> {
+        (dcol_lo..=dcol_hi)
+            .map(|c| {
+                self.columns
+                    .get(c)
+                    .map(|col| col.name.clone())
+                    .unwrap_or_default()
+            })
+            .collect()
+    }
+
+    /// The browsed table's bare name, which the SQL clipboard form targets with its
+    /// `INSERT`s. `None` for editor SQL, where there is no single source table.
+    pub(in crate::result) fn copy_table_name(&self) -> Option<&str> {
+        self.table.as_ref().map(|(_, table)| table.as_str())
     }
 }
 
@@ -1306,6 +1343,14 @@ pub(crate) struct PendingCopy {
     pub(crate) id: OpId,
     pub(crate) dcol_lo: usize,
     pub(crate) dcol_hi: usize,
+    /// The shape the reply is rendered in. Captured when the copy was raised, not
+    /// read back off the grid on arrival: the user can re-sort or re-open between
+    /// the request and the reply, and the copy they asked for is the one they get.
+    pub(crate) format: ClipboardFormat,
+    /// The selected columns' names, captured with the format for the same reason.
+    pub(crate) names: Vec<String>,
+    /// The source table for the SQL form, captured likewise.
+    pub(crate) table: Option<String>,
 }
 
 /// An in-flight FK click-through awaiting its single-row `CopyRows`
@@ -1342,7 +1387,7 @@ struct FkPlan {
 
 /// How [`ResultGrid::copy_plan`] resolves a selection copy.
 pub(crate) enum CopyPlan {
-    /// Ready to copy now: the assembled TSV.
+    /// Ready to copy now: the assembled clipboard text.
     Ready(String),
     /// The selection holds display-clipped cells; re-fetch the rows in full
     /// (`CopyRows`) and assemble the clipboard text from the reply. `dcol_lo..=dcol_hi`
@@ -1356,25 +1401,32 @@ pub(crate) enum CopyPlan {
     },
 }
 
-/// Assemble TSV from freshly re-fetched rows over data columns `dcol_lo..=dcol_hi`
-/// (NULL → empty); the [`CopyPlan::Refetch`] counterpart to the buffer path.
+/// Assemble clipboard text from freshly re-fetched rows over data columns
+/// `dcol_lo..=dcol_hi`; the [`CopyPlan::Refetch`] counterpart to the buffer path.
+///
 /// Consumes `rows` so each row's `Vec<Value>` is freed as its text is appended,
 /// rather than holding the whole `Vec<Vec<Value>>` alongside the finished string
 /// (which doubled the peak on a large select-all copy).
-pub(crate) fn rows_tsv(rows: Vec<Vec<Value>>, dcol_lo: usize, dcol_hi: usize) -> String {
-    let mut out = String::new();
+pub(crate) fn rows_clipboard(
+    rows: Vec<Vec<Value>>,
+    dcol_lo: usize,
+    dcol_hi: usize,
+    format: ClipboardFormat,
+    names: Vec<String>,
+    table: Option<&str>,
+) -> String {
+    let mut writer = ClipboardWriter::begin(format, names, table);
+    let mut cells: Vec<Value> = Vec::with_capacity(dcol_hi + 1 - dcol_lo);
     for row in rows {
-        for (i, dcol) in (dcol_lo..=dcol_hi).enumerate() {
-            if i > 0 {
-                out.push('\t');
-            }
-            if let Some(value) = row.get(dcol) {
-                out.push_str(&cell_string(value));
-            }
+        cells.clear();
+        // A re-fetched row carries every column, so the selected span is sliced
+        // out here rather than at the fetch.
+        for dcol in dcol_lo..=dcol_hi {
+            cells.push(row.get(dcol).cloned().unwrap_or(Value::Null));
         }
-        out.push('\n');
+        writer.write_row(&cells);
     }
-    out
+    writer.finish()
 }
 
 /// Position the virtual-scroll window so absolute ordinal `target` sits at the
@@ -1395,21 +1447,6 @@ pub(in crate::result) fn place_window(
     let x = st.base_handle.offset().x;
     st.base_handle
         .set_offset(point(x, px(-(local as f32 * row_height))));
-}
-
-/// A value as a plain TSV/clipboard string (NULL → empty).
-fn cell_string(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::Integer(n) => n.to_string(),
-        Value::Real(x) => x.to_string(),
-        Value::Text(s) => s.to_string(),
-        Value::Blob(b) => format!("<{} bytes>", b.len()),
-        // A capped blob copies as its summary; a capped text would re-fetch full
-        // before reaching here (`copy_plan`), so its head is only a defensive form.
-        Value::Capped(c) if c.blob => format!("<{} bytes>", c.len),
-        Value::Capped(c) => format!("{}…", c.head),
-    }
 }
 
 impl AppState {
@@ -2685,10 +2722,39 @@ impl AppState {
         cx.notify();
     }
 
+    /// The table an `INSERT` clipboard copy would target, or `None` when the
+    /// active result isn't a plain table browse. Gates the SQL entry in the
+    /// "Copy as" menu rather than offering a copy that would name the fallback
+    /// table and paste `INSERT INTO "exported_table"`.
+    pub(crate) fn copy_as_sql_target(&self, cx: &App) -> Option<String> {
+        let _ = cx;
+        match &self.phase {
+            Phase::Connected(active) => active
+                .active_result()
+                .and_then(|grid| grid.copy_table_name().map(str::to_string)),
+            _ => None,
+        }
+    }
+
+    /// Copy the grid selection in the default shape (bare TSV), the ⌘C path.
     pub(crate) fn copy_result_selection(&mut self, cx: &mut Context<Self>) {
+        self.copy_result_selection_as(ClipboardFormat::Tsv, cx);
+    }
+
+    /// Copy the grid selection as `format`. Both branches of [`CopyPlan`] render
+    /// through the same [`ClipboardWriter`], so a selection that happens to hold a
+    /// display-clipped cell (and so re-fetches) copies byte-identically to one
+    /// that doesn't.
+    pub(crate) fn copy_result_selection_as(
+        &mut self,
+        format: ClipboardFormat,
+        cx: &mut Context<Self>,
+    ) {
         let gutter = self.gutter();
         let plan = match &self.phase {
-            Phase::Connected(active) => active.active_result().and_then(|g| g.copy_plan(gutter)),
+            Phase::Connected(active) => active
+                .active_result()
+                .and_then(|g| g.copy_plan(gutter, format)),
             _ => None,
         };
         match plan {
@@ -2718,10 +2784,23 @@ impl AppState {
                 }
                 let id = red_service::OpId::new(self.next_copy_id);
                 self.next_copy_id += 1;
+                let (names, table) = match &self.phase {
+                    Phase::Connected(active) => match active.active_result() {
+                        Some(grid) => (
+                            grid.selected_column_names(dcol_lo, dcol_hi),
+                            grid.copy_table_name().map(str::to_string),
+                        ),
+                        None => (Vec::new(), None),
+                    },
+                    _ => (Vec::new(), None),
+                };
                 self.pending_copy = Some(PendingCopy {
                     id,
                     dcol_lo,
                     dcol_hi,
+                    format,
+                    names,
+                    table,
                 });
                 self.send_active(Command::CopyRows {
                     offset,
@@ -2754,8 +2833,15 @@ impl AppState {
         let Some(pending) = self.pending_copy.take_if(|p| p.id == id) else {
             return;
         };
-        let tsv = rows_tsv(rows, pending.dcol_lo, pending.dcol_hi);
-        cx.write_to_clipboard(ClipboardItem::new_string(tsv));
+        let text = rows_clipboard(
+            rows,
+            pending.dcol_lo,
+            pending.dcol_hi,
+            pending.format,
+            pending.names,
+            pending.table.as_deref(),
+        );
+        cx.write_to_clipboard(ClipboardItem::new_string(text));
     }
 
     /// FK click-through affordances for the focused cell's grid: the

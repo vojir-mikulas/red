@@ -281,7 +281,7 @@ fn wrap_report_html(
         .map(str::trim)
         .filter(|t| !t.is_empty())
         .unwrap_or("RED — report");
-    let t = red_driver::html_escape(title);
+    let t = red_core::valuefmt::html_escape(title);
     let safe_body = strip_scripts(body);
     // The base document style: RED's active theme if the UI supplied one, else
     // the built-in light/dark (follows the OS).

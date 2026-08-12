@@ -13,6 +13,9 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
+use red_core::valuefmt::{
+    csv_cell, csv_record, html_cell, html_escape, json_string, json_value, sql_ident, sql_value,
+};
 use red_core::{ExportFormat, ExportOutcome, ExportShortfall, Value};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -301,127 +304,14 @@ fn html_foot(rows: u64) -> String {
     format!("</tbody></table><p class=\"meta\">{rows} row{plural}</p></main></body></html>\n")
 }
 
-/// One HTML cell's inner content: NULL renders as a dim italic marker, blobs as a
-/// length marker, everything else HTML-escaped text.
-pub(crate) fn html_cell(value: &Value) -> String {
-    match value {
-        Value::Null => "<span class=\"null\">NULL</span>".to_string(),
-        Value::Integer(n) => n.to_string(),
-        Value::Real(x) => x.to_string(),
-        Value::Text(s) => html_escape(s),
-        Value::Blob(b) => format!("&lt;{} bytes&gt;", b.len()),
-        Value::Capped(_) => html_escape(&value.to_string()),
-    }
-}
-
-/// Escape the five HTML-significant characters so cell text can't break the markup
-/// (or inject it). Shared with the AI report path (`red-service`) so both HTML
-/// emitters escape identically.
-pub fn html_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    for ch in s.chars() {
-        match ch {
-            '&' => out.push_str("&amp;"),
-            '<' => out.push_str("&lt;"),
-            '>' => out.push_str("&gt;"),
-            '"' => out.push_str("&quot;"),
-            '\'' => out.push_str("&#39;"),
-            c => out.push(c),
-        }
-    }
-    out
-}
-
-pub(crate) fn csv_record<'a>(fields: impl Iterator<Item = &'a str>) -> String {
-    fields.map(csv_escape).collect::<Vec<_>>().join(",")
-}
-
-pub(crate) fn csv_escape(field: &str) -> String {
-    if field.contains([',', '"', '\n', '\r']) {
-        format!("\"{}\"", field.replace('"', "\"\""))
-    } else {
-        field.to_string()
-    }
-}
-
-pub(crate) fn csv_cell(value: &Value) -> String {
-    match value {
-        Value::Null => String::new(),
-        Value::Integer(n) => n.to_string(),
-        Value::Real(x) => x.to_string(),
-        Value::Text(s) => s.to_string(),
-        Value::Blob(b) => format!("<{} bytes>", b.len()),
-        // Export never caps, so a `Capped` can't reach here; rendered for totality.
-        Value::Capped(_) => value.to_string(),
-    }
-}
-
-pub(crate) fn json_value(value: &Value) -> String {
-    match value {
-        Value::Null => "null".to_string(),
-        Value::Integer(n) => n.to_string(),
-        // JSON has no NaN/Infinity literal, and `f64::to_string` emits bare
-        // `NaN`/`inf` that fails every parser; render them as `null` (the
-        // conventional JSON stand-in) rather than writing an unparseable file.
-        Value::Real(x) if !x.is_finite() => "null".to_string(),
-        Value::Real(x) => x.to_string(),
-        Value::Text(s) => json_string(s),
-        Value::Blob(b) => json_string(&format!("<{} bytes>", b.len())),
-        Value::Capped(_) => json_string(&value.to_string()),
-    }
-}
-
-/// A SQL identifier (table or column) in portable ANSI form: double-quoted with
-/// any embedded `"` doubled. Works for SQLite / Postgres / ClickHouse and for
-/// MySQL under `ANSI_QUOTES`; a deliberately dialect-neutral default for a text
-/// file the user carries elsewhere.
-pub(crate) fn sql_ident(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
-}
-
-/// A SQL literal for one cell: NULL keyword, bare numbers, single-quoted strings
-/// (embedded `'` doubled). Blobs keep the module-wide `<N bytes>` length-marker
-/// convention (rendered as a string literal), not raw/hex bytes.
-pub(crate) fn sql_value(value: &Value) -> String {
-    match value {
-        Value::Null => "NULL".to_string(),
-        Value::Integer(n) => n.to_string(),
-        // `VALUES (NaN)` / `(inf)` load in no engine (bare `NaN` is a syntax
-        // error). Postgres accepts the quoted `'NaN'`/`'Infinity'` float forms,
-        // and other engines have no NaN at all, so the portable choice is a
-        // single-quoted spelling that Postgres reads and others reject cleanly
-        // rather than mis-parsing.
-        Value::Real(x) if x.is_nan() => "'NaN'".to_string(),
-        Value::Real(x) if x.is_infinite() => if *x < 0.0 {
-            "'-Infinity'"
-        } else {
-            "'Infinity'"
-        }
-        .to_string(),
-        Value::Real(x) => x.to_string(),
-        Value::Text(s) => sql_string(s),
-        Value::Blob(b) => sql_string(&format!("<{} bytes>", b.len())),
-        Value::Capped(_) => sql_string(&value.to_string()),
-    }
-}
-
-/// Single-quote a string literal, doubling embedded quotes **and** backslashes.
-/// This is a **portable** `.sql` dump, so it is written for the stricter reader:
-/// MySQL (by default) and ClickHouse honour `\` as an escape inside `'…'`, and
-/// without the doubled backslash a value ending in `\` swallows the closing
-/// quote — a hostile cell like `\', 1); DROP TABLE users; -- ` then breaks out of
-/// the literal when the dump is reloaded. Engines that treat `\` literally
-/// (Postgres/SQLite under standard-conforming strings) would reimport a doubled
-/// backslash; that data-fidelity nit is the deliberate price of an
-/// injection-safe portable dump. Mirrors the driver's own `sql_literal`.
-fn sql_string(s: &str) -> String {
-    format!("'{}'", s.replace('\\', "\\\\").replace('\'', "''"))
-}
-
 /// Derive a target table name for a SQL `INSERT` export from the destination file
 /// stem: keep alphanumerics and `_`, fold everything else to `_`, and fall back to
 /// `exported_table` when nothing usable remains (e.g. a leading-digit or empty
 /// stem). The result is later double-quoted by [`sql_ident`].
+///
+/// File-path-derived, so it stays here rather than moving to `red_core::valuefmt`
+/// with the rest of the formatters: the clipboard names its table from the browsed
+/// table, never from a destination path.
 pub(crate) fn sql_table_name(path: &Path) -> String {
     let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or("");
     let sanitized: String = stem
@@ -440,24 +330,6 @@ pub(crate) fn sql_table_name(path: &Path) -> String {
     } else {
         trimmed.to_string()
     }
-}
-
-pub(crate) fn json_string(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for ch in s.chars() {
-        match ch {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 #[cfg(test)]
