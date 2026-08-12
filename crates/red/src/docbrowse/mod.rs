@@ -334,6 +334,7 @@ impl CollView {
                     "doc.aggregation_pipeline_e_g_group_runs",
                     "Aggregation pipeline, e.g. [ { \"$group\": … } ]. \u{2318}\u{21b5} runs."
                 ))
+                .edit_menu_labels(crate::editor::edit_menu_labels())
                 .a11y_label(crate::i18n::tr!(
                     "doc.mongodb_aggregation_pipeline",
                     "MongoDB aggregation pipeline"
@@ -354,6 +355,7 @@ impl CollView {
         let inspector_editor = cx.new(|cx| {
             CodeEditor::new(cx)
                 .soft_wrap(false)
+                .edit_menu_labels(crate::editor::edit_menu_labels())
                 .a11y_label(crate::i18n::tr!(
                     "doc.mongodb_document_editor",
                     "MongoDB document editor"

@@ -128,6 +128,7 @@ impl AppState {
                         // scrolling — without letting the composer eat the
                         // transcript.
                         .rows(4..=8)
+                        .edit_menu_labels(crate::editor::edit_menu_labels())
                         .a11y_label(crate::i18n::tr!("assistant.agent_prompt", "Agent prompt"))
                         .placeholder(crate::i18n::tr!(
                             "assistant.message_claude_agent_for_commands",

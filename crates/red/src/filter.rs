@@ -227,6 +227,7 @@ impl AppState {
                 // out of view and raise a scrollbar over a one-line buffer.
                 .vertical_padding(px(0.))
                 .corner_radius(px(0.))
+                .edit_menu_labels(crate::editor::edit_menu_labels())
                 .a11y_label(crate::i18n::tr!(
                     "filter.filter_expression",
                     "Filter expression"

@@ -245,6 +245,7 @@ impl KvConsole {
                     "kv.console_hint",
                     "One command per line. # comments and blanks are skipped. ⌘↵ runs all."
                 ))
+                .edit_menu_labels(crate::editor::edit_menu_labels())
                 .a11y_label(crate::i18n::tr!(
                     "kv.redis_batch_composer",
                     "Redis batch composer"

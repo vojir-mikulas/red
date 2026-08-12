@@ -1200,6 +1200,33 @@ impl AppState {
         self.run_editor_query_impl(None, cx);
     }
 
+    /// Beautify just the highlighted SQL, leaving the rest of the buffer alone —
+    /// the right-click menu's take on ⌥⌘F, which reformats everything. With no
+    /// selection it falls through to the whole-buffer command.
+    pub(crate) fn format_editor_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Phase::Connected(active) = &self.phase else {
+            return;
+        };
+        let Some(editor) = active
+            .active()
+            .filter(|t| !t.is_er())
+            .map(|t| t.editor.clone())
+        else {
+            return;
+        };
+        let Some(selected) = editor.read(cx).selected_text() else {
+            self.format_active_sql(cx);
+            return;
+        };
+        let formatted = crate::sql::format_sql(&selected);
+        if formatted != selected {
+            editor.update(cx, |editor, cx| {
+                editor.replace_selection(&formatted, window, cx)
+            });
+            cx.notify();
+        }
+    }
+
     /// Run the statement whose gutter run marker (▶) on 0-based `line` was clicked
     /// (Phase D). Resolves the marker's byte offset in the active tab, then runs the
     /// statement there through the same path as ⌘↵.
@@ -1767,6 +1794,72 @@ impl AppState {
             )
             .child(floating(div().occlude().child(menu)).at(pos))
     }
+}
+
+/// RED's translations for Flint's built-in editor context-menu items. Every
+/// `CodeEditor` in the app passes these, so right-click reads the same in the
+/// query editor, the inspectors and the consoles — and the pseudolocale audit
+/// doesn't turn up four stray English strings.
+pub(crate) fn edit_menu_labels() -> EditMenuLabels {
+    EditMenuLabels {
+        cut: crate::i18n::tr!("editor.menu_cut", "Cut"),
+        copy: crate::i18n::tr!("editor.menu_copy", "Copy"),
+        paste: crate::i18n::tr!("editor.menu_paste", "Paste"),
+        select_all: crate::i18n::tr!("editor.menu_select_all", "Select All"),
+    }
+}
+
+/// The query editor's own right-click items, which Flint renders above its
+/// built-in Cut / Copy / Paste / Select All block. These are the commands that
+/// read the highlighted text (or, with none, the statement under the caret), so
+/// the labels say which of the two the click will act on.
+///
+/// Built per click from the [`ContextMenuTarget`]: the editor is mid-render when
+/// the provider runs, so it can't be read back here. The handlers fire later,
+/// from the click, and go through the same [`AppState`] commands as ⌘↵ / ⇧⌘E /
+/// ⌥⌘F — the menu is another way to reach them, never a second implementation.
+pub(crate) fn query_editor_menu_items(
+    app: &gpui::WeakEntity<AppState>,
+    target: &ContextMenuTarget,
+) -> Vec<ContextMenuItem> {
+    let has_selection = target.selection.is_some();
+    let (run_label, format_label) = if has_selection {
+        (
+            crate::i18n::tr!("editor.menu_run_selection", "Run selection"),
+            crate::i18n::tr!("editor.menu_format_selection", "Format selection"),
+        )
+    } else {
+        (
+            crate::i18n::tr!("editor.menu_run_statement", "Run statement"),
+            crate::i18n::tr!("editor.menu_format_sql", "Format SQL"),
+        )
+    };
+    let (run, explain, format) = (app.clone(), app.clone(), app.clone());
+    vec![
+        ContextMenuItem::new("editor-menu-run", run_label)
+            .shortcut(crate::keymap::localize_hint("⌘↵"))
+            .on_click(move |_, _, cx| {
+                run.update(cx, |this, cx| this.run_editor_query(cx)).ok();
+            }),
+        ContextMenuItem::new(
+            "editor-menu-explain",
+            crate::i18n::tr!("editor.menu_explain", "Explain"),
+        )
+        .shortcut(crate::keymap::localize_hint("⇧⌘E"))
+        .on_click(move |_, _, cx| {
+            explain
+                .update(cx, |this, cx| this.explain_query(false, cx))
+                .ok();
+        }),
+        ContextMenuItem::new("editor-menu-format", format_label)
+            .shortcut(crate::keymap::localize_hint("⌥⌘F"))
+            .disabled(target.read_only)
+            .on_click(move |_, window, cx| {
+                format
+                    .update(cx, |this, cx| this.format_editor_selection(window, cx))
+                    .ok();
+            }),
+    ]
 }
 
 /// Resolve a sniffed `(schema_hint, table)` against the connection's namespace

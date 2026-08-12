@@ -204,7 +204,7 @@ impl PostgresDriver {
         let version: String = client
             .query_one("SHOW server_version", &[])
             .await
-            .map_err(driver_err)?
+            .map_err(map_pg_err)?
             .get(0);
 
         Ok(Self {
@@ -291,7 +291,7 @@ impl DatabaseDriver for PostgresDriver {
         self.client
             .batch_execute("SELECT 1")
             .await
-            .map_err(driver_err)
+            .map_err(map_pg_err)
     }
 
     fn server_version(&self) -> String {
@@ -324,7 +324,7 @@ impl DatabaseDriver for PostgresDriver {
         let stream = client
             .query_raw(&stmt, no_params())
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
 
         // Out-of-band cancel: a separate cancel request over a fresh connection.
         let cancel = pg_cancel_token(&client);
@@ -350,7 +350,7 @@ impl DatabaseDriver for PostgresDriver {
                 &[],
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
 
         let mut schemas = Vec::with_capacity(schema_rows.len());
         for schema_row in schema_rows {
@@ -370,7 +370,7 @@ impl DatabaseDriver for PostgresDriver {
                     &[&schema],
                 )
                 .await
-                .map_err(driver_err)?;
+                .map_err(map_pg_err)?;
             let objects = object_rows
                 .iter()
                 .map(|row| {
@@ -430,7 +430,7 @@ impl DatabaseDriver for PostgresDriver {
                 &[],
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
         Ok(rows
             .iter()
             .filter_map(|row| {
@@ -501,7 +501,7 @@ impl DatabaseDriver for PostgresDriver {
             .client
             .query(sql, &[&namespace])
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
         Ok(rows
             .iter()
             .map(|row| ObjectMeta {
@@ -525,7 +525,7 @@ impl DatabaseDriver for PostgresDriver {
                 &[&schema, &table],
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
         let pk: std::collections::HashSet<String> =
             pk_rows.iter().map(|r| r.get::<_, String>(0)).collect();
 
@@ -546,7 +546,7 @@ impl DatabaseDriver for PostgresDriver {
                 &[&schema, &table],
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
         let columns = column_rows
             .iter()
             .map(|row| {
@@ -584,7 +584,7 @@ impl DatabaseDriver for PostgresDriver {
                 &[&schema, &table],
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
         let foreign_keys = fk_rows
             .iter()
             .map(|row| ForeignKeyMeta {
@@ -603,7 +603,7 @@ impl DatabaseDriver for PostgresDriver {
                 &[&schema, &table],
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
         let indexes = index_rows
             .iter()
             .map(|row| {
@@ -646,7 +646,7 @@ impl DatabaseDriver for PostgresDriver {
                 &[&schema, &table.name],
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
         let mut out: std::collections::HashMap<String, Vec<String>> =
             std::collections::HashMap::new();
         for row in &rows {
@@ -680,7 +680,7 @@ impl DatabaseDriver for PostgresDriver {
                 &[],
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
         let edges = crate::group_fk_edges(rows.iter().map(|r| crate::FkRow {
             from_schema: r.get(0),
             from_table: r.get(1),
@@ -901,10 +901,10 @@ impl DatabaseDriver for PostgresDriver {
         // duration, so a write wedged on a lock is stoppable (57014 → Interrupted
         // via `map_pg_err`, rolled back below).
         self.with_fetch_conn(abort, |client| async move {
-            client.batch_execute("BEGIN").await.map_err(driver_err)?;
+            client.batch_execute("BEGIN").await.map_err(map_pg_err)?;
             match client.execute(sql, &[]).await {
                 Ok(affected) => {
-                    client.batch_execute("COMMIT").await.map_err(driver_err)?;
+                    client.batch_execute("COMMIT").await.map_err(map_pg_err)?;
                     Ok(affected)
                 }
                 Err(e) => {
@@ -925,7 +925,7 @@ impl DatabaseDriver for PostgresDriver {
             return Ok(Vec::new());
         }
         self.with_fetch_conn(abort, |client| async move {
-            client.batch_execute("BEGIN").await.map_err(driver_err)?;
+            client.batch_execute("BEGIN").await.map_err(map_pg_err)?;
             let mut affected = Vec::with_capacity(statements.len());
             for sql in statements {
                 // Re-checked *between* statements, not just before `BEGIN`. The
@@ -949,7 +949,7 @@ impl DatabaseDriver for PostgresDriver {
                     }
                 }
             }
-            client.batch_execute("COMMIT").await.map_err(driver_err)?;
+            client.batch_execute("COMMIT").await.map_err(map_pg_err)?;
             Ok(affected)
         })
         .await
@@ -963,7 +963,7 @@ impl DatabaseDriver for PostgresDriver {
         // cursor's connection; see `execute`.
         let client = self.acquire().await?;
         let result = async {
-            client.batch_execute("BEGIN").await.map_err(driver_err)?;
+            client.batch_execute("BEGIN").await.map_err(map_pg_err)?;
             let mut total = 0u64;
             for op in ops {
                 // Typed placeholders (`$n::int8`, …) like the seek path: the value's
@@ -995,7 +995,7 @@ impl DatabaseDriver for PostgresDriver {
                     }
                 }
             }
-            client.batch_execute("COMMIT").await.map_err(driver_err)?;
+            client.batch_execute("COMMIT").await.map_err(map_pg_err)?;
             Ok(total)
         }
         .await;
@@ -1016,7 +1016,7 @@ impl DatabaseDriver for PostgresDriver {
         // connection; see `execute`/`apply_edits`.
         let client = self.acquire().await?;
         let result = async {
-            client.batch_execute("BEGIN").await.map_err(driver_err)?;
+            client.batch_execute("BEGIN").await.map_err(map_pg_err)?;
             let max = crate::insert_chunk_rows(columns.len(), PG_PARAM_CAP);
             let mut total = 0u64;
             for chunk in rows.chunks(max) {
@@ -1040,7 +1040,7 @@ impl DatabaseDriver for PostgresDriver {
                     }
                 }
             }
-            client.batch_execute("COMMIT").await.map_err(driver_err)?;
+            client.batch_execute("COMMIT").await.map_err(map_pg_err)?;
             Ok(total)
         }
         .await;
@@ -1055,10 +1055,10 @@ impl DatabaseDriver for PostgresDriver {
         };
         let client = self.acquire().await?;
         let result = async {
-            client.batch_execute("BEGIN").await.map_err(driver_err)?;
+            client.batch_execute("BEGIN").await.map_err(map_pg_err)?;
             match client.execute(&format!("DELETE FROM {qualify}"), &[]).await {
                 Ok(affected) => {
-                    client.batch_execute("COMMIT").await.map_err(driver_err)?;
+                    client.batch_execute("COMMIT").await.map_err(map_pg_err)?;
                     Ok(affected)
                 }
                 Err(e) => {
@@ -1152,7 +1152,7 @@ impl DatabaseDriver for PostgresDriver {
                 &[&scope],
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
         let mut totals = SizeTotals::default();
         for row in &rows {
             let (schema, name): (String, String) = (row.get(0), row.get(1));
@@ -1650,7 +1650,7 @@ impl DatabaseDriver for PostgresDriver {
                 &[],
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
 
         let mut restricted = false;
         let sessions = rows
@@ -1707,7 +1707,7 @@ impl DatabaseDriver for PostgresDriver {
             .client
             .query_one(sql, &[&pid])
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
         // Both functions answer false when the pid is gone or out of reach, which
         // is a real outcome and not an error the caller should swallow.
         if row.get::<_, bool>(0) {
@@ -1762,7 +1762,7 @@ impl DatabaseDriver for PostgresDriver {
                         &[&namespace, &name],
                     )
                     .await
-                    .map_err(driver_err)?
+                    .map_err(map_pg_err)?
                     .ok_or_else(|| RedError::Driver(format!("{name} not found in {namespace}")))?;
                 let body: String = row.get(0);
                 let what = if materialized {
@@ -1789,7 +1789,7 @@ impl DatabaseDriver for PostgresDriver {
                         &[&signature],
                     )
                     .await
-                    .map_err(driver_err)?
+                    .map_err(map_pg_err)?
                     .ok_or_else(|| RedError::Driver(format!("{name} not found in {namespace}")))?;
                 let body: Option<String> = row.get(0);
                 return body.map(|b| format!("{}\n", b.trim_end())).ok_or_else(|| {
@@ -1809,7 +1809,7 @@ impl DatabaseDriver for PostgresDriver {
                         &[&namespace, &trigger],
                     )
                     .await
-                    .map_err(driver_err)?
+                    .map_err(map_pg_err)?
                     .ok_or_else(|| RedError::Driver(format!("{name} not found in {namespace}")))?;
                 let body: String = row.get(0);
                 return Ok(format!("{};\n", body.trim_end()));
@@ -1818,13 +1818,13 @@ impl DatabaseDriver for PostgresDriver {
                 let row = self
                     .client
                     .query_opt(
-                        "SELECT data_type::text, start_value, increment, min_value, max_value, \
-                                cycle \
+                        "SELECT data_type::text, start_value, increment_by, min_value, \
+                                max_value, cycle \
                          FROM pg_sequences WHERE schemaname = $1 AND sequencename = $2",
                         &[&namespace, &name],
                     )
                     .await
-                    .map_err(driver_err)?
+                    .map_err(map_pg_err)?
                     .ok_or_else(|| RedError::Driver(format!("{name} not found in {namespace}")))?;
                 let (ty, start, inc): (String, i64, i64) = (row.get(0), row.get(1), row.get(2));
                 let (min, max, cycle): (i64, i64, bool) = (row.get(3), row.get(4), row.get(5));
@@ -1848,7 +1848,7 @@ impl DatabaseDriver for PostgresDriver {
                         &[&namespace, &name],
                     )
                     .await
-                    .map_err(driver_err)?;
+                    .map_err(map_pg_err)?;
                 if !labels.is_empty() {
                     let variants: Vec<String> = labels
                         .iter()
@@ -1874,7 +1874,7 @@ impl DatabaseDriver for PostgresDriver {
                         &[&namespace, &name],
                     )
                     .await
-                    .map_err(driver_err)?;
+                    .map_err(map_pg_err)?;
                 let cols: Vec<String> = attrs
                     .iter()
                     .map(|r| {
@@ -1922,7 +1922,7 @@ impl DatabaseDriver for PostgresDriver {
                 &[&namespace, &name],
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
         if columns.is_empty() {
             return Err(RedError::Driver(format!("{name} not found in {namespace}")));
         }
@@ -1965,7 +1965,7 @@ impl DatabaseDriver for PostgresDriver {
                 &[&namespace, &name],
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
         for row in &constraints {
             let cname: String = row.get(0);
             let def: String = row.get(1);
@@ -1993,7 +1993,7 @@ impl DatabaseDriver for PostgresDriver {
                 &[&namespace, &name],
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
         if !indexes.is_empty() {
             out.push('\n');
             for row in &indexes {
@@ -2015,7 +2015,7 @@ impl DatabaseDriver for PostgresDriver {
                 &[&namespace, &name],
             )
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
         let table_comment = self
             .client
             .query_opt(
@@ -2025,7 +2025,7 @@ impl DatabaseDriver for PostgresDriver {
                 &[&namespace, &name],
             )
             .await
-            .map_err(driver_err)?
+            .map_err(map_pg_err)?
             .and_then(|r| r.get::<_, Option<String>>(0));
         if table_comment.is_some() || !comments.is_empty() {
             out.push('\n');
@@ -2091,7 +2091,7 @@ impl DatabaseDriver for PostgresDriver {
         let stream = conn
             .query_raw(&stmt, no_params())
             .await
-            .map_err(driver_err)?;
+            .map_err(map_pg_err)?;
         futures_util::pin_mut!(stream);
 
         let file = File::create(path).map_err(driver_err)?;
@@ -2133,7 +2133,7 @@ impl DatabaseDriver for PostgresDriver {
 
     async fn begin_sandbox(&self) -> Result<Option<Box<dyn crate::Sandbox>>> {
         let client = self.acquire().await?;
-        client.batch_execute("BEGIN").await.map_err(driver_err)?;
+        client.batch_execute("BEGIN").await.map_err(map_pg_err)?;
         // A server-side backstop for the case RED's own deadline can't cover: if
         // the app crashes mid-review, this connection would otherwise sit in
         // `idle in transaction` holding locks until somebody noticed. RED's timer
@@ -2490,6 +2490,11 @@ fn map_connect_err(e: tokio_postgres::Error) -> RedError {
 /// bare `"db error"`; the useful text lives only in the attached `DbError`. So
 /// surface the server's message (with SQLSTATE and any hint) rather than letting
 /// the round-trip bounce back as the cryptic `"db error"`.
+///
+/// Every `tokio_postgres::Error` in this driver goes through here, catalog reads
+/// included. Sending those through the plain `driver_err` is what turned a
+/// misspelled column in the sequence DDL query into an undiagnosable
+/// `"driver error: db error"` in the UI.
 fn map_pg_err(e: tokio_postgres::Error) -> RedError {
     if let Some(db) = e.as_db_error() {
         if db.code() == &tokio_postgres::error::SqlState::QUERY_CANCELED {
@@ -2577,7 +2582,7 @@ impl PgSandbox {
             // registry first, so this is a double-resolve and a no-op, not an error.
             return Ok(());
         }
-        let out = self.client.batch_execute(verb).await.map_err(driver_err);
+        let out = self.client.batch_execute(verb).await.map_err(map_pg_err);
         release_to(&self.pool, self.client.clone());
         out
     }
@@ -2988,6 +2993,74 @@ mod tests {
             .unwrap();
         battery::filters_contains(&driver, &schema, &f, &format!("SELECT * FROM {f}")).await;
         driver.execute(&format!("DROP TABLE {f}")).await.unwrap();
+    }
+
+    /// A sequence's DDL reads back from `pg_sequences`, whose increment column is
+    /// `increment_by` — spelling it `increment` made every sequence in the schema
+    /// tree fail to open, and the failure reached the UI as a bare "db error"
+    /// because the catalog paths did not route through `map_pg_err`. Both halves
+    /// of that are asserted here: the DDL renders, and the group lists.
+    #[tokio::test]
+    async fn sequence_ddl_renders_and_lists() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, false).await.unwrap();
+        let s = tag("seq");
+        let schema = current_schema(&driver).await;
+        driver
+            .execute(&format!(
+                "CREATE SEQUENCE {s} AS bigint START WITH 5 INCREMENT BY 3 \
+                 MINVALUE 1 MAXVALUE 900 CYCLE"
+            ))
+            .await
+            .unwrap();
+
+        let ddl = driver
+            .object_ddl(&schema, &s, ObjectKind::Sequence)
+            .await
+            .unwrap();
+        assert!(ddl.contains("START WITH 5"), "start value: {ddl}");
+        assert!(ddl.contains("INCREMENT BY 3"), "increment: {ddl}");
+        assert!(ddl.contains("MINVALUE 1"), "min: {ddl}");
+        assert!(ddl.contains("MAXVALUE 900"), "max: {ddl}");
+        assert!(
+            ddl.contains("CYCLE") && !ddl.contains("NO CYCLE"),
+            "cycle: {ddl}"
+        );
+
+        let listed = driver
+            .list_object_group(&schema, ObjectKind::Sequence)
+            .await
+            .unwrap();
+        assert!(
+            listed.iter().any(|o| o.name == s),
+            "the sequence group lists {s}"
+        );
+
+        driver.execute(&format!("DROP SEQUENCE {s}")).await.unwrap();
+    }
+
+    /// A catalog failure must name itself. `map_pg_err` unwraps the attached
+    /// `DbError`, so a missing relation arrives with its SQLSTATE and message
+    /// rather than `tokio_postgres::Error`'s bare "db error" `Display`.
+    #[tokio::test]
+    async fn db_errors_carry_the_server_message() {
+        let url = url_or_skip!();
+        let driver = PostgresDriver::connect(&url, true).await.unwrap();
+        let missing = tag("nope");
+        let err = driver
+            .fetch_page(
+                &format!("SELECT * FROM {missing}"),
+                0,
+                1,
+                PageCap::Full,
+                &AbortSignal::new(),
+            )
+            .await
+            .expect_err("a missing relation must fail");
+        let text = err.to_string();
+        assert!(text.contains("42P01"), "SQLSTATE is surfaced: {text}");
+        assert!(text.contains(&missing), "the relation is named: {text}");
+        assert_ne!(text, "db error", "never the bare tokio-postgres Display");
     }
 
     #[tokio::test]

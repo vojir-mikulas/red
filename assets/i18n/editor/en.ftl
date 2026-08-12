@@ -61,3 +61,21 @@ editor-tab_close_left = Close Left
 editor-tab_close_right = Close Right
 
 editor-tab_close_all = Close All
+
+editor-menu_cut = Cut
+
+editor-menu_copy = Copy
+
+editor-menu_paste = Paste
+
+editor-menu_select_all = Select All
+
+editor-menu_run_selection = Run selection
+
+editor-menu_format_selection = Format selection
+
+editor-menu_run_statement = Run statement
+
+editor-menu_format_sql = Format SQL
+
+editor-menu_explain = Explain

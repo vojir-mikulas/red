@@ -1578,6 +1578,9 @@ impl QueryTab {
         dialect: crate::sql::Dialect,
         cx: &mut Context<AppState>,
     ) -> Self {
+        // The right-click menu's SQL items call back into the app state; a weak
+        // handle keeps the editor from owning the state that owns it.
+        let app = cx.weak_entity();
         let editor = cx.new(|cx| {
             // A play run marker in the gutter on each statement's first line.
             // gpui's `svg()` paints only when the svg element's *own* `text_color`
@@ -1603,6 +1606,10 @@ impl QueryTab {
                 })
                 .corner_radius(px(0.))
                 .resting_border(false)
+                // Right-click: the SQL commands for the highlighted text, over
+                // Flint's own editing block.
+                .context_menu(move |target| crate::editor::query_editor_menu_items(&app, target))
+                .edit_menu_labels(crate::editor::edit_menu_labels())
                 .a11y_label(crate::i18n::tr!("editor.a11y_query_editor", "Query editor"))
                 .with_content(EMPTY_QUERY)
         });

@@ -135,6 +135,7 @@ pub(crate) fn value_body_editor_base(
         .resting_border(false)
         .corner_radius(px(0.))
         .soft_wrap(wrap)
+        .edit_menu_labels(crate::editor::edit_menu_labels())
         .a11y_label(a11y_label)
 }
 

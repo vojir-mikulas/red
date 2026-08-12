@@ -135,6 +135,7 @@ impl AppState {
                 .gutter(false)
                 .resting_border(false)
                 .corner_radius(px(0.))
+                .edit_menu_labels(crate::editor::edit_menu_labels())
                 .a11y_label(crate::i18n::tr!("schema.ddl_title", "Object definition"))
                 .with_content(ddl.clone());
             e.set_read_only(true, cx);

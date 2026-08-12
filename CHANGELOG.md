@@ -17,6 +17,15 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - Dropdowns can be multi-select: a pick toggles and the list stays open so
   choosing three values costs one visit, the closed control summarises the set,
   and a Clear beside its search resets that dropdown alone.
+- Right-click in any editing surface for a context menu with Cut, Copy, Paste
+  and Select All. Clicking inside highlighted text keeps the highlight, so the
+  menu acts on what you selected; clicking elsewhere moves the caret there
+  first.
+- The query editor's right-click menu leads with the SQL commands: Run
+  selection, Explain, and Format selection. With nothing highlighted they read
+  Run statement and Format SQL and act on the statement under the caret or the
+  whole buffer, and formatting a selection now reformats just that fragment
+  rather than the entire tab.
 
 ### Changed
 - The welcome screen's search box also matches the engine and the environment,
@@ -25,6 +34,12 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   screen, `←`/`→` page a long roster and `Home`/`End` jump to its ends.
 
 ### Fixed
+- Opening a PostgreSQL sequence from the schema explorer shows its definition
+  instead of failing with "driver error: db error".
+- PostgreSQL failures now carry the server's own message and SQLSTATE wherever
+  they surface. Schema explorer, DDL and introspection errors used to arrive as
+  the bare "db error" the driver renders by default, which said nothing about
+  what went wrong.
 - Assistant settings picked before the first message now apply to that message.
   Fast mode, the model, the thinking level and the permission mode are sent to
   the agent as its session opens, instead of only taking effect from the second

@@ -61,3 +61,21 @@ editor-tab_close_left = [Çlösé Léft]
 editor-tab_close_right = [Çlösé Ríght]
 
 editor-tab_close_all = [Çlösé Áll]
+
+editor-menu_cut = [Çút]
+
+editor-menu_copy = [Çöpy]
+
+editor-menu_paste = [Pásté]
+
+editor-menu_select_all = [Séléçt Áll]
+
+editor-menu_run_selection = [Rúñ séléçtíöñ]
+
+editor-menu_format_selection = [Förmát séléçtíöñ]
+
+editor-menu_run_statement = [Rúñ státéméñt]
+
+editor-menu_format_sql = [Förmát SQL]
+
+editor-menu_explain = [Éxpláíñ]
