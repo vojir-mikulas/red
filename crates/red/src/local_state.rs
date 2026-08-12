@@ -78,6 +78,101 @@ pub(crate) struct StoredConnectView {
     pub envs: Vec<String>,
 }
 
+/// One restored query tab: what the user typed and how the tab was arranged.
+///
+/// The *result* is deliberately absent. Rows are the database's to give, not
+/// ours to cache: re-running on restore would fire a write-shaped statement at a
+/// server the user has not looked at yet, and persisting rows would put query
+/// output on disk outside the export path. A restored browse re-opens (a plain
+/// `SELECT`, which the browse path already grades as safe); a restored editor tab
+/// comes back with its SQL and an empty grid, waiting for ⌘↵.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct StoredTab {
+    pub title: String,
+    /// The editor buffer verbatim, which is the part that is otherwise lost.
+    #[serde(default)]
+    pub sql: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pinned: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    /// The pane this tab belonged to, as the raw [`PaneId`](crate::panes::PaneId)
+    /// index. Meaningless without [`StoredWorkspace::layout`], and defaulted to
+    /// the first pane so a tab whose pane vanished still lands somewhere.
+    #[serde(default)]
+    pub pane: u32,
+    /// `(schema, table)` when the tab was a table browse rather than editor SQL,
+    /// so it re-opens as a browse (with its FK affordances and keyset paging)
+    /// rather than as a tab holding the equivalent `SELECT` text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub browse: Option<(String, String)>,
+}
+
+/// One connection's restored workspace.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct StoredWorkspace {
+    pub tabs: Vec<StoredTab>,
+    /// Which tab had focus, as an index into `tabs`. Out-of-range (a file written
+    /// by a build that stored more tabs) simply focuses the first.
+    #[serde(default)]
+    pub active: usize,
+    /// The pane geometry, absent when the workspace was a single unsplit pane
+    /// (the overwhelming case, and the one that costs nothing to rebuild).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<StoredLayout>,
+}
+
+/// A persisted pane tree: the geometry plus which pane held focus.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct StoredLayout {
+    pub root: StoredNode,
+    pub focus: u32,
+    /// The id counter, carried so restored panes keep their ids and a later
+    /// split cannot mint an id a restored tab already claims.
+    pub next: u32,
+}
+
+/// A node of the persisted pane tree, mirroring `panes::Node`.
+///
+/// Untagged-free (serde's default externally-tagged form) so an unreadable
+/// variant fails this field alone and drops the layout, leaving the tabs to
+/// restore into one pane rather than taking the whole workspace down.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) enum StoredNode {
+    Leaf(u32),
+    Split {
+        /// `true` stacks children as rows, matching `SplitAxis::Vertical`.
+        vertical: bool,
+        children: Vec<StoredChild>,
+    },
+}
+
+/// One slot of a persisted split: its fraction and what sits in it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct StoredChild {
+    /// Serialized as its bit pattern: `f32` has no `Eq`, and the weights are
+    /// only ever round-tripped, never compared.
+    pub weight_bits: u32,
+    pub node: StoredNode,
+}
+
+impl StoredChild {
+    pub(crate) fn new(weight: f32, node: StoredNode) -> Self {
+        Self {
+            weight_bits: weight.to_bits(),
+            node,
+        }
+    }
+
+    /// The slot's fraction. A non-finite or non-positive weight (a corrupt file)
+    /// reads as an equal share, which `normalize` then rebalances, rather than
+    /// as a pane with zero or NaN width that the renderer cannot lay out.
+    pub(crate) fn weight(&self) -> f32 {
+        let w = f32::from_bits(self.weight_bits);
+        if w.is_finite() && w > 0.0 { w } else { 0.5 }
+    }
+}
+
 /// The on-disk shape: a wrapper object (not a bare value) so new fields can be
 /// added later without breaking older files.
 #[derive(Default, Serialize, Deserialize)]
@@ -103,6 +198,12 @@ struct StateFile {
     /// a roster opens the way it was left. Absent until the user changes either.
     #[serde(default)]
     connect_view: Option<StoredConnectView>,
+    /// Each connection's last workspace, keyed by `conn_id`. Per connection
+    /// rather than one global workspace because RED parks several sessions at
+    /// once and ⌘P flips between them: restoring one connection's tabs onto
+    /// another would be worse than restoring nothing.
+    #[serde(default)]
+    workspaces: HashMap<String, StoredWorkspace>,
 }
 
 /// The app-state store. Loaded once at startup; mutations persist immediately.
@@ -211,6 +312,34 @@ impl LocalState {
         self.persist();
     }
 
+    /// The workspace last saved for `conn_id`, or `None` when that connection has
+    /// never been open (or its workspace held nothing worth restoring).
+    pub(crate) fn workspace(&self, conn_id: &str) -> Option<&StoredWorkspace> {
+        self.file.workspaces.get(conn_id)
+    }
+
+    /// Record `conn_id`'s workspace, persisting only when it actually changed.
+    ///
+    /// The equality check is what makes it safe to call this on every tab event
+    /// and on a debounced editor tick: a workspace that has not moved writes
+    /// nothing, so an idle app does no disk I/O.
+    pub(crate) fn set_workspace(&mut self, conn_id: &str, workspace: StoredWorkspace) {
+        // An empty workspace is a removal, not a stored emptiness: otherwise
+        // closing every tab would persist a blank workspace that then "restores"
+        // over the tabs a later session opened before quitting uncleanly.
+        if workspace.tabs.is_empty() {
+            if self.file.workspaces.remove(conn_id).is_some() {
+                self.persist();
+            }
+            return;
+        }
+        if self.file.workspaces.get(conn_id) == Some(&workspace) {
+            return;
+        }
+        self.file.workspaces.insert(conn_id.to_string(), workspace);
+        self.persist();
+    }
+
     /// Serialize the whole state to disk. Best-effort: a write failure is logged,
     /// never fatal (local state is a convenience, not correctness).
     fn persist(&self) {
@@ -309,10 +438,49 @@ mod tests {
                 kinds: vec!["postgres".into()],
                 envs: vec!["prod".into()],
             }),
+            workspaces: HashMap::from([(
+                "conn-1".to_string(),
+                StoredWorkspace {
+                    tabs: vec![StoredTab {
+                        title: "query 1".into(),
+                        sql: "SELECT 1".into(),
+                        pinned: true,
+                        namespace: Some("public".into()),
+                        pane: 2,
+                        browse: Some(("public".into(), "users".into())),
+                    }],
+                    active: 0,
+                    layout: Some(StoredLayout {
+                        root: StoredNode::Split {
+                            vertical: false,
+                            children: vec![
+                                StoredChild::new(0.5, StoredNode::Leaf(0)),
+                                StoredChild::new(0.5, StoredNode::Leaf(2)),
+                            ],
+                        },
+                        focus: 2,
+                        next: 3,
+                    }),
+                },
+            )]),
         })
         .unwrap();
         let back: StateFile = serde_json::from_str(&json).unwrap();
         assert_eq!(back.last_seen_version.as_deref(), Some("1.2.3"));
+        let ws = back
+            .workspaces
+            .get("conn-1")
+            .expect("workspace round-trips");
+        assert_eq!(ws.tabs[0].sql, "SELECT 1");
+        assert_eq!(ws.tabs[0].pane, 2);
+        assert_eq!(
+            ws.tabs[0]
+                .browse
+                .as_ref()
+                .map(|(s, t)| (s.as_str(), t.as_str())),
+            Some(("public", "users"))
+        );
+        assert_eq!(ws.layout.as_ref().map(|l| l.focus), Some(2));
         assert_eq!(back.last_agent.as_deref(), Some("codex"));
         let view = back.connect_view.expect("the connect view round-trips");
         assert_eq!(view.sort, "name");

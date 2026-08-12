@@ -884,6 +884,14 @@ impl ResultGrid {
         self.table.as_ref().map(|(_, t)| t.clone())
     }
 
+    /// The `(schema, table)` this result browses, or `None` for editor SQL.
+    /// Distinct from [`browsed_table`](Self::browsed_table), which drops the
+    /// namespace: a workspace snapshot has to re-open the same table in the same
+    /// schema, so it needs both halves.
+    pub(crate) fn browse_spec(&self) -> Option<(String, String)> {
+        self.table.clone()
+    }
+
     /// The result's column names, in order: what a filter predicate can name.
     pub(crate) fn column_names(&self) -> Vec<String> {
         self.columns.iter().map(|c| c.name.clone()).collect()

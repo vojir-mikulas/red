@@ -7,6 +7,11 @@ use super::*;
 use crate::settings::ConfirmThreshold;
 use red_core::sql::RiskLevel;
 
+/// How often the open workspace is snapshotted to `state.json`. The window of
+/// typing an unclean exit can cost; slow enough that the capture (which reads
+/// each open buffer) is never a cost anyone could measure.
+const WORKSPACE_SAVE_TICK: std::time::Duration = std::time::Duration::from_secs(10);
+
 impl AppState {
     // --- settings: live observers ---
 
@@ -90,6 +95,23 @@ impl AppState {
             })
             .detach();
         }
+
+        // Snapshot the open workspace on a slow tick, so a quit (or a crash, or a
+        // power loss) costs at most one interval of typing. A tick rather than a
+        // hook on each of the dozen tab mutations: the buffer text changes on
+        // every keystroke, which no lifecycle event covers, and one periodic
+        // capture cannot be forgotten the way a thirteenth mutation site can.
+        // `set_workspace` compares before writing, so an idle app does no disk
+        // I/O however often this fires.
+        cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
+            loop {
+                cx.background_executor().timer(WORKSPACE_SAVE_TICK).await;
+                if this.update(cx, |this, cx| this.save_workspace(cx)).is_err() {
+                    break; // view dropped (window closed)
+                }
+            }
+        })
+        .detach();
 
         // Reconnect to the most recently used connection on launch, when the user
         // opted in. The list arrives recency-sorted (newest first), so the first

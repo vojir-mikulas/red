@@ -116,12 +116,58 @@ impl PaneTree {
         }
     }
 
+    /// Rebuild a tree from a persisted shape, then restore the module's
+    /// invariants over it.
+    ///
+    /// [`normalize`](Self::normalize) is run rather than trusted-as-written
+    /// because the caller is a *file*: a hand-edited or truncated `state.json`
+    /// can name a one-child split or a same-axis nesting that no in-app
+    /// operation would ever produce, and every later operation assumes those are
+    /// impossible. Focus falls back to the first surviving pane when the stored
+    /// one is not in the tree, so a restored workspace always has a focused pane.
+    ///
+    /// Never zoomed: zoom is a transient "look at this one pane for a moment"
+    /// state, and restoring into it would hide the rest of the workspace with no
+    /// hint as to why.
+    pub(crate) fn restore(root: Node, focus: PaneId, next: u32) -> Self {
+        let mut tree = Self {
+            root,
+            focus,
+            // A `next` at or below a live id would hand out a duplicate on the
+            // first split; the max guards a file that under-reports it.
+            next: next.max(1),
+            zoom: None,
+        };
+        tree.normalize();
+        let panes = tree.panes();
+        // `normalize` collapses a one-child split but has no answer for a
+        // *zero*-child one, which no in-app operation can build and only a
+        // corrupt file can supply. A paneless tree would render an empty work
+        // area with focus pointing at nothing, so fall back to a fresh layout.
+        if panes.is_empty() {
+            return Self::new();
+        }
+        tree.next = tree
+            .next
+            .max(panes.iter().map(|p| p.0 + 1).max().unwrap_or(1));
+        if !tree.contains(tree.focus) {
+            tree.focus = panes.first().copied().unwrap_or(PaneId::FIRST);
+        }
+        tree
+    }
+
     pub(crate) fn root(&self) -> &Node {
         &self.root
     }
 
     pub(crate) fn focus(&self) -> PaneId {
         self.focus
+    }
+
+    /// The next pane id this tree would hand out, so a persisted layout can carry
+    /// the counter and restored panes keep their ids.
+    pub(crate) fn next_id(&self) -> u32 {
+        self.next
     }
 
     /// Point focus at `pane`. Returns whether it moved, so callers notify only on
@@ -712,5 +758,54 @@ mod tests {
             assert!(!tree.panes().is_empty(), "step {step} emptied the layout");
             check(&tree);
         }
+    }
+
+    /// A restored tree keeps its shape and focus, and the id counter clears every
+    /// live pane so the next split cannot mint a duplicate.
+    #[test]
+    fn restore_round_trips_a_split_layout() {
+        let root = Node::Split {
+            axis: SplitAxis::Horizontal,
+            children: vec![
+                Child::new(0.3, Node::Leaf(PaneId(0))),
+                Child::new(0.7, Node::Leaf(PaneId(4))),
+            ],
+        };
+        let tree = PaneTree::restore(root, PaneId(4), 5);
+        check(&tree);
+        assert_eq!(tree.panes(), vec![PaneId(0), PaneId(4)]);
+        assert_eq!(tree.focus(), PaneId(4));
+        assert_eq!(tree.next_id(), 5);
+    }
+
+    /// A file naming a focus pane that is not in the tree still restores, with
+    /// focus pulled to a live pane rather than left dangling.
+    #[test]
+    fn restore_repoints_a_dangling_focus() {
+        let tree = PaneTree::restore(Node::Leaf(PaneId(1)), PaneId(9), 2);
+        check(&tree);
+        assert_eq!(tree.focus(), PaneId(1));
+    }
+
+    /// An under-reported `next` cannot hand out an id a restored pane already
+    /// holds: the counter is lifted past every live pane.
+    #[test]
+    fn restore_lifts_the_id_counter_past_live_panes() {
+        let tree = PaneTree::restore(Node::Leaf(PaneId(7)), PaneId(7), 1);
+        assert!(tree.next_id() > 7, "next {} would collide", tree.next_id());
+    }
+
+    /// A corrupt file describing a childless split has no panes at all;
+    /// `normalize` cannot collapse it, so restore falls back to a fresh layout
+    /// rather than rendering an empty work area.
+    #[test]
+    fn restore_falls_back_when_the_file_describes_no_panes() {
+        let root = Node::Split {
+            axis: SplitAxis::Horizontal,
+            children: Vec::new(),
+        };
+        let tree = PaneTree::restore(root, PaneId(3), 4);
+        check(&tree);
+        assert_eq!(tree.panes(), vec![PaneId::FIRST]);
     }
 }

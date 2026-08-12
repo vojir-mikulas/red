@@ -192,6 +192,11 @@ impl AppState {
                 self.service.send_to(id, Command::LoadObjectCounts);
                 self.service.send_to(id, Command::LoadForeignKeys);
             }
+            // Rebuild the tabs this connection was last left with. After the
+            // seam-specific kickoffs above: a restored SQL browse re-opens its
+            // result here, and the Redis/Mongo seams keep their own tab models
+            // (`restore_workspace` no-ops on them, since it reads `active.tabs`).
+            self.restore_workspace(cx);
             self.rebuild_switcher(cx);
         }
     }
@@ -412,6 +417,9 @@ impl AppState {
         let id = stored.id.clone();
         let mut config = stored.config.clone();
         self.persist(cx);
+        // A cold connect parks the foreground session; snapshot it first, for the
+        // same reason `switch_to_warm` does.
+        self.save_workspace(cx);
         // Materialize the password from the keychain unless we already hold it in
         // memory (a keychain write that failed earlier this session keeps it there).
         if config.password.is_empty() && !config.kind.is_file() {
@@ -664,6 +672,9 @@ impl AppState {
     /// means a clean slate, not a pile of orphaned warm sessions the welcome
     /// screen can't reach.
     pub(crate) fn disconnect(&mut self, cx: &mut Context<Self>) {
+        // Keep the tabs the user is walking away from: disconnecting is not a
+        // decision to discard half-written SQL, and reconnecting restores it.
+        self.save_workspace(cx);
         for id in self.parked.keys().copied().collect::<Vec<_>>() {
             self.service.send_to(id, Command::CloseSession);
         }

@@ -129,6 +129,11 @@ impl AppState {
             }
             self.persist(cx);
         }
+        // Snapshot before the outgoing connection leaves the foreground: parking
+        // keeps its tabs in memory, but a quit from the *new* connection would
+        // otherwise persist only that one, and the parked workspace would fall
+        // back to whatever the last tick happened to catch.
+        self.save_workspace(cx);
         self.park_foreground();
         self.foreground_parked(id, cx);
         self.rebuild_switcher(cx);

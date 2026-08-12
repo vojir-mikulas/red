@@ -124,6 +124,22 @@ impl PaneLayout {
         }
     }
 
+    /// Rebuild a layout around a restored [`PaneTree`], minting the per-pane UI
+    /// state each surviving pane needs. The transient fields (an in-flight drag,
+    /// a drop target, a divider grab) start empty: none of them can be mid-flight
+    /// at restore.
+    pub(crate) fn restore(tree: PaneTree) -> Self {
+        let mut layout = Self {
+            tree,
+            ui: HashMap::new(),
+            drop: None,
+            gap: None,
+            divider: None,
+        };
+        layout.sync();
+        layout
+    }
+
     // --- geometry (delegated, so callers never reach through to the tree) ---
 
     pub(crate) fn tree(&self) -> &PaneTree {

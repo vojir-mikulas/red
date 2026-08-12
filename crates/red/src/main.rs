@@ -69,6 +69,7 @@ mod sql;
 mod tabstrip;
 mod theme;
 mod window_chrome;
+mod workspace;
 
 // Connection-list persistence and OS-keychain access were extracted into the
 // UI-free `red-config` crate so a headless CLI can read the same
@@ -155,27 +156,42 @@ fn main() {
             clippy::expect_used,
             reason = "window open failing at startup is unrecoverable"
         )]
-        cx.open_window(
-            WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
-                window_min_size: Some(gpui::size(gpui::px(720.), gpui::px(480.))),
-                titlebar: Some(titlebar_options()),
-                // The Wayland app_id (and X11 WM_CLASS) GNOME matches against a
-                // `.desktop` file to pick the alt-tab / taskbar icon. Must equal
-                // our desktop file's basename (`red.desktop`, `Icon=red`) and its
-                // `StartupWMClass`, or the running window shows no icon.
-                app_id: Some("red".into()),
-                // On Linux (GNOME/Wayland in particular) the compositor draws no
-                // titlebar, so we ask for client-side decorations and paint our
-                // own controls + resize borders (see `window_chrome`). macOS and
-                // Windows keep their native frame (the default, `Server`).
-                #[cfg(target_os = "linux")]
-                window_decorations: Some(gpui::WindowDecorations::Client),
-                ..Default::default()
-            },
-            |_, cx| cx.new(|cx| AppState::new(cx, service, events)),
-        )
-        .expect("failed to open RED window");
+        let window = cx
+            .open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    window_min_size: Some(gpui::size(gpui::px(720.), gpui::px(480.))),
+                    titlebar: Some(titlebar_options()),
+                    // The Wayland app_id (and X11 WM_CLASS) GNOME matches against a
+                    // `.desktop` file to pick the alt-tab / taskbar icon. Must equal
+                    // our desktop file's basename (`red.desktop`, `Icon=red`) and its
+                    // `StartupWMClass`, or the running window shows no icon.
+                    app_id: Some("red".into()),
+                    // On Linux (GNOME/Wayland in particular) the compositor draws no
+                    // titlebar, so we ask for client-side decorations and paint our
+                    // own controls + resize borders (see `window_chrome`). macOS and
+                    // Windows keep their native frame (the default, `Server`).
+                    #[cfg(target_os = "linux")]
+                    window_decorations: Some(gpui::WindowDecorations::Client),
+                    ..Default::default()
+                },
+                |_, cx| cx.new(|cx| AppState::new(cx, service, events)),
+            )
+            .expect("failed to open RED window");
+        // Flush the open workspace on the way out, so quitting never costs the
+        // SQL in an editor. `on_app_quit` cannot veto the quit, so this saves
+        // rather than prompts: the autosave tick already covers a crash, and this
+        // closes the gap between the last tick and a clean exit.
+        //
+        // A window whose root view has already gone simply has nothing to save,
+        // so the handle is read best-effort rather than unwrapped.
+        if let Ok(app_state) = window.entity(cx) {
+            cx.on_app_quit(move |cx: &mut App| {
+                app_state.update(cx, |state, cx| state.save_workspace(cx));
+                async {}
+            })
+            .detach();
+        }
 
         // Closing the last window quits, or GPUI's event loop lingers with no UI.
         cx.on_window_closed(|cx, _| {
