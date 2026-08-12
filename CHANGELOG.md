@@ -6,98 +6,61 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.22.0] - 2026-08-12
+
 ### Added
-- Result columns size themselves to their contents the first time rows arrive,
-  and each one can be dragged wider or narrower by its header edge. A
-  double-click on that edge fits the column to what is loaded, and the header's
-  right-click menu fits one column, fits them all, or puts every width back.
-  Columns used to be a fixed 180 pixels each, so a boolean took as much room as
-  a description and a long value could only be read in the inspector.
-- Hide and reorder result columns from the header's right-click menu: hide the
-  column under the cursor, move it left, right or to the front, bring a single
-  hidden column back, or show them all again. On a wide table this is what makes
-  the handful of columns you care about sit beside each other. The arrangement
-  is per result and changes nothing about the query.
-- Copy a selection in whichever shape you are pasting into: TSV with headers,
-  CSV, JSON, a Markdown table, an `IN (…)` list of the first selected column, or
-  one `INSERT` per row when the result is a table browse. Plain ⌘C still copies
-  bare tab-separated text. Reached from the cell right-click menu under "Copy
-  as".
-- Run a whole buffer of statements as a script with ⌥⌘↵, instead of only the
-  statement under the caret. Each statement runs in order and reports its own
-  outcome in a log beside the editor, so a failed migration names the statement
-  that failed and what the ones before it did; a trailing `SELECT` opens in the
-  grid as usual. A script stops at the first failure, and a script holding
-  anything destructive raises the same confirmation a single statement would.
-- Jump straight to a table with ⌘O: a fuzzy search over every table, view and
-  loaded object in the schema, opening the chosen one as a browse. Unlike the
-  sidebar filter it matches loosely, so `usrpref` finds `user_preferences`.
-- Hold a transaction open across several statements. "Transaction: begin" from
-  the command palette pins a connection, every write after it is held rather
-  than applied, and the status bar shows how many uncommitted changes are
-  waiting until you commit or roll back. Offered only on PostgreSQL, MySQL and
-  SQLite, and never on a read-only connection. Reads taken while a transaction
-  is open still come from the connection pool, so they show committed data
-  rather than your uncommitted changes.
-- Reopening a connection restores the tabs you left it with: their titles, the
-  SQL in each editor, which was focused, which were pinned, their per-tab
-  database, the table each was browsing, and the pane layout they were arranged
-  in. Quitting no longer discards unsaved SQL. Turn it on with "Restore last
-  session", which previously only reconnected to the last connection.
-- Filter the welcome screen's saved connections by engine and by deployment
-  environment. Two dropdowns under the search box offer only the engines and
-  environments your roster actually contains, each row carrying the number of
-  connections that pick would leave; both take several values at once, so
-  picking two engines widens and adding an environment narrows. The heading
-  shows "3 of 12" with a Clear whenever anything is hiding a connection, and the
-  sort and filters are remembered between launches.
-- Dropdowns can be multi-select: a pick toggles and the list stays open so
-  choosing three values costs one visit, the closed control summarises the set,
-  and a Clear beside its search resets that dropdown alone.
-- Right-click in any editing surface for a context menu with Cut, Copy, Paste
-  and Select All. Clicking inside highlighted text keeps the highlight, so the
-  menu acts on what you selected; clicking elsewhere moves the caret there
-  first.
-- The query editor's right-click menu leads with the SQL commands: Run
-  selection, Explain, and Format selection. With nothing highlighted they read
-  Run statement and Format SQL and act on the statement under the caret or the
-  whole buffer, and formatting a selection now reformats just that fragment
-  rather than the entire tab.
+- Result columns size themselves to their contents, and drag by the header edge
+  to resize; double-click that edge to fit, or use the header menu to fit one,
+  fit all, or reset every width.
+- Hide and reorder result columns from the header's right-click menu. The
+  arrangement is per result and never re-runs the query.
+- "Copy as" in the cell menu: TSV with headers, CSV, JSON, a Markdown table, an
+  `IN (…)` list, or one `INSERT` per row on a table browse. Plain ⌘C is
+  unchanged.
+- Run a whole buffer as a script with ⌥⌘↵. Each statement reports its own
+  outcome in a log beside the editor, a trailing `SELECT` opens in the grid, and
+  the run stops at the first failure.
+- Jump to any table or view with ⌘O, matched fuzzily, so `usrpref` finds
+  `user_preferences`.
+- Manual transactions: "Transaction: begin" pins the connection and holds every
+  write, with the pending count in the status bar, until you commit or roll
+  back. PostgreSQL, MySQL and SQLite only. Reads still come from the pool, so
+  they show committed data.
+- "Restore last session" now reopens the tabs you left a connection with: their
+  SQL, focus, pins, per-tab database, browsed table and pane layout. Quitting no
+  longer discards unsaved SQL.
+- Filter welcome-screen connections by engine and environment, several values at
+  once, with a count per option and a "3 of 12" heading. Sort and filters are
+  remembered between launches.
+- Dropdowns can be multi-select: picks toggle with the list open, the closed
+  control summarises the set, and a Clear resets that dropdown alone.
+- Right-click any editing surface for Cut, Copy, Paste and Select All. Clicking
+  inside a highlight keeps it.
+- The query editor's right-click menu leads with Run selection, Explain and
+  Format selection, falling back to the statement under the caret; formatting a
+  selection no longer reformats the whole tab.
 
 ### Changed
-- The welcome screen's search box also matches the engine and the environment,
-  so typing "postgres" or "prod" narrows the list without opening a dropdown,
-  and it now carries a clear button. `/` jumps into it from anywhere on the
-  screen, `←`/`→` page a long roster and `Home`/`End` jump to its ends.
+- The welcome screen's search box also matches engine and environment, and
+  carries a clear button. `/` jumps into it, `←`/`→` page the roster and
+  `Home`/`End` jump to its ends.
 
 ### Fixed
-- Hiding a result column no longer crashes the app. The rows kept drawing a cell
-  for every column the query returned while the header had dropped the hidden
-  one, and the mismatch aborted the process. Row selection, the keyboard cursor
-  and the staged-insert row now all stop at the last column actually shown, and
-  the footer reads "12 of 17 columns" while any are hidden.
-- Right-clicking inside a selection of several result cells keeps that
-  selection instead of collapsing it to the one cell under the cursor, so the
-  menu's Copy and "Copy as" act on everything you selected. Right-clicking
-  outside the selection still selects the cell you clicked.
+- Hiding a result column no longer crashes the app; the footer reads "12 of 17
+  columns" while any are hidden.
+- Right-clicking inside a multi-cell selection keeps it, so Copy and "Copy as"
+  act on everything selected.
 - Opening a PostgreSQL sequence from the schema explorer shows its definition
   instead of failing with "driver error: db error".
-- PostgreSQL failures now carry the server's own message and SQLSTATE wherever
-  they surface. Schema explorer, DDL and introspection errors used to arrive as
-  the bare "db error" the driver renders by default, which said nothing about
-  what went wrong.
-- Assistant settings picked before the first message now apply to that message.
-  Fast mode, the model, the thinking level and the permission mode are sent to
-  the agent as its session opens, instead of only taking effect from the second
-  turn onwards; a fast-mode flip is also remembered per agent, so a new chat
-  starts the way you left it.
-- The review-transaction control is no longer shown on subscription chats. That
-  agent is never handed write tools, so there was nothing for it to hold and the
-  control could not be switched on.
-- Splitting the Redis or MongoDB browser no longer breaks the key/document list:
-  in a narrow half the list collapsed to its column headers with no rows under
-  them. The browse toolbar now wraps onto a second row in a narrow pane instead
-  of pushing its trailing controls (Actions, refresh) out of reach.
+- PostgreSQL failures carry the server's own message and SQLSTATE wherever they
+  surface, instead of a bare "db error".
+- Assistant settings picked before the first message now apply to that message,
+  and a fast-mode flip is remembered per agent.
+- The review-transaction control is no longer shown on subscription chats, which
+  are never handed write tools.
+- Splitting the Redis or MongoDB browser no longer empties the key/document
+  list; the browse toolbar wraps in a narrow pane instead of pushing Actions and
+  refresh out of reach.
 
 ## [0.21.0] - 2026-08-03
 
