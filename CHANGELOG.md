@@ -7,6 +7,43 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Result columns size themselves to their contents the first time rows arrive,
+  and each one can be dragged wider or narrower by its header edge. A
+  double-click on that edge fits the column to what is loaded, and the header's
+  right-click menu fits one column, fits them all, or puts every width back.
+  Columns used to be a fixed 180 pixels each, so a boolean took as much room as
+  a description and a long value could only be read in the inspector.
+- Hide and reorder result columns from the header's right-click menu: hide the
+  column under the cursor, move it left, right or to the front, bring a single
+  hidden column back, or show them all again. On a wide table this is what makes
+  the handful of columns you care about sit beside each other. The arrangement
+  is per result and changes nothing about the query.
+- Copy a selection in whichever shape you are pasting into: TSV with headers,
+  CSV, JSON, a Markdown table, an `IN (…)` list of the first selected column, or
+  one `INSERT` per row when the result is a table browse. Plain ⌘C still copies
+  bare tab-separated text. Reached from the cell right-click menu under "Copy
+  as".
+- Run a whole buffer of statements as a script with ⌥⌘↵, instead of only the
+  statement under the caret. Each statement runs in order and reports its own
+  outcome in a log beside the editor, so a failed migration names the statement
+  that failed and what the ones before it did; a trailing `SELECT` opens in the
+  grid as usual. A script stops at the first failure, and a script holding
+  anything destructive raises the same confirmation a single statement would.
+- Jump straight to a table with ⌘O: a fuzzy search over every table, view and
+  loaded object in the schema, opening the chosen one as a browse. Unlike the
+  sidebar filter it matches loosely, so `usrpref` finds `user_preferences`.
+- Hold a transaction open across several statements. "Transaction: begin" from
+  the command palette pins a connection, every write after it is held rather
+  than applied, and the status bar shows how many uncommitted changes are
+  waiting until you commit or roll back. Offered only on PostgreSQL, MySQL and
+  SQLite, and never on a read-only connection. Reads taken while a transaction
+  is open still come from the connection pool, so they show committed data
+  rather than your uncommitted changes.
+- Reopening a connection restores the tabs you left it with: their titles, the
+  SQL in each editor, which was focused, which were pinned, their per-tab
+  database, the table each was browsing, and the pane layout they were arranged
+  in. Quitting no longer discards unsaved SQL. Turn it on with "Restore last
+  session", which previously only reconnected to the last connection.
 - Filter the welcome screen's saved connections by engine and by deployment
   environment. Two dropdowns under the search box offer only the engines and
   environments your roster actually contains, each row carrying the number of
