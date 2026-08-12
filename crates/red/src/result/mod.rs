@@ -2299,9 +2299,13 @@ impl AppState {
         let gutter = self.gutter();
         if let Phase::Connected(active) = &mut self.phase {
             active.with_active_result(cx, |grid| {
-                let ncols = grid.columns.len();
+                // The *visible* count: the selection is in display space, so a
+                // row select must stop at the last column actually drawn. Spanning
+                // every data column would leave the range pointing past the
+                // header once anything is hidden.
+                let ncols = grid.visible_len();
                 grid.selection = if gutter == 1 && table_col == 0 {
-                    // Gutter click: span every data column (table cols
+                    // Gutter click: span every visible column (table cols
                     // `gutter..=ncols`); an empty result has no columns to select.
                     (ncols > 0).then(|| match (extend, grid.selection) {
                         (true, Some(mut range)) => {
@@ -2372,10 +2376,12 @@ impl AppState {
                 if !grid.ready || grid.error.is_some() || grid.columns.is_empty() {
                     return;
                 }
-                let ncols = grid.columns.len();
+                let ncols = grid.visible_len();
                 let last_row = grid.total.saturating_sub(1);
                 let page = grid.viewport_rows(row_height).max(1);
-                // Data columns occupy table indices `gutter..=ncols-1+gutter`.
+                // Visible columns occupy table indices `gutter..=ncols-1+gutter`;
+                // the cursor moves through what is drawn, so a hidden column is
+                // stepped over rather than landed on.
                 let (first_col, last_col) = (gutter, ncols + gutter - 1);
                 // The cursor is the selection's focus; with nothing selected yet
                 // it starts at the first visible row's first data column.
@@ -3880,6 +3886,35 @@ mod width_tests {
         let full = g.content_width(0.0);
         g.hide_slot(0);
         assert_eq!(g.content_width(0.0), full - DATA_COL_WIDTH);
+    }
+
+    /// The row renderer walks the display order, so it emits exactly as many
+    /// cells as the header has columns. Handing Flint's `Table` more cells than
+    /// columns indexed past its column list and aborted the process, so this is
+    /// the invariant that must hold after any hide or reorder.
+    #[test]
+    fn a_row_emits_one_cell_per_visible_column() {
+        let mut g = grid(4);
+        assert_eq!(g.visible.len(), g.columns.len(), "nothing hidden yet");
+        g.hide_slot(1);
+        assert_eq!(g.visible.len(), 3);
+        assert!(
+            g.visible.len() < g.columns.len(),
+            "a hidden column still exists as data"
+        );
+        // What the renderer iterates, and what the header is built from, are the
+        // same vector; the cursor and row-select bounds read its length.
+        assert_eq!(g.visible_len(), g.visible.len());
+    }
+
+    /// Hiding cannot leave the selection bounds pointing past the last drawn
+    /// column, which is what the cursor and gutter-click row select clamp to.
+    #[test]
+    fn hiding_shrinks_the_selectable_column_span() {
+        let mut g = grid(4);
+        let before = g.visible_len();
+        g.hide_slot(0);
+        assert_eq!(g.visible_len(), before - 1);
     }
 
     /// Re-syncing after the column set grows appends the newcomers and keeps the

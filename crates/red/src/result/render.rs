@@ -551,6 +551,7 @@ impl AppState {
         let joined_cols = grid.joined_cols.clone();
         let joined_tint = Hsla { a: 0.05, ..cyan };
         let bg_cols = data_cols.clone();
+        let row_cols = data_cols.clone();
         let sender = grid.sender.clone();
         let epoch = grid.epoch;
         let (sort_view, cell_view, nav_view) = (view.clone(), view.clone(), view.clone());
@@ -892,7 +893,7 @@ impl AppState {
             .render_row(move |ix, _, _| {
                 // `ix` is list-local; the gutter and buffer are absolute.
                 let abs = base + ix;
-                let mut out = Vec::with_capacity(ncols + gutter);
+                let mut out = Vec::with_capacity(row_cols.len() + gutter);
                 let buffer = buffer_row.borrow();
                 let struck = overlay_cells.deleted.contains(&abs);
                 if show_gutter {
@@ -921,7 +922,12 @@ impl AppState {
                     }
                 }
                 let resident = buffer.row(abs);
-                for c in 0..ncols {
+                // The display order, not `0..ncols`: the header has one column per
+                // *visible* column, and a row that emitted one per *data* column
+                // would hand Flint more cells than it has columns to lay them out
+                // in. `c` stays a data-column index, which is what the staged-edit
+                // overlay, the FK set and the resident row are all keyed by.
+                for &c in &row_cols {
                     // The open inline editor takes over its cell. The field is
                     // `bare`, so it fills the cell (the Flint cell wrapper supplies
                     // the height/padding) rather than drawing a smaller box inside.
@@ -981,7 +987,14 @@ impl AppState {
                     .child(crate::i18n::tr!("result.rows_unit", "rows")),
             )
             .child(div().text_color(border_soft).child("·"))
-            .child(div().text_color(dim).child(format!("{ncols} columns")))
+            // "12 of 17 columns" whenever some are hidden, mirroring the filtered
+            // row count's "n of N": a column that is simply absent from the header
+            // is otherwise indistinguishable from one the query never returned.
+            .child(div().text_color(dim).child(if data_cols.len() < ncols {
+                format!("{} of {ncols} columns", data_cols.len())
+            } else {
+                format!("{ncols} columns")
+            }))
             .child(div().text_color(border_soft).child("·"))
             // Which paging mode this result got (keyset = seek key resolved;
             // offset = the O(offset) fallback); the at-a-glance diagnostic.
@@ -1351,9 +1364,11 @@ impl AppState {
         // to discard a staged insert.
         let ncols = grid.columns.len();
         let content_w = grid.content_width(gutter_px);
-        // The draft zone lays its cells out against the same per-column widths as
-        // the grid above it, or a staged insert row would shear away from the
-        // columns it belongs to the moment one is resized.
+        // The draft zone lays its cells out against the same display order and
+        // per-column widths as the grid above it.
+        let draft_cols: Vec<usize> = grid.visible.clone();
+        // Indexed by *data* column, like the loop variable below, so a reordered
+        // grid still gives each cell the width of the column it holds.
         let widths: Vec<f32> = (0..ncols).map(|c| grid.width_of(c)).collect();
         // The cell of an open editor that targets a draft row.
         let draft_inline: Option<(usize, usize, Entity<TextInput>)> =
@@ -1397,7 +1412,10 @@ impl AppState {
                     )
                     .into_any_element(),
             );
-            for c in 0..ncols {
+            // Display order, matching the grid above: a draft row that laid its
+            // cells out per data column would shear away from the columns it
+            // belongs to the moment one was hidden or moved.
+            for &c in &draft_cols {
                 if let Some((di, dc, input)) = &draft_inline
                     && *di == index
                     && *dc == c

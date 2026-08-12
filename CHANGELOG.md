@@ -71,6 +71,11 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   screen, `←`/`→` page a long roster and `Home`/`End` jump to its ends.
 
 ### Fixed
+- Hiding a result column no longer crashes the app. The rows kept drawing a cell
+  for every column the query returned while the header had dropped the hidden
+  one, and the mismatch aborted the process. Row selection, the keyboard cursor
+  and the staged-insert row now all stop at the last column actually shown, and
+  the footer reads "12 of 17 columns" while any are hidden.
 - Right-clicking inside a selection of several result cells keeps that
   selection instead of collapsing it to the one cell under the cursor, so the
   menu's Copy and "Copy as" act on everything you selected. Right-clicking
