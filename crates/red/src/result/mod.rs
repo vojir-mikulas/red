@@ -71,12 +71,29 @@ pub(crate) fn new_epoch() -> red_service::Epoch {
     next_epoch()
 }
 
-/// Fixed wide-mode column widths, shared between the renderer (which lays the
-/// table out at these widths) and the keyboard cursor's horizontal
-/// scroll-into-view (which derives a cell's x-extent arithmetically). Keep in
-/// sync with the `Column` widths built in [`render`].
+/// Default wide-mode data-column width, used until a column is auto-fitted or
+/// dragged. Per-column widths live in [`ResultGrid::widths`]; this is only the
+/// starting value.
 pub(in crate::result) const DATA_COL_WIDTH: f32 = 180.0;
 pub(in crate::result) const GUTTER_WIDTH: f32 = 56.0;
+
+/// Widest a column is allowed to become when *auto*-fitted. A dragged column has
+/// no ceiling (the user is looking at what they are making), but auto-fit runs
+/// off one screenful of sampled rows, and a single 4 KB JSON cell would
+/// otherwise size the column to something no window can show.
+pub(in crate::result) const AUTO_FIT_MAX: f32 = 520.0;
+
+/// Approximate width of one character in the grid's monospace cell font, used to
+/// turn a sampled cell's character count into a pixel width.
+///
+/// An estimate on purpose: measuring text properly means a font-system round
+/// trip per cell, and auto-fit runs over every loaded row of every column at
+/// once. Being a few pixels generous is invisible; being slow is not.
+const CHAR_W: f32 = 7.2;
+
+/// Horizontal padding a cell adds around its text (`px_2p5` each side, plus the
+/// sort caret's room in the header).
+const CELL_PADDING: f32 = 26.0;
 
 /// How many draft (insert) rows the zone below the grid shows before it starts
 /// scrolling — it is pinned over the results, so it must never eat the grid.
@@ -235,6 +252,23 @@ pub(crate) struct ResultGrid {
     pub(in crate::result) error: Option<String>,
     /// `(data column, ascending)`; `None` is unsorted.
     pub(in crate::result) sort: Option<(usize, bool)>,
+    /// Per-data-column pixel widths, parallel to [`columns`](Self::columns).
+    ///
+    /// Always the same length as `columns` (see [`sync_widths`](Self::sync_widths)):
+    /// the renderer, the horizontal extent arithmetic, and the keyboard cursor's
+    /// scroll-into-view all index it positionally, and a short vector would make
+    /// them disagree about where a column starts.
+    pub(in crate::result) widths: Vec<f32>,
+    /// The column-resize drag in flight, held here rather than on `AppState` so
+    /// two split panes can each drag their own grid without sharing an anchor.
+    pub(in crate::result) column_drag: Option<flint::ColumnDrag>,
+    /// Whether this result has had its one automatic fit.
+    ///
+    /// Fits once, on the first rows to arrive, and never again: a later page
+    /// holding a longer value must not reflow the columns under a user who is
+    /// reading them, and a width the user dragged must not be undone by
+    /// scrolling. Re-fitting on demand is what the header menu is for.
+    pub(in crate::result) fitted: bool,
     /// The active result filter, pushed into the query on (re)open.
     /// `None` is unfiltered. Survives a re-sort (both ride the same `OpenResult`).
     pub(in crate::result) filter: Option<ResultFilter>,
@@ -361,6 +395,9 @@ impl ResultGrid {
             ready: false,
             error: None,
             sort: None,
+            widths: Vec::new(),
+            column_drag: None,
+            fitted: false,
             filter: None,
             unfiltered_total: None,
             last_good_filter: None,
@@ -884,6 +921,83 @@ impl ResultGrid {
         self.table.as_ref().map(|(_, t)| t.clone())
     }
 
+    /// Bring [`widths`](Self::widths) back into step with the column set, seeding
+    /// new columns at [`DATA_COL_WIDTH`] and dropping any past the end.
+    ///
+    /// Called wherever the column set can change (a fresh result, an inline FK
+    /// expansion), because every consumer indexes the two together and a
+    /// mismatch would silently shift the grid's geometry against its headers.
+    pub(in crate::result) fn sync_widths(&mut self) {
+        self.widths.resize(self.columns.len(), DATA_COL_WIDTH);
+    }
+
+    /// This column's current width, or the default when the vector has not caught
+    /// up with a just-arrived column set.
+    pub(in crate::result) fn width_of(&self, data_col: usize) -> f32 {
+        self.widths.get(data_col).copied().unwrap_or(DATA_COL_WIDTH)
+    }
+
+    /// Set one column's width, floored at Flint's minimum so a column can never
+    /// be dragged narrower than its own grab handle.
+    pub(in crate::result) fn set_width(&mut self, data_col: usize, width: f32) {
+        self.sync_widths();
+        if let Some(w) = self.widths.get_mut(data_col) {
+            *w = width.max(flint::MIN_COLUMN_WIDTH);
+        }
+    }
+
+    /// Size `data_col` to the widest value currently loaded, bounded by
+    /// [`AUTO_FIT_MAX`].
+    ///
+    /// Measures only the *resident* rows. The alternative is asking the engine
+    /// for `max(length(col))` over the whole table, which is a full scan on a
+    /// large result: the streaming invariant that keeps RED fast is exactly the
+    /// reason auto-fit is allowed to be approximate. The header is included so a
+    /// long column name is never clipped by a fit over short values.
+    pub(in crate::result) fn auto_fit(&mut self, data_col: usize) {
+        let header = self
+            .columns
+            .get(data_col)
+            .map(|c| c.name.chars().count())
+            .unwrap_or(0);
+        let widest = {
+            let buffer = self.buffer.borrow();
+            buffer.widest_cell(data_col).max(header)
+        };
+        let fitted =
+            (widest as f32 * CHAR_W + CELL_PADDING).clamp(flint::MIN_COLUMN_WIDTH, AUTO_FIT_MAX);
+        self.set_width(data_col, fitted);
+    }
+
+    /// Size the columns to their content the first time a result has rows, and
+    /// only then. See [`fitted`](Self::fitted) for why this is once-only.
+    pub(in crate::result) fn fit_once(&mut self) {
+        if self.fitted || self.columns.is_empty() {
+            return;
+        }
+        self.fitted = true;
+        self.auto_fit_all();
+    }
+
+    /// Auto-fit every column at once (the header menu's "Fit all columns").
+    pub(in crate::result) fn auto_fit_all(&mut self) {
+        for col in 0..self.columns.len() {
+            self.auto_fit(col);
+        }
+    }
+
+    /// The x offset of data column `data_col`'s left edge, past the gutter.
+    /// Summed rather than multiplied now that columns differ in width.
+    pub(in crate::result) fn column_left(&self, data_col: usize, gutter_w: f32) -> f32 {
+        gutter_w + self.widths.iter().take(data_col).sum::<f32>()
+    }
+
+    /// Total width of the gutter plus every data column: the fixed-width track
+    /// the header and rows share in wide mode.
+    pub(in crate::result) fn content_width(&self, gutter_w: f32) -> f32 {
+        gutter_w + self.widths.iter().sum::<f32>()
+    }
+
     /// The `(schema, table)` this result browses, or `None` for editor SQL.
     /// Distinct from [`browsed_table`](Self::browsed_table), which drops the
     /// namespace: a workspace snapshot has to re-open the same table in the same
@@ -927,7 +1041,16 @@ impl ResultGrid {
         });
         self.key = key;
         self.edit = edit;
+        let shape_changed = self.columns != columns;
         self.columns = columns;
+        // Widths follow the column set. A re-open with the same shape (a re-sort,
+        // a filter change) keeps the widths the user set; a genuinely different
+        // column set gains defaults for whatever is new and re-fits once its rows
+        // land.
+        self.sync_widths();
+        if shape_changed {
+            self.fitted = false;
+        }
         self.total = total;
         // An unfiltered open re-baselines the "of N" the filtered status reads
         // against; a filtered one leaves the last baseline alone.
@@ -1195,10 +1318,10 @@ impl ResultGrid {
     }
 
     /// Keep the keyboard cursor's *column* on screen after a horizontal move:
-    /// the wide-mode counterpart to `scroll_cursor_into_view`. Columns are
-    /// fixed-width (a [`GUTTER_WIDTH`] row-number column when shown, then
-    /// [`DATA_COL_WIDTH`] per data column), so the focused cell's x-extent is
-    /// pure arithmetic; nudge the horizontal handle by the minimum to bring the
+    /// the wide-mode counterpart to `scroll_cursor_into_view`. A cell's x-extent
+    /// is the running sum of the columns before it
+    /// ([`column_left`](Self::column_left)), so this stays exact once columns
+    /// differ in width; nudge the horizontal handle by the minimum to bring the
     /// cell fully into the viewport, leaving it untouched when already visible.
     /// `table_col` is in table space (gutter included); `gutter` is its width in
     /// columns (0 or 1).
@@ -1209,8 +1332,8 @@ impl ResultGrid {
         }
         let gutter_w = gutter as f32 * gutter_width(self.total);
         let data_col = table_col.saturating_sub(gutter);
-        let col_left = gutter_w + data_col as f32 * DATA_COL_WIDTH;
-        let col_right = col_left + DATA_COL_WIDTH;
+        let col_left = self.column_left(data_col, gutter_w);
+        let col_right = col_left + self.width_of(data_col);
         // The handle's x offset is 0 at the left edge and grows negative as the
         // content scrolls left, so the visible window is `[-off.x, -off.x + w]`.
         let off = self.h_scroll.offset();
@@ -1222,7 +1345,7 @@ impl ResultGrid {
         } else {
             return; // already fully visible; leave the scroll untouched
         };
-        let content_w = gutter_w + self.columns.len() as f32 * DATA_COL_WIDTH;
+        let content_w = self.content_width(gutter_w);
         let max_left = (content_w - viewport_w).max(0.0);
         self.h_scroll
             .set_offset(point(px(-new_left.clamp(0.0, max_left)), off.y));
@@ -1620,6 +1743,7 @@ impl AppState {
             grid.buffer
                 .borrow_mut()
                 .apply_run(fetch, rows, estimated, seq, total);
+            grid.fit_once();
         }
         cx.notify();
     }
@@ -1639,6 +1763,7 @@ impl AppState {
             && let Some(grid) = active.result_by_epoch(epoch)
         {
             grid.buffer.borrow_mut().insert_page(offset, rows);
+            grid.fit_once();
         }
         cx.notify();
     }
@@ -3429,5 +3554,98 @@ mod identity_tests {
         let grid = ResultGrid::new("query".into(), "SELECT 1".into(), None, sender, 100);
         assert!(!grid.editable_browse());
         assert!(!grid.insertable_browse());
+    }
+}
+
+#[cfg(test)]
+mod width_tests {
+    use super::*;
+    use red_core::Column;
+    use red_service::{SessionId, spawn};
+
+    /// A grid with `n` unnamed columns and no rows.
+    fn grid(n: usize) -> ResultGrid {
+        let handle = spawn();
+        let sender = handle.command_sender(SessionId::new(1));
+        let mut grid = ResultGrid::new("t".into(), "SELECT * FROM t".into(), None, sender, 100);
+        grid.columns = (0..n)
+            .map(|i| Column {
+                name: format!("c{i}"),
+                decl_type: None,
+            })
+            .collect();
+        grid.sync_widths();
+        grid
+    }
+
+    /// Widths track the column set: every column gets one, seeded at the default.
+    #[test]
+    fn widths_match_the_column_set() {
+        let grid = grid(3);
+        assert_eq!(grid.widths.len(), 3);
+        assert!(grid.widths.iter().all(|w| *w == DATA_COL_WIDTH));
+    }
+
+    /// A column's left edge is the running sum of the ones before it, so the
+    /// cursor's scroll-into-view stays exact once widths differ.
+    #[test]
+    fn column_left_sums_preceding_widths() {
+        let mut grid = grid(3);
+        grid.set_width(0, 100.0);
+        grid.set_width(1, 50.0);
+        grid.set_width(2, 200.0);
+        assert_eq!(grid.column_left(0, 56.0), 56.0);
+        assert_eq!(grid.column_left(1, 56.0), 156.0);
+        assert_eq!(grid.column_left(2, 56.0), 206.0);
+        assert_eq!(grid.content_width(56.0), 406.0);
+    }
+
+    /// A column cannot be dragged narrower than its own grab handle, or it could
+    /// never be dragged back.
+    #[test]
+    fn a_column_cannot_be_dragged_below_the_minimum() {
+        let mut grid = grid(1);
+        grid.set_width(0, 1.0);
+        assert_eq!(grid.width_of(0), flint::MIN_COLUMN_WIDTH);
+    }
+
+    /// Auto-fit never exceeds the cap, however long the widest sampled value is:
+    /// one 4 KB JSON cell must not size a column past any window.
+    #[test]
+    fn auto_fit_is_capped() {
+        let mut g = grid(1);
+        g.columns[0].name = "x".repeat(4000);
+        g.auto_fit(0);
+        assert_eq!(g.width_of(0), AUTO_FIT_MAX);
+    }
+
+    /// Auto-fit never falls under the minimum, so an empty column keeps a
+    /// grabbable handle.
+    #[test]
+    fn auto_fit_respects_the_minimum() {
+        let mut g = grid(1);
+        g.columns[0].name = String::new();
+        g.auto_fit(0);
+        assert_eq!(g.width_of(0), flint::MIN_COLUMN_WIDTH);
+    }
+
+    /// The automatic fit happens once. A later page holding a longer value must
+    /// not reflow columns under a user who is reading them.
+    #[test]
+    fn auto_fit_runs_only_once() {
+        let mut grid = grid(1);
+        grid.fit_once();
+        grid.set_width(0, 300.0);
+        grid.fit_once();
+        assert_eq!(grid.width_of(0), 300.0, "a second fit must not reflow");
+    }
+
+    /// A width past the end of the column set reads as the default rather than
+    /// panicking: the column set and the width vector can be momentarily out of
+    /// step while a fresh result lands.
+    #[test]
+    fn an_out_of_range_column_reads_the_default() {
+        let grid = grid(2);
+        assert_eq!(grid.width_of(99), DATA_COL_WIDTH);
     }
 }

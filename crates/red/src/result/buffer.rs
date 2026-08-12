@@ -620,6 +620,23 @@ impl GridBuffer {
         out
     }
 
+    /// The longest display text, in characters, that data column `col` holds
+    /// among the *resident* rows; `0` when nothing is loaded.
+    ///
+    /// Resident-only by design, like [`find_matches`](Self::find_matches): this
+    /// backs auto-fit, and asking the engine for the true maximum would be a full
+    /// scan of a result the rest of the module goes to some length never to
+    /// materialize.
+    pub(super) fn widest_cell(&self, col: usize) -> usize {
+        let mut widest = 0;
+        self.for_each_resident(|_, row| {
+            if let Some(cell) = row.display.get(col) {
+                widest = widest.max(cell.text.chars().count());
+            }
+        });
+        widest
+    }
+
     /// Call `f(absolute ordinal, row)` for every resident row, in no particular
     /// order. For whole-resident-set passes (the watch-mode snapshot) that would
     /// otherwise walk `0..total` and skip the non-resident majority — `total`

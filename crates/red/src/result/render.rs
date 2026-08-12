@@ -514,10 +514,11 @@ impl AppState {
                     .align_end(),
             );
         }
-        for c in &grid.columns {
+        for (i, c) in grid.columns.iter().enumerate() {
             let mut col = Column::new(c.name.clone())
-                .width(px(DATA_COL_WIDTH))
-                .sortable();
+                .width(px(grid.width_of(i)))
+                .sortable()
+                .resizable();
             if let Some(t) = &c.decl_type
                 && !t.is_empty()
             {
@@ -541,6 +542,8 @@ impl AppState {
         let epoch = grid.epoch;
         let (sort_view, cell_view, nav_view) = (view.clone(), view.clone(), view.clone());
         let sec_view = view.clone();
+        let (drag_start_view, resize_view) = (view.clone(), view.clone());
+        let (drag_end_view, auto_fit_view) = (view.clone(), view.clone());
 
         // Resolve (and possibly re-center) the virtual-scroll window for this
         // frame; everything below works in list-local coordinates offset by
@@ -734,6 +737,59 @@ impl AppState {
                 if !settled {
                     window.refresh();
                 }
+            })
+            .column_drag(grid.column_drag)
+            .on_column_resize_start(move |drag, _window, cx| {
+                drag_start_view
+                    .update(cx, |this, cx| {
+                        if let Phase::Connected(active) = &mut this.phase {
+                            active.with_active_result(cx, |grid| grid.column_drag = Some(drag));
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            })
+            .on_column_resize(move |table_col, width, _window, cx| {
+                resize_view
+                    .update(cx, |this, cx| {
+                        let gutter = this.gutter();
+                        // The gutter is not resizable, so a handle only ever
+                        // names a data column; the guard is for totality.
+                        let Some(data_col) = table_col.checked_sub(gutter) else {
+                            return;
+                        };
+                        if let Phase::Connected(active) = &mut this.phase {
+                            active.with_active_result(cx, |grid| {
+                                grid.set_width(data_col, f32::from(width))
+                            });
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            })
+            .on_column_resize_end(move |_window, cx| {
+                drag_end_view
+                    .update(cx, |this, cx| {
+                        if let Phase::Connected(active) = &mut this.phase {
+                            active.with_active_result(cx, |grid| grid.column_drag = None);
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+            })
+            .on_column_auto_fit(move |table_col, _window, cx| {
+                auto_fit_view
+                    .update(cx, |this, cx| {
+                        let gutter = this.gutter();
+                        let Some(data_col) = table_col.checked_sub(gutter) else {
+                            return;
+                        };
+                        if let Phase::Connected(active) = &mut this.phase {
+                            active.with_active_result(cx, |grid| grid.auto_fit(data_col));
+                        }
+                        cx.notify();
+                    })
+                    .ok();
             })
             .on_sort(move |table_col, window, cx| {
                 // ⌘/Ctrl-click a header selects the whole column; add Shift to
@@ -1256,7 +1312,11 @@ impl AppState {
         // even when the row-number gutter is hidden — otherwise there is no way
         // to discard a staged insert.
         let ncols = grid.columns.len();
-        let content_w = gutter_px + ncols as f32 * DATA_COL_WIDTH;
+        let content_w = grid.content_width(gutter_px);
+        // The draft zone lays its cells out against the same per-column widths as
+        // the grid above it, or a staged insert row would shear away from the
+        // columns it belongs to the moment one is resized.
+        let widths: Vec<f32> = (0..ncols).map(|c| grid.width_of(c)).collect();
         // The cell of an open editor that targets a draft row.
         let draft_inline: Option<(usize, usize, Entity<TextInput>)> =
             self.grid_edit.as_ref().and_then(|e| match &e.slot {
@@ -1307,7 +1367,7 @@ impl AppState {
                     cells.push(
                         div()
                             .relative()
-                            .w(px(DATA_COL_WIDTH))
+                            .w(px(widths.get(c).copied().unwrap_or(DATA_COL_WIDTH)))
                             .flex_shrink_0()
                             .h_full()
                             .px_2p5()
@@ -1333,7 +1393,7 @@ impl AppState {
                 if !grid.insertable_column(c) {
                     cells.push(
                         div()
-                            .w(px(DATA_COL_WIDTH))
+                            .w(px(widths.get(c).copied().unwrap_or(DATA_COL_WIDTH)))
                             .flex_shrink_0()
                             .h_full()
                             .px_2p5()
@@ -1366,7 +1426,7 @@ impl AppState {
                 cells.push(
                     div()
                         .id(("draft-cell", index * ncols + c))
-                        .w(px(DATA_COL_WIDTH))
+                        .w(px(widths.get(c).copied().unwrap_or(DATA_COL_WIDTH)))
                         .flex_shrink_0()
                         .h_full()
                         .px_2p5()
