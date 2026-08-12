@@ -94,6 +94,9 @@ keymap-ShowShortcuts =
 keymap-RunQuery =
     .label = [Rúñ qúéry]
 
+keymap-RunScript =
+    .label = [Rúñ sçrípt]
+
 keymap-NewConnection =
     .label = [Ñéw çöññéçtíöñ]
 

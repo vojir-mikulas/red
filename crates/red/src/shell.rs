@@ -2155,7 +2155,9 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let tab = active.tabs.get(tab_idx);
-        if tab.is_some_and(|t| t.plan.is_some()) {
+        if tab.is_some_and(|t| t.script.is_some()) {
+            self.render_script(active, tab_idx, cx)
+        } else if tab.is_some_and(|t| t.plan.is_some()) {
             self.render_plan(active, tab_idx, cx)
         } else {
             self.render_result(active, tab_idx, pane, is_focused, window, cx)

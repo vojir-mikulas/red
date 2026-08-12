@@ -64,6 +64,8 @@ menu-query-title = Query
 
 menu-query-run_query = Run Query
 
+menu-query-run_script = Run Script
+
 menu-query-format_sql = Format SQL
 
 menu-query-er_diagram = ER Diagram

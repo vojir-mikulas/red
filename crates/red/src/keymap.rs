@@ -79,6 +79,10 @@ actions!(
         /// ⌘↵ from anywhere: run the active tab's query; or, while the connection
         /// form is open, test the connection.
         RunQuery,
+        /// ⌥⌘↵: run every statement in the active tab's buffer (or its selection)
+        /// in order, reporting each. Falls through to `RunQuery` on a buffer
+        /// holding a single statement.
+        RunScript,
         /// Open a new-connection form (the disconnected screen's ⌘N).
         NewConnection,
         /// Open the settings panel (⌘,). Also reachable from the gear and palette.
@@ -646,6 +650,9 @@ const DEFAULTS: &[ActionDef] = &[
     // Run event); this covers every other focus (grid, schema, root) and tests
     // the connection while the form is open.
     def("cmd-enter", "RunQuery", "Run query", Some("RedRoot")),
+    // ⌥⌘↵ runs the whole buffer as a script. Beside ⌘↵ so the pair reads as one
+    // idea; ⇧⌘↵ was taken (maximize pane) and ⌥ is the "more of this" modifier.
+    def("cmd-alt-enter", "RunScript", "Run script", Some("RedRoot")),
     // ⌘N opens a new-connection form on the welcome screen (no-op elsewhere).
     def("cmd-n", "NewConnection", "New connection", Some("RedRoot")),
     // Settings. `⌘,` is the macOS-standard binding; the menu's RED → Settings…
@@ -1081,6 +1088,7 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
         "CycleFocusPrev" => kb!(CycleFocusPrev),
         "ShowShortcuts" => kb!(ShowShortcuts),
         "RunQuery" => kb!(RunQuery),
+        "RunScript" => kb!(RunScript),
         "NewConnection" => kb!(NewConnection),
         "Settings" => kb!(Settings),
         "BeginEdit" => kb!(BeginEdit),

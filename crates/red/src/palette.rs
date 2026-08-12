@@ -37,6 +37,8 @@ pub(crate) enum Cmd {
     /// Open the connection switcher popover (the ⌘P switcher).
     SwitchConnection,
     RunQuery,
+    /// Run the whole buffer as a multi-statement script.
+    RunScript,
     NewTab,
     CloseTab,
     NextTab,
@@ -473,6 +475,7 @@ impl AppState {
             // to the next render (drained there), like the pane-focus jumps.
             Cmd::SwitchConnection => self.open_switcher = true,
             Cmd::RunQuery => self.run_editor_query(cx),
+            Cmd::RunScript => self.run_editor_script(cx),
             Cmd::NewTab => self.new_query(cx),
             Cmd::CloseTab => self.close_active_tab(cx),
             Cmd::NextTab => {
@@ -678,6 +681,10 @@ impl AppState {
             }
             Phase::Connected(active) => {
                 out.push((item("cmd:run", "query: run").hint("⌘↵"), Cmd::RunQuery));
+                out.push((
+                    item("cmd:run-script", "query: run script").hint("⌥⌘↵"),
+                    Cmd::RunScript,
+                ));
                 out.push((
                     item("cmd:new-tab", "query: new tab").hint("⌘T"),
                     Cmd::NewTab,

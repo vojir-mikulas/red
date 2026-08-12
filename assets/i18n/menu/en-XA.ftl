@@ -64,6 +64,8 @@ menu-query-title = [Qúéry]
 
 menu-query-run_query = [Rúñ Qúéry]
 
+menu-query-run_script = [Rúñ Sçrípt]
+
 menu-query-format_sql = [Förmát SQL]
 
 menu-query-er_diagram = [ÉR Díágrám]

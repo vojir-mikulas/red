@@ -2223,6 +2223,12 @@ impl AppState {
                     cx.notify();
                 }
             }
+            Event::ScriptStep(step) => self.on_script_step(step, cx),
+            Event::ScriptDone {
+                ran,
+                failed,
+                trailing_read,
+            } => self.on_script_done(ran, failed, trailing_read, cx),
             Event::Executed {
                 statements,
                 affected,
@@ -2557,6 +2563,7 @@ impl AppState {
         };
         match write {
             Some(PendingWrite::EditorSql { sql, .. }) => self.execute_sql_on(owner, sql, cx),
+            Some(PendingWrite::Script { statements, .. }) => self.send_script(statements, cx),
             Some(PendingWrite::Batch {
                 ops,
                 sources,

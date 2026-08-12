@@ -28,6 +28,8 @@ palette-cmd_kv_pubsub = redis: open pub/sub
 
 palette-cmd_run = query: run
 
+palette-cmd_run_script = query: run script
+
 palette-cmd_new_tab = query: new tab
 
 palette-cmd_close_tab = query: close tab

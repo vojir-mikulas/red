@@ -1204,6 +1204,16 @@ pub(crate) enum PendingWrite {
         sql: String,
         assessment: red_core::sql::Assessment,
     },
+    /// A graded multi-statement script, dispatched via `send_script` on confirm.
+    /// Separate from [`EditorSql`](Self::EditorSql) because the two run under
+    /// different contracts: one statement in a transaction versus N statements
+    /// reported individually, and the dialog says which.
+    Script {
+        statements: Vec<String>,
+        /// The whole script's grading (the max across its statements), so the
+        /// dialog explains the worst thing in it rather than the first.
+        assessment: red_core::sql::Assessment,
+    },
     /// A staged grid edit batch: the previewed, parameterized
     /// [`EditOp`]s sent as one `Command::ApplyBatch` on confirm. `epoch` scopes the
     /// reply to its result.
@@ -1540,6 +1550,10 @@ pub(crate) struct QueryTab {
     /// The query plan (EXPLAIN), when one is open. Occupies the result
     /// pane in place of the grid; running a query clears it. `None` is the grid.
     pub plan: Option<crate::plan::PlanView>,
+    /// A multi-statement script run's log, when one is open. Occupies the result
+    /// pane in place of the grid, like [`plan`](Self::plan); the two are mutually
+    /// exclusive because each displaces the other on open.
+    pub script: Option<crate::script::ScriptRun>,
     /// This tab's live watch (re-run on an interval), or `None`. Transient: a
     /// watch dies with its tab and is never persisted, matching the Redis
     /// browse's auto-refresh.
@@ -1637,6 +1651,7 @@ impl QueryTab {
             editor,
             result: None,
             plan: None,
+            script: None,
             watch: None,
             view: None,
             // New tabs join the focused pane; `push_tab` reassigns this when split.

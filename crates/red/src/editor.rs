@@ -1177,7 +1177,7 @@ impl AppState {
     /// qualifier must name a real object. An ambiguous bare name (same table in two
     /// namespaces) stays `None`: the engine picks by search-path, which we don't
     /// track, so guessing could tag the wrong table.
-    fn resolve_browse_table(&self, sql: &str, cx: &App) -> Option<(String, String)> {
+    pub(crate) fn resolve_browse_table(&self, sql: &str, cx: &App) -> Option<(String, String)> {
         let (schema_hint, table) = crate::sql::single_table_star(sql)?;
         let Phase::Connected(active) = &self.phase else {
             return None;
@@ -1406,6 +1406,40 @@ impl AppState {
         assessment: red_core::sql::Assessment,
         cx: &mut Context<Self>,
     ) {
+        let pending = crate::app::PendingWrite::EditorSql {
+            sql: sql.clone(),
+            assessment: assessment.clone(),
+        };
+        self.open_confirm_for(sql, assessment, pending, cx);
+    }
+
+    /// Raise the confirm for a graded **script**: the same preflight (row count,
+    /// optional AI review, type-to-confirm) over the script's text, resolving to
+    /// a `RunScript` rather than an `Execute`.
+    pub(crate) fn open_script_confirm(
+        &mut self,
+        source: String,
+        statements: Vec<String>,
+        assessment: red_core::sql::Assessment,
+        cx: &mut Context<Self>,
+    ) {
+        let pending = crate::app::PendingWrite::Script {
+            statements,
+            assessment: assessment.clone(),
+        };
+        self.open_confirm_for(source, assessment, pending, cx);
+    }
+
+    /// The confirm machinery both paths share: grade-driven type-to-confirm, the
+    /// engine row-count preflight, and the optional advisory review. `sql` is the
+    /// text those preflights run against; `pending` is what a confirm resolves to.
+    fn open_confirm_for(
+        &mut self,
+        sql: String,
+        assessment: red_core::sql::Assessment,
+        pending: crate::app::PendingWrite,
+        cx: &mut Context<Self>,
+    ) {
         self.confirm_input = self
             .confirm_policy()
             .requires_typing(assessment.level)
@@ -1450,8 +1484,7 @@ impl AppState {
                     state: AiReviewState::Pending,
                 }
             });
-        self.confirm_exec =
-            self.pending_confirm(crate::app::PendingWrite::EditorSql { sql, assessment });
+        self.confirm_exec = self.pending_confirm(pending);
         // Focus the modal (or, when there is one, its type-to-confirm box) so its
         // Enter/Esc handling is heard.
         self.focus_modal = true;

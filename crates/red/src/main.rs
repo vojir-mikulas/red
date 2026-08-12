@@ -59,6 +59,7 @@ mod reset;
 mod result;
 mod sample;
 mod schema;
+mod script;
 mod server_panel;
 mod settings;
 mod settings_reg;

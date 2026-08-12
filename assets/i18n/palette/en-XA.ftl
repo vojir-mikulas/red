@@ -28,6 +28,8 @@ palette-cmd_kv_pubsub = [rédís: öpéñ púb/súb]
 
 palette-cmd_run = [qúéry: rúñ]
 
+palette-cmd_run_script = [qúéry: rúñ sçrípt]
+
 palette-cmd_new_tab = [qúéry: ñéw táb]
 
 palette-cmd_close_tab = [qúéry: çlösé táb]

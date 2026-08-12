@@ -807,6 +807,20 @@ pub enum Command {
     /// batch, so a `CREATE TABLE` + `CREATE INDEX` + seed `INSERT` pasted into the
     /// editor commits together on every engine whose transactions cover DDL. Replied
     /// with `Executed`.
+    /// Run a multi-statement script in order, reporting each statement's outcome
+    /// as it lands (`Event::ScriptStep`) and a summary at the end
+    /// (`Event::ScriptDone`).
+    ///
+    /// Distinct from [`Execute`](Self::Execute), which wraps its statements in
+    /// one transaction and reports a single total. A script is the other
+    /// contract: statements are independent, a read is allowed among them, and
+    /// the user is told which one failed rather than that the batch rolled back.
+    RunScript {
+        statements: Vec<String>,
+        namespace: Option<String>,
+        stop: red_core::ScriptStop,
+    },
+
     Execute {
         sql: String,
         /// The namespace unqualified names in `sql` resolve against, exactly as for
@@ -1764,6 +1778,18 @@ pub enum Event {
     Executed {
         statements: usize,
         affected: usize,
+    },
+    /// One statement of a running script finished. Emitted as each lands, so a
+    /// long script's log fills in live rather than arriving all at once.
+    ScriptStep(red_core::ScriptStep),
+    /// A script finished: how many statements ran, how many failed, and whether
+    /// the last one returns rows (so the UI can open it in the grid). The
+    /// row-returning tail is deliberately *not* executed by the script, so
+    /// opening it is the only time it runs.
+    ScriptDone {
+        ran: usize,
+        failed: usize,
+        trailing_read: Option<String>,
     },
     /// A guarded edit batch committed on its result's session. Echoes
     /// `epoch` so the UI patches/refetches the right result (and drops a reply for a

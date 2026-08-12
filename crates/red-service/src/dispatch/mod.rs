@@ -4229,6 +4229,151 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
+            Command::RunScript {
+                statements,
+                namespace,
+                stop,
+            } => {
+                let Some(id) = session_id else { continue };
+                let Some(state) = sessions.get(&id) else {
+                    emit(&events, session_id, Event::Error("not connected".into()));
+                    continue;
+                };
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::Error("not a SQL connection".into()),
+                    );
+                    continue;
+                };
+                let driver = driver.scoped(namespace.as_deref());
+                let dialect = red_core::sql::Dialect::of(state.kind);
+                let results = state.results.clone();
+                // Statement-at-a-time rather than `execute_batch`: a script is
+                // explicitly not atomic (that is `Execute`), and the per-statement
+                // report is the feature. Each runs under its own cancel so the
+                // Stop affordance interrupts the statement in flight and the rest
+                // report as skipped.
+                let abort = AbortSignal::new();
+                write_seq += 1;
+                let write_id = write_seq;
+                lock(&state.writes).insert(write_id, abort.clone());
+                let writes = state.writes.clone();
+                let pin = PinGuard::new(state.busy.clone());
+                let timeout = statement_timeout;
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let _pin = pin;
+                    // A trailing read is handed back for the UI to open as a
+                    // result rather than run here: running it would drain rows
+                    // the user then cannot see, and re-running it to show them
+                    // would execute the same statement twice.
+                    let trailing_read = statements
+                        .last()
+                        .filter(|sql| {
+                            red_core::sql::assess(sql, dialect).level
+                                == red_core::sql::RiskLevel::Safe
+                        })
+                        .cloned();
+                    let body = &statements[..statements.len() - trailing_read.is_some() as usize];
+
+                    let mut ran = 0usize;
+                    let mut failed = 0usize;
+                    let mut stopped = false;
+                    for (index, sql) in body.iter().enumerate() {
+                        if stopped {
+                            emit(
+                                &events,
+                                session_id,
+                                Event::ScriptStep(red_core::ScriptStep {
+                                    index,
+                                    summary: red_core::script_summary(sql),
+                                    outcome: red_core::ScriptOutcome::Skipped,
+                                }),
+                            );
+                            continue;
+                        }
+                        let timed_out = Arc::new(AtomicBool::new(false));
+                        let timer = timeout.map(|t| {
+                            let abort = abort.clone();
+                            let timed_out = timed_out.clone();
+                            tokio::spawn(async move {
+                                tokio::time::sleep(t).await;
+                                timed_out.store(true, Ordering::Relaxed);
+                                abort.abort();
+                            })
+                        });
+                        let result = driver.execute_abort(sql, &abort).await;
+                        if let Some(timer) = timer {
+                            timer.abort();
+                        }
+                        // A read among the body statements runs for its side
+                        // effects and reports as such: `execute` discards rows,
+                        // and claiming "0 rows affected" would read as a no-op.
+                        let is_read = red_core::sql::assess(sql, dialect).level
+                            == red_core::sql::RiskLevel::Safe;
+                        let outcome = match result {
+                            Ok(_) if is_read => red_core::ScriptOutcome::Rows,
+                            Ok(affected) => red_core::ScriptOutcome::Ok { affected },
+                            Err(RedError::Interrupted) if timed_out.load(Ordering::Relaxed) => {
+                                red_core::ScriptOutcome::Failed {
+                                    error: RedError::Timeout.to_string(),
+                                }
+                            }
+                            // A user cancel stops the script wherever it stops,
+                            // regardless of the stop mode: they asked it to end.
+                            Err(RedError::Interrupted) => {
+                                stopped = true;
+                                red_core::ScriptOutcome::Failed {
+                                    error: RedError::Interrupted.to_string(),
+                                }
+                            }
+                            Err(e) => red_core::ScriptOutcome::Failed {
+                                error: e.to_string(),
+                            },
+                        };
+                        if outcome.is_failure() {
+                            failed += 1;
+                            if stop == red_core::ScriptStop::OnError {
+                                stopped = true;
+                            }
+                        } else {
+                            ran += 1;
+                        }
+                        emit(
+                            &events,
+                            session_id,
+                            Event::ScriptStep(red_core::ScriptStep {
+                                index,
+                                summary: red_core::script_summary(sql),
+                                outcome,
+                            }),
+                        );
+                    }
+                    lock(&writes).remove(&write_id);
+                    // The script may have moved rows under any open result, so
+                    // drop the checkpoint indexes (same reason as `Execute`).
+                    for spec in lock(&results).values() {
+                        let mut idx = lock(&spec.checkpoints);
+                        idx.points.clear();
+                        idx.status = BuildStatus::Idle;
+                    }
+                    emit(
+                        &events,
+                        session_id,
+                        Event::ScriptDone {
+                            ran,
+                            failed,
+                            // A script that stopped early must not then open its
+                            // trailing read: the state it would read is not the
+                            // state the script was meant to produce.
+                            trailing_read: trailing_read.filter(|_| !stopped),
+                        },
+                    );
+                });
+            }
+
             Command::Execute { sql, namespace } => {
                 let Some(id) = session_id else { continue };
                 let Some(state) = sessions.get(&id) else {

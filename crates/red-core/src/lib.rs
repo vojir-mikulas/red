@@ -2835,6 +2835,85 @@ pub enum ExportFormat {
     Xlsx,
 }
 
+/// How one statement of a script run ended.
+///
+/// A script reports per statement rather than as one number, because the whole
+/// point of running several statements together is knowing *which* one failed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ScriptOutcome {
+    /// Ran and changed `affected` rows (0 for DDL and for a read).
+    Ok { affected: u64 },
+    /// Ran and returned rows. The count is deliberately absent: counting would
+    /// mean draining the result, which is exactly the whole-result
+    /// materialization the streaming invariant forbids.
+    Rows,
+    /// The engine rejected it. Carries the message so the log can name the cause
+    /// beside the statement that caused it.
+    Failed { error: String },
+    /// Not attempted, because an earlier statement failed under
+    /// [`ScriptStop::OnError`].
+    Skipped,
+}
+
+impl ScriptOutcome {
+    /// Whether this outcome should stop a script that stops on error.
+    pub fn is_failure(&self) -> bool {
+        matches!(self, Self::Failed { .. })
+    }
+}
+
+/// What a script does when a statement fails.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScriptStop {
+    /// Stop at the first failure, leaving the rest [`ScriptOutcome::Skipped`].
+    /// The default: a migration whose third statement failed rarely wants its
+    /// fourth applied on top.
+    OnError,
+    /// Run every statement regardless, reporting each. For a script of
+    /// independent statements where one bad line should not block the rest.
+    Never,
+}
+
+/// One statement's line in a script run's log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScriptStep {
+    /// Position in the script, 0-based, so the UI can say "statement 3 of 12".
+    pub index: usize,
+    /// A short single-line form of the statement, for the log. Truncated at the
+    /// source rather than in the UI so a megabyte-long generated `INSERT` never
+    /// crosses the channel just to be shortened on arrival.
+    pub summary: String,
+    pub outcome: ScriptOutcome,
+}
+
+/// How wide a script step's `summary` is cut. Long enough to identify the
+/// statement, short enough that a thousand-step script's log stays bounded.
+pub const SCRIPT_SUMMARY_MAX: usize = 120;
+
+/// Cut `sql` down to a single-line [`ScriptStep::summary`]: collapse all
+/// whitespace runs to one space, then clip to [`SCRIPT_SUMMARY_MAX`] on a char
+/// boundary with an ellipsis.
+pub fn script_summary(sql: &str) -> String {
+    let mut out = String::with_capacity(sql.len().min(SCRIPT_SUMMARY_MAX + 1));
+    let mut space = false;
+    for ch in sql.trim().chars() {
+        if ch.is_whitespace() {
+            space = !out.is_empty();
+            continue;
+        }
+        if space {
+            out.push(' ');
+            space = false;
+        }
+        if out.chars().count() >= SCRIPT_SUMMARY_MAX {
+            out.push('…');
+            return out;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// What a finished export actually wrote.
 ///
 /// Its reason for existing is [`shortfall`](Self::shortfall): an export that
@@ -3061,6 +3140,61 @@ mod namespace_caps_tests {
     }
 }
 
+#[cfg(test)]
+mod script_tests {
+    use super::*;
+
+    /// A summary is one line: every whitespace run (including the newlines a
+    /// formatted statement is full of) collapses to a single space.
+    #[test]
+    fn summary_collapses_whitespace_to_one_line() {
+        assert_eq!(
+            script_summary("SELECT *\n  FROM   users\n  WHERE id = 1"),
+            "SELECT * FROM users WHERE id = 1"
+        );
+        assert_eq!(
+            script_summary("   \n  UPDATE t SET x=1  \n "),
+            "UPDATE t SET x=1"
+        );
+        assert_eq!(script_summary(""), "");
+    }
+
+    /// A generated statement far past the cap is clipped, so a script's log stays
+    /// bounded no matter what the buffer holds.
+    #[test]
+    fn summary_clips_a_long_statement() {
+        let long = format!("INSERT INTO t VALUES {}", "x".repeat(500));
+        let summary = script_summary(&long);
+        assert_eq!(summary.chars().count(), SCRIPT_SUMMARY_MAX + 1);
+        assert!(summary.ends_with('…'));
+    }
+
+    /// Clipping counts characters, not bytes, so a multi-byte statement is never
+    /// cut mid-character (which would not even be a `String`).
+    #[test]
+    fn summary_clips_on_a_char_boundary() {
+        let long = "é".repeat(500);
+        let summary = script_summary(&long);
+        assert_eq!(summary.chars().count(), SCRIPT_SUMMARY_MAX + 1);
+    }
+
+    /// Only a failure stops a script that stops on error; a read among the
+    /// statements is a normal outcome.
+    #[test]
+    fn only_failures_stop_a_script() {
+        assert!(
+            ScriptOutcome::Failed {
+                error: "boom".into()
+            }
+            .is_failure()
+        );
+        assert!(!ScriptOutcome::Ok { affected: 0 }.is_failure());
+        assert!(!ScriptOutcome::Rows.is_failure());
+        assert!(!ScriptOutcome::Skipped.is_failure());
+    }
+}
+
+#[cfg(test)]
 #[cfg(test)]
 mod value_size_tests {
     use super::*;

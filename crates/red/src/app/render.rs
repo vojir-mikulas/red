@@ -13,8 +13,8 @@ use crate::keymap::{
     About, AddRow, BeginEdit, CloseInspector, ClosePane, CloseTab, CycleFocusNext, CycleFocusPrev,
     DeleteRow, EqualizePanes, Explain, FindInResult, FocusOtherHalf, FormatSql, MaximizePane,
     NewConnection, NewTab, NextTab, OpenSavedQueries, PrevTab, RefreshSchema, ReportBug,
-    RevertChanges, RunQuery, SaveQuery, SearchSchema, SelectAll, SetNull, Settings, ShowChangelog,
-    ShowErDiagram, ShowShortcuts, SplitDown, SubmitChanges, SwitchConnection,
+    RevertChanges, RunQuery, RunScript, SaveQuery, SearchSchema, SelectAll, SetNull, Settings,
+    ShowChangelog, ShowErDiagram, ShowShortcuts, SplitDown, SubmitChanges, SwitchConnection,
     SwitchToConnectionSlot, SwitchToPreviousConnection, ToggleAssistant, ToggleColumnsPanel,
     ToggleFilter, ToggleHistory, ToggleInspector, ToggleSidebar, ToggleSplit,
 };
@@ -690,6 +690,11 @@ impl Render for AppState {
                     this.test_connection(cx);
                 } else if this.globals_enabled() {
                     this.run_editor_query(cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &RunScript, _, cx| {
+                if this.globals_enabled() {
+                    this.run_editor_script(cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &NewConnection, _, cx| {
@@ -1877,6 +1882,26 @@ impl AppState {
                 sql.clone(),
                 "Run statement",
             ),
+            // A script says how many statements it is up front: the count is the
+            // fact the single-statement dialog has no need to state, and the one
+            // that changes what the user is agreeing to.
+            PendingWrite::Script {
+                statements,
+                assessment,
+            } => (
+                match assessment.level {
+                    RiskLevel::Critical => "This script destroys data",
+                    _ => "Confirm this script",
+                },
+                format!(
+                    "{} statements, run in order and reported one by one. \
+                     This is not one transaction: statements that succeed before a \
+                     failure stay applied.",
+                    statements.len()
+                ),
+                statements.join(";\n"),
+                "Run script",
+            ),
             // The atomic contract: one transaction, all or nothing. The generic
             // `preview_sql` is enough here because the driver binds the same op and
             // rolls the whole batch back if any of it surprises us.
@@ -1964,7 +1989,8 @@ impl AppState {
         // "are you sure" teaches nothing and gets dismissed; one that says "no WHERE
         // clause: this rewrites every row in orders" is a different question.
         let risk_card = match &pending {
-            PendingWrite::EditorSql { assessment, .. } => self.render_risk_card(assessment, &theme),
+            PendingWrite::EditorSql { assessment, .. }
+            | PendingWrite::Script { assessment, .. } => self.render_risk_card(assessment, &theme),
             _ => None,
         };
         // The "Don't ask again" opt-out belongs only on the settings-gated editor

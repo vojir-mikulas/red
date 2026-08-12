@@ -33,8 +33,8 @@ use crate::i18n::tr;
 use crate::keymap::{
     About, ClosePane, CloseTab, CycleFocusNext, CycleFocusPrev, EqualizePanes, FocusOtherHalf,
     FormatSql, MaximizePane, NewConnection, NewTab, NextTab, PrevTab, RefreshSchema, ReportBug,
-    RunQuery, SearchSchema, Settings, ShowChangelog, ShowErDiagram, ShowShortcuts, SplitDown,
-    SwitchConnection, ToggleSidebar, ToggleSplit,
+    RunQuery, RunScript, SearchSchema, Settings, ShowChangelog, ShowErDiagram, ShowShortcuts,
+    SplitDown, SwitchConnection, ToggleSidebar, ToggleSplit,
 };
 use crate::palette::{CopyResult, GoToRow, ToggleCommandPalette};
 
@@ -133,6 +133,7 @@ pub(crate) fn build_menus() -> Vec<Menu> {
             // ⌘↵ runs the active tab's query, or tests the connection while the
             // connection form is open (the unified `RunQuery` action).
             MenuItem::action(tr!("menu.query.run_query", "Run Query"), RunQuery),
+            MenuItem::action(tr!("menu.query.run_script", "Run Script"), RunScript),
             MenuItem::action(tr!("menu.query.format_sql", "Format SQL"), FormatSql),
             MenuItem::action(tr!("menu.query.er_diagram", "ER Diagram"), ShowErDiagram),
             MenuItem::action(
