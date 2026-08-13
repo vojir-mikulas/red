@@ -1899,7 +1899,23 @@ pub(crate) fn query_editor_menu_items(
         )
     };
     let (run, explain, format) = (app.clone(), app.clone(), app.clone());
-    vec![
+    // "Transfer results into…" only when there is a selection to transfer: the
+    // wizard seeds one item from that SQL, so an empty selection would seed an
+    // item with no source.
+    let transfer = target.selection.clone().map(|sql| {
+        let app = app.clone();
+        ContextMenuItem::new(
+            "editor-menu-transfer",
+            crate::i18n::tr!("editor.menu_transfer", "Transfer results into…"),
+        )
+        .on_click(move |_, _, cx| {
+            app.update(cx, |this, cx| {
+                this.open_transfer(crate::transfer::TransferEntry::Sql(sql.clone()), cx)
+            })
+            .ok();
+        })
+    });
+    let mut items = vec![
         ContextMenuItem::new("editor-menu-run", run_label)
             .shortcut(crate::keymap::localize_hint("⌘↵"))
             .on_click(move |_, _, cx| {
@@ -1923,7 +1939,9 @@ pub(crate) fn query_editor_menu_items(
                     .update(cx, |this, cx| this.format_editor_selection(window, cx))
                     .ok();
             }),
-    ]
+    ];
+    items.extend(transfer);
+    items
 }
 
 /// Resolve a sniffed `(schema_hint, table)` against the connection's namespace

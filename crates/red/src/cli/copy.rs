@@ -9,6 +9,9 @@
 //! - `migrate` moves **many** tables create-fresh (skipping any that already
 //!   exist on the target), FK-ordered (the whole-schema headline). It just needs
 //!   the table names + both sessions.
+//! - `transfer` runs a saved [`TransferPlan`](red_core::transfer::TransferPlan)
+//!   from a JSON file: the *same* artefact the GUI wizard writes, so a plan built
+//!   and reviewed on screen is the plan a cron job re-runs.
 
 use std::collections::HashSet;
 
@@ -77,6 +80,28 @@ pub struct MigrateArgs {
     /// exit without writing.
     #[arg(long)]
     dry_run: bool,
+}
+
+#[derive(Args)]
+pub struct TransferArgs {
+    /// Source connection (a saved name or an inline DSN).
+    conn: String,
+    /// Target connection (a saved name or an inline DSN). Defaults to the source,
+    /// which is what a same-connection duplicate wants.
+    #[arg(long = "to")]
+    to: Option<String>,
+    /// The saved plan to run (`<config>/red/plans/*.json`, or any path).
+    #[arg(long)]
+    plan: std::path::PathBuf,
+    /// Override the plan's target namespace.
+    #[arg(long = "target-schema")]
+    target_schema: Option<String>,
+    /// Plan and render the script without writing anything.
+    #[arg(long)]
+    dry_run: bool,
+    /// Skip the confirmation prompt for a plan that clears or drops tables.
+    #[arg(long)]
+    yes: bool,
 }
 
 #[derive(Copy, Clone, ValueEnum)]
@@ -331,6 +356,147 @@ pub fn cmd_migrate(args: MigrateArgs) -> u8 {
     let code = drain_transfer(&mut events, "migrate");
     shutdown(&svc);
     code
+}
+
+/// Run a saved transfer plan. The plan file is the whole specification, so this
+/// verb takes almost no flags: what moves, under what names, with which rows, is
+/// already decided and reviewable in the file.
+pub fn cmd_transfer(args: TransferArgs) -> u8 {
+    let saved = match red_config::plans::read_file(&args.plan) {
+        Ok(p) => p,
+        Err(e) => return usage(format!("{e:#}")),
+    };
+    let mut plan = saved.plan;
+    if let Some(schema) = args.target_schema.clone() {
+        plan.target_namespace = Some(schema);
+    }
+    plan.options.dry_run = args.dry_run;
+
+    // The same destructive gate the GUI raises, asked once for the whole plan.
+    let destructive = plan.items.iter().filter(|i| i.is_destructive()).count();
+    if destructive > 0
+        && !args.dry_run
+        && let Some(code) = super::confirm_destructive(
+            args.yes,
+            &format!(
+                "{destructive} table(s) in “{}” will be cleared or dropped on the target.",
+                saved.name
+            ),
+        )
+    {
+        return code;
+    }
+
+    let source = match resolve(&args.conn) {
+        Ok(c) => c,
+        Err(e) => return usage(e),
+    };
+    let target_config = match resolve(args.to.as_deref().unwrap_or(&args.conn)) {
+        Ok(c) => c,
+        Err(e) => return usage(e),
+    };
+    if let Some(code) = reject_kv(&source, &target_config) {
+        return code;
+    }
+
+    let (svc, mut events) = start();
+    if let Err(code) = connect_session(&svc, &mut events, PRIMARY, source) {
+        shutdown(&svc);
+        return code;
+    }
+    if let Err(code) = connect_session(&svc, &mut events, TARGET, target_config) {
+        shutdown(&svc);
+        return code;
+    }
+
+    note!(
+        "running plan “{}” ({} item(s))…",
+        saved.name,
+        plan.items.len()
+    );
+    svc.send_to(
+        PRIMARY,
+        Command::RunTransfer {
+            id: JOB_ID,
+            plan: Box::new(plan),
+            target_session: TARGET,
+        },
+    );
+    let code = drain_plan(&mut events);
+    shutdown(&svc);
+    code
+}
+
+/// Consume a `RunTransfer`'s events, printing one line per item so a headless
+/// run says which table did what rather than one cumulative number.
+fn drain_plan(events: &mut EventRx) -> u8 {
+    loop {
+        match recv(events) {
+            Some(Event::TransferProgress {
+                table,
+                item,
+                items,
+                item_rows,
+                ..
+            }) => {
+                progress!("\r[{}/{items}] {table}: {item_rows} row(s)…   ", item + 1);
+            }
+            Some(Event::TransferItemDone { report, .. }) => {
+                note!(
+                    "\r{}: {} ({} row(s))   ",
+                    report.table,
+                    crate::transfer::outcome_label(&report.outcome),
+                    report.rows
+                );
+                for warning in &report.warnings {
+                    note!("  warning: {}: {warning}", report.table);
+                }
+            }
+            Some(Event::TransferFinished { summary, .. }) => {
+                let failures = summary.failures();
+                note!(
+                    "ok: {} item(s), {} row(s){}",
+                    summary.items.len(),
+                    summary.rows,
+                    if failures > 0 {
+                        format!(", {failures} failed")
+                    } else {
+                        String::new()
+                    }
+                );
+                // A failed item is a failed run, even when `on_error` let the
+                // rest continue: a green exit code would read as "it all worked".
+                return if failures > 0 { EXIT_QUERY } else { EXIT_OK };
+            }
+            Some(Event::TransferPlanned {
+                script, estimates, ..
+            }) => {
+                for (table, estimate) in &estimates {
+                    match estimate {
+                        Some(n) => note!("-- {table}: ~{n} row(s)"),
+                        None => note!("-- {table}: not counted"),
+                    }
+                }
+                outln!("{script}");
+                return EXIT_OK;
+            }
+            Some(Event::TransferFailed { message, rows, .. }) => {
+                let so_far = if rows > 0 {
+                    format!(" after {rows} row(s)")
+                } else {
+                    String::new()
+                };
+                eprintln!("transfer failed{so_far}: {message}");
+                return EXIT_QUERY;
+            }
+            Some(Event::TransferCancelled { rows, .. }) => {
+                eprintln!("transfer cancelled ({rows} row(s) kept)");
+                return EXIT_QUERY;
+            }
+            Some(_) => continue,
+            None => return backend_gone(),
+        }
+    }
 }
 
 // ---- source result ---------------------------------------------------------

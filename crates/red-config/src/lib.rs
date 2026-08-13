@@ -8,6 +8,7 @@
 //! - [`secrets`]: the OS keychain (passwords never touch `connections.toml`).
 //! - [`history`]: the per-connection log of statements the user ran.
 //! - [`queries`]: the saved-query library (`queries/*.sql`).
+//! - [`plans`]: the saved transfer-plan library (`plans/*.json`).
 //! - [`recent_keys`]: the Redis browser's recently-viewed keys.
 //!
 //! The last three were UI state until the assistant needed them as *grounding*:
@@ -17,6 +18,7 @@
 
 pub mod config;
 pub mod history;
+pub mod plans;
 pub mod queries;
 pub mod recent_keys;
 pub mod secrets;

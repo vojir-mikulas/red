@@ -76,6 +76,10 @@ actions!(
         /// Query menu, the schema-panel button, and the `schema: ER diagram` palette
         /// command.
         ShowErDiagram,
+        /// Open the transfer wizard on whatever the schema tree has selected: a
+        /// table, or the whole namespace. F5, matching the muscle memory of every
+        /// other tool's "copy this somewhere".
+        OpenTransfer,
         /// ⌘↵ from anywhere: run the active tab's query; or, while the connection
         /// form is open, test the connection.
         RunQuery,
@@ -331,6 +335,7 @@ static SHORTCUTS: &[ShortcutGroup] = &[
                 "Search schema (focus filter)",
             ),
             ("refresh_schema", "⌘R", "Refresh schema"),
+            ("transfer_selection", "F5", "Transfer table / database to…"),
         ],
     ),
     (
@@ -550,6 +555,10 @@ const DEFAULTS: &[ActionDef] = &[
     // a focused text field keeps any ⌘O of its own; nothing binds it today, and
     // the editor's `CodeEditor` context does not, so it fires from the editor too.
     def("cmd-o", "GoToObject", "Go to table", Some("RedRoot")),
+    // F5 opens the transfer wizard on the tree's selection. `RedRoot`-scoped so a
+    // focused field or editor keeps any F5 of its own; nothing binds it today, so
+    // in practice it fires from anywhere in the app.
+    def("f5", "OpenTransfer", "Transfer to…", Some("RedRoot")),
     def("cmd-q", "Quit", "Quit", None),
     // --- RedRoot: app chrome, fires from any focus within the app ---
     // ⌘C copies the result grid's selection, scoped to `RedRoot` so a focused text
@@ -1094,6 +1103,7 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
         "CycleFocusNext" => kb!(CycleFocusNext),
         "CycleFocusPrev" => kb!(CycleFocusPrev),
         "ShowShortcuts" => kb!(ShowShortcuts),
+        "OpenTransfer" => kb!(OpenTransfer),
         "RunQuery" => kb!(RunQuery),
         "RunScript" => kb!(RunScript),
         "NewConnection" => kb!(NewConnection),

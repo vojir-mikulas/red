@@ -18,8 +18,6 @@ notify-downloading_update = [Döwñlöádíñg úpdáté…]
 
 notify-reset_problems = [Rését fíñíshéd wíth { $n } pröblém(s); sömé dátá máy rémáíñ]
 
-notify-migrating_tables = [Mígrátíñg { $n } táblé(s)…]
-
 notify-exported_rows = [Éxpörtéd { $rows } röw(s) tö { $path }]
 
 notify-importing_rows = [Ímpörtíñg… { $rows } röw(s)]

@@ -124,12 +124,6 @@ pub struct AppState {
     /// A pending "new table" copy, held while the user types the table name in the
     /// prompt (mirrors `pending_copy_target`).
     pub(crate) pending_copy_new: Option<PendingCopyNewTable>,
-    /// The target namespaces backing the open "Migrate to…" picker, indexed by
-    /// `Cmd::MigrateTarget(usize)`.
-    pub(crate) migrate_targets: Vec<CopyNamespace>,
-    /// The source of a pending whole-schema migrate, `(source session, source schema,
-    /// table names)`, held while the user picks a target namespace from the picker.
-    pub(crate) pending_migrate: Option<(SessionId, String, Vec<String>)>,
     /// The in-flight data-compare (table diff) op id, if any; the diff events ignore
     /// a reply that isn't for the current op.
     pub(crate) diff_op: Option<OpId>,
@@ -429,6 +423,9 @@ pub struct AppState {
     /// The saved queries shown by the open picker, held only while it's open so an
     /// activation can resolve its index. Loaded on demand, never at startup.
     pub(crate) saved_queries: Vec<red_config::queries::SavedQuery>,
+    /// The saved transfer plans the picker last listed, indexed by
+    /// `Cmd::OpenSavedPlan(usize)` (mirrors `saved_queries`).
+    pub(crate) saved_plans: Vec<red_config::plans::SavedPlan>,
     /// The schema objects shown by the open jump-to-table picker, held only while
     /// it's open so an activation can resolve its index. Rebuilt per open, so it
     /// never goes stale against a refreshed tree.
@@ -525,6 +522,16 @@ pub struct AppState {
     /// DBGate), scan, then choose which discovered connections to import. `None`
     /// when no import is in flight (see [`import_ui`]).
     pub(crate) import_wizard: Option<import_ui::ImportWizard>,
+    /// The transfer wizard while it's open: the stepped modal that builds and
+    /// runs a `TransferPlan` (copy, duplicate, migrate). `None` when no transfer
+    /// is being planned. See [`crate::transfer`].
+    pub(crate) transfer: Option<crate::transfer::TransferWizard>,
+    /// A `CreateNamespace` in flight for the wizard's "Duplicate database…",
+    /// with the name it asked for, so the reply can be matched to the request.
+    pub(crate) pending_namespace: Option<(OpId, String)>,
+    /// Set by the destructive confirm so the retried `start_transfer` runs
+    /// instead of asking again. Cleared as soon as it is spent.
+    pub(crate) transfer_confirmed: bool,
     /// The "Database knowledge" editor while it's open: the connection's
     /// `knowledge/<id>.md` in a markdown editor. `None` when it's closed. See
     /// [`crate::knowledge_panel`].
@@ -1351,8 +1358,6 @@ impl AppState {
             copy_targets: Vec::new(),
             copy_new_namespaces: Vec::new(),
             pending_copy_new: None,
-            migrate_targets: Vec::new(),
-            pending_migrate: None,
             diff_op: None,
             diff_notif: None,
             diff_labels: None,
@@ -1445,6 +1450,7 @@ impl AppState {
             palette_cmds: Vec::new(),
             palette_prompt: PromptKind::GoToRow,
             saved_queries: Vec::new(),
+            saved_plans: Vec::new(),
             goto_objects: Vec::new(),
             loaded_conversations: Vec::new(),
             query_history: cx.new(|_| red_config::history::QueryHistory::load()),
@@ -1471,6 +1477,9 @@ impl AppState {
             shortcuts_open: false,
             whats_new_open: false,
             import_wizard: None,
+            transfer: None,
+            pending_namespace: None,
+            transfer_confirmed: false,
             knowledge_editor: None,
             pending_update,
             connect_sel: 0,
@@ -2313,6 +2322,30 @@ impl AppState {
             Event::CopyFinished { id, rows } => self.on_copy_finished(id, rows, cx),
             Event::CopyFailed { id, rows, message } => self.on_copy_failed(id, rows, message, cx),
             Event::CopyCancelled { id, rows } => self.on_copy_cancelled(id, rows, cx),
+            Event::TransferProgress {
+                id,
+                table,
+                item_rows,
+                rows,
+                ..
+            } => self.on_transfer_progress(id, table, item_rows, rows, cx),
+            Event::TransferItemDone { id, item, report } => {
+                self.on_transfer_item_done(id, item, report, cx)
+            }
+            Event::TransferFinished { id, summary } => self.on_transfer_finished(id, summary, cx),
+            Event::TransferFailed {
+                id,
+                message,
+                summary,
+                ..
+            } => self.on_transfer_failed(id, message, summary, cx),
+            Event::TransferCancelled { id, rows, .. } => self.on_transfer_cancelled(id, rows, cx),
+            Event::TransferPlanned {
+                id,
+                script,
+                estimates,
+            } => self.on_transfer_planned(id, script, estimates, cx),
+            Event::NamespaceCreated { id, name } => self.on_namespace_created(id, name, cx),
             Event::DiffProgress { id, scanned } => self.on_diff_progress(id, scanned, cx),
             Event::DiffFinished {
                 id,
@@ -2604,6 +2637,7 @@ impl AppState {
                 id,
                 ..
             }) => self.start_import(path, format, target, mapping, id, cx),
+            Some(PendingWrite::Transfer { .. }) => self.confirmed_transfer(cx),
             Some(PendingWrite::Copy {
                 id,
                 source_epoch,
@@ -2710,6 +2744,7 @@ impl AppState {
             || self.settings_open
             || self.form.is_some()
             || self.import_wizard.is_some()
+            || self.transfer.is_some()
             || self.knowledge_editor.is_some()
             || self.kv_create_key_open()
             || self.kv_import_open()

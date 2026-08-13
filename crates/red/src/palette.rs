@@ -100,9 +100,13 @@ pub(crate) enum Cmd {
     /// Open the "Migrate schema to…" picker for the foreground connection's selected
     /// schema (all its tables → another database).
     MigrateSchema,
-    /// Migrate the pending source schema into the target namespace at this index; the
-    /// "Migrate to…" picker activation.
-    MigrateTarget(usize),
+    /// Open the transfer wizard on the focused result: its already-filtered,
+    /// already-sorted SQL becomes one `ItemSource::Result` item.
+    TransferResult,
+    /// Open the saved transfer-plan picker.
+    OpenSavedPlans,
+    /// Open the saved transfer plan at this index; the picker's activation.
+    OpenSavedPlan(usize),
     /// Open the "Compare table against…" picker: pick the left table (data-diff).
     CompareTable,
     /// A left table was picked at this index; open the picker for the right table.
@@ -522,8 +526,10 @@ impl AppState {
             Cmd::CopyToTable => self.open_copy_picker(cx),
             Cmd::CopyTarget(index) => self.pick_copy_target(index, cx),
             Cmd::CopyNewTable(index) => self.pick_copy_new_table(index, cx),
-            Cmd::MigrateSchema => self.open_migrate_picker(cx),
-            Cmd::MigrateTarget(index) => self.pick_migrate_target(index, cx),
+            Cmd::MigrateSchema => self.open_schema_transfer(cx),
+            Cmd::TransferResult => self.open_result_transfer(cx),
+            Cmd::OpenSavedPlans => self.open_saved_plan_picker(cx),
+            Cmd::OpenSavedPlan(index) => self.open_saved_plan(index, cx),
             Cmd::CompareTable => self.open_compare_picker(cx),
             Cmd::CompareLeft(index) => self.pick_compare_left(index, cx),
             Cmd::CompareRight(index) => self.pick_compare_right(index, cx),
@@ -765,12 +771,24 @@ impl AppState {
                 }
                 // Whole-schema migration, offered only when the selected/only schema
                 // has tables to move (the handler picks the target database).
-                if self.migrate_source(cx).is_some() {
+                if self.transfer_schema_source(cx).is_some() {
                     out.push((
                         item("cmd:migrate-schema", "schema: migrate to…"),
                         Cmd::MigrateSchema,
                     ));
                 }
+                // Shape a result into a table without leaving it: the same
+                // wizard, seeded with the result instead of a table list.
+                if self.transfer_result_epoch().is_some() {
+                    out.push((
+                        item("cmd:transfer-result", "result: transfer into…"),
+                        Cmd::TransferResult,
+                    ));
+                }
+                out.push((
+                    item("cmd:open-saved-plan", "transfer: open saved plan…"),
+                    Cmd::OpenSavedPlans,
+                ));
                 // Data-compare (table diff), offered when the connection has at least
                 // two tables to compare (the handler picks left then right).
                 if self.compare_candidates(cx).len() >= 2 {
@@ -1171,6 +1189,49 @@ impl AppState {
         cx.notify();
     }
 
+    /// The saved transfer-plan picker: one row per `plans/*.json`. Picking one
+    /// reopens the wizard on it, so a named transfer is re-runnable rather than
+    /// rebuilt from memory.
+    pub(crate) fn open_saved_plan_picker(&mut self, cx: &mut Context<Self>) {
+        if !matches!(self.phase, Phase::Connected(_)) {
+            return;
+        }
+        let plans = red_config::plans::load();
+        if plans.is_empty() {
+            self.notify(
+                ToastVariant::Info,
+                "No saved transfer plans yet. Save one from the transfer wizard's Review step.",
+                cx,
+            );
+            return;
+        }
+        let entries: Vec<(PaletteItem, Cmd)> = plans
+            .iter()
+            .enumerate()
+            .map(|(i, p)| {
+                let id = ElementId::from(SharedString::from(format!("saved-plan:{i}")));
+                let item = PaletteItem::new(id, p.name.clone())
+                    .hint(red_core::transfer::summarize(&p.plan));
+                (item, Cmd::OpenSavedPlan(i))
+            })
+            .collect();
+        self.saved_plans = plans;
+        self.palette_cmds = entries
+            .iter()
+            .map(|(item, cmd)| (item.id.clone(), *cmd))
+            .collect();
+        let items: Vec<PaletteItem> = entries.into_iter().map(|(item, _)| item).collect();
+        let palette = cx.new(|cx| {
+            let mut p = Palette::new(cx);
+            p.set_placeholder("Open saved transfer plan…", cx);
+            p.set_items(items, cx);
+            p
+        });
+        let sub = cx.subscribe(&palette, Self::on_palette_event);
+        self.palette = Some((palette, sub));
+        cx.notify();
+    }
+
     /// Open the picked saved query in a fresh tab titled with its name (rather than
     /// stomping the active editor), ready to run.
     fn open_saved_query(&mut self, index: usize, cx: &mut Context<Self>) {
@@ -1413,86 +1474,6 @@ impl AppState {
             Some(create),
             cx,
         );
-    }
-
-    /// "schema: migrate to…": take the foreground connection's selected schema (all its
-    /// tables) and open a picker over every *other* writable namespace (a target
-    /// database). On pick, `pick_migrate_target` fires the whole-schema migration.
-    /// No-op (with a hint) when nothing is migratable / no target is open.
-    pub(crate) fn open_migrate_picker(&mut self, cx: &mut Context<Self>) {
-        let Some((session, schema, tables)) = self.migrate_source(cx) else {
-            self.notify(
-                ToastVariant::Info,
-                "Select a schema with tables to migrate",
-                cx,
-            );
-            return;
-        };
-        // Targets: every writable namespace except the source schema itself.
-        let targets: Vec<_> = self
-            .copy_namespace_candidates(cx)
-            .into_iter()
-            .filter(|ns| !(ns.session == session && ns.schema == schema))
-            .collect();
-        if targets.is_empty() {
-            self.notify(
-                ToastVariant::Info,
-                "No other writable database to migrate into. Open one first",
-                cx,
-            );
-            return;
-        }
-        let table_count = tables.len();
-        let entries: Vec<(PaletteItem, Cmd)> = targets
-            .iter()
-            .enumerate()
-            .map(|(i, ns)| {
-                let id = ElementId::from(SharedString::from(format!("migrate-target:{i}")));
-                let item = PaletteItem::new(
-                    id,
-                    crate::i18n::tr!(
-                        "palette.migrate_target",
-                        "{schema} ({table_count} table(s))",
-                        schema = ns.schema,
-                        table_count = table_count
-                    ),
-                )
-                .hint(ns.conn_name.clone());
-                (item, Cmd::MigrateTarget(i))
-            })
-            .collect();
-        self.pending_migrate = Some((session, schema, tables));
-        self.migrate_targets = targets;
-        self.palette_cmds = entries
-            .iter()
-            .map(|(item, cmd)| (item.id.clone(), *cmd))
-            .collect();
-        let items: Vec<PaletteItem> = entries.into_iter().map(|(item, _)| item).collect();
-        let palette = cx.new(|cx| {
-            let mut p = Palette::new(cx);
-            p.set_placeholder("Migrate schema into database…", cx);
-            p.set_items(items, cx);
-            p
-        });
-        let sub = cx.subscribe(&palette, Self::on_palette_event);
-        self.palette = Some((palette, sub));
-        cx.notify();
-    }
-
-    /// A target namespace was picked for a migrate: fire the whole-schema migration
-    /// (the source is the foreground connection's chosen schema, stashed in
-    /// `pending_migrate`).
-    fn pick_migrate_target(&mut self, index: usize, cx: &mut Context<Self>) {
-        let Some(target) = self.migrate_targets.get(index).cloned() else {
-            return;
-        };
-        // The source is the foreground session (`start_migrate` uses `send_active`).
-        let Some((_source_session, source_schema, tables)) = self.pending_migrate.take() else {
-            return;
-        };
-        let id = red_service::OpId::new(self.next_export_id);
-        self.next_export_id += 1;
-        self.start_migrate(id, source_schema, tables, target.session, target.schema, cx);
     }
 
     /// The foreground connection's tables (`(session, schema, name)`): the pool the

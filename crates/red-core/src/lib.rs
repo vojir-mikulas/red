@@ -5,6 +5,7 @@
 use std::fmt;
 use std::sync::Arc;
 
+pub mod ddl;
 pub mod diff;
 pub mod doc;
 pub mod health;
@@ -12,6 +13,7 @@ pub mod kv;
 pub mod schema_diff;
 pub mod server;
 pub mod sql;
+pub mod transfer;
 pub mod typemap;
 pub mod valuefmt;
 
@@ -2992,7 +2994,10 @@ pub enum ImportFormat {
 /// coerce the text cell and to cast the bound parameter). Built UI-side from the
 /// file header + the target table's columns; the dispatch import loop reads it to
 /// project each source row into target-column order.
-#[derive(Debug, Clone)]
+// Serializable so a saved [`transfer::TransferPlan`] can pin an explicit
+// projection; nothing on the live path depends on serde.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ColumnMap {
     pub source: usize,
     pub column: String,
@@ -3037,6 +3042,8 @@ impl Default for QueryOptions {
 /// deliberately **not** here: it needs a per-engine conflict-key seam and a key
 /// picker, which is the on-ramp to the sync machinery table-copy exists to avoid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+#[cfg_attr(feature = "serde", serde(rename_all = "snake_case"))]
 pub enum CopyMode {
     /// Insert the source rows into the target as-is (the target keeps its rows).
     Append,

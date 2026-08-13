@@ -2880,3 +2880,489 @@ fn lock_recovers_from_a_poisoned_mutex() {
     *lock(&m) += 1;
     assert_eq!(*lock(&m), 1);
 }
+
+// --- transfer plans ---
+
+/// Seed a scratch DB shaped like a small schema worth transferring: a parent and
+/// a child joined by a foreign key, a table that already exists on the "target"
+/// side, and a table nobody wants to move.
+fn seed_transfer_db(tag: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(format!("red_svc_xfer_{tag}_{}.db", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    conn.execute_batch(
+        "CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+         INSERT INTO parent VALUES (1,'a'),(2,'b');
+         CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER REFERENCES parent(id), n INTEGER);
+         INSERT INTO child VALUES (1,1,10),(2,1,20),(3,2,30);
+         CREATE INDEX ix_child_n ON child(n);
+         CREATE TABLE audit(id INTEGER PRIMARY KEY, note TEXT);
+         INSERT INTO audit VALUES (1,'kept'),(2,'kept');
+         CREATE TABLE existing_target(id INTEGER PRIMARY KEY, name TEXT);
+         INSERT INTO existing_target VALUES (99,'already here');
+         CREATE TABLE migrations(id INTEGER PRIMARY KEY);",
+    )
+    .unwrap();
+    path
+}
+
+/// Consume a transfer's per-item chatter and hand back its terminal event.
+async fn drain_transfer(
+    events: &mut UnboundedReceiver<(Option<SessionId>, Event)>,
+    transfer_id: u64,
+) -> Event {
+    loop {
+        match events.next().await.map(|(_, e)| e) {
+            Some(Event::TransferProgress { id, .. } | Event::TransferItemDone { id, .. }) => {
+                assert_eq!(id.get(), transfer_id)
+            }
+            Some(
+                e @ (Event::TransferFinished { .. }
+                | Event::TransferFailed { .. }
+                | Event::TransferCancelled { .. }
+                | Event::TransferPlanned { .. }),
+            ) => return e,
+            other => panic!("unexpected event during transfer: {other:?}"),
+        }
+    }
+}
+
+/// One plan exercising every action and content the executor supports, into the
+/// same connection: create + fill, create empty, append into an existing table,
+/// filter, rename, and an explicit skip. The point is that a single pass can say
+/// all of that, which is the thing neither `CopyToTable` nor `MigrateTables` could.
+#[tokio::test]
+async fn one_plan_covers_every_action_and_content() {
+    use red_core::transfer::{
+        ItemAction, ItemContent, ItemOutcome, TransferItem, TransferOptions, TransferPlan,
+    };
+    let path = seed_transfer_db("all");
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    let item = |source: &str, target: &str, action, content| TransferItem {
+        source: red_core::transfer::ItemSource::Table {
+            schema: Some("main".into()),
+            name: source.into(),
+        },
+        target_name: target.into(),
+        action,
+        content,
+        mapping: Vec::new(),
+    };
+    let plan = TransferPlan {
+        source_namespace: Some("main".into()),
+        target_namespace: Some("main".into()),
+        items: vec![
+            // Child before parent in the plan: the executor must reorder them.
+            item(
+                "child",
+                "child_copy",
+                ItemAction::Create,
+                ItemContent::AllRows,
+            ),
+            item(
+                "parent",
+                "parent_copy",
+                ItemAction::Create,
+                ItemContent::AllRows,
+            ),
+            // Structure only: the "empty table" ask.
+            item(
+                "audit",
+                "audit_copy",
+                ItemAction::Create,
+                ItemContent::StructureOnly,
+            ),
+            // Into a table that is already there, keeping its row.
+            item(
+                "parent",
+                "existing_target",
+                ItemAction::Existing {
+                    mode: red_core::CopyMode::Append,
+                },
+                ItemContent::AllRows,
+            ),
+            // A filtered subset under a new name.
+            item(
+                "child",
+                "child_recent",
+                ItemAction::Create,
+                ItemContent::Where("n > 15".into()),
+            ),
+            // First N rows.
+            item(
+                "child",
+                "child_sample",
+                ItemAction::Create,
+                ItemContent::Limit(1),
+            ),
+            item(
+                "migrations",
+                "migrations",
+                ItemAction::Skip,
+                ItemContent::AllRows,
+            ),
+        ],
+        options: TransferOptions::default(),
+    };
+    send(
+        &handle,
+        Command::RunTransfer {
+            id: OpId::new(21),
+            plan: Box::new(plan),
+            target_session: S,
+        },
+    );
+    let summary = match drain_transfer(&mut events, 21).await {
+        Event::TransferFinished { id, summary } => {
+            assert_eq!(id.get(), 21);
+            summary
+        }
+        other => panic!("expected TransferFinished, got {other:?}"),
+    };
+
+    // Every planned item is reported, including the skip: nothing is swallowed.
+    assert_eq!(summary.items.len(), 7, "one report per planned item");
+    let outcome = |table: &str| {
+        summary
+            .items
+            .iter()
+            .find(|r| r.table == table)
+            .map(|r| (r.outcome.clone(), r.rows))
+            .unwrap_or_else(|| panic!("no report for {table}"))
+    };
+    assert_eq!(outcome("parent_copy"), (ItemOutcome::Created, 2));
+    assert_eq!(outcome("child_copy"), (ItemOutcome::Created, 3));
+    assert_eq!(outcome("audit_copy"), (ItemOutcome::CreatedEmpty, 0));
+    assert_eq!(outcome("existing_target"), (ItemOutcome::Appended, 2));
+    assert_eq!(outcome("child_recent"), (ItemOutcome::Created, 2));
+    assert_eq!(outcome("child_sample"), (ItemOutcome::Created, 1));
+    assert!(matches!(
+        outcome("migrations").0,
+        ItemOutcome::Skipped { .. }
+    ));
+    assert_eq!(summary.rows, 2 + 3 + 2 + 2 + 1);
+
+    send(&handle, Command::Shutdown);
+    drop(handle);
+
+    // Read the results back with a plain connection: the target tables hold what
+    // the plan said, the skipped one was never created, and the pre-existing row
+    // survived the append.
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let count = |t: &str| -> i64 {
+        conn.query_row(&format!("SELECT count(*) FROM {t}"), [], |r| r.get(0))
+            .unwrap()
+    };
+    assert_eq!(count("parent_copy"), 2);
+    assert_eq!(count("child_copy"), 3);
+    assert_eq!(count("audit_copy"), 0, "structure only means no rows");
+    assert_eq!(count("existing_target"), 3, "append kept the original row");
+    assert_eq!(count("child_recent"), 2, "the filter was applied");
+    assert_eq!(count("child_sample"), 1);
+    let created: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='migrations_copy'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(created, 0, "a skipped item creates nothing");
+    // The deferred index pass recreated the source's secondary index (renamed
+    // targets and all), and skipped the primary-key-backing one.
+    let indexes: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='index' AND tbl_name='child_copy'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(indexes >= 1, "the secondary index was recreated");
+    drop(conn);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// `Recreate` drops the target and rebuilds it, so the rows that were there are
+/// gone and only the source's remain. The destructive action, verified as such.
+#[tokio::test]
+async fn recreate_replaces_the_target_wholesale() {
+    use red_core::transfer::{
+        ItemAction, ItemContent, ItemOutcome, ItemSource, TransferItem, TransferOptions,
+        TransferPlan,
+    };
+    let path = seed_transfer_db("recreate");
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    send(
+        &handle,
+        Command::RunTransfer {
+            id: OpId::new(22),
+            plan: Box::new(TransferPlan {
+                source_namespace: Some("main".into()),
+                target_namespace: Some("main".into()),
+                items: vec![TransferItem {
+                    source: ItemSource::Table {
+                        schema: Some("main".into()),
+                        name: "parent".into(),
+                    },
+                    target_name: "existing_target".into(),
+                    action: ItemAction::Recreate,
+                    content: ItemContent::AllRows,
+                    mapping: Vec::new(),
+                }],
+                options: TransferOptions::default(),
+            }),
+            target_session: S,
+        },
+    );
+    match drain_transfer(&mut events, 22).await {
+        Event::TransferFinished { summary, .. } => {
+            assert_eq!(summary.items[0].outcome, ItemOutcome::Recreated);
+            assert_eq!(summary.rows, 2);
+        }
+        other => panic!("expected TransferFinished, got {other:?}"),
+    }
+
+    send(&handle, Command::Shutdown);
+    drop(handle);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let kept: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM existing_target WHERE id = 99",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(kept, 0, "recreate dropped the target's own rows");
+    drop(conn);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A failing item under `OnError::SkipItem` is recorded and the job carries on,
+/// so one bad table doesn't cost the other thirty-nine.
+#[tokio::test]
+async fn on_error_skip_item_continues_past_a_bad_item() {
+    use red_core::transfer::{
+        ItemContent, ItemSource, OnError, TransferItem, TransferOptions, TransferPlan,
+    };
+    let path = seed_transfer_db("skip");
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    let mut bad = TransferItem::table("parent");
+    bad.target_name = "bad_filter".into();
+    bad.source = ItemSource::Table {
+        schema: Some("main".into()),
+        name: "parent".into(),
+    };
+    bad.content = ItemContent::Where("this is not sql".into());
+    let mut good = TransferItem::table("parent");
+    good.target_name = "good_copy".into();
+    good.source = ItemSource::Table {
+        schema: Some("main".into()),
+        name: "parent".into(),
+    };
+
+    send(
+        &handle,
+        Command::RunTransfer {
+            id: OpId::new(23),
+            plan: Box::new(TransferPlan {
+                source_namespace: Some("main".into()),
+                target_namespace: Some("main".into()),
+                items: vec![bad, good],
+                options: TransferOptions {
+                    on_error: OnError::SkipItem,
+                    ..TransferOptions::default()
+                },
+            }),
+            target_session: S,
+        },
+    );
+    match drain_transfer(&mut events, 23).await {
+        Event::TransferFinished { summary, .. } => {
+            assert_eq!(summary.failures(), 1, "the bad item is reported as failed");
+            assert_eq!(summary.rows, 2, "the good item still moved its rows");
+        }
+        other => panic!("expected TransferFinished, got {other:?}"),
+    }
+
+    // The same plan with the default `OnError::Stop` gives up at the bad item.
+    let mut bad = TransferItem::table("parent");
+    bad.target_name = "bad_filter2".into();
+    bad.source = ItemSource::Table {
+        schema: Some("main".into()),
+        name: "parent".into(),
+    };
+    bad.content = ItemContent::Where("still not sql".into());
+    let mut good = TransferItem::table("parent");
+    good.target_name = "never_created".into();
+    good.source = ItemSource::Table {
+        schema: Some("main".into()),
+        name: "parent".into(),
+    };
+    send(
+        &handle,
+        Command::RunTransfer {
+            id: OpId::new(24),
+            plan: Box::new(TransferPlan {
+                source_namespace: Some("main".into()),
+                target_namespace: Some("main".into()),
+                items: vec![bad, good],
+                options: TransferOptions::default(),
+            }),
+            target_session: S,
+        },
+    );
+    match drain_transfer(&mut events, 24).await {
+        Event::TransferFailed { item, summary, .. } => {
+            assert_eq!(item, Some(0));
+            assert_eq!(summary.items.len(), 1, "the job stopped at the bad item");
+        }
+        other => panic!("expected TransferFailed, got {other:?}"),
+    }
+
+    send(&handle, Command::Shutdown);
+    drop(handle);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let created: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='never_created'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(created, 0, "Stop means the later item never ran");
+    drop(conn);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A dry run renders the script and estimates rows without touching the target.
+#[tokio::test]
+async fn a_dry_run_writes_nothing() {
+    use red_core::transfer::{ItemSource, TransferItem, TransferOptions, TransferPlan};
+    let path = seed_transfer_db("dry");
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+
+    let mut item = TransferItem::table("child");
+    item.target_name = "child_dry".into();
+    item.source = ItemSource::Table {
+        schema: Some("main".into()),
+        name: "child".into(),
+    };
+    send(
+        &handle,
+        Command::RunTransfer {
+            id: OpId::new(25),
+            plan: Box::new(TransferPlan {
+                source_namespace: Some("main".into()),
+                target_namespace: Some("main".into()),
+                items: vec![item],
+                options: TransferOptions {
+                    dry_run: true,
+                    ..TransferOptions::default()
+                },
+            }),
+            target_session: S,
+        },
+    );
+    match drain_transfer(&mut events, 25).await {
+        Event::TransferPlanned {
+            script, estimates, ..
+        } => {
+            assert!(
+                script.contains("CREATE TABLE IF NOT EXISTS"),
+                "script renders the create: {script}"
+            );
+            assert!(
+                script.contains("child_dry"),
+                "script names the target: {script}"
+            );
+            assert_eq!(estimates, vec![("child_dry".to_string(), Some(3))]);
+        }
+        other => panic!("expected TransferPlanned, got {other:?}"),
+    }
+
+    send(&handle, Command::Shutdown);
+    drop(handle);
+    let conn = rusqlite::Connection::open(&path).unwrap();
+    let created: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type='table' AND name='child_dry'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(created, 0, "a dry run creates nothing");
+    drop(conn);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// SQLite has no create-a-database statement, so the seam says so rather than
+/// reporting a success the caller would then write tables into.
+#[tokio::test]
+async fn create_namespace_is_refused_where_it_is_meaningless() {
+    let path = seed_transfer_db("ns");
+    let mut handle = spawn();
+    let mut events = handle.take_events().expect("event stream");
+    send(
+        &handle,
+        Command::Connect(sqlite(path.to_str().unwrap(), false)),
+    );
+    assert!(matches!(
+        next(&mut events).await,
+        Some(Event::Connected { .. })
+    ));
+    send(
+        &handle,
+        Command::CreateNamespace {
+            id: OpId::new(26),
+            name: "brand_new".into(),
+        },
+    );
+    match next(&mut events).await {
+        Some(Event::TransferFailed { id, message, .. }) => {
+            assert_eq!(id.get(), 26);
+            assert!(!message.is_empty(), "the refusal explains itself");
+        }
+        other => panic!("expected TransferFailed, got {other:?}"),
+    }
+    send(&handle, Command::Shutdown);
+    drop(handle);
+    let _ = std::fs::remove_file(&path);
+}

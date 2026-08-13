@@ -78,4 +78,6 @@ editor-menu_run_statement = [Rúñ státéméñt]
 
 editor-menu_format_sql = [Förmát SQL]
 
+editor-menu_transfer = [Tráñsfér résúlts íñtö…]
+
 editor-menu_explain = [Éxpláíñ]

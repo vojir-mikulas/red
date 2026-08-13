@@ -13,10 +13,10 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use red_core::{
-    BASE_ALIAS, CmpOp, Column, ColumnMeta, ColumnPredicate, ColumnStats, ColumnValue, DbKind,
-    EditOp, ExportFormat, ExportOutcome, FkEdge, FkJoin, KeySpec, QueryOptions, QueryPlan,
-    RedError, Result, ResultPage, RowEditCaps, RowWindow, SchemaMeta, SortDirection, StatsFlags,
-    TableDetail, TableRef, Value,
+    BASE_ALIAS, CmpOp, Column, ColumnMeta, ColumnPredicate, ColumnStats, ColumnValue, EditOp,
+    ExportFormat, ExportOutcome, FkEdge, FkJoin, KeySpec, QueryOptions, QueryPlan, RedError,
+    Result, ResultPage, RowEditCaps, RowWindow, SchemaMeta, SortDirection, StatsFlags, TableDetail,
+    TableRef, Value,
 };
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -330,176 +330,16 @@ pub(crate) fn insert_chunk_rows(columns: usize, param_cap: usize) -> usize {
     (param_cap / columns.max(1)).max(1)
 }
 
-/// Qualify and quote a table reference (`schema.name`, or just `name` when there's no
-/// schema) using `quote`: the shared body of every driver's [`quote_table`] and the
-/// `CREATE TABLE` builder. Identifiers are quoted, never interpolated raw.
-pub(crate) fn qualify_table(table: &TableRef, quote: impl Fn(&str) -> String) -> String {
-    match &table.schema {
-        Some(s) if !s.is_empty() => format!("{}.{}", quote(s), quote(&table.name)),
-        _ => quote(&table.name),
-    }
-}
+/// Qualify and quote a table reference, and build a `CREATE TABLE IF NOT EXISTS`:
+/// the shared bodies of every driver's [`quote_table`](DatabaseDriver::quote_table)
+/// and [`create_table`](DatabaseDriver::create_table). They live in `red-core`
+/// because the transfer wizard previews the same `CREATE` the driver executes, and
+/// a preview built by a second string builder is a preview that drifts.
+pub(crate) use red_core::ddl::{create_table_sql, qualify_table};
 
-/// Build a `CREATE TABLE IF NOT EXISTS` for `table` from `columns`, spelling each
-/// column's declared type into `kind`'s dialect via [`red_core::typemap`], the
-/// shared body of every driver's [`create_table`](DatabaseDriver::create_table). A
-/// Postgres `int4`/`numeric(10,2)`/`jsonb`/`uuid` becomes a faithful column in the
-/// target engine instead of invalid DDL; a type the lattice can't classify falls
-/// through verbatim (the engine accepts or rejects it, like dbgate). `NOT NULL` is
-/// emitted, primary-key columns are gathered into a trailing `PRIMARY KEY (…)`, and an
-/// auto-increment column is re-spelled per dialect (SQLite `INTEGER PRIMARY KEY`,
-/// Postgres `serial`/`bigserial`, MySQL `… AUTO_INCREMENT`) so the migrated table keeps
-/// auto-numbering. Indexes and foreign keys are **not** emitted here; they ride a
-/// deferred pass after the data loads.
-/// Identifiers are quoted by `quote`; the only interpolated type text comes from the
-/// fixed per-engine spelling table, never raw user input.
-pub(crate) fn create_table_sql(
-    table: &TableRef,
-    columns: &[ColumnMeta],
-    kind: DbKind,
-    quote: impl Fn(&str) -> String,
-) -> String {
-    use red_core::typemap::{NormType, normalize, spell};
-    let qualify = qualify_table(table, &quote);
-    let pk_count = columns.iter().filter(|c| c.primary_key).count();
-    // SQLite expresses a sole-INTEGER-PK auto-increment column *inline* as
-    // `INTEGER PRIMARY KEY` (the rowid alias), which then must NOT also appear in a
-    // trailing PRIMARY KEY clause.
-    let sqlite_inline_pk = kind == DbKind::Sqlite
-        && pk_count == 1
-        && columns.iter().any(|c| c.primary_key && c.auto_increment);
-    let mut defs: Vec<String> = columns
-        .iter()
-        .map(|c| {
-            let nt = normalize(c.type_name.as_deref().unwrap_or(""));
-            if c.auto_increment {
-                match kind {
-                    DbKind::Sqlite if sqlite_inline_pk && c.primary_key => {
-                        format!("{} INTEGER PRIMARY KEY", quote(&c.name))
-                    }
-                    // A non-sole-PK auto-inc in SQLite can't be the rowid alias; emit a
-                    // plain INTEGER (the values still carry across; future auto-numbering
-                    // is the only loss).
-                    DbKind::Sqlite => format!("{} INTEGER", quote(&c.name)),
-                    DbKind::Postgres => {
-                        let serial = if matches!(nt, NormType::BigInt) {
-                            "bigserial"
-                        } else {
-                            "serial"
-                        };
-                        format!("{} {serial}", quote(&c.name))
-                    }
-                    DbKind::Mysql => {
-                        format!("{} {} AUTO_INCREMENT", quote(&c.name), spell(kind, &nt))
-                    }
-                    DbKind::Clickhouse => format!("{} {}", quote(&c.name), spell(kind, &nt)),
-                    // No column/DDL model, no `DatabaseDriver` impl, so this
-                    // never sees `DbKind::Redis` (see `typemap::spell`). Degrade
-                    // rather than panic on the backend thread if that ever breaks.
-                    DbKind::Redis => {
-                        debug_assert!(false, "Redis has no column/DDL model");
-                        format!("{} {}", quote(&c.name), spell(kind, &nt))
-                    }
-                    // Schemaless document store, no `DatabaseDriver`/DDL model, so
-                    // this never sees `DbKind::Mongo` (see `typemap::spell`).
-                    DbKind::Mongo => {
-                        debug_assert!(false, "MongoDB has no column/DDL model");
-                        format!("{} {}", quote(&c.name), spell(kind, &nt))
-                    }
-                }
-            } else {
-                let ty = spell(kind, &nt);
-                let null = if c.not_null { " NOT NULL" } else { "" };
-                format!("{} {ty}{null}", quote(&c.name))
-            }
-        })
-        .collect();
-    if pk_count > 0 && !sqlite_inline_pk {
-        let pk = columns
-            .iter()
-            .filter(|c| c.primary_key)
-            .map(|c| quote(&c.name))
-            .collect::<Vec<_>>()
-            .join(", ");
-        defs.push(format!("PRIMARY KEY ({pk})"));
-    }
-    format!("CREATE TABLE IF NOT EXISTS {qualify} ({})", defs.join(", "))
-}
-
-/// Build a `CREATE [UNIQUE] INDEX` for `table` over `columns` in `kind`'s dialect: the
-/// shared body of every driver's [`create_index`](DatabaseDriver::create_index), run as
-/// the migration's deferred index pass. `IF NOT EXISTS` is used where the engine
-/// supports it (not MySQL). Identifiers are quoted by `quote`, never interpolated raw.
-pub(crate) fn create_index_sql(
-    table: &TableRef,
-    name: &str,
-    unique: bool,
-    columns: &[String],
-    kind: DbKind,
-    quote: impl Fn(&str) -> String,
-) -> String {
-    let uniq = if unique { "UNIQUE " } else { "" };
-    // MySQL has no `IF NOT EXISTS` for `CREATE INDEX`; SQLite and Postgres do.
-    let guard = if matches!(kind, DbKind::Mysql) {
-        ""
-    } else {
-        "IF NOT EXISTS "
-    };
-    let cols = columns
-        .iter()
-        .map(|c| quote(c))
-        .collect::<Vec<_>>()
-        .join(", ");
-    match kind {
-        // SQLite puts the schema on the *index name*; the table name in `CREATE INDEX`
-        // is never schema-qualified (`CREATE INDEX main.ix ON child(...)`).
-        DbKind::Sqlite => {
-            let idx = match &table.schema {
-                Some(s) if !s.is_empty() => format!("{}.{}", quote(s), quote(name)),
-                _ => quote(name),
-            };
-            format!(
-                "CREATE {uniq}INDEX {guard}{idx} ON {} ({cols})",
-                quote(&table.name)
-            )
-        }
-        // Postgres/MySQL: bare index name, schema-qualified table.
-        _ => format!(
-            "CREATE {uniq}INDEX {guard}{} ON {} ({cols})",
-            quote(name),
-            qualify_table(table, &quote)
-        ),
-    }
-}
-
-/// Build an `ALTER TABLE … ADD FOREIGN KEY (…) REFERENCES … (…)` in `kind`'s dialect,
-/// the shared body of every (FK-capable) driver's [`add_foreign_key`]. No referential
-/// actions are emitted (`FkEdge` doesn't carry them). Identifiers are quoted, never
-/// interpolated raw. `kind` is currently unused (the syntax is the same on Postgres and
-/// MySQL) but kept for symmetry with the other builders and future per-dialect needs.
-pub(crate) fn add_fk_sql(
-    child: &TableRef,
-    columns: &[String],
-    parent: &TableRef,
-    ref_columns: &[String],
-    quote: impl Fn(&str) -> String,
-) -> String {
-    let cols = columns
-        .iter()
-        .map(|c| quote(c))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let refs = ref_columns
-        .iter()
-        .map(|c| quote(c))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "ALTER TABLE {} ADD FOREIGN KEY ({cols}) REFERENCES {} ({refs})",
-        qualify_table(child, &quote),
-        qualify_table(parent, &quote)
-    )
-}
+/// The `CREATE INDEX` and `ALTER TABLE … ADD FOREIGN KEY` builders, shared with
+/// the dry-run script the transfer wizard shows (see `create_table_sql` above).
+pub(crate) use red_core::ddl::{add_fk_sql, create_index_sql};
 
 /// The error for an edit whose row count wasn't the expected one, surfaced to the
 /// user in the result pane (not as a silent success). `affected = 0` means the row
@@ -1562,12 +1402,47 @@ pub trait DatabaseDriver: Send + Sync {
     /// foreign type that fails at execute time), `NOT NULL` and a composite
     /// `PRIMARY KEY` are carried, and the `CREATE` runs through the same transaction
     /// wrapper as [`execute`](DatabaseDriver::execute) (shared body:
-    /// `create_table_sql`). Defaults, indexes, foreign keys, and auto-increment are
-    /// **not** emitted in v1. Idempotent
-    /// (`IF NOT EXISTS`). A read-only driver (ClickHouse) rejects it at the engine, so
+    /// `create_table_sql`). A column `DEFAULT` rides when the caller left it on the
+    /// [`ColumnMeta`] (a cross-engine transfer strips it first; see
+    /// `red_core::ddl::strip_defaults`); indexes and foreign keys are **not**
+    /// emitted here and ride a deferred pass. Idempotent
+    /// (`IF NOT EXISTS`). A read-only connection rejects it at the engine, so
     /// it is never a migration target. Returns the engine's affected-row count (0 for
     /// DDL on most engines).
     async fn create_table(&self, table: &TableRef, columns: &[ColumnMeta]) -> Result<u64>;
+
+    /// Drop `table` if it exists: the destructive half of a transfer's *recreate*,
+    /// which replaces a target whose shape has drifted from the source's rather
+    /// than appending into it (shared body: `red_core::ddl::drop_table_sql`).
+    ///
+    /// Separate from [`drop_object_sql`](Self::drop_object_sql), which deliberately
+    /// answers `None` for a table: that one is a *rendered pre-fill* the user edits
+    /// before anything runs, and dropping a table full of rows is not something to
+    /// hand someone as a pre-filled statement. This one executes, and every caller
+    /// of it sits behind the destructive confirm.
+    ///
+    /// Runs through the same transaction wrapper as
+    /// [`execute`](Self::execute), so a read-only connection refuses it at the
+    /// engine. No `CASCADE`: see `drop_table_sql`.
+    async fn drop_table(&self, table: &TableRef) -> Result<u64>;
+
+    /// Create a namespace: `CREATE DATABASE` on MySQL/ClickHouse, `CREATE SCHEMA`
+    /// on Postgres. The seam "duplicate this database into a *new* one" needs and
+    /// nothing else in RED had.
+    ///
+    /// Errors on engines where a namespace is not a thing you can create through a
+    /// connection: a new SQLite database is a new *file*, which belongs in the
+    /// connection form, not here. That is a clear error rather than a silent
+    /// success, because the caller is about to write tables into it.
+    ///
+    /// Idempotent (`IF NOT EXISTS`) where the engine spells it, so re-running a
+    /// saved plan is not an error.
+    async fn create_namespace(&self, name: &str) -> Result<()> {
+        let _ = name;
+        Err(RedError::Driver(
+            "this engine can't create a database from a connection".to_string(),
+        ))
+    }
 
     /// Qualify + quote `table` for this engine (`"schema"."name"`, `` `schema`.`name` ``)
     /// so the migration job can build a `SELECT * FROM <table>` source query without
@@ -2090,100 +1965,6 @@ mod tests {
             "DELETE FROM \"main\".\"t\" WHERE \"a\" = $1 AND \"b\" = $2"
         );
         assert_eq!(params.len(), 2);
-    }
-
-    #[test]
-    fn create_table_sql_emits_auto_increment_per_dialect() {
-        let cols = vec![
-            ColumnMeta {
-                name: "id".into(),
-                type_name: Some("bigint".into()),
-                not_null: true,
-                primary_key: true,
-                default: None,
-                auto_increment: true,
-            },
-            ColumnMeta {
-                name: "name".into(),
-                type_name: Some("text".into()),
-                not_null: false,
-                primary_key: false,
-                default: None,
-                auto_increment: false,
-            },
-        ];
-        let t = TableRef {
-            schema: None,
-            name: "t".into(),
-        };
-        // SQLite: a sole INTEGER PK auto-inc column is emitted inline as the rowid
-        // alias, and must NOT also appear in a trailing PRIMARY KEY clause.
-        let s = create_table_sql(&t, &cols, DbKind::Sqlite, |i| format!("\"{i}\""));
-        assert!(s.contains("\"id\" INTEGER PRIMARY KEY"), "{s}");
-        assert!(!s.contains("PRIMARY KEY (\"id\")"), "{s}");
-        // Postgres: bigserial (Int → serial) + a trailing PK clause.
-        let p = create_table_sql(&t, &cols, DbKind::Postgres, |i| format!("\"{i}\""));
-        assert!(p.contains("\"id\" bigserial"), "{p}");
-        assert!(p.contains("PRIMARY KEY (\"id\")"), "{p}");
-        // MySQL: `<type> AUTO_INCREMENT` + a trailing PK clause.
-        let m = create_table_sql(&t, &cols, DbKind::Mysql, |i| format!("`{i}`"));
-        assert!(m.contains("`id` bigint AUTO_INCREMENT"), "{m}");
-        assert!(m.contains("PRIMARY KEY (`id`)"), "{m}");
-    }
-
-    #[test]
-    fn add_fk_and_create_index_sql_quote_identifiers() {
-        let child = TableRef {
-            schema: Some("public".into()),
-            name: "child".into(),
-        };
-        let parent = TableRef {
-            schema: Some("public".into()),
-            name: "parent".into(),
-        };
-        let q = |i: &str| format!("\"{i}\"");
-        assert_eq!(
-            add_fk_sql(&child, &["parent_id".into()], &parent, &["id".into()], q),
-            "ALTER TABLE \"public\".\"child\" ADD FOREIGN KEY (\"parent_id\") \
-             REFERENCES \"public\".\"parent\" (\"id\")"
-        );
-        // Postgres: UNIQUE off, `IF NOT EXISTS` supported.
-        assert_eq!(
-            create_index_sql(
-                &child,
-                "ix_child_pid",
-                false,
-                &["parent_id".into()],
-                DbKind::Postgres,
-                q
-            ),
-            "CREATE INDEX IF NOT EXISTS \"ix_child_pid\" ON \"public\".\"child\" (\"parent_id\")"
-        );
-        // MySQL: UNIQUE on, no `IF NOT EXISTS`, composite columns.
-        let myq = |i: &str| format!("`{i}`");
-        assert_eq!(
-            create_index_sql(
-                &child,
-                "ix",
-                true,
-                &["a".into(), "b".into()],
-                DbKind::Mysql,
-                myq
-            ),
-            "CREATE UNIQUE INDEX `ix` ON `public`.`child` (`a`, `b`)"
-        );
-        // SQLite: the schema rides on the *index name*, the table is bare.
-        assert_eq!(
-            create_index_sql(
-                &child,
-                "ix",
-                false,
-                &["parent_id".into()],
-                DbKind::Sqlite,
-                q
-            ),
-            "CREATE INDEX IF NOT EXISTS \"public\".\"ix\" ON \"child\" (\"parent_id\")"
-        );
     }
 
     #[test]

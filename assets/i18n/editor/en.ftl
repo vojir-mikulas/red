@@ -78,4 +78,6 @@ editor-menu_run_statement = Run statement
 
 editor-menu_format_sql = Format SQL
 
+editor-menu_transfer = Transfer results into…
+
 editor-menu_explain = Explain

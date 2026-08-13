@@ -233,17 +233,54 @@ pub(super) async fn stream_into(
     target_columns: &[Column],
     cancel: &Arc<AtomicBool>,
     base: u64,
-    mut on_progress: impl FnMut(u64),
+    on_progress: impl FnMut(u64),
 ) -> (u64, Option<RedError>) {
-    let opts = QueryOptions {
-        window: COPY_CHUNK_ROWS,
-        timeout: None,
-        full_fidelity: true,
-    };
-    let cursor = match src.open_cursor(source_sql, opts).await {
+    let cursor = match src.open_cursor(source_sql, copy_read_opts()).await {
         Ok(c) => c,
         Err(e) => return (0, Some(e)),
     };
+    stream_cursor_into(
+        cursor,
+        dst,
+        target,
+        mapping,
+        target_columns,
+        cancel,
+        base,
+        on_progress,
+    )
+    .await
+}
+
+/// The read options every transfer-shaped read uses: one bounded window and
+/// **full fidelity**, so a long `TEXT`/blob round-trips byte-exact instead of
+/// arriving as the grid's display-capped `Value::Capped`.
+pub(super) fn copy_read_opts() -> QueryOptions {
+    QueryOptions {
+        window: COPY_CHUNK_ROWS,
+        timeout: None,
+        full_fidelity: true,
+    }
+}
+
+/// [`stream_into`] over a cursor the caller already opened.
+///
+/// The transfer job opens its own cursor for a result / free-SQL source, because
+/// that is the only way to learn the source's column shape before creating the
+/// target from it; it then drains that same cursor rather than re-running the
+/// query. Takes the cursor by value: `dyn QueryCursor` is `Send` but not `Sync`,
+/// so a shared reference to one would not cross the spawn boundary.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn stream_cursor_into(
+    cursor: Box<dyn red_driver::QueryCursor>,
+    dst: &Arc<dyn DatabaseDriver>,
+    target: &TableRef,
+    mapping: &[ColumnMap],
+    target_columns: &[Column],
+    cancel: &Arc<AtomicBool>,
+    base: u64,
+    mut on_progress: impl FnMut(u64),
+) -> (u64, Option<RedError>) {
     let mut committed = 0u64;
     loop {
         if cancel.load(Ordering::Relaxed) {
