@@ -717,6 +717,18 @@ impl Render for AppState {
                 {
                     return;
                 }
+                // While the search box has focus, letters/backspace must edit the
+                // query; only the navigation keys act as card shortcuts there.
+                let search_focused = this.connect_search.focus_handle(cx).is_focused(window);
+                // Any *other* text-entry surface owns the keyboard outright until
+                // it loses focus: this listener sits at the root, so it also sees
+                // keys typed into the engine/env filter combos several levels
+                // down, where "redis" used to fire `e` mid-word and open the edit
+                // form. The search box is the one exception — it belongs to this
+                // screen, so ↑/↓/↵ keep driving the cards while you type in it.
+                if !search_focused && crate::focus::text_entry_focused(window) {
+                    return;
+                }
                 // Navigate the *visible* (filtered + sorted) list; `connect_sel` is a
                 // position within it, mapped back to the stored index for actions.
                 let visible = this.visible_connections(cx);
@@ -724,9 +736,6 @@ impl Render for AppState {
                 if n == 0 {
                     return;
                 }
-                // While the search box has focus, letters/backspace must edit the
-                // query; only the navigation keys act as card shortcuts there.
-                let search_focused = this.connect_search.focus_handle(cx).is_focused(window);
                 // A bare keystroke. Shift is allowed (the hints spell these as
                 // capitals), but a ⌘/⌥/⌃ combination belongs to a real binding —
                 // ⌘/ opens the shortcut reference — and must not be swallowed

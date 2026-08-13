@@ -6,6 +6,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+- Typing in a dropdown's search field no longer triggers shortcuts underneath
+  it: filtering the welcome screen by "redis" types the word instead of opening
+  the edit form on the letter `e`.
+- Esc with a settings dropdown open closes the dropdown and leaves the settings
+  panel where it was.
+
 ## [0.22.0] - 2026-08-12
 
 ### Added
