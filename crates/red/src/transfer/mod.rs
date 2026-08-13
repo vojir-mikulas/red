@@ -143,6 +143,11 @@ pub(crate) struct TransferWizard {
     pub run: Option<TransferRun>,
     /// A message the last action produced (a refused namespace, a saved plan).
     pub note: Option<String>,
+    /// Keeps the Content step's editors wired to [`AppState::sync_transfer_editors`].
+    /// The plan is the state of record, so every keystroke lands in it rather than
+    /// waiting for a button nobody should have to find. Dropping the wizard drops
+    /// these, which is what unsubscribes them.
+    _editor_subs: Vec<gpui::Subscription>,
 }
 
 impl TransferWizard {
@@ -388,6 +393,7 @@ impl AppState {
             dry_run: None,
             run: None,
             note: None,
+            _editor_subs: Vec::new(),
         };
         // A `Duplicate…` fixes its own namespace and skips the Destination step,
         // but only if that namespace really is a legal target: dropping the step
@@ -406,6 +412,18 @@ impl AppState {
             _ => TransferOptions::default(),
         };
         wizard.plan.options = options;
+        // `set_content` deliberately does not emit `Change`, so re-seeding the
+        // editors on a focus change cannot echo back through these.
+        wizard._editor_subs = [&wizard.rename, &wizard.where_expr, &wizard.limit]
+            .into_iter()
+            .map(|editor| {
+                cx.subscribe(editor, |this, _, event: &TextInputEvent, cx| {
+                    if matches!(event, TextInputEvent::Change) {
+                        this.sync_transfer_editors(cx);
+                    }
+                })
+            })
+            .collect();
         wizard.revalidate();
         self.transfer = Some(wizard);
         self.seed_transfer_editors(cx);
@@ -1090,9 +1108,23 @@ impl AppState {
             });
             w.note = None;
         }
-        // The script also opens in a query tab, the way the schema diff's does:
-        // a dry run worth keeping is one worth editing, saving, or handing to
-        // someone else. Text, not execution - nothing here runs it.
+        let _ = script;
+        cx.notify();
+    }
+
+    /// Put the dry run's script in a query tab, on request. Deliberately *not*
+    /// automatic: a dry run is something you read in place, and silently
+    /// swapping the modal for a new tab reads as "it ran".
+    pub(crate) fn open_transfer_script(&mut self, cx: &mut Context<Self>) {
+        let Some(script) = self
+            .transfer
+            .as_ref()
+            .and_then(|w| w.dry_run.as_ref())
+            .map(|dry| dry.script.clone())
+        else {
+            return;
+        };
+        // Text, not execution: nothing here runs it.
         self.new_query(cx);
         if let Phase::Connected(active) = &self.phase
             && let Some(tab) = active.active()
@@ -1100,6 +1132,12 @@ impl AppState {
             let editor = tab.editor.clone();
             editor.update(cx, |editor, cx| editor.set_content(script, cx));
         }
+        self.close_transfer(cx);
+        self.notify(
+            ToastVariant::Info,
+            "Transfer script opened in a query tab. Nothing has run.",
+            cx,
+        );
         cx.notify();
     }
 

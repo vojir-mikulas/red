@@ -18,6 +18,15 @@ use super::{
 };
 use crate::app::AppState;
 
+/// How one step of the rail reads: only the current one carries weight.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StepState {
+    Done,
+    Current,
+    Pending,
+    Issue,
+}
+
 impl AppState {
     /// Render the wizard: one modal, one body per step, one rail across the top
     /// and a live plan summary in the footer, so the consequence of the last
@@ -72,7 +81,7 @@ impl AppState {
                     .child(
                         div()
                             .id("transfer-body")
-                            .min_h(px(300.))
+                            .min_h(px(200.))
                             .max_h(px(440.))
                             .overflow_y_scroll()
                             .child(body),
@@ -80,8 +89,13 @@ impl AppState {
             )
     }
 
-    /// The step rail: where you are, what is left, and which step owns a problem.
-    /// Clickable, because the rail is navigation and not a gate.
+    /// The step rail: where you are, what is behind you, and which step owns a
+    /// problem. Clickable, because the rail is navigation and not a gate.
+    ///
+    /// Only the *current* step carries weight. A row of four equally-solid chips
+    /// reads as a toolbar of buttons; a rail should read as a path, so the steps
+    /// behind you are quiet ticks, the ones ahead are outlines, and the connector
+    /// between them is filled in as far as you have got.
     fn render_step_rail(
         &self,
         w: &TransferWizard,
@@ -89,51 +103,106 @@ impl AppState {
     ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let current = w.current;
-        let mut rail = div().flex().items_center().gap_1().flex_wrap();
+        let mut rail = div().flex().items_center().flex_wrap().gap_y_1();
         for (i, step) in w.steps.iter().copied().enumerate() {
             let issues = w.issues_for(step);
-            let is_current = i == current;
-            // A step is reachable once it is the current one or before it; the
+            let state = if issues > 0 && i != current {
+                StepState::Issue
+            } else if i == current {
+                StepState::Current
+            } else if i < current {
+                StepState::Done
+            } else {
+                StepState::Pending
+            };
+            // A step is reachable once it is the current one or behind it; the
             // Progress step only once there is a run to look at.
             let reachable =
                 (i <= current || w.runnable()) && (step != Step::Progress || w.run.is_some());
-            let (fg, bg) = match (is_current, issues > 0) {
-                (true, _) => (theme.on_accent, theme.accent),
-                (false, true) => (theme.on_accent, theme.red),
-                (false, false) => (theme.text_muted, theme.bg_input),
-            };
+
             if i > 0 {
-                rail = rail.child(div().w(px(18.)).h(px(1.)).bg(theme.border).flex_shrink_0());
+                // Filled behind you, hairline ahead: the connector is the part
+                // that makes a row of chips read as a sequence.
+                let done = i <= current;
+                rail = rail.child(
+                    div()
+                        .w(px(20.))
+                        .h(px(1.))
+                        .mx_1()
+                        .flex_shrink_0()
+                        .bg(if done { theme.accent } else { theme.border }),
+                );
             }
+
+            let (badge_bg, badge_fg, badge_border) = match state {
+                StepState::Current => (theme.accent, theme.on_accent, theme.accent),
+                StepState::Done => (theme.accent_ghost, theme.accent, theme.accent_ghost),
+                StepState::Issue => (theme.red, theme.on_accent, theme.red),
+                StepState::Pending => (theme.bg_input, theme.text_faint, theme.border),
+            };
+            let badge = div()
+                .w(px(20.))
+                .h(px(20.))
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .border_1()
+                .border_color(badge_border)
+                .bg(badge_bg)
+                .text_size(theme.scale(10.5))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(badge_fg)
+                .child(match state {
+                    StepState::Done => "✓".to_string(),
+                    StepState::Issue => "!".to_string(),
+                    _ => (i + 1).to_string(),
+                });
+
+            let label_color = match state {
+                StepState::Current => theme.text,
+                StepState::Issue => theme.red,
+                StepState::Done => theme.text_muted,
+                StepState::Pending => theme.text_faint,
+            };
             let mut chip = div()
                 .id(ElementId::from(("transfer-step", i)))
                 .flex()
                 .items_center()
                 .gap_1p5()
-                .px_2p5()
+                .px_1p5()
                 .py_1()
                 .rounded(theme.radius_sm)
-                .bg(bg)
-                .text_size(theme.scale(11.5))
-                .text_color(fg)
-                .child(format!("{}", i + 1))
-                .child(step.label());
-            if issues > 0 && !is_current {
-                chip = chip.child(
+                .child(badge)
+                .child(
                     div()
-                        .text_size(theme.scale(10.5))
-                        .child(format!("· {issues}")),
+                        .text_size(theme.scale(12.))
+                        .font_weight(if state == StepState::Current {
+                            gpui::FontWeight::MEDIUM
+                        } else {
+                            gpui::FontWeight::NORMAL
+                        })
+                        .text_color(label_color)
+                        .child(step.label()),
                 );
-            }
             if reachable {
                 chip = chip
                     .cursor_pointer()
                     .tab_index(0)
+                    .hover(|s| s.bg(theme.bg_hover))
+                    .focus(|s| s.bg(theme.bg_hover))
                     .on_click(cx.listener(move |this, _, _, cx| this.goto_transfer_step(i, cx)));
             }
             rail = rail.child(chip);
         }
-        rail
+        div()
+            .flex()
+            .items_center()
+            .pb_2()
+            .border_b_1()
+            .border_color(theme.border)
+            .child(rail)
     }
 
     /// The footer: the live plan summary on the left, the actions on the right.
@@ -226,32 +295,71 @@ impl AppState {
         let mut list = div().flex().flex_col();
         for (i, dest) in w.destinations.iter().enumerate() {
             let is_selected = selected == Some(i);
+            let here = dest.session == w.source
+                && w.plan
+                    .source_namespace
+                    .as_deref()
+                    .is_some_and(|ns| ns.eq_ignore_ascii_case(&dest.namespace));
+            // What each row is worth knowing: the engine, how full it is, and
+            // whether it is the source itself.
+            let mut facts: Vec<String> = vec![
+                dest.kind.to_string(),
+                match dest.objects.len() {
+                    0 => "empty".to_string(),
+                    1 => "1 object".to_string(),
+                    n => format!("{n} objects"),
+                },
+            ];
+            if here {
+                facts.push("the source".to_string());
+            }
             let lossy = (!dest.same_connection).then(|| {
                 format!(
-                    "cross-engine into {} — column types are mapped, defaults are dropped",
+                    "another connection: types are mapped into {} and column defaults are dropped",
                     dest.kind
                 )
             });
-            let mut info = div().flex_1().min_w_0().flex().flex_col().gap_0p5().child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().text_color(theme.text).child(dest.namespace.clone()))
-                    .child(
-                        div()
-                            .text_size(theme.scale(11.))
-                            .text_color(theme.text_faint)
-                            .child(dest.conn_name.clone()),
-                    ),
-            );
+            let mut info = div()
+                .flex_1()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .gap_0p5()
+                .child(
+                    div()
+                        .flex()
+                        .items_baseline()
+                        .gap_2()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .min_w_0()
+                                .truncate()
+                                .text_color(theme.text)
+                                .child(dest.namespace.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_shrink_0()
+                                .text_size(theme.scale(11.))
+                                .text_color(theme.text_faint)
+                                .child(dest.conn_name.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(theme.scale(11.))
+                        .text_color(theme.text_muted)
+                        .truncate()
+                        .child(facts.join(" · ")),
+                );
             if let Some(lossy) = lossy {
                 info = info.child(
                     div()
                         .text_size(theme.scale(11.))
                         .text_color(theme.orange)
                         .truncate()
-                        .child(lossy),
+                        .child(format!("⚠ {lossy}")),
                 );
             }
             list = list.child(
@@ -276,7 +384,7 @@ impl AppState {
                             .flex()
                             .items_center()
                             .gap_2()
-                            .child(div().flex_1().child(input.clone()))
+                            .child(grow_field(input.clone()))
                             .child(
                                 Button::new("transfer-create-ns", "Create")
                                     .variant(ButtonVariant::Secondary)
@@ -396,7 +504,7 @@ impl AppState {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().child(w.filter.clone()))
+                    .child(grow_field(w.filter.clone()))
                     .child(
                         bulk("transfer-all", "All").on_click(cx.listener(|this, _, _, cx| {
                             this.transfer_bulk(TransferBulk::SelectAll, cx)
@@ -494,7 +602,7 @@ impl AppState {
                         ),
                 );
             }
-            list_frame(&theme).child(rail)
+            list_frame(&theme).flex_shrink_0().child(rail)
         });
 
         let action_ix = match item.action {
@@ -564,7 +672,7 @@ impl AppState {
                             .text_color(theme.text_muted)
                             .child("where"),
                     )
-                    .child(div().flex_1().child(w.where_expr.clone())),
+                    .child(grow_field(w.where_expr.clone())),
             ),
             ItemContent::Limit(_) => Some(
                 div()
@@ -578,7 +686,7 @@ impl AppState {
                             .text_color(theme.text_muted)
                             .child("rows"),
                     )
-                    .child(div().w(px(120.)).child(w.limit.clone())),
+                    .child(div().w(px(140.)).flex().flex_col().child(w.limit.clone())),
             ),
             _ => None,
         };
@@ -621,23 +729,7 @@ impl AppState {
             .flex()
             .flex_col()
             .gap_3()
-            .child(
-                labeled("Target name", &theme).child(
-                    div()
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .child(div().flex_1().child(w.rename.clone()))
-                        .child(
-                            Button::new("transfer-rename-apply", "Set")
-                                .variant(ButtonVariant::Secondary)
-                                .size(ButtonSize::Sm)
-                                .on_click(
-                                    cx.listener(|this, _, _, cx| this.sync_transfer_editors(cx)),
-                                ),
-                        ),
-                ),
-            )
+            .child(labeled("Target name", &theme).child(w.rename.clone()))
             .child(labeled("Action", &theme).child(action_picker))
             .child(
                 labeled("Rows", &theme)
@@ -658,6 +750,7 @@ impl AppState {
 
         div()
             .flex()
+            .items_start()
             .gap_3()
             .children(rail)
             .child(pane)
@@ -770,24 +863,46 @@ impl AppState {
                                 ),
                         );
                     }
-                    // The same builder the driver runs, so the preview cannot
-                    // drift from the statement. Identifiers are quoted
-                    // generically here; the live statement uses the engine's.
+                    // The `CREATE` is shown only when the action actually
+                    // creates. Rendering one under `Existing` claims a statement
+                    // that will never run, against a table that is already there.
                     let kind = w
                         .target()
                         .map(|d| d.kind)
                         .unwrap_or(red_core::DbKind::Sqlite);
-                    let ddl = red_core::ddl::create_table_sql(
-                        &red_core::TableRef {
-                            schema: w.plan.target_namespace.clone(),
-                            name: item.target_name.clone(),
-                        },
-                        &detail.columns,
-                        kind,
-                        red_core::ddl::quote_generic,
-                    );
-                    panel = panel.child(columns).child(
+                    let ddl = matches!(item.action, ItemAction::Create | ItemAction::Recreate)
+                        .then(|| {
+                            // The same builder the driver runs, so the preview cannot
+                            // drift from the statement. Identifiers are quoted
+                            // generically here; the live one uses the engine's.
+                            let create = red_core::ddl::create_table_sql(
+                                &red_core::TableRef {
+                                    schema: w.plan.target_namespace.clone(),
+                                    name: item.target_name.clone(),
+                                },
+                                &detail.columns,
+                                kind,
+                                red_core::ddl::quote_generic,
+                            );
+                            match item.action {
+                                ItemAction::Recreate => format!(
+                                    "DROP TABLE IF EXISTS {};\n{create};",
+                                    red_core::ddl::qualify_table(
+                                        &red_core::TableRef {
+                                            schema: w.plan.target_namespace.clone(),
+                                            name: item.target_name.clone(),
+                                        },
+                                        red_core::ddl::quote_generic,
+                                    )
+                                ),
+                                _ => format!("{create};"),
+                            }
+                        });
+                    panel = panel.child(columns).children(ddl.map(|ddl| {
                         div()
+                            .id("transfer-item-ddl")
+                            .max_h(px(120.))
+                            .overflow_y_scroll()
                             .p_2()
                             .rounded(theme.radius_sm)
                             .bg(theme.bg_input)
@@ -796,8 +911,8 @@ impl AppState {
                             .font_family(theme.mono_family.clone())
                             .text_size(theme.scale(11.5))
                             .text_color(theme.text_muted)
-                            .child(ddl),
-                    );
+                            .child(ddl)
+                    }));
                 }
                 None => {
                     panel = panel.child(
@@ -900,25 +1015,59 @@ impl AppState {
             div()
                 .flex()
                 .flex_col()
-                .gap_1()
+                .gap_1p5()
                 .child(
                     div()
                         .flex()
                         .items_center()
                         .justify_between()
-                        .child(field_caption("Dry run", &theme))
-                        // The script is already open in a query tab; this is for
-                        // handing it to someone else instead of running it.
+                        .gap_2()
+                        .child(field_caption("Dry run · nothing was written", &theme))
                         .child(
-                            Button::new("transfer-copy-script", "Copy script")
-                                .variant(ButtonVariant::Ghost)
-                                .size(ButtonSize::Sm)
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.copy_to_clipboard(script.clone(), "Script copied", cx)
-                                })),
+                            div()
+                                .flex()
+                                .gap_1()
+                                .child(
+                                    Button::new("transfer-copy-script", "Copy script")
+                                        .variant(ButtonVariant::Ghost)
+                                        .size(ButtonSize::Sm)
+                                        .on_click(cx.listener(move |this, _, _, cx| {
+                                            this.copy_to_clipboard(
+                                                script.clone(),
+                                                "Script copied",
+                                                cx,
+                                            )
+                                        })),
+                                )
+                                .child(
+                                    Button::new("transfer-open-script", "Open in editor")
+                                        .variant(ButtonVariant::Ghost)
+                                        .size(ButtonSize::Sm)
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.open_transfer_script(cx)
+                                        })),
+                                ),
                         ),
                 )
                 .child(rows)
+                // The script reads here, in the step that asked for it. Opening
+                // a query tab behind the modal was the old behaviour and it read
+                // as "it ran".
+                .child(
+                    div()
+                        .id("transfer-script")
+                        .max_h(px(160.))
+                        .overflow_y_scroll()
+                        .p_2()
+                        .rounded(theme.radius_sm)
+                        .bg(theme.bg_input)
+                        .border_1()
+                        .border_color(theme.border_soft)
+                        .font_family(theme.mono_family.clone())
+                        .text_size(theme.scale(11.5))
+                        .text_color(theme.text_muted)
+                        .child(dry.script.clone()),
+                )
         });
 
         let toggle = |id: &'static str, label: &'static str, on: bool, option: TransferOption| {
@@ -1011,7 +1160,7 @@ impl AppState {
                         .flex()
                         .items_center()
                         .gap_2()
-                        .child(div().flex_1().child(w.plan_name.clone()))
+                        .child(grow_field(w.plan_name.clone()))
                         .child(
                             Button::new("transfer-save-plan", "Save plan")
                                 .variant(ButtonVariant::Secondary)
@@ -1234,16 +1383,22 @@ fn pick_row(
         .when(selected, |d| d.bg(theme.accent_ghost))
 }
 
-/// The selection dot on a destination row.
+/// The selection control on a destination row: a ring with a filled centre, so
+/// it reads as "one of these" rather than as a status dot.
 fn radio_dot(selected: bool, theme: &Theme) -> Div {
     div()
-        .w(px(10.))
-        .h(px(10.))
+        .w(px(14.))
+        .h(px(14.))
         .flex_shrink_0()
+        .flex()
+        .items_center()
+        .justify_center()
         .rounded_full()
         .border_1()
         .border_color(if selected { theme.accent } else { theme.border })
-        .when(selected, |d| d.bg(theme.accent))
+        .when(selected, |d| {
+            d.child(div().w(px(6.)).h(px(6.)).rounded_full().bg(theme.accent))
+        })
 }
 
 /// The framed container the dense rows sit in.
@@ -1263,6 +1418,14 @@ fn field_caption(label: &str, theme: &Theme) -> Div {
         .font_weight(gpui::FontWeight::SEMIBOLD)
         .text_color(theme.text_faint)
         .child(label.to_uppercase())
+}
+
+/// A field that fills the remaining width of its row.
+///
+/// A `TextInput` sizes to its content, so a bare `flex_1` wrapper leaves it a
+/// stub: it needs a *column* to stretch across. This is that column.
+fn grow_field(input: gpui::Entity<TextInput>) -> Div {
+    div().flex_1().min_w_0().flex().flex_col().child(input)
 }
 
 /// A caption plus its control, stacked.
