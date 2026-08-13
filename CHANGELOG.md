@@ -6,7 +6,40 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- The row-number gutter now holds the left edge instead of scrolling away with
+  the columns, so a row stays identifiable however far right you scroll.
+- Freeze result columns: "Pin <column> left" in the header menu holds a column
+  (or several) against the left edge while the rest scroll under it, with
+  "Unpin" and "Unpin all columns" to release them. Frozen columns keep their own
+  order, survive hiding and reordering, and can't take more than half the grid.
+- Pin result rows (⌥⌘P, or "Pin row" in the cell menu) to hold them under the
+  header while you scroll the rest of the result away. A pinned row appears
+  above the grid only once it scrolls out of view, so it is never on screen
+  twice; while it is in view its ordinal carries a pin in the row-number gutter,
+  which releases it on click. Up to six rows can be pinned; they keep their place
+  when you sort, filter or re-run the query, show staged edits and deletions
+  exactly as the grid does, and stay copyable when the row itself is far off
+  screen.
+
 ### Fixed
+- The result filter bar belongs to its tab. A term you were typing — a `WHERE`
+  expression, a contains term, the column chips you were building — stays with
+  the result it was written for instead of following you to the next tab, where
+  Apply would have run it against a different grid.
+- The SQL editor follows the caret sideways on a line wider than the pane, so
+  typing past the right edge, jumping to the end of the line, or clicking a
+  match no longer leaves the caret off-screen. A sideways trackpad swipe (or
+  Shift+wheel) pans the text, and the line numbers stay put while it does.
+- A sideways swipe over the SQL editor no longer scrolls it up and down
+  instead.
+- Selecting text with the mouse inside a result cell you are editing keeps the
+  selection: releasing the button no longer commits the edit and throws the
+  caret to the end of the value.
+- Clicking near the top or bottom edge of any text field now puts the caret
+  under the pointer instead of jumping it to the start or end of the value.
+- The cell you are editing is drawn on the input background, so the text you
+  have selected inside it stands out against the cell's own highlight.
 - Typing in a dropdown's search field no longer triggers shortcuts underneath
   it: filtering the welcome screen by "redis" types the word instead of opening
   the edit form on the letter `e`.

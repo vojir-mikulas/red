@@ -133,6 +133,9 @@ keymap-RevertChanges =
 keymap-DeleteRow =
     .label = Mark row for deletion
 
+keymap-PinRow =
+    .label = Pin row
+
 keymap-AddRow =
     .label = Add row
 

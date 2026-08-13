@@ -168,11 +168,51 @@ impl FilterBarState {
 }
 
 impl AppState {
+    /// The focused tab's filter bar, when it has one open.
+    ///
+    /// The bar lives on the tab (`QueryTab::filter_bar`), not on the window, so
+    /// every accessor here resolves against whichever tab the user is looking at:
+    /// switching tabs shows that tab's own bar (or none), never the last one
+    /// touched. Everything below goes through these four so the storage stays a
+    /// detail of this module.
+    pub(crate) fn filter_bar(&self) -> Option<&FilterBarState> {
+        match &self.phase {
+            Phase::Connected(active) => active.active()?.filter_bar.as_ref(),
+            _ => None,
+        }
+    }
+
+    fn filter_bar_mut(&mut self) -> Option<&mut FilterBarState> {
+        match &mut self.phase {
+            Phase::Connected(active) => active.active_mut()?.filter_bar.as_mut(),
+            _ => None,
+        }
+    }
+
+    /// Install (or drop) the focused tab's bar. A no-op with no tab focused —
+    /// there is then no result to filter either.
+    fn set_filter_bar(&mut self, bar: Option<FilterBarState>) {
+        if let Phase::Connected(active) = &mut self.phase
+            && let Some(tab) = active.active_mut()
+        {
+            tab.filter_bar = bar;
+        }
+    }
+
+    /// Close the focused tab's bar, handing back what was open (`None` when it
+    /// wasn't) so callers can tell a close from a no-op.
+    fn take_filter_bar(&mut self) -> Option<FilterBarState> {
+        match &mut self.phase {
+            Phase::Connected(active) => active.active_mut()?.filter_bar.take(),
+            _ => None,
+        }
+    }
+
     /// ⌘⇧F / the toolbar chip: open the filter bar, or, when it's already open,
     /// focus it (a second ⌘⇧F *in* the bar closes it). Opening seeds the input +
     /// mode from the active result's current filter so it's editable.
     pub(crate) fn toggle_filter_bar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(bar) = &self.filter_bar {
+        if let Some(bar) = self.filter_bar() {
             // Open but focus is elsewhere (the grid, the editor): bring focus here
             // rather than closing a bar the user may not even be looking at.
             if bar.input.focus_handle(cx).is_focused(window) {
@@ -198,6 +238,12 @@ impl AppState {
         terms: Vec<ColumnPredicate>,
         cx: &mut Context<Self>,
     ) {
+        // The bar hangs off the focused tab, so with no tab focused there is
+        // nowhere to put it (and no result to filter): don't build one only to
+        // drop it unrendered.
+        if !matches!(&self.phase, Phase::Connected(a) if a.active().is_some()) {
+            return;
+        }
         // `bare()`: the box has no chrome of its own, the combined field around it
         // owns the border/background (see `render_filter_bar`).
         // `emit_nav`: a one-line field has no vertical motion of its own, so ↑/↓
@@ -291,7 +337,7 @@ impl AppState {
             | TextInputEvent::Down => {}
         });
         self.filter_mode = mode;
-        self.filter_bar = Some(FilterBarState {
+        self.set_filter_bar(Some(FilterBarState {
             input,
             expr,
             value,
@@ -307,7 +353,7 @@ impl AppState {
             _sub: sub,
             _expr_sub: expr_sub,
             _value_sub: value_sub,
-        });
+        }));
         self.refresh_filter_completions(cx);
         // The Window isn't in hand here; focus the box on the next render.
         self.focus_filter = true;
@@ -319,7 +365,7 @@ impl AppState {
     /// equivalent expression, since it has no text form of its own.
     pub(crate) fn seed_filter_bar(&mut self, cx: &mut Context<Self>) {
         let applied = self.active_result_filter(cx);
-        let Some(bar) = &self.filter_bar else { return };
+        let Some(bar) = self.filter_bar() else { return };
         let (input, expr, value) = (bar.input.clone(), bar.expr.clone(), bar.value.clone());
         let (mode, text, terms) = bar_seed(applied.as_ref(), bar.mode);
         let (contains, where_expr) = match mode {
@@ -331,7 +377,7 @@ impl AppState {
         expr.update(cx, |e, cx| e.set_content(where_expr, cx));
         // The builder row is scratch space, not part of what's applied.
         value.update(cx, |v, cx| v.set_content("", cx));
-        if let Some(bar) = &mut self.filter_bar {
+        if let Some(bar) = self.filter_bar_mut() {
             bar.terms = terms;
         }
         self.set_filter_mode(mode, cx);
@@ -339,7 +385,7 @@ impl AppState {
 
     /// Close the bar, leaving any applied filter in place. Returns focus to root.
     pub(crate) fn close_filter_bar(&mut self, cx: &mut Context<Self>) {
-        if self.filter_bar.take().is_some() {
+        if self.take_filter_bar().is_some() {
             self.refocus_root = true;
             cx.notify();
         }
@@ -350,7 +396,7 @@ impl AppState {
     /// second Esc closes the bar. Never clears an applied filter.
     fn filter_escape(&mut self, cx: &mut Context<Self>) {
         // An open recall dropdown is the innermost thing Esc dismisses.
-        if let Some(bar) = &mut self.filter_bar
+        if let Some(bar) = self.filter_bar_mut()
             && bar.history_open
         {
             bar.history_open = false;
@@ -358,7 +404,7 @@ impl AppState {
             return;
         }
         let applied = self.active_result_filter(cx);
-        let Some(bar) = &self.filter_bar else { return };
+        let Some(bar) = self.filter_bar() else { return };
         let (mode, text, terms) = bar_seed(applied.as_ref(), bar.mode);
         // Unedited (the box, and in `Column` mode the chips, already match what's
         // applied): this Esc is the one that closes the bar.
@@ -375,7 +421,7 @@ impl AppState {
 
     /// Toggle the leading mode dropdown.
     pub(crate) fn toggle_filter_mode_menu(&mut self, cx: &mut Context<Self>) {
-        if let Some(bar) = &mut self.filter_bar {
+        if let Some(bar) = self.filter_bar_mut() {
             bar.mode_open = !bar.mode_open;
             cx.notify();
         }
@@ -387,7 +433,7 @@ impl AppState {
     /// the text means something different now, so the user presses Enter/Apply.
     pub(crate) fn set_filter_mode(&mut self, mode: FilterMode, cx: &mut Context<Self>) {
         self.filter_mode = mode;
-        let Some(bar) = &self.filter_bar else { return };
+        let Some(bar) = self.filter_bar() else { return };
         // Carry the text across the two text modes, so switching reinterprets what's
         // typed rather than throwing it away. `Column` builds structure, so there is
         // nothing to carry either way and its chips are left alone.
@@ -400,7 +446,7 @@ impl AppState {
                 FilterMode::Column => {}
             }
         }
-        if let Some(bar) = &mut self.filter_bar {
+        if let Some(bar) = self.filter_bar_mut() {
             bar.mode = mode;
             bar.mode_open = false;
             // Recall walks one mode's entries (see `recall_filter`), so a mode
@@ -419,18 +465,18 @@ impl AppState {
     /// completed, so a user who typed a value and hit Enter doesn't have to press
     /// "+" first to be taken seriously.
     pub(crate) fn submit_filter(&mut self, cx: &mut Context<Self>) {
-        let Some(mode) = self.filter_bar.as_ref().map(|bar| bar.mode) else {
+        let Some(mode) = self.filter_bar().map(|bar| bar.mode) else {
             return;
         };
         if mode == FilterMode::Column {
-            let Some(mut terms) = self.filter_bar.as_ref().map(|b| b.terms.clone()) else {
+            let Some(mut terms) = self.filter_bar().map(|b| b.terms.clone()) else {
                 return;
             };
             if let Some(pending) = self.pending_filter_term(cx) {
                 terms.push(pending);
             }
             let filter = (!terms.is_empty()).then(|| ResultFilter::Cmp(terms.clone()));
-            if let Some(bar) = &mut self.filter_bar {
+            if let Some(bar) = self.filter_bar_mut() {
                 // The pending term is now part of the conjunction, so it becomes a
                 // chip and the builder row resets for the next one.
                 bar.terms = terms;
@@ -441,8 +487,7 @@ impl AppState {
             return;
         }
         let text = self
-            .filter_bar
-            .as_ref()
+            .filter_bar()
             .map(|bar| bar.text(cx).trim().to_string())
             .unwrap_or_default();
         let filter = if text.is_empty() {
@@ -469,7 +514,7 @@ impl AppState {
     /// re-run. The tail every submit path shares.
     fn apply_filter_and_refocus(&mut self, filter: Option<ResultFilter>, cx: &mut Context<Self>) {
         self.apply_result_filter(filter, cx);
-        if let Some(bar) = &mut self.filter_bar {
+        if let Some(bar) = self.filter_bar_mut() {
             bar.history_open = false;
             bar.recall = None;
         }
@@ -513,7 +558,7 @@ impl AppState {
     /// incomplete (no column, or a value-taking operator with a blank / uncoercible
     /// value). Never partially applied: an incomplete row is simply not a term.
     fn pending_filter_term(&self, cx: &gpui::App) -> Option<ColumnPredicate> {
-        let bar = self.filter_bar.as_ref()?;
+        let bar = self.filter_bar()?;
         let columns = self.filter_columns(cx);
         let column = columns.get(bar.col_ix)?;
         if !bar.op.takes_value() {
@@ -539,7 +584,7 @@ impl AppState {
 
     /// Toggle the builder row's column picker.
     pub(crate) fn toggle_filter_column_menu(&mut self, cx: &mut Context<Self>) {
-        if let Some(bar) = &mut self.filter_bar {
+        if let Some(bar) = self.filter_bar_mut() {
             bar.col_open = !bar.col_open;
             cx.notify();
         }
@@ -550,7 +595,7 @@ impl AppState {
     pub(crate) fn set_filter_column(&mut self, ix: usize, cx: &mut Context<Self>) {
         let columns = self.filter_columns(cx);
         let ops = self.filter_ops(columns.get(ix));
-        if let Some(bar) = &mut self.filter_bar {
+        if let Some(bar) = self.filter_bar_mut() {
             bar.col_ix = ix;
             bar.col_open = false;
             if !ops.contains(&bar.op) {
@@ -562,7 +607,7 @@ impl AppState {
 
     /// Toggle the builder row's operator picker.
     pub(crate) fn toggle_filter_op_menu(&mut self, cx: &mut Context<Self>) {
-        if let Some(bar) = &mut self.filter_bar {
+        if let Some(bar) = self.filter_bar_mut() {
             bar.op_open = !bar.op_open;
             cx.notify();
         }
@@ -570,7 +615,7 @@ impl AppState {
 
     /// Pick the builder row's operator.
     pub(crate) fn set_filter_op(&mut self, op: CmpOp, cx: &mut Context<Self>) {
-        if let Some(bar) = &mut self.filter_bar {
+        if let Some(bar) = self.filter_bar_mut() {
             bar.op = op;
             bar.op_open = false;
             cx.notify();
@@ -584,7 +629,7 @@ impl AppState {
         let Some(term) = self.pending_filter_term(cx) else {
             return;
         };
-        if let Some(bar) = &mut self.filter_bar {
+        if let Some(bar) = self.filter_bar_mut() {
             bar.terms.push(term);
             let value = bar.value.clone();
             value.update(cx, |v, cx| v.set_content("", cx));
@@ -597,7 +642,7 @@ impl AppState {
     /// say. Dropping the last term clears the filter rather than applying an empty
     /// conjunction.
     pub(crate) fn remove_filter_term(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(bar) = &mut self.filter_bar else {
+        let Some(bar) = self.filter_bar_mut() else {
             return;
         };
         if ix >= bar.terms.len() {
@@ -647,7 +692,7 @@ impl AppState {
         // Open (or re-seed) the bar in `Column` mode so the new filter is visible
         // and editable as chips, rather than appearing only as a toolbar chip.
         self.apply_result_filter(Some(ResultFilter::Cmp(terms.clone())), cx);
-        match &mut self.filter_bar {
+        match self.filter_bar_mut() {
             Some(bar) => {
                 bar.terms = terms;
                 self.set_filter_mode(FilterMode::Column, cx);
@@ -694,7 +739,7 @@ impl AppState {
 
     /// Toggle the trailing recall dropdown of recent filters.
     pub(crate) fn toggle_filter_history(&mut self, cx: &mut Context<Self>) {
-        if let Some(bar) = &mut self.filter_bar {
+        if let Some(bar) = self.filter_bar_mut() {
             bar.history_open = !bar.history_open;
             cx.notify();
         }
@@ -711,7 +756,7 @@ impl AppState {
         let Some(mode) = entry.mode() else { return };
         self.set_filter_mode(mode, cx);
         self.set_filter_text(&entry.text, cx);
-        if let Some(bar) = &mut self.filter_bar {
+        if let Some(bar) = self.filter_bar_mut() {
             bar.history_open = false;
             bar.recall = None;
         }
@@ -740,7 +785,7 @@ impl AppState {
     /// out from under the arrow keys. The dropdown lists every mode, where a
     /// click can safely switch.
     fn recall_filter(&mut self, prev: bool, cx: &mut Context<Self>) {
-        let Some(mode) = self.filter_bar.as_ref().map(|b| b.mode) else {
+        let Some(mode) = self.filter_bar().map(|b| b.mode) else {
             return;
         };
         let entries: Vec<String> = self
@@ -756,11 +801,11 @@ impl AppState {
         // been edited, so the walk restarts from the newest. Derived from the text
         // rather than from a change event, because `CodeEditor` (the `WHERE` box)
         // has none — and this stays correct for the `Contains` box either way.
-        let edited = self.filter_bar.as_ref().is_some_and(|bar| {
+        let edited = self.filter_bar().is_some_and(|bar| {
             bar.recall
                 .is_some_and(|i| entries.get(i) != Some(&bar.text(cx)))
         });
-        let Some(bar) = &mut self.filter_bar else {
+        let Some(bar) = self.filter_bar_mut() else {
             return;
         };
         if edited {
@@ -781,7 +826,7 @@ impl AppState {
 
     /// Typing ends a recall walk, so the next ↑ starts again from the newest.
     fn reset_filter_recall(&mut self) {
-        if let Some(bar) = &mut self.filter_bar {
+        if let Some(bar) = self.filter_bar_mut() {
             bar.recall = None;
         }
     }
@@ -790,7 +835,7 @@ impl AppState {
     /// Programmatic, so it doesn't echo back as a `Change` and clear the recall
     /// position it was just set from.
     fn set_filter_text(&mut self, text: &str, cx: &mut Context<Self>) {
-        let Some(bar) = &self.filter_bar else { return };
+        let Some(bar) = self.filter_bar() else { return };
         match bar.mode {
             FilterMode::Contains => {
                 let input = bar.input.clone();
@@ -810,7 +855,7 @@ impl AppState {
     /// Clear the applied filter and close the bar (the chip's ✕ / the Clear button).
     pub(crate) fn clear_result_filter(&mut self, cx: &mut Context<Self>) {
         self.apply_result_filter(None, cx);
-        self.filter_bar = None;
+        self.set_filter_bar(None);
         self.refocus_root = true;
         cx.notify();
     }
@@ -922,7 +967,7 @@ impl AppState {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let bar = self.filter_bar.as_ref()?;
+        let bar = self.filter_bar()?;
         // The recall clock's measured window rect, recorded by the canvas overlay
         // below and read back here to place the list under it. `None` on the very
         // first frame (nothing measured yet), where the list simply waits a frame.

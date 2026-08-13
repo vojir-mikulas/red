@@ -150,7 +150,11 @@ impl ResultGrid {
 
     /// The data-column indices of this result's seek key, when it has one whose
     /// columns are all present in the projection.
-    fn watch_key_cols(&self) -> Option<Vec<usize>> {
+    ///
+    /// The one answer to "which columns identify a row here", shared with the
+    /// pinned rows: a watch and a pin that disagreed about identity would flash
+    /// and follow different rows on the same re-run.
+    pub(in crate::result) fn watch_key_cols(&self) -> Option<Vec<usize>> {
         let key = self.key.as_ref()?;
         // The seek key is a lead column plus an optional PK tiebreaker; together
         // they are the row identity the backend already guarantees is unique.

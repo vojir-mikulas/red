@@ -133,6 +133,9 @@ keymap-RevertChanges =
 keymap-DeleteRow =
     .label = [Márk röw för délétíöñ]
 
+keymap-PinRow =
+    .label = [Píñ röw]
+
 keymap-AddRow =
     .label = [Ádd röw]
 

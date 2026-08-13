@@ -125,6 +125,9 @@ actions!(
         RevertChanges,
         /// Toggle deletion of the selected result row(s) (⌘⌫).
         DeleteRow,
+        /// Pin or unpin the selected result row(s), holding them under the header
+        /// while the grid scrolls (⌥⌘P).
+        PinRow,
         /// Append a new draft (insert) row to the result (⌘⌥N).
         AddRow,
         /// Set the focused result cell to NULL (⌘⌥0).
@@ -714,6 +717,10 @@ const DEFAULTS: &[ActionDef] = &[
         "Mark row for deletion",
         Some("Table"),
     ),
+    // ⌥⌘P pins the selected row(s) under the header. `Table`-scoped, so with the
+    // grid focused it wins over the dev-only perf-HUD toggle bound on the same
+    // chord with no context; anywhere else that toggle still fires.
+    def("cmd-alt-p", "PinRow", "Pin row", Some("Table")),
     def("cmd-alt-n", "AddRow", "Add row", Some("Table")),
     def("cmd-alt-0", "SetNull", "Set cell to NULL", Some("Table")),
     // ⌘A selects the whole result. `Table`-scoped so it fires only with the grid
@@ -1095,6 +1102,7 @@ fn bind_named(keystroke: &str, action: &str, context: Option<&str>) -> Result<Ke
         "SubmitChanges" => kb!(SubmitChanges),
         "RevertChanges" => kb!(RevertChanges),
         "DeleteRow" => kb!(DeleteRow),
+        "PinRow" => kb!(PinRow),
         "AddRow" => kb!(AddRow),
         "SetNull" => kb!(SetNull),
         "SelectAll" => kb!(SelectAll),

@@ -199,12 +199,10 @@ pub struct AppState {
     /// filter bar's visibility). When on, selecting a column requests its
     /// pushed-down aggregate summary; the per-column result lives on the grid.
     pub(crate) stats_bar: bool,
-    /// The result filter bar, when open. The transient editing UI; the
-    /// *applied* filter lives on the grid (`ResultGrid::filter`).
-    pub(crate) filter_bar: Option<crate::filter::FilterBarState>,
     /// The mode the filter bar last opened / switched to, so a `WHERE` user isn't
-    /// thrown back to `Contains` on every new result. Session-scoped, like the
-    /// bar's visibility.
+    /// thrown back to `Contains` on every new result. Session-scoped: it seeds the
+    /// *next* bar, while an open bar carries its own mode on the tab that owns it
+    /// (`QueryTab::filter_bar`).
     pub(crate) filter_mode: crate::filter::FilterMode,
     /// Recent result filters per `(connection, browsed table)` (see `filters.rs`),
     /// loaded once at startup: what the filter bar's recall dropdown lists and
@@ -1378,7 +1376,6 @@ impl AppState {
             focus_login_code: false,
             next_conversation_id: 0,
             stats_bar: false,
-            filter_bar: None,
             filter_mode: crate::filter::FilterMode::default(),
             filter_history: crate::filters::FilterHistory::load(),
             find_bar: None,

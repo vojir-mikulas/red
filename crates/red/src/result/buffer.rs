@@ -74,6 +74,7 @@ pub(super) enum CellKind {
 /// heap copy) plus its [`CellKind`] color tag. Built once per cell when its row
 /// lands in the buffer, so a repaint never re-formats a number, re-clones a
 /// string, or re-runs UUID/JSON classification.
+#[derive(Clone)]
 pub(super) struct DisplayCell {
     pub(super) text: SharedString,
     pub(super) kind: CellKind,

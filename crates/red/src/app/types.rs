@@ -1547,6 +1547,13 @@ pub(crate) struct QueryTab {
     pub editor: Entity<CodeEditor>,
     /// The open result browsed in the grid: a table preview or an editor run.
     pub result: Option<ResultGrid>,
+    /// This tab's result filter bar, when open. Per tab rather than per window
+    /// because the bar edits *this* tab's result: a `WHERE` half-typed against one
+    /// grid must not follow the user to another tab, where the boxes would
+    /// describe a result they were never written for and Apply would run them
+    /// against it. The *applied* filter already lives per tab, on the grid
+    /// (`ResultGrid::filter`); this is the editing surface for it.
+    pub filter_bar: Option<crate::filter::FilterBarState>,
     /// The query plan (EXPLAIN), when one is open. Occupies the result
     /// pane in place of the grid; running a query clears it. `None` is the grid.
     pub plan: Option<crate::plan::PlanView>,
@@ -1650,6 +1657,7 @@ impl QueryTab {
             title,
             editor,
             result: None,
+            filter_bar: None,
             plan: None,
             script: None,
             watch: None,

@@ -235,7 +235,7 @@ impl AppState {
                 handle,
             ));
         }
-        if let Some(bar) = &self.filter_bar {
+        if let Some(bar) = self.filter_bar() {
             out.push(FocusTarget::new(
                 FocusTargetId::FilterBar,
                 tr!("focus.filter_bar", "Filter"),

@@ -12,7 +12,7 @@ use crate::app::PreflightCount;
 use crate::keymap::{
     About, AddRow, BeginEdit, CloseInspector, ClosePane, CloseTab, CycleFocusNext, CycleFocusPrev,
     DeleteRow, EqualizePanes, Explain, FindInResult, FocusOtherHalf, FormatSql, MaximizePane,
-    NewConnection, NewTab, NextTab, OpenSavedQueries, PrevTab, RefreshSchema, ReportBug,
+    NewConnection, NewTab, NextTab, OpenSavedQueries, PinRow, PrevTab, RefreshSchema, ReportBug,
     RevertChanges, RunQuery, RunScript, SaveQuery, SearchSchema, SelectAll, SetNull, Settings,
     ShowChangelog, ShowErDiagram, ShowShortcuts, SplitDown, SubmitChanges, SwitchConnection,
     SwitchToConnectionSlot, SwitchToPreviousConnection, ToggleAssistant, ToggleColumnsPanel,
@@ -242,7 +242,7 @@ impl Render for AppState {
         // the current mode shows, so typing lands in it at once.
         if self.focus_filter {
             self.focus_filter = false;
-            if let Some(bar) = &self.filter_bar {
+            if let Some(bar) = self.filter_bar() {
                 window.focus(&bar.focus_handle(cx), cx);
             }
         }
@@ -676,6 +676,7 @@ impl Render for AppState {
             }))
             .on_action(cx.listener(|this, _: &RevertChanges, _, cx| this.revert_changes(cx)))
             .on_action(cx.listener(|this, _: &DeleteRow, _, cx| this.toggle_delete_rows(cx)))
+            .on_action(cx.listener(|this, _: &PinRow, _, cx| this.toggle_pin_rows(cx)))
             .on_action(cx.listener(|this, _: &AddRow, _, cx| this.add_draft_row(cx)))
             .on_action(cx.listener(|this, _: &SetNull, _, cx| this.set_cell_null(cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.result_select_all(cx)))
