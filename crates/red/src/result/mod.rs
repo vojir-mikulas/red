@@ -1453,7 +1453,7 @@ impl ResultGrid {
     /// Keep the keyboard cursor's *column* on screen after a horizontal move:
     /// the wide-mode counterpart to `scroll_cursor_into_view`. A cell's x-extent
     /// is the running sum of the columns before it
-    /// ([`column_left`](Self::column_left)), so this stays exact once columns
+    /// ([`slot_left`](Self::slot_left)), so this stays exact once columns
     /// differ in width; nudge the horizontal handle by the minimum to bring the
     /// cell fully into the viewport, leaving it untouched when already visible.
     /// `table_col` is in table space (gutter included); `gutter` is its width in
@@ -1931,8 +1931,8 @@ impl AppState {
 
     /// Mutate the focused tab's grid, for the display-only changes the header
     /// menu makes (widths, visibility, order). A thin wrapper over
-    /// [`ActiveConn::with_active_result`] so those call sites read as one line
-    /// and none of them has to re-match on `Phase`.
+    /// [`crate::app::ActiveConn::with_active_result`] so those call sites read
+    /// as one line and none of them has to re-match on `Phase`.
     pub(crate) fn with_grid<R>(
         &mut self,
         cx: &mut App,
