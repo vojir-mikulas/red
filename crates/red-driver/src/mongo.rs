@@ -18,7 +18,7 @@ use mongodb::results::CollectionType;
 use mongodb::{Client, Cursor, IndexModel};
 use red_core::doc::{
     CollKind, CollectionInfo, DbInfo, DocCursor, DocPage, DocPlan, DocSchema, DocSeek, DocTopology,
-    DocUpdate, DocValue, Document, Filter, FindQuery, IndexInfo, IndexSpec, PlanStage,
+    DocUpdate, DocValue, Document, Filter, FindQuery, IndexInfo, IndexKey, IndexSpec, PlanStage,
 };
 use red_core::{RedError, Result};
 
@@ -236,6 +236,7 @@ impl DocDriver for MongoDriver {
         db: &str,
         coll: &str,
         filter: Option<&Filter>,
+        projection: Option<&red_core::doc::Projection>,
         seek: DocSeek,
         limit: usize,
         abort: &AbortSignal,
@@ -264,6 +265,9 @@ impl DocDriver for MongoDriver {
 
         let sort = doc! { "_id": if ascending { 1 } else { -1 } };
         let mut find = coll_h.find(query).sort(sort).limit(limit as i64);
+        if let Some(p) = projection {
+            find = find.projection(doc_to_bson_document(p));
+        }
         if let DocSeek::Jump { skip } = seek {
             find = find.skip(skip);
         }
@@ -731,12 +735,33 @@ impl DocDriver for MongoDriver {
         let keys: BsonDocument = spec
             .keys
             .iter()
-            .map(|(field, dir)| (field.clone(), Bson::Int32(*dir)))
+            .map(|(field, kind)| {
+                let value = match kind {
+                    IndexKey::Asc => Bson::Int32(1),
+                    IndexKey::Desc => Bson::Int32(-1),
+                    // A special index names its type where a direction would go.
+                    other => Bson::String(other.spec_value().to_string()),
+                };
+                (field.clone(), value)
+            })
             .collect();
-        let options = IndexOptions::builder()
+        let mut options = IndexOptions::builder()
             .unique(spec.unique)
+            .sparse(spec.sparse)
             .name(spec.name.clone())
             .build();
+        options.expire_after = spec
+            .ttl_seconds
+            .map(|secs| std::time::Duration::from_secs(secs.max(0) as u64));
+        options.partial_filter_expression = match &spec.partial_filter {
+            Some(text) => Some(doc_to_bson_document(&self.parse_ext_json(text)?)),
+            None => None,
+        };
+        options.collation = spec.collation_locale.as_ref().map(|locale| {
+            mongodb::options::Collation::builder()
+                .locale(locale)
+                .build()
+        });
         let model = IndexModel::builder().keys(keys).options(options).build();
         self.client
             .database(db)
@@ -744,6 +769,23 @@ impl DocDriver for MongoDriver {
             .create_index(model)
             .await
             .map(|_| ())
+            .map_err(query_err)
+    }
+
+    async fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<()> {
+        self.ensure_writable()?;
+        // `_id_` cannot be dropped; the server refuses it, but saying so here
+        // names the reason instead of relaying a code.
+        if name == "_id_" {
+            return Err(RedError::Query(
+                "the _id index cannot be dropped".to_string(),
+            ));
+        }
+        self.client
+            .database(db)
+            .collection::<BsonDocument>(coll)
+            .drop_index(name)
+            .await
             .map_err(query_err)
     }
 }

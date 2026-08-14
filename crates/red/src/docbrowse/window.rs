@@ -40,6 +40,23 @@ pub(super) struct FetchCtx<'a> {
     pub db: &'a str,
     pub coll: &'a str,
     pub filter: Option<&'a str>,
+    /// The field subset to fetch, as extended JSON, or `None` for whole documents.
+    /// Narrows what comes back; changes nothing about ordering or paging.
+    pub projection: Option<&'a str>,
+    /// The browse order, as extended JSON, or `None` for the `_id` order the
+    /// keyset paging assumes. Setting it switches the run to ordinal paging: see
+    /// [`FetchCtx::keyed`].
+    pub sort: Option<&'a str>,
+}
+
+impl FetchCtx<'_> {
+    /// Whether windows can be addressed by an `_id` boundary. False once a sort is
+    /// applied: the boundary orders nothing when another key leads, so the run
+    /// extends by *position* instead (an exact `skip`), trading the keyset's
+    /// O(window) depth for the ordering the user asked for.
+    fn keyed(&self) -> bool {
+        self.sort.is_none()
+    }
 }
 
 /// The windowed document run. Holds at most ~`2 * MARGIN_PAGES * page` documents
@@ -193,6 +210,8 @@ impl DocWindow {
             db: ctx.db.to_string(),
             coll: ctx.coll.to_string(),
             filter: ctx.filter.map(str::to_string),
+            projection: ctx.projection.map(str::to_string),
+            sort: ctx.sort.map(str::to_string),
             seek,
             limit: self.page,
             seq: self.seq,
@@ -295,7 +314,23 @@ impl DocWindow {
         let need_back = run_start > lo && !self.at_start;
         // The direction still uncovered inside the viewport goes first; margins
         // prefetch after.
-        let seek = if range.start < run_start && need_back {
+        let backward_first = range.start < run_start && need_back;
+        let seek = if !ctx.keyed() {
+            // Ordinal paging: extend by an exact `skip` at the run's edge. `apply`
+            // recognizes a jump that lands flush against the run and appends or
+            // prepends it, so a sorted browse scrolls as smoothly as a keyed one.
+            if backward_first || (need_back && !need_fwd) {
+                Some(DocSeek::Jump {
+                    skip: run_start.saturating_sub(self.page) as u64,
+                })
+            } else if need_fwd {
+                Some(DocSeek::Jump {
+                    skip: run_end as u64,
+                })
+            } else {
+                None
+            }
+        } else if backward_first {
             self.first_id().map(|before| DocSeek::Backward { before })
         } else if need_fwd {
             self.last_id()
@@ -363,9 +398,32 @@ impl DocWindow {
                 }
             }
             DocSeek::Jump { skip } => {
+                let skip = skip as usize;
+                let run_start = self.anchor;
+                let run_end = self.anchor + self.docs.len();
+                // A jump that lands flush against the resident run is contiguous
+                // with it, so it *extends* rather than replaces. This is what makes
+                // a sorted (ordinal-paged) browse scroll instead of thrashing one
+                // page at a time, and it is a no-op for the keyed path, which only
+                // jumps across a gap.
+                if !self.docs.is_empty() && skip == run_end {
+                    self.docs.extend(docs.into_iter().map(Rc::new));
+                    self.at_end = short;
+                    if short && let Some(total) = self.total {
+                        self.anchor = total.saturating_sub(self.docs.len());
+                    }
+                    return;
+                }
+                if !self.docs.is_empty() && skip + n == run_start {
+                    for doc in docs.into_iter().rev() {
+                        self.docs.push_front(Rc::new(doc));
+                    }
+                    self.anchor = skip;
+                    self.at_start = self.anchor == 0;
+                    return;
+                }
                 self.docs = docs.into_iter().map(Rc::new).collect();
                 self.at_end = short;
-                let skip = skip as usize;
                 self.anchor = match self.total {
                     Some(total) if short => total.saturating_sub(self.docs.len()),
                     Some(total) => skip.min(total.saturating_sub(self.docs.len())),
@@ -508,6 +566,58 @@ mod tests {
         );
         assert_eq!(w.docs.len(), 2 * PAGE);
         assert_eq!(w.anchor, 0);
+    }
+
+    /// A sorted browse pages by ordinal, so its windows arrive as jumps that land
+    /// flush against the run. Those extend it; only a jump across a gap replaces
+    /// it. Without this a sorted scroll would re-fetch one page at a time forever.
+    #[test]
+    fn a_flush_jump_extends_the_run_and_a_distant_one_replaces_it() {
+        let mut w = pending(DocWindow::new(PAGE), 1);
+        w.apply(
+            DocSeek::Forward { after: None },
+            docs(1..=PAGE as i64),
+            1,
+            Some(TOTAL),
+        );
+        assert_eq!(w.anchor, 0);
+
+        // Flush against the end of the run: append.
+        w = pending(w, 2);
+        w.apply(
+            DocSeek::Jump { skip: PAGE as u64 },
+            docs(PAGE as i64 + 1..=2 * PAGE as i64),
+            2,
+            None,
+        );
+        assert_eq!(w.anchor, 0);
+        assert_eq!(w.docs.len(), 2 * PAGE);
+        assert_eq!(w.doc_at(PAGE).unwrap().id, DocValue::Int64(PAGE as i64 + 1));
+
+        // Flush against the front: prepend, and the anchor moves back.
+        w.anchor = 500;
+        w = pending(w, 3);
+        w.apply(
+            DocSeek::Jump {
+                skip: (500 - PAGE) as u64,
+            },
+            docs(9_000..9_000 + PAGE as i64),
+            3,
+            None,
+        );
+        assert_eq!(w.anchor, 500 - PAGE);
+        assert_eq!(w.docs.len(), 3 * PAGE);
+
+        // Across a gap: the run is replaced, not spliced.
+        w = pending(w, 4);
+        w.apply(
+            DocSeek::Jump { skip: 6_700 },
+            docs(1..=PAGE as i64),
+            4,
+            None,
+        );
+        assert_eq!(w.anchor, 6_700);
+        assert_eq!(w.docs.len(), PAGE);
     }
 
     #[test]

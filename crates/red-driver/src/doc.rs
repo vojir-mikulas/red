@@ -54,16 +54,26 @@ pub trait DocDriver: Send + Sync {
 
     /// One `_id`-keyset window for the browse grid's continuous scroll: the docs
     /// ordered by `_id` ascending, seeked relative to a boundary `_id` per
-    /// [`DocSeek`], narrowed by the same `filter` a `find` takes. O(window) at any
-    /// depth on the always present `_id` index (unlike the O(skip) `find`), except
-    /// a [`DocSeek::Jump`] which pays one `skip` to land at an exact ordinal.
-    /// Returns at most `limit` documents, always in ascending `_id` order.
-    /// Cancellable via `abort`; never materializes more than the window.
+    /// [`DocSeek`], narrowed by the same `filter` a `find` takes and trimmed to
+    /// `projection` when one is given. O(window) at any depth on the always present
+    /// `_id` index (unlike the O(skip) `find`), except a [`DocSeek::Jump`] which
+    /// pays one `skip` to land at an exact ordinal. Returns at most `limit`
+    /// documents, always in ascending `_id` order. Cancellable via `abort`; never
+    /// materializes more than the window.
+    ///
+    /// A *sorted* browse does not come through here: the keyset boundary is an
+    /// `_id`, which orders nothing once another key leads. That case pages by
+    /// position through [`find`](Self::find).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a window is addressed by namespace, narrowing, seek and bound; bundling them into a struct would only move the same fields behind a name the call sites do not need"
+    )]
     async fn find_seek(
         &self,
         db: &str,
         coll: &str,
         filter: Option<&Filter>,
+        projection: Option<&red_core::doc::Projection>,
         seek: DocSeek,
         limit: usize,
         abort: &AbortSignal,
@@ -227,6 +237,10 @@ pub trait DocDriver: Send + Sync {
 
     /// Create an index (`createIndex`).
     async fn create_index(&self, db: &str, coll: &str, spec: &IndexSpec) -> Result<()>;
+
+    /// Drop an index by name (`dropIndexes`). Destructive: the queries that relied
+    /// on it become collection scans, so the host gate confirms it first.
+    async fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -325,6 +339,7 @@ mod tests {
             db: &str,
             coll: &str,
             _filter: Option<&Filter>,
+            _projection: Option<&red_core::doc::Projection>,
             seek: DocSeek,
             limit: usize,
             _abort: &AbortSignal,
@@ -544,6 +559,10 @@ mod tests {
             Ok(())
         }
         async fn create_index(&self, _db: &str, _coll: &str, _spec: &IndexSpec) -> Result<()> {
+            self.ensure_writable()?;
+            Ok(())
+        }
+        async fn drop_index(&self, _db: &str, _coll: &str, _name: &str) -> Result<()> {
             self.ensure_writable()?;
             Ok(())
         }

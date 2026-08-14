@@ -832,6 +832,7 @@ impl Render for AppState {
             .children(self.render_doc_export_modal(cx))
             .children(self.render_doc_import_modal(cx))
             .children(self.render_doc_copy_modal(cx))
+            .children(self.render_doc_index_modal(cx))
             // The Redis delete-key confirmation, likewise root-mounted.
             .children(self.render_kv_delete_modal(cx))
             // The palette renders its own full-screen overlay; last = on top.

@@ -7,6 +7,10 @@
 //! KV families). Extended-JSON rendering is hand-rolled below so this crate stays
 //! dependency-light (no `serde_json`).
 
+mod fastfilter;
+
+pub use fastfilter::{FastFilter, compile_fast_filter};
+
 use std::fmt::Write as _;
 
 use crate::Value;
@@ -344,6 +348,53 @@ pub struct FindQuery {
     pub skip: u64,
     pub limit: Option<u64>,
     pub batch: usize,
+}
+
+/// Render a browse sort as an extended-JSON document (`{"age":-1,"name":1}`), the
+/// spelling [`FindQuery::sort`] wants. Keys ride in the order given: a document
+/// store's sort is ordered, so the first key is the primary one.
+///
+/// `_id` is appended as a final tiebreaker unless it is already a key, so a sort on
+/// a field with repeats has a *total* order. Without it, two windows of a paged
+/// browse can disagree about which of two equal-keyed documents comes first, and the
+/// grid shows a document twice while another never appears.
+pub fn sort_json(keys: &[(String, bool)]) -> String {
+    let mut out = String::from("{");
+    for (i, (field, ascending)) in keys.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_json_string(&mut out, field);
+        out.push_str(if *ascending { ":1" } else { ":-1" });
+    }
+    if !keys.iter().any(|(f, _)| f == "_id") {
+        if !keys.is_empty() {
+            out.push(',');
+        }
+        out.push_str("\"_id\":1");
+    }
+    out.push('}');
+    out
+}
+
+/// Render a projection over `fields` as extended JSON (`{"name":1,"user.city":1}`).
+///
+/// `_id` is never listed: MongoDB includes it unless explicitly excluded, and every
+/// RED surface addresses a document by it, so a projection that dropped it would
+/// leave rows the inspector, the editor and the delete path cannot identify.
+pub fn projection_json(fields: &[String]) -> String {
+    let mut out = String::from("{");
+    let mut first = true;
+    for field in fields.iter().filter(|f| f.as_str() != "_id") {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        write_json_string(&mut out, field);
+        out.push_str(":1");
+    }
+    out.push('}');
+    out
 }
 
 /// A streamed document-export target format.
@@ -752,15 +803,118 @@ pub enum DocUpdate {
     Replace(Document),
 }
 
-/// A new index to create (`createIndex`). v1 covers b-tree keys with an optional
-/// unique constraint and name; ttl/partial creation is a later refinement.
+/// How one index key is spelled: a b-tree direction, or the index type that
+/// replaces a direction for a special index.
+///
+/// A **wildcard** index has no variant here because it is not a key type: it is a
+/// key *path* (`"$**"`, or `"user.$**"`) with an ordinary ascending direction, so
+/// it is expressed by the field name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexKey {
+    Asc,
+    Desc,
+    /// A text index over the field (`"text"`). At most one per collection, which
+    /// is the server's rule, not RED's.
+    Text,
+    /// A hashed index (`"hashed"`), the shard-key shape.
+    Hashed,
+    /// A 2dsphere geospatial index (`"2dsphere"`).
+    Sphere2d,
+}
+
+impl IndexKey {
+    /// The value the key takes in a `createIndex` key document, as Mongo spells
+    /// it: a number for a b-tree direction, a string for a special type.
+    pub fn spec_value(self) -> &'static str {
+        match self {
+            IndexKey::Asc => "1",
+            IndexKey::Desc => "-1",
+            IndexKey::Text => "text",
+            IndexKey::Hashed => "hashed",
+            IndexKey::Sphere2d => "2dsphere",
+        }
+    }
+
+    /// Whether the key is a b-tree direction rather than a special type. Only a
+    /// b-tree key can carry a sort, so this is what decides whether an index can
+    /// serve one.
+    pub fn is_btree(self) -> bool {
+        matches!(self, IndexKey::Asc | IndexKey::Desc)
+    }
+
+    /// The label the index dialog shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            IndexKey::Asc => "ascending",
+            IndexKey::Desc => "descending",
+            IndexKey::Text => "text",
+            IndexKey::Hashed => "hashed",
+            IndexKey::Sphere2d => "2dsphere",
+        }
+    }
+
+    /// The kinds the dialog offers, in menu order.
+    pub const ALL: [IndexKey; 5] = [
+        IndexKey::Asc,
+        IndexKey::Desc,
+        IndexKey::Text,
+        IndexKey::Hashed,
+        IndexKey::Sphere2d,
+    ];
+}
+
+/// A new index to create (`createIndex`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexSpec {
-    /// `(field, direction)` pairs; direction is `1` (ascending) or `-1`.
-    pub keys: Vec<(String, i32)>,
+    /// `(field, kind)` pairs, in key order. Order is load-bearing for a compound
+    /// index: only a prefix of the keys can serve a query.
+    pub keys: Vec<(String, IndexKey)>,
     pub unique: bool,
+    /// Skip documents that lack the indexed field entirely.
+    pub sparse: bool,
     /// An explicit index name, or `None` to let the server derive one.
     pub name: Option<String>,
+    /// Delete a document this many seconds after its indexed date value: a TTL
+    /// index. Only meaningful on a single date-valued key, which is the server's
+    /// constraint.
+    pub ttl_seconds: Option<i64>,
+    /// Index only the documents matching this filter: a partial index.
+    ///
+    /// Carried as extended-JSON **text**, not a parsed [`Filter`], for the reason
+    /// `Command::DocFetchRun`'s filter is: it is typed by a user in a UI that has
+    /// no parser, and the driver owns the extended-JSON dialect. The driver parses
+    /// it, and a syntax error surfaces as the write failing rather than as a
+    /// silently ignored option.
+    pub partial_filter: Option<String>,
+    /// An ICU locale for a case- and accent-aware index (`"en"`, `"de@collation=phonebook"`).
+    pub collation_locale: Option<String>,
+}
+
+impl IndexSpec {
+    /// A plain b-tree index over `keys`, ascending, with every option off. The
+    /// shape most indexes actually are, so the dialog and the agent both start
+    /// here and set what they need.
+    pub fn ascending(keys: impl IntoIterator<Item = String>) -> IndexSpec {
+        IndexSpec {
+            keys: keys.into_iter().map(|k| (k, IndexKey::Asc)).collect(),
+            unique: false,
+            sparse: false,
+            name: None,
+            ttl_seconds: None,
+            partial_filter: None,
+            collation_locale: None,
+        }
+    }
+
+    /// The name Mongo would derive for this spec (`field_1_other_-1`), which the
+    /// dialog shows as the placeholder so the user can see what they will get.
+    pub fn derived_name(&self) -> String {
+        self.keys
+            .iter()
+            .map(|(field, kind)| format!("{field}_{}", kind.spec_value()))
+            .collect::<Vec<_>>()
+            .join("_")
+    }
 }
 
 /// One document-store write, the unit the classifier ([`classify_doc_op`]) and
@@ -806,6 +960,11 @@ pub enum DocWrite {
         coll: String,
         spec: IndexSpec,
     },
+    DropIndex {
+        db: String,
+        coll: String,
+        name: String,
+    },
 }
 
 pub use crate::OpClass;
@@ -830,6 +989,10 @@ pub fn classify_doc_op(op: &DocWrite) -> OpClass {
         DocWrite::DropCollection { .. } => true,
         DocWrite::Delete { filter, many, .. } => *many || filter_is_empty(filter),
         DocWrite::Update { filter, many, .. } => *many || filter_is_empty(filter),
+        // Dropping an index writes no documents and is still the write most
+        // likely to take a production deployment down: the queries that relied on
+        // it silently become collection scans.
+        DocWrite::DropIndex { .. } => true,
         DocWrite::Insert { .. }
         | DocWrite::Replace { .. }
         | DocWrite::CreateCollection { .. }
@@ -840,6 +1003,31 @@ pub fn classify_doc_op(op: &DocWrite) -> OpClass {
     } else {
         OpClass::Write
     }
+}
+
+/// The index keys a filter would want, when `plan` says the query is scanning the
+/// whole collection. Empty when the plan already uses an index, when the filter
+/// names no fields, or when it is not a document.
+///
+/// The same reasoning the `index_advice` agent tool applies, lifted here so the
+/// Indexes panel can offer the suggestion without asking a model. Deliberately
+/// shallow: the equality fields at the top level, in the order they appear.
+/// Ordering a compound key well needs the selectivity numbers neither an `explain`
+/// nor a sample supplies, so RED suggests the keys and leaves the ordering to a
+/// human who knows the data.
+pub fn suggested_index_keys(filter: &Filter, plan: &DocPlan) -> Vec<String> {
+    if !plan.collscan {
+        return Vec::new();
+    }
+    let DocValue::Document(fields) = filter else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .map(|(k, _)| k.clone())
+        // `$and` / `$or` / `$where` name no field to index.
+        .filter(|k| !k.starts_with('$'))
+        .collect()
 }
 
 /// The first pipeline stage that writes (`$out`/`$merge`), if any. Aggregation is
@@ -948,7 +1136,7 @@ pub fn server_js_operator(value: &DocValue) -> Option<&'static str> {
 
 /// Append `s` as a JSON string literal (quotes + minimal escaping), matching
 /// `serde_json`'s escaping so the output parses cleanly downstream.
-fn write_json_string(out: &mut String, s: &str) {
+pub(super) fn write_json_string(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -1307,6 +1495,27 @@ mod tests {
         // match the probe would then have to disprove.
         assert_eq!(match_collection("person", &catalog), None);
         assert_eq!(match_collection("invoice", &catalog), None);
+    }
+
+    #[test]
+    fn sort_json_keeps_key_order_and_totalizes_with_id() {
+        assert_eq!(
+            sort_json(&[("age".into(), false), ("name".into(), true)]),
+            r#"{"age":-1,"name":1,"_id":1}"#
+        );
+        // An explicit `_id` key is not doubled.
+        assert_eq!(sort_json(&[("_id".into(), false)]), r#"{"_id":-1}"#);
+        assert_eq!(sort_json(&[]), r#"{"_id":1}"#);
+    }
+
+    #[test]
+    fn projection_never_drops_id() {
+        assert_eq!(
+            projection_json(&["name".into(), "user.city".into()]),
+            r#"{"name":1,"user.city":1}"#
+        );
+        // Listing `_id` changes nothing: it rides along regardless.
+        assert_eq!(projection_json(&["_id".into()]), "{}");
     }
 
     #[test]

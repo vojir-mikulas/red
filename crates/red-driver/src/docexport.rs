@@ -89,6 +89,7 @@ pub async fn run_doc_export(
                 db,
                 coll,
                 req.filter.as_ref(),
+                None,
                 DocSeek::Forward {
                     after: after.clone(),
                 },

@@ -283,6 +283,7 @@ pub(super) async fn doc_copy_job(
                 &src_db,
                 &src_coll,
                 filter.as_ref(),
+                None,
                 red_core::doc::DocSeek::Forward {
                     after: after.clone(),
                 },

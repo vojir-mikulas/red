@@ -233,6 +233,10 @@ async fn apply_doc_write(
             driver.drop_collection(&db, &coll).await?;
             Ok(format!("dropped collection {coll}"))
         }
+        DocWrite::DropIndex { db, coll, name } => {
+            driver.drop_index(&db, &coll, &name).await?;
+            Ok(format!("dropped index {name}"))
+        }
         DocWrite::CreateIndex { db, coll, spec } => {
             driver.create_index(&db, &coll, &spec).await?;
             Ok("index created".into())
@@ -453,6 +457,10 @@ fn doc_write_prompt(write: &red_core::doc::DocWrite) -> String {
         DocWrite::Update { db, coll, .. } => {
             format!("Update all matching documents in {db}.{coll}?")
         }
+        DocWrite::DropIndex { db, coll, name } => format!(
+            "Drop index {name} on {db}.{coll}? Queries that relied on it will scan the whole \
+             collection until it is rebuilt."
+        ),
         _ => "Apply this write?".into(),
     }
 }
@@ -3458,6 +3466,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 db,
                 coll,
                 filter,
+                projection,
+                sort,
                 seek,
                 limit,
                 seq,
@@ -3468,22 +3478,49 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 else {
                     continue;
                 };
-                // Parse the extended-JSON filter up front so a syntax error is a
-                // clean `DocError` rather than a failed find deep in the spawn.
-                let filter = match filter.as_deref().map(|f| driver.parse_ext_json(f)) {
-                    Some(Ok(f)) => Some(f),
-                    Some(Err(e)) => {
+                // Parse every extended-JSON document up front so a syntax error is
+                // a clean `DocError` rather than a failed find deep in the spawn.
+                macro_rules! parse_opt {
+                    ($text:expr_2021) => {
+                        match $text.as_deref().map(|t| driver.parse_ext_json(t)) {
+                            Some(Ok(v)) => Some(v),
+                            Some(Err(e)) => {
+                                emit(
+                                    &events,
+                                    session_id,
+                                    Event::DocError {
+                                        epoch,
+                                        message: e.to_string(),
+                                    },
+                                );
+                                continue;
+                            }
+                            None => None,
+                        }
+                    };
+                }
+                let filter = parse_opt!(filter);
+                let projection = parse_opt!(projection);
+                let sort = parse_opt!(sort);
+                // A sorted browse pages by position, because the `_id` boundary a
+                // keyset seek carries orders nothing once another key leads. The
+                // window buffer only ever sends `Jump` in that mode; anything else
+                // is a bug worth naming rather than silently mispaging.
+                let skip = match (&sort, &seek) {
+                    (None, _) => None,
+                    (Some(_), red_core::doc::DocSeek::Jump { skip }) => Some(*skip),
+                    (Some(_), red_core::doc::DocSeek::Forward { after: None }) => Some(0),
+                    (Some(_), _) => {
                         emit(
                             &events,
                             session_id,
                             Event::DocError {
                                 epoch,
-                                message: e.to_string(),
+                                message: "a sorted browse pages by position, not by _id".into(),
                             },
                         );
                         continue;
                     }
-                    None => None,
                 };
                 // A new window (or a new collection selection) supersedes the
                 // in-flight seek, like a flung SQL scrollbar.
@@ -3491,10 +3528,38 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let abort = entry.supersede(Slot::DocPage);
                 let events = events.clone();
                 tokio::spawn(async move {
-                    let docs = match driver
-                        .find_seek(&db, &coll, filter.as_ref(), seek.clone(), limit, &abort)
-                        .await
-                    {
+                    let window = match skip {
+                        Some(skip) => driver
+                            .find(
+                                &red_core::doc::FindQuery {
+                                    db: db.clone(),
+                                    coll: coll.clone(),
+                                    filter: filter.clone(),
+                                    projection,
+                                    sort,
+                                    skip,
+                                    limit: Some(limit as u64),
+                                    batch: limit,
+                                },
+                                &abort,
+                            )
+                            .await
+                            .map(|page| page.docs),
+                        None => {
+                            driver
+                                .find_seek(
+                                    &db,
+                                    &coll,
+                                    filter.as_ref(),
+                                    projection.as_ref(),
+                                    seek.clone(),
+                                    limit,
+                                    &abort,
+                                )
+                                .await
+                        }
+                    };
+                    let docs = match window {
                         Ok(docs) => docs,
                         // A superseded fetch emits nothing; a real failure both
                         // surfaces (banner) and frees the buffer's in-flight slot.
@@ -3762,16 +3827,24 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         batch: DOC_PAGE_ROWS,
                     };
                     match driver.explain(&query).await {
-                        Ok(plan) => emit(
-                            &events,
-                            session_id,
-                            Event::DocPlanReady {
-                                epoch,
-                                db,
-                                coll,
-                                plan,
-                            },
-                        ),
+                        Ok(plan) => {
+                            let advice = query
+                                .filter
+                                .as_ref()
+                                .map(|f| red_core::doc::suggested_index_keys(f, &plan))
+                                .unwrap_or_default();
+                            emit(
+                                &events,
+                                session_id,
+                                Event::DocPlanReady {
+                                    epoch,
+                                    db,
+                                    coll,
+                                    plan,
+                                    advice,
+                                },
+                            )
+                        }
                         Err(e) => emit(
                             &events,
                             session_id,

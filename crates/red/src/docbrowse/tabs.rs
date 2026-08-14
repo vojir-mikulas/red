@@ -87,6 +87,17 @@ impl AppState {
         let view_mode = self.settings.doc.default_view.into();
         let coll_view = CollView::new(epoch, db.clone(), coll.clone(), sender, page, view_mode, cx);
         coll_view.seed_browse();
+        // Sample the schema up front, not on the Schema panel's first open: it is
+        // what the filter box completes from and the Fields dropdown lists, and a
+        // bounded `$sample` alongside the first window is cheap.
+        self.service.send_to(
+            session,
+            Command::DocInferSchema {
+                epoch,
+                db: db.clone(),
+                coll: coll.clone(),
+            },
+        );
         let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())

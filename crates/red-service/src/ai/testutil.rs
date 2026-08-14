@@ -92,6 +92,7 @@ impl DocDriver for DocStub {
         _db: &str,
         _coll: &str,
         _filter: Option<&red_core::doc::Filter>,
+        _projection: Option<&red_core::doc::Projection>,
         _seek: red_core::doc::DocSeek,
         _limit: usize,
         _abort: &AbortSignal,
@@ -266,6 +267,9 @@ impl DocDriver for DocStub {
         _coll: &str,
         _spec: &IndexSpec,
     ) -> red_core::Result<()> {
+        Err(RedError::Driver("read-only stub".into()))
+    }
+    async fn drop_index(&self, _db: &str, _coll: &str, _name: &str) -> red_core::Result<()> {
         Err(RedError::Driver("read-only stub".into()))
     }
 }

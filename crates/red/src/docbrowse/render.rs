@@ -133,6 +133,14 @@ impl AppState {
             .and_then(|v| v.coll_menu.clone())
             .map(|(db, coll, pos)| self.render_doc_coll_menu(active, db, coll, pos, cx));
 
+        // The toolbar's "Fields" projection dropdown, on the same terms.
+        let fields_menu = active
+            .doc_view
+            .as_ref()
+            .and_then(|v| v.focused_coll())
+            .and_then(|c| c.fields_menu)
+            .map(|pos| self.render_doc_fields_menu(active, pos, cx));
+
         let statusbar = self.render_doc_statusbar(active, &theme, cx);
 
         div()
@@ -149,6 +157,7 @@ impl AppState {
             .children(tab_menu)
             .children(actions_menu)
             .children(coll_menu)
+            .children(fields_menu)
     }
 
     /// The whole work body: the `database -> collection` sidebar tree (a
@@ -594,6 +603,34 @@ impl AppState {
                 floating(div().occlude().child(menu.into_any_element()))
                     .at(pos)
                     .anchor(gpui::Anchor::TopLeft),
+            )
+            .into_any_element()
+    }
+
+    /// Float `menu` at `pos` over a full-window backdrop that dismisses it, the
+    /// shape every positioned Mongo dropdown shares.
+    fn dismissable_menu(
+        &self,
+        menu: ContextMenu,
+        pos: gpui::Point<gpui::Pixels>,
+        session: SessionId,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.doc_close_fields_menu(session, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| this.doc_close_fields_menu(session, cx)),
+            )
+            .child(
+                floating(div().occlude().child(menu.into_any_element()))
+                    .at(pos)
+                    .anchor(gpui::Anchor::TopRight),
             )
             .into_any_element()
     }
@@ -1217,7 +1254,7 @@ impl AppState {
             ),
             DocPanel::Query => self.render_doc_query(session, current, theme, view),
             DocPanel::Schema => render_doc_schema_panel(current, theme),
-            DocPanel::Indexes => render_doc_indexes_panel(current, theme),
+            DocPanel::Indexes => render_doc_indexes_panel(session, current, read_only, theme, view),
         };
         div()
             .flex()
@@ -1340,6 +1377,73 @@ impl AppState {
                     theme.text_muted,
                 ));
 
+            let fields_view = view.clone();
+            let projecting = current.projection.is_some();
+            let fields_button = div()
+                .id("doc-fields")
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_1()
+                .h(px(24.))
+                .px(px(8.))
+                .rounded(px(4.))
+                .border_1()
+                .border_color(if projecting {
+                    theme.accent
+                } else {
+                    theme.border
+                })
+                .bg(theme.bg_panel)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.bg_elevated))
+                .text_color(if projecting {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                })
+                .text_size(theme.scale(12.))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    move |ev: &gpui::MouseDownEvent, _, cx| {
+                        let pos = ev.position;
+                        fields_view
+                            .update(cx, |this, cx| this.doc_open_fields_menu(session, pos, cx))
+                            .ok();
+                    },
+                )
+                .child(crate::i18n::tr!("doc.fields", "Fields"))
+                .child(crate::icons::icon(
+                    "chevron-down",
+                    theme.scale(11.),
+                    if projecting {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    },
+                ));
+
+            let filter_mode_view = view.clone();
+            let filter_mode_ix = DocFilterMode::ALL
+                .iter()
+                .position(|(m, _)| *m == current.filter_mode)
+                .unwrap_or(0);
+            let filter_mode = DocFilterMode::ALL
+                .iter()
+                .fold(Segmented::new("doc-filter-mode"), |seg, (_, label)| {
+                    seg.segment(*label)
+                })
+                .selected(filter_mode_ix)
+                .on_select(move |ix, _, cx| {
+                    let Some((mode, _)) = DocFilterMode::ALL.get(ix) else {
+                        return;
+                    };
+                    let mode = *mode;
+                    filter_mode_view
+                        .update(cx, |this, cx| this.doc_set_filter_mode(session, mode, cx))
+                        .ok();
+                });
+
             let toolbar = div()
                 .flex()
                 .items_center()
@@ -1347,11 +1451,16 @@ impl AppState {
                 .px_3()
                 .pb_2()
                 .child(mode)
+                .child(filter_mode)
                 .child(
+                    // The suggestion popup anchors to this cell, so the box and its
+                    // dropdown move together as the toolbar reflows.
                     div()
+                        .relative()
                         .flex_1()
                         .min_w(px(120.))
-                        .child(current.filter_input.clone()),
+                        .child(current.filter_input.clone())
+                        .children(self.render_doc_suggestions(session, current, theme, view)),
                 )
                 .child(
                     Button::new("doc-run-filter", "Run")
@@ -1363,10 +1472,241 @@ impl AppState {
                                 .ok();
                         }),
                 )
+                .child(fields_button)
                 .child(actions_button);
             header = header.child(toolbar);
+            if let Some(chips) = self.render_doc_query_chips(session, current, theme, view) {
+                header = header.child(chips);
+            }
         }
         header.into_any_element()
+    }
+
+    /// The field-name suggestion popup, floating under the filter box. Absent
+    /// unless the token being typed matches something in the sampled schema.
+    fn render_doc_suggestions(
+        &self,
+        session: SessionId,
+        current: &CollView,
+        theme: &Theme,
+        view: &WeakEntity<AppState>,
+    ) -> Option<gpui::AnyElement> {
+        if current.suggestions.is_empty() {
+            return None;
+        }
+        let highlighted = current.suggestion_ix;
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .py(px(2.))
+            .rounded(px(4.))
+            .bg(theme.bg_elevated)
+            .border_1()
+            .border_color(theme.border)
+            .shadow_md()
+            .text_size(theme.scale(12.));
+        for (i, path) in current.suggestions.iter().enumerate() {
+            let take_view = view.clone();
+            list = list.child(
+                div()
+                    .id(gpui::SharedString::from(format!("doc-suggest-{i}")))
+                    .px_2()
+                    .py(px(3.))
+                    .cursor_pointer()
+                    .when(i == highlighted, |d| d.bg(theme.bg_selected))
+                    .hover(|s| s.bg(theme.bg_selected))
+                    .text_color(theme.text)
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        take_view
+                            .update(cx, |this, cx| {
+                                this.doc_take_suggestion(session, Some(i), cx);
+                            })
+                            .ok();
+                    })
+                    .child(path.clone()),
+            );
+        }
+        Some(
+            div()
+                .occlude()
+                .absolute()
+                .top(px(28.))
+                .left_0()
+                .w_full()
+                .child(list)
+                .into_any_element(),
+        )
+    }
+
+    /// The row of active sort keys and the projection badge, under the toolbar.
+    /// Absent entirely when the browse is in its natural shape, so the common case
+    /// costs no vertical space.
+    fn render_doc_query_chips(
+        &self,
+        session: SessionId,
+        current: &CollView,
+        theme: &Theme,
+        view: &WeakEntity<AppState>,
+    ) -> Option<gpui::AnyElement> {
+        // A fast filter that cannot compile says so here. `Incomplete` prints
+        // nothing: the user is still typing, and a bar that scolds mid-word is
+        // worse than one that waits.
+        let complaint = match &current.filter_status {
+            red_core::doc::FastFilter::Invalid(why) => Some(why.clone()),
+            _ => None,
+        };
+        if current.sort.is_empty() && current.projection.is_none() && complaint.is_none() {
+            return None;
+        }
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .pb_2()
+            .text_size(theme.scale(11.))
+            .children(complaint.map(|why| div().text_color(theme.red).child(why)));
+
+        for (i, (field, ascending)) in current.sort.iter().enumerate() {
+            let chip_view = view.clone();
+            let field_name = field.clone();
+            row = row.child(
+                div()
+                    .id(gpui::SharedString::from(format!("doc-sort-chip-{i}")))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px(px(6.))
+                    .h(px(20.))
+                    .rounded(px(10.))
+                    .bg(theme.bg_elevated)
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_color(theme.text_muted)
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(theme.accent))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        // A click on the chip cycles the same key the header
+                        // does, so the chip is a control and not just a label.
+                        let field = field_name.clone();
+                        chip_view
+                            .update(cx, |this, cx| {
+                                this.doc_toggle_sort(session, field, true, cx)
+                            })
+                            .ok();
+                    })
+                    .child(format!(
+                        "{} {} {}",
+                        if i == 0 { "sort" } else { "then" },
+                        field,
+                        if *ascending { "\u{2191}" } else { "\u{2193}" }
+                    )),
+            );
+        }
+        if !current.sort.is_empty() {
+            let clear_view = view.clone();
+            row = row.child(
+                div()
+                    .id("doc-sort-clear")
+                    .px(px(4.))
+                    .text_color(theme.text_faint)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme.text))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        clear_view
+                            .update(cx, |this, cx| this.doc_clear_sort(session, cx))
+                            .ok();
+                    })
+                    .child(crate::i18n::tr!("doc.clear_sort", "clear sort")),
+            );
+        }
+        if let Some(fields) = &current.projection {
+            let clear_view = view.clone();
+            row = row.child(
+                div()
+                    .id("doc-projection-clear")
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px(px(6.))
+                    .h(px(20.))
+                    .rounded(px(10.))
+                    .bg(theme.bg_elevated)
+                    .border_1()
+                    .border_color(theme.accent)
+                    .text_color(theme.text_muted)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme.text))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        clear_view
+                            .update(cx, |this, cx| this.doc_clear_projection(session, cx))
+                            .ok();
+                    })
+                    .child(format!("{} field(s) \u{00d7}", fields.len())),
+            );
+        }
+        Some(row.into_any_element())
+    }
+
+    /// The "Fields" dropdown: one toggle per inferred schema path, so a wide
+    /// collection can be narrowed to the handful of fields being looked at.
+    fn render_doc_fields_menu(
+        &self,
+        active: &ActiveConn,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let session = active.session;
+        let current = active.doc_view.as_ref().and_then(|v| v.focused_coll());
+        let mut menu = ContextMenu::new("doc-fields-menu");
+        let chosen: Option<&Vec<String>> = current.and_then(|c| c.projection.as_ref());
+        let paths: Vec<String> = current
+            .and_then(|c| c.schema.as_ref())
+            .map(|s| {
+                s.fields
+                    .iter()
+                    .map(|f| f.path.clone())
+                    .filter(|p| p != "_id")
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        menu = menu.item(
+            ContextMenuItem::new("doc-fields-all", "All fields").on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.doc_close_fields_menu(session, cx);
+                    this.doc_clear_projection(session, cx);
+                },
+            )),
+        );
+        if paths.is_empty() {
+            // The schema request the dropdown fired is still in flight (or the
+            // sample found nothing); say so rather than showing an empty menu.
+            return self.dismissable_menu(
+                menu.separator().item(
+                    ContextMenuItem::new("doc-fields-loading", "Sampling fields\u{2026}")
+                        .disabled(true),
+                ),
+                pos,
+                session,
+                cx,
+            );
+        }
+        menu = menu.separator();
+        for (i, path) in paths.into_iter().enumerate() {
+            // No projection means every field is shown, so every row reads ticked.
+            let on = chosen.is_none_or(|fields| fields.contains(&path));
+            let label = format!("{} {path}", if on { "\u{2713}" } else { " " });
+            let field = path.clone();
+            menu = menu.item(
+                ContextMenuItem::new(gpui::SharedString::from(format!("doc-field-{i}")), label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.doc_toggle_projection_field(session, field.clone(), cx);
+                    })),
+            );
+        }
+        self.dismissable_menu(menu, pos, session, cx)
     }
 
     /// The Documents panel: the explain readout (when requested) over the chosen
@@ -1570,13 +1910,23 @@ impl AppState {
             .iter()
             .enumerate()
             .map(|(i, name)| {
-                if i == 0 {
+                let column = if i == 0 {
                     Column::new(name.clone()).width(px(220.))
                 } else {
                     Column::new(name.clone()).flex()
-                }
+                };
+                column.sortable()
             })
             .collect();
+        // The caret marks the *primary* key only: a multi-key sort has one leading
+        // column, and painting a caret on each would suggest they are peers.
+        let sort_caret = current.sort.first().and_then(|(field, ascending)| {
+            current
+                .columns
+                .iter()
+                .position(|c| c == field)
+                .map(|ix| (ix, *ascending))
+        });
 
         // Resolve (and possibly re-center) the virtual-scroll window for this
         // frame; the list lays out only `win.len` rows offset by `base`, so it
@@ -1622,6 +1972,7 @@ impl AppState {
             current.filter.clone(),
             current.epoch,
         );
+        let (projection_doc, sort_doc) = (current.projection_doc.clone(), current.sort_doc.clone());
 
         let table = Table::<()>::new("doc-grid", columns)
             .row_count(win.len)
@@ -1637,6 +1988,34 @@ impl AppState {
                 nav_view
                     .update(cx, |this, cx| this.doc_grid_nav(session, nav, cx))
                     .ok();
+            })
+            .sort(sort_caret)
+            .sort_carets(
+                {
+                    let (accent, size) = (theme.accent, theme.scale(10.));
+                    move || crate::icons::icon("sort-asc", size, accent).into_any_element()
+                },
+                {
+                    let (accent, size) = (theme.accent, theme.scale(10.));
+                    move || crate::icons::icon("sort-desc", size, accent).into_any_element()
+                },
+            )
+            .on_sort({
+                let sort_view = view.clone();
+                let sort_cols = cols.clone();
+                move |table_col, window, cx| {
+                    let Some(field) = sort_cols.get(table_col).cloned() else {
+                        return;
+                    };
+                    // Shift-click appends a key instead of replacing the sort, the
+                    // convention every grid that supports multi-sort uses.
+                    let additive = window.modifiers().shift;
+                    sort_view
+                        .update(cx, |this, cx| {
+                            this.doc_toggle_sort(session, field, additive, cx)
+                        })
+                        .ok();
+                }
             })
             .selected(selected)
             .on_select(move |ix, _click, window, cx| {
@@ -1662,6 +2041,8 @@ impl AppState {
                     db: &db,
                     coll: &coll,
                     filter: filter.as_deref(),
+                    projection: projection_doc.as_deref(),
+                    sort: sort_doc.as_deref(),
                 };
                 let settled = window_rc.borrow_mut().ensure(abs, &ctx, &sender);
                 // Mid-fling we skipped fetching; ask for another paint so the
@@ -2158,42 +2539,168 @@ fn render_doc_schema_panel(current: &CollView, theme: &Theme) -> gpui::AnyElemen
 
 /// The Indexes panel: one row per index with its keys and properties, or a hint
 /// while the list loads.
-fn render_doc_indexes_panel(current: &CollView, theme: &Theme) -> gpui::AnyElement {
-    let Some(indexes) = current.indexes.as_ref() else {
-        return doc_centered_hint("Loading indexes...", theme);
+fn render_doc_indexes_panel(
+    session: SessionId,
+    current: &CollView,
+    read_only: bool,
+    theme: &Theme,
+    view: &WeakEntity<AppState>,
+) -> gpui::AnyElement {
+    // The panel's own toolbar, present even while the list loads: creating the
+    // first index on an unindexed collection is exactly when it is wanted.
+    let new_view = view.clone();
+    let toolbar = div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(div().flex_1())
+        .when(!read_only, |d| {
+            d.child(
+                Button::new("doc-index-new", "New index\u{2026}")
+                    .size(ButtonSize::Sm)
+                    .variant(ButtonVariant::Secondary)
+                    .on_click(move |_, _, cx| {
+                        new_view
+                            .update(cx, |this, cx| {
+                                this.doc_open_index_form(session, Vec::new(), cx)
+                            })
+                            .ok();
+                    }),
+            )
+        });
+
+    // The suggestion the last explain earned: a COLLSCAN over a filter that names
+    // fields. Offered here rather than only to the agent, because this is the
+    // panel a user opens when a query is slow.
+    let suggestion = current
+        .index_advice
+        .as_ref()
+        .filter(|keys| !keys.is_empty())
+        .map(|keys| {
+            let create_view = view.clone();
+            let seed = keys.clone();
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(theme.border)
+                .bg(theme.bg_panel)
+                .text_size(theme.scale(12.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_color(theme.yellow)
+                        .child(format!(
+                            "The current filter scans the whole collection. Suggested index: {}",
+                            keys.join(", ")
+                        )),
+                )
+                .when(!read_only, |d| {
+                    d.child(
+                        Button::new("doc-index-suggested", "Create it\u{2026}")
+                            .size(ButtonSize::Sm)
+                            .variant(ButtonVariant::Secondary)
+                            .on_click(move |_, _, cx| {
+                                let seed = seed.clone();
+                                create_view
+                                    .update(cx, |this, cx| {
+                                        this.doc_open_index_form(session, seed, cx)
+                                    })
+                                    .ok();
+                            }),
+                    )
+                })
+        });
+
+    let body = match current.indexes.as_ref() {
+        None => doc_centered_hint("Loading indexes...", theme),
+        Some(indexes) if indexes.is_empty() => doc_centered_hint("No indexes.", theme),
+        Some(indexes) => {
+            let rows = indexes.iter().enumerate().map(|(i, idx)| {
+                let keys = idx
+                    .keys
+                    .iter()
+                    .map(|(field, order)| format!("{field}: {order}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut props = Vec::new();
+                if idx.unique {
+                    props.push("unique".to_string());
+                }
+                if idx.sparse {
+                    props.push("sparse".to_string());
+                }
+                if idx.partial {
+                    props.push("partial".to_string());
+                }
+                if let Some(ttl) = idx.ttl {
+                    props.push(format!("ttl {ttl}s"));
+                }
+                // `_id_` is not droppable, so it carries no drop affordance: an
+                // offer the server would refuse is worse than no offer.
+                let droppable = !read_only && idx.name != "_id_";
+                let drop_view = view.clone();
+                let name = idx.name.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .child(div().flex_1().min_w(px(0.)).child(doc_row3(
+                        idx.name.clone(),
+                        keys,
+                        props.join(", "),
+                        theme,
+                        false,
+                    )))
+                    .child(
+                        div()
+                            .w(px(70.))
+                            .flex_shrink_0()
+                            .pr_2()
+                            .when(droppable, |d| {
+                                d.child(
+                                    Button::new(format!("doc-index-drop-{i}"), "Drop")
+                                        .size(ButtonSize::Sm)
+                                        .variant(ButtonVariant::Ghost)
+                                        .on_click(move |_, _, cx| {
+                                            let name = name.clone();
+                                            drop_view
+                                                .update(cx, |this, cx| {
+                                                    this.doc_drop_index(session, name, cx)
+                                                })
+                                                .ok();
+                                        }),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+            });
+            div()
+                .id("doc-indexes")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .text_size(theme.scale(12.))
+                .child(doc_row3("Index", "Keys", "Properties", theme, true))
+                .children(rows)
+                .into_any_element()
+        }
     };
-    if indexes.is_empty() {
-        return doc_centered_hint("No indexes.", theme);
-    }
-    let rows = indexes.iter().map(|idx| {
-        let keys = idx
-            .keys
-            .iter()
-            .map(|(field, order)| format!("{field}: {order}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut props = Vec::new();
-        if idx.unique {
-            props.push("unique".to_string());
-        }
-        if idx.sparse {
-            props.push("sparse".to_string());
-        }
-        if idx.partial {
-            props.push("partial".to_string());
-        }
-        if let Some(ttl) = idx.ttl {
-            props.push(format!("ttl {ttl}s"));
-        }
-        doc_row3(idx.name.clone(), keys, props.join(", "), theme, false)
-    });
+
     div()
-        .id("doc-indexes")
+        .flex()
+        .flex_col()
         .size_full()
-        .overflow_y_scroll()
-        .text_size(theme.scale(12.))
-        .child(doc_row3("Index", "Keys", "Properties", theme, true))
-        .children(rows)
+        .child(toolbar)
+        .children(suggestion)
+        .child(body)
         .into_any_element()
 }
 

@@ -647,18 +647,26 @@ pub enum Command {
         epoch: Epoch,
         db: String,
     },
-    /// One `_id`-keyset window for the browse grid's continuous scroll: the
-    /// documents at `seek` (relative to a boundary `_id`, or an exact ordinal
-    /// jump), narrowed by the optional extended-JSON `filter` the driver parses (a
-    /// parse error replies `DocError`). `want_total` (the first window of a fresh
-    /// browse) also asks for the collection count. `seq` echoes back on
+    /// One window for the browse grid's continuous scroll: the documents at `seek`
+    /// (relative to a boundary `_id`, or an exact ordinal jump), narrowed by the
+    /// optional extended-JSON `filter` the driver parses (a parse error replies
+    /// `DocError`) and trimmed to `projection`. `want_total` (the first window of a
+    /// fresh browse) also asks for the collection count. `seq` echoes back on
     /// `DocRunReady`/`DocRunFailed` so a stale window is dropped; cancellable and
     /// epoch-superseded like a SQL run fetch.
+    ///
+    /// `sort` changes *how* the window is read, not just its order. Unsorted, the
+    /// window is an `_id`-keyset seek: O(window) at any depth. Sorted, an `_id`
+    /// boundary orders nothing, so the window is read by position instead, and the
+    /// caller must address it with a [`DocSeek::Jump`] (any other arm replies
+    /// `DocError` rather than quietly paging by the wrong key).
     DocFetchRun {
         epoch: Epoch,
         db: String,
         coll: String,
         filter: Option<String>,
+        projection: Option<String>,
+        sort: Option<String>,
         seek: DocSeek,
         limit: usize,
         seq: u64,
@@ -1723,6 +1731,11 @@ pub enum Event {
         db: String,
         coll: String,
         plan: DocPlan,
+        /// The index keys this filter would want, when the plan is a collection
+        /// scan (see `red_core::doc::suggested_index_keys`). Empty when the query
+        /// is already covered or the filter names nothing indexable. Computed here
+        /// rather than UI-side because only this layer holds the parsed filter.
+        advice: Vec<String>,
     },
     /// A write succeeded (in response to `DocApplyWrite`); `summary` is a short
     /// human line for a toast, and the UI refreshes the affected browse.

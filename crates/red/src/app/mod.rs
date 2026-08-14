@@ -2126,8 +2126,9 @@ impl AppState {
                 db,
                 coll,
                 plan,
+                advice,
             } => {
-                self.on_doc_plan(session, epoch, db, coll, plan, cx);
+                self.on_doc_plan(session, epoch, db, coll, plan, advice, cx);
             }
             Event::DocWriteDone { epoch, summary } => {
                 self.on_doc_write_done(session, epoch, summary, cx);

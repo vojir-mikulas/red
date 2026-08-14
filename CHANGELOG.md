@@ -23,6 +23,27 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   It streams window by window with progress and cancel, like the SQL table copy.
 - A right-click menu on the MongoDB collection tree: open (in this tab or a new
   one), export, import, copy, drop, and refresh a database's collection list.
+- A fast filter for MongoDB: `status:active age>30 created:last7d` compiles to a
+  filter document, so the common narrowing costs no JSON. It understands `>`,
+  `>=`, `<`, `<=`, `!=`, `field:*` for "has this field", `field:~text` for a
+  case-insensitive contains, quoted values, relative dates (`last7d`, `last24h`,
+  `today`), and typed scalars including ObjectIds in `_id`. A half-typed term is
+  left alone rather than flagged; only a real mistake is called out. The JSON box
+  is still there behind the Fast/JSON toggle.
+- Field-name completion in the MongoDB filter box, from the collection's sampled
+  schema: type a prefix, pick with ↑/↓ and Enter.
+- Sort a MongoDB browse by clicking a column header (again for descending, a
+  third time to clear); shift-click adds a second key. The active keys show as
+  chips under the toolbar.
+- Choose which MongoDB fields to load with the toolbar's Fields dropdown, so a
+  wide collection can be narrowed to the handful you are reading. `_id` always
+  comes along.
+- Create and drop MongoDB indexes from the Indexes panel. The dialog covers
+  compound keys, ascending/descending/text/hashed/2dsphere, unique, sparse, TTL,
+  a partial filter, and a collation locale. Dropping one asks first, because the
+  queries that relied on it become collection scans.
+- The Indexes panel suggests an index when the current filter is scanning the
+  whole collection, and creating it is one click.
 - The row-number gutter now holds the left edge instead of scrolling away with
   the columns, so a row stays identifiable however far right you scroll.
 - Freeze result columns: "Pin <column> left" in the header menu holds a column
