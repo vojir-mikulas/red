@@ -51,7 +51,14 @@ pub(crate) fn render_blocks_with(
 pub(crate) enum Block {
     Paragraph(String),
     Heading(u8, String),
-    Code(String),
+    /// A fenced block, with the info string that followed the opening fence when
+    /// there was one. The language is kept rather than dropped because it decides
+    /// whether the block renders as code or as a component (see
+    /// [`crate::aiblocks`]).
+    Code {
+        lang: Option<String>,
+        text: String,
+    },
     Bullets(Vec<String>),
     Numbers(Vec<String>),
     Table {
@@ -91,18 +98,22 @@ fn parse_blocks(src: &str) -> Vec<Block> {
         let trimmed = line.trim_start();
 
         // Fenced code block: collect verbatim until the closing fence.
-        if let Some(fence) = trimmed.strip_prefix("```").map(|_| "```") {
+        if let Some(info) = trimmed.strip_prefix("```") {
             flush_para(&mut blocks, &mut para);
             flush_bullets(&mut blocks, &mut bullets);
             flush_numbers(&mut blocks, &mut numbers);
+            let lang = Some(info.trim().to_string()).filter(|l| !l.is_empty());
             let mut code = Vec::new();
             for l in lines.by_ref() {
-                if l.trim_start().starts_with(fence) {
+                if l.trim_start().starts_with("```") {
                     break;
                 }
                 code.push(l);
             }
-            blocks.push(Block::Code(code.join("\n")));
+            blocks.push(Block::Code {
+                lang,
+                text: code.join("\n"),
+            });
             continue;
         }
 
@@ -266,7 +277,15 @@ fn render_block(block: &Block, theme: &Theme, leaf: &mut TextLeaf) -> AnyElement
                 .child(inline_bold(text, theme, leaf))
                 .into_any_element()
         }
-        Block::Code(code) => {
+        Block::Code { lang, text: code } => {
+            // A fenced block the assistant meant as data renders as data. A body
+            // that will not parse falls through to the code rendering below, so
+            // nothing the model wrote is ever swallowed.
+            if let Some(lang) = lang
+                && let Some(rich) = crate::aiblocks::render(lang, code, theme)
+            {
+                return rich;
+            }
             let mut block = div()
                 .flex()
                 .flex_col()
@@ -579,7 +598,7 @@ mod tests {
     fn a_citation_inside_a_code_block_stays_literal() {
         let blocks = parse("```sql\nSELECT a[3] FROM t\n```");
         match &blocks[..] {
-            [Block::Code(code)] => assert!(code.contains("a[3]"), "{code}"),
+            [Block::Code { text, .. }] => assert!(text.contains("a[3]"), "{text}"),
             other => panic!("expected one code block, got {} blocks", other.len()),
         }
         // An inline code span is verbatim too.
@@ -627,7 +646,7 @@ mod tests {
         assert!(matches!(blocks[0], Block::Heading(1, _)));
         assert!(matches!(blocks[1], Block::Paragraph(_)));
         assert!(matches!(&blocks[2], Block::Bullets(v) if v.len() == 2));
-        assert!(matches!(blocks[3], Block::Code(_)));
+        assert!(matches!(blocks[3], Block::Code { .. }));
     }
 
     #[test]

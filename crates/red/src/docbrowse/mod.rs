@@ -14,6 +14,7 @@ mod render;
 mod tabs;
 mod transfer;
 mod validator;
+mod watch;
 mod window;
 
 pub(crate) use aggregate::{DocQueryMode, DocStage};
@@ -21,6 +22,7 @@ pub(crate) use form::{DocForm, InspectorMode};
 pub(crate) use indexes::DocIndexForm;
 pub(crate) use transfer::{DocCopyState, DocExportState, DocImportState};
 pub(crate) use validator::DocValidatorForm;
+pub(crate) use watch::DocWatchState;
 
 use window::{DocWindow, FetchCtx};
 
@@ -52,15 +54,18 @@ enum DocPanel {
     Schema,
     /// The collection's indexes.
     Indexes,
+    /// The live change stream.
+    Watch,
 }
 
 impl DocPanel {
     /// The panels in toolbar order, with their segment labels.
-    const ALL: [(DocPanel, &'static str); 4] = [
+    const ALL: [(DocPanel, &'static str); 5] = [
         (DocPanel::Documents, "Documents"),
         (DocPanel::Query, "Query"),
         (DocPanel::Schema, "Schema"),
         (DocPanel::Indexes, "Indexes"),
+        (DocPanel::Watch, "Watch"),
     ];
 }
 
@@ -406,6 +411,9 @@ pub(crate) struct CollView {
     /// Shared "who owns the live selection" cell for the List/JSON blocks.
     selection_group: SelectionGroup,
     pub(crate) list_focus: FocusHandle,
+    /// The change stream's state: whether it is running, what it has seen, and
+    /// which operations the viewer shows.
+    watch: DocWatchState,
     /// The keyboard row cursor as an absolute ordinal (arrow / vim motions), or
     /// `None` before the grid has been touched. Drives the grid highlight and the
     /// Enter-to-inspect target, falling back to the inspected row.
@@ -550,6 +558,7 @@ impl CollView {
             list_labels: BTreeMap::new(),
             selection_group: SelectionGroup::default(),
             list_focus: cx.focus_handle(),
+            watch: DocWatchState::default(),
             cursor: None,
         }
     }

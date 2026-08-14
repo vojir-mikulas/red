@@ -1448,6 +1448,7 @@ impl AppState {
             DocPanel::Query => self.render_doc_query(session, current, theme, view, cx),
             DocPanel::Schema => render_doc_schema_panel(current, theme),
             DocPanel::Indexes => render_doc_indexes_panel(session, current, read_only, theme, view),
+            DocPanel::Watch => self.render_doc_watch(session, current, theme, view),
         };
         div()
             .flex()
@@ -2672,6 +2673,11 @@ fn render_doc_empty(theme: &Theme) -> gpui::AnyElement {
 }
 
 /// A centered muted hint filling the panel body (loading / empty states).
+/// [`doc_centered_hint`] for the sibling panel modules.
+pub(super) fn doc_hint(text: &str, theme: &Theme) -> gpui::AnyElement {
+    doc_centered_hint(text, theme)
+}
+
 fn doc_centered_hint(text: &str, theme: &Theme) -> gpui::AnyElement {
     div()
         .flex()

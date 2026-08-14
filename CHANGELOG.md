@@ -70,6 +70,16 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   data size, size on disk, mean document size, index bytes per index, and whether
   it is sharded or capped. Numbers the server declines to report are left out
   rather than shown as zero.
+- A Watch panel on every MongoDB collection: follow its writes live through a
+  change stream, filter by insert/update/replace/delete, pause without missing
+  anything, and see the resume token a consumer would restart from. Needs a
+  replica set or sharded cluster, and says so on a standalone instead of failing
+  obscurely.
+- The AI assistant can now answer with rendered blocks: a fenced `datatable`,
+  `barchart`, or `stats` draws as a table, a bar comparison, or a row of stat
+  tiles instead of as JSON. A block that does not parse is still shown as code,
+  so nothing the model wrote is lost. Works in every markdown surface, on every
+  engine.
 - The row-number gutter now holds the left edge instead of scrolling away with
   the columns, so a row stays identifiable however far right you scroll.
 - Freeze result columns: "Pin <column> left" in the header menu holds a column

@@ -3674,6 +3674,118 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
+            Command::DocWatch {
+                epoch,
+                db,
+                coll,
+                resume_after,
+            } => {
+                let Some((state, driver)) =
+                    require_doc_driver_mut(&mut sessions, session_id, &events)
+                else {
+                    continue;
+                };
+                let entry = state.inflight.entry(epoch).or_default();
+                let abort = entry.supersede(Slot::DocWatch);
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let mut watch = match driver.watch(&db, &coll, resume_after.as_deref()).await {
+                        Ok(w) => w,
+                        Err(e) => {
+                            emit(
+                                &events,
+                                session_id,
+                                Event::DocError {
+                                    epoch,
+                                    message: e.to_string(),
+                                },
+                            );
+                            emit(
+                                &events,
+                                session_id,
+                                Event::DocWatchEnded {
+                                    epoch,
+                                    message: None,
+                                },
+                            );
+                            return;
+                        }
+                    };
+                    // A change stream has no native cancel, like a Redis Pub/Sub
+                    // subscription: poll with a bounded timeout so a stop is
+                    // noticed within a tick rather than blocking on a change that
+                    // may never come.
+                    let mut rate = StreamRate::new();
+                    loop {
+                        if abort.is_aborted() {
+                            return;
+                        }
+                        match tokio::time::timeout(Duration::from_millis(500), watch.stream.next())
+                            .await
+                        {
+                            Ok(Some(change)) => {
+                                let terminal = change.op.is_terminal();
+                                // Rate-limit a busy collection so it cannot
+                                // outgrow the event channel.
+                                let (admit, dropped) = rate.admit();
+                                if let Some(n) = dropped {
+                                    emit(
+                                        &events,
+                                        session_id,
+                                        Event::DocError {
+                                            epoch,
+                                            message: format!(
+                                                "{n} change(s) dropped: they arrived faster than \
+                                                 the viewer can show them"
+                                            ),
+                                        },
+                                    );
+                                }
+                                if admit {
+                                    emit(&events, session_id, Event::DocChanged { epoch, change });
+                                }
+                                if terminal {
+                                    emit(
+                                        &events,
+                                        session_id,
+                                        Event::DocWatchEnded {
+                                            epoch,
+                                            message: Some(
+                                                "the collection was dropped or renamed".into(),
+                                            ),
+                                        },
+                                    );
+                                    return;
+                                }
+                            }
+                            // The stream closed on its own.
+                            Ok(None) => {
+                                emit(
+                                    &events,
+                                    session_id,
+                                    Event::DocWatchEnded {
+                                        epoch,
+                                        message: None,
+                                    },
+                                );
+                                return;
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                });
+            }
+
+            Command::DocWatchStop { epoch } => {
+                let Some(sid) = session_id else { continue };
+                if let Some(state) = sessions.get_mut(&sid)
+                    && let Some(entry) = state.inflight.get(&epoch)
+                    && let Some(sig) = entry.slot(Slot::DocWatch)
+                {
+                    sig.abort();
+                }
+            }
+
             Command::DocReferenceMap { epoch, db } => {
                 let Some(driver) = require_doc_driver(&sessions, session_id, &events) else {
                     continue;

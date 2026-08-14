@@ -679,6 +679,26 @@ pub enum Command {
         db: String,
         coll: String,
     },
+    /// Watch a collection for changes, streaming one `DocChanged` per event until
+    /// a `DocWatchStop` on the same `epoch` (or the tab closing) ends it. Needs a
+    /// replica set or sharded cluster; a standalone replies `DocError` saying so.
+    ///
+    /// `resume_after` restarts from a token a previous run reported, so a viewer
+    /// picks up where it left off rather than from "now".
+    ///
+    /// Long-lived by design, like `KvSubscribe`: it holds its own
+    /// `Slot::DocWatch`, and starting a second watch on the same tab supersedes
+    /// the first.
+    DocWatch {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        resume_after: Option<String>,
+    },
+    /// Stop the `DocWatch` running for `epoch`.
+    DocWatchStop {
+        epoch: Epoch,
+    },
     /// Infer the relationships between a database's collections: sample each
     /// collection's schema, guess which fields reference another collection from
     /// their names, and *test each guess* against the target's `_id`. The read
@@ -1732,6 +1752,18 @@ pub enum Event {
         db: String,
         coll: String,
         schema: DocSchema,
+    },
+    /// One change from a live `DocWatch`.
+    DocChanged {
+        epoch: Epoch,
+        change: red_core::doc::DocChange,
+    },
+    /// A `DocWatch` ended: the stream closed (the collection was dropped or
+    /// renamed, or the connection went), so the panel stops looking live. Not an
+    /// error on its own; `message` says why when the server gave a reason.
+    DocWatchEnded {
+        epoch: Epoch,
+        message: Option<String>,
     },
     /// A database's inferred relationships, in response to `DocReferenceMap`.
     /// `collections` carries every collection and how many fields its sample

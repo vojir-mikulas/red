@@ -38,7 +38,7 @@ mod redis_kv;
 mod sqlite;
 mod xlsx;
 pub use clickhouse::ClickhouseDriver;
-pub use doc::DocDriver;
+pub use doc::{DocChangeStream, DocDriver};
 pub use docexport::{DocExportRequest, run_doc_export};
 pub use docimport::DocImportReader;
 pub use import::ImportReader;

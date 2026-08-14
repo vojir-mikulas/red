@@ -807,6 +807,49 @@ impl DocDriver for MongoDriver {
             .map_err(query_err)
     }
 
+    async fn watch(
+        &self,
+        db: &str,
+        coll: &str,
+        resume_after: Option<&str>,
+    ) -> Result<crate::DocChangeStream> {
+        if self.topology == DocTopology::Standalone {
+            return Err(RedError::Query(
+                "change streams need a replica set or a sharded cluster: a standalone mongod \
+                 keeps no oplog to read them from"
+                    .to_string(),
+            ));
+        }
+        // The handle is bound first: `watch()` borrows the collection, and a
+        // temporary would not outlive the builder chain.
+        let handle = self.client.database(db).collection::<BsonDocument>(coll);
+        let mut watch = handle
+            .watch()
+            // Without this an update reports only its changed fields, and the
+            // panel would show "update" with nothing to look at.
+            .full_document(mongodb::options::FullDocumentType::UpdateLookup);
+        if let Some(token) = resume_after {
+            let parsed = doc_to_bson_document(&self.parse_ext_json(token)?);
+            // `ResumeToken` wraps its raw BSON privately, so it is reached through
+            // its `Deserialize` rather than a constructor.
+            let token: mongodb::change_stream::event::ResumeToken =
+                mongodb::bson::from_bson(Bson::Document(parsed))
+                    .map_err(|e| RedError::Query(format!("that is not a resume token: {e}")))?;
+            watch = watch.resume_after(token);
+        }
+        let stream = watch.await.map_err(query_err)?;
+        let namespace = format!("{db}.{coll}");
+        Ok(crate::DocChangeStream {
+            stream: Box::pin(stream.filter_map(move |event| {
+                let namespace = namespace.clone();
+                // A failed event ends nothing: the driver resumes a resumable
+                // error itself, and a non-resumable one closes the stream, which
+                // the caller sees as the stream ending.
+                async move { event.ok().map(|e| change_event(e, &namespace)) }
+            })),
+        })
+    }
+
     async fn set_validator(&self, db: &str, coll: &str, validator: Option<&str>) -> Result<()> {
         self.ensure_writable()?;
         // An empty validator document is how `collMod` is told to remove one; the
@@ -842,6 +885,63 @@ impl DocDriver for MongoDriver {
 }
 
 // --- topology / error mapping ------------------------------------------------
+
+/// Convert one change-stream event into the engine-free [`DocChange`] mirror.
+/// `fallback_ns` is the watched namespace, used when the event names none (a
+/// collection-level event such as `invalidate`).
+fn change_event(
+    event: mongodb::change_stream::event::ChangeStreamEvent<BsonDocument>,
+    fallback_ns: &str,
+) -> red_core::doc::DocChange {
+    use mongodb::change_stream::event::OperationType as Op;
+    use red_core::doc::DocChangeOp;
+
+    let op = match event.operation_type {
+        Op::Insert => DocChangeOp::Insert,
+        Op::Update => DocChangeOp::Update,
+        Op::Replace => DocChangeOp::Replace,
+        Op::Delete => DocChangeOp::Delete,
+        Op::Drop => DocChangeOp::Drop,
+        Op::Rename => DocChangeOp::Rename,
+        Op::Invalidate => DocChangeOp::Invalidate,
+        _ => DocChangeOp::Other,
+    };
+    let namespace = event
+        .ns
+        .as_ref()
+        .map(|ns| match &ns.coll {
+            Some(coll) => format!("{}.{coll}", ns.db),
+            None => ns.db.clone(),
+        })
+        .unwrap_or_else(|| fallback_ns.to_string());
+    let id = event
+        .document_key
+        .as_ref()
+        .and_then(|k| k.get("_id"))
+        .map(|v| bson_to_doc(v.clone()));
+    let (updated, removed) = event
+        .update_description
+        .as_ref()
+        .map(|d| {
+            (
+                d.updated_fields.keys().cloned().collect(),
+                d.removed_fields.clone(),
+            )
+        })
+        .unwrap_or_default();
+    red_core::doc::DocChange {
+        op,
+        namespace,
+        id,
+        full: event.full_document.map(split_document),
+        updated,
+        removed,
+        at_ms: event.wall_time.map(|t| t.timestamp_millis()),
+        resume_token: mongodb::bson::to_bson(&event.id)
+            .ok()
+            .map(|b| bson_to_doc(b).to_extended_json()),
+    }
+}
 
 /// Read the deployment topology off a `hello` reply: a mongos router announces
 /// itself via `msg: "isdbgrid"`, a replica-set member carries a `setName`, and

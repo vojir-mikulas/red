@@ -16,7 +16,18 @@ use red_core::doc::{
     DocUpdate, DocValue, Document, Filter, FindQuery, IndexInfo, IndexSpec,
 };
 
+use std::pin::Pin;
+
+use futures_util::Stream;
+
 use crate::AbortSignal;
+
+/// A live change stream over a collection (see [`DocDriver::watch`]). Boxed
+/// because the concrete stream type is engine-specific, exactly like
+/// [`KvSubscription`](crate::KvSubscription).
+pub struct DocChangeStream {
+    pub stream: Pin<Box<dyn Stream<Item = red_core::doc::DocChange> + Send>>,
+}
 
 /// One open document-store session. The parallel seam to [`DatabaseDriver`](crate::DatabaseDriver)
 /// and [`KvDriver`](crate::KvDriver) for engines that are document-shaped.
@@ -251,6 +262,28 @@ pub trait DocDriver: Send + Sync {
     /// Drop an index by name (`dropIndexes`). Destructive: the queries that relied
     /// on it become collection scans, so the host gate confirms it first.
     async fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<()>;
+
+    /// Watch a collection for changes (`watch`), yielding one event per change
+    /// until the returned stream is dropped.
+    ///
+    /// Requires a replica set or a sharded cluster: change streams read the
+    /// oplog, which a standalone does not keep. The caller checks
+    /// [`topology`](Self::topology) first so the refusal is a sentence rather
+    /// than a driver error.
+    ///
+    /// `resume_after` restarts from a token a previous stream reported, which is
+    /// how a viewer picks up where it left off instead of from "now".
+    async fn watch(
+        &self,
+        db: &str,
+        coll: &str,
+        resume_after: Option<&str>,
+    ) -> Result<DocChangeStream> {
+        let _ = (db, coll, resume_after);
+        Err(red_core::RedError::Driver(
+            "this engine has no change streams".to_string(),
+        ))
+    }
 
     /// Set a collection's validator (`collMod`), or remove it with `None`.
     /// `validator` is extended-JSON text, parsed by the driver. Existing documents

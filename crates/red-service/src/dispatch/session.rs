@@ -200,6 +200,10 @@ pub(crate) enum Slot {
     /// A running `DocImport` ("Import documents…"), kept apart from every read on
     /// the same epoch for the reason [`Slot::KvImport`] is.
     DocImport,
+    /// A live `DocWatch` (a collection's change stream). Long-lived by design,
+    /// like [`Slot::KvSubscribe`]: it stays armed while the panel is open rather
+    /// than being superseded by a follow-up read.
+    DocWatch,
 }
 
 /// The cancellable work in flight for one open result. Each detached fetch carries

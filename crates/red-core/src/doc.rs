@@ -328,6 +328,78 @@ pub struct CollectionInfo {
     pub validator: Option<String>,
 }
 
+/// What a change stream reported happening.
+///
+/// The CRUD four plus the collection-level events, because those are what end a
+/// stream: a dropped or renamed collection invalidates it, and a viewer that
+/// showed nothing would just look frozen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocChangeOp {
+    Insert,
+    Update,
+    Replace,
+    Delete,
+    Drop,
+    Rename,
+    /// The stream can no longer continue (the collection was dropped or renamed).
+    Invalidate,
+    /// Anything the server reports that this list does not name, rather than
+    /// dropping it: an unrecognized event is still evidence something happened.
+    Other,
+}
+
+impl DocChangeOp {
+    pub fn label(self) -> &'static str {
+        match self {
+            DocChangeOp::Insert => "insert",
+            DocChangeOp::Update => "update",
+            DocChangeOp::Replace => "replace",
+            DocChangeOp::Delete => "delete",
+            DocChangeOp::Drop => "drop",
+            DocChangeOp::Rename => "rename",
+            DocChangeOp::Invalidate => "invalidate",
+            DocChangeOp::Other => "other",
+        }
+    }
+
+    /// Whether this event ends the stream. A viewer must say so rather than sit
+    /// there looking live.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, DocChangeOp::Invalidate | DocChangeOp::Drop)
+    }
+
+    /// The operations a viewer can filter by, in menu order.
+    pub const FILTERABLE: [DocChangeOp; 4] = [
+        DocChangeOp::Insert,
+        DocChangeOp::Update,
+        DocChangeOp::Replace,
+        DocChangeOp::Delete,
+    ];
+}
+
+/// One event from a collection's change stream.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocChange {
+    pub op: DocChangeOp,
+    /// `db.collection` the change happened on.
+    pub namespace: String,
+    /// The `_id` of the document that changed, when the event names one.
+    pub id: Option<DocValue>,
+    /// The document after the change, for an insert or a replace (and for an
+    /// update when the stream was opened with full-document lookup).
+    pub full: Option<Document>,
+    /// Fields an update set, as dotted paths.
+    pub updated: Vec<String>,
+    /// Fields an update removed.
+    pub removed: Vec<String>,
+    /// Server wall-clock time of the change, in milliseconds since the epoch.
+    pub at_ms: Option<i64>,
+    /// The resume token *after* this event, as extended JSON. Surfaced so a user
+    /// can see (and copy) the point a consumer would restart from, which is the
+    /// one thing a change-stream UI can offer that a log tail cannot.
+    pub resume_token: Option<String>,
+}
+
 /// A collection's storage numbers (`collStats`): what it costs, as opposed to
 /// what it holds.
 ///

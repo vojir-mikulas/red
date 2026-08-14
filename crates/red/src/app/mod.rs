@@ -2121,6 +2121,10 @@ impl AppState {
             } => {
                 self.on_doc_aggregate(session, epoch, db, coll, docs, cx);
             }
+            Event::DocChanged { epoch, change } => self.on_doc_changed(session, epoch, change, cx),
+            Event::DocWatchEnded { epoch, message } => {
+                self.on_doc_watch_ended(session, epoch, message, cx)
+            }
             Event::DocReferencesReady {
                 epoch,
                 db,
