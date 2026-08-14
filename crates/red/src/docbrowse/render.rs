@@ -124,6 +124,15 @@ impl AppState {
             .and_then(|v| v.actions_menu)
             .map(|pos| self.render_doc_actions_menu(active, pos, cx));
 
+        // The collection tree's right-click menu, rendered from the shell root for
+        // the reason the schema sidebar's is: the narrow dock would clip it and
+        // offset its window-coordinate anchor.
+        let coll_menu = active
+            .doc_view
+            .as_ref()
+            .and_then(|v| v.coll_menu.clone())
+            .map(|(db, coll, pos)| self.render_doc_coll_menu(active, db, coll, pos, cx));
+
         let statusbar = self.render_doc_statusbar(active, &theme, cx);
 
         div()
@@ -139,6 +148,7 @@ impl AppState {
             .children(confirm)
             .children(tab_menu)
             .children(actions_menu)
+            .children(coll_menu)
     }
 
     /// The whole work body: the `database -> collection` sidebar tree (a
@@ -389,7 +399,40 @@ impl AppState {
                 },
             )),
         );
+        // Not gated on `writable`: an export only reads.
+        let namespace = active
+            .doc_view
+            .as_ref()
+            .and_then(|v| v.focused_coll())
+            .map(|c| (c.db.clone(), c.coll.clone()));
+        if let Some((db, coll)) = namespace.clone() {
+            menu = menu.item(
+                ContextMenuItem::new("doc-act-export", "Export documents…").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.doc_open_export(session, db.clone(), coll.clone(), cx);
+                    },
+                )),
+            );
+        }
         if writable {
+            if let Some((db, coll)) = namespace {
+                let (cp_db, cp_coll) = (db.clone(), coll.clone());
+                menu = menu
+                    .item(
+                        ContextMenuItem::new("doc-act-import", "Import documents…").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.doc_open_import(session, db.clone(), coll.clone(), cx);
+                            }),
+                        ),
+                    )
+                    .item(
+                        ContextMenuItem::new("doc-act-copy", "Copy collection to…").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.doc_open_copy(session, cp_db.clone(), cp_coll.clone(), cx);
+                            }),
+                        ),
+                    );
+            }
             menu = menu
                 .separator()
                 .item(
@@ -424,6 +467,133 @@ impl AppState {
                 floating(div().occlude().child(menu.into_any_element()))
                     .at(pos)
                     .anchor(gpui::Anchor::TopRight),
+            )
+            .into_any_element()
+    }
+
+    /// The collection tree's right-click menu. A collection row offers open /
+    /// data movement / drop; a database row offers only what applies to a whole
+    /// database, which today is refreshing its collection list.
+    fn render_doc_coll_menu(
+        &self,
+        active: &ActiveConn,
+        db: String,
+        coll: Option<String>,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let session = active.session;
+        let writable = !active.config.read_only;
+        let mut menu = ContextMenu::new("doc-coll-menu");
+        match coll.clone() {
+            Some(coll) => {
+                let (open_db, open_coll) = (db.clone(), coll.clone());
+                let (tab_db, tab_coll) = (db.clone(), coll.clone());
+                let (exp_db, exp_coll) = (db.clone(), coll.clone());
+                menu = menu
+                    .item(
+                        ContextMenuItem::new("doc-coll-open", "Open").on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.doc_close_coll_menu(session, cx);
+                                this.doc_open_collection(
+                                    session,
+                                    open_db.clone(),
+                                    open_coll.clone(),
+                                    false,
+                                    cx,
+                                );
+                            },
+                        )),
+                    )
+                    .item(
+                        ContextMenuItem::new("doc-coll-open-tab", "Open in new tab").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.doc_close_coll_menu(session, cx);
+                                this.doc_open_collection(
+                                    session,
+                                    tab_db.clone(),
+                                    tab_coll.clone(),
+                                    true,
+                                    cx,
+                                );
+                            }),
+                        ),
+                    )
+                    .separator()
+                    .item(
+                        ContextMenuItem::new("doc-coll-export", "Export documents…").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.doc_open_export(session, exp_db.clone(), exp_coll.clone(), cx);
+                            }),
+                        ),
+                    );
+                if writable {
+                    let (imp_db, imp_coll) = (db.clone(), coll.clone());
+                    let (cp_db, cp_coll) = (db.clone(), coll.clone());
+                    let (drop_db, drop_coll) = (db.clone(), coll.clone());
+                    menu = menu
+                        .item(
+                            ContextMenuItem::new("doc-coll-import", "Import documents…").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.doc_open_import(
+                                        session,
+                                        imp_db.clone(),
+                                        imp_coll.clone(),
+                                        cx,
+                                    );
+                                }),
+                            ),
+                        )
+                        .item(
+                            ContextMenuItem::new("doc-coll-copy", "Copy collection to…").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.doc_open_copy(session, cp_db.clone(), cp_coll.clone(), cx);
+                                }),
+                            ),
+                        )
+                        .separator()
+                        .item(
+                            ContextMenuItem::new("doc-coll-drop", "Drop collection…").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.doc_close_coll_menu(session, cx);
+                                    this.doc_drop_collection(
+                                        session,
+                                        drop_db.clone(),
+                                        drop_coll.clone(),
+                                        cx,
+                                    );
+                                }),
+                            ),
+                        );
+                }
+            }
+            None => {
+                let refresh_db = db.clone();
+                menu = menu.item(
+                    ContextMenuItem::new("doc-db-refresh", "Refresh collections").on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.doc_close_coll_menu(session, cx);
+                            this.doc_reload_collections(session, refresh_db.clone(), cx);
+                        }),
+                    ),
+                );
+            }
+        }
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.doc_close_coll_menu(session, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| this.doc_close_coll_menu(session, cx)),
+            )
+            .child(
+                floating(div().occlude().child(menu.into_any_element()))
+                    .at(pos)
+                    .anchor(gpui::Anchor::TopLeft),
             )
             .into_any_element()
     }
@@ -919,9 +1089,11 @@ impl AppState {
             .map(|e| div().px_2().py_1().text_color(theme.red).child(e.clone()));
 
         let (nav_view, toggle_view, select_view) = (view.clone(), view.clone(), view.clone());
+        let menu_view = view.clone();
         let rows_render = rows.clone();
         let rows_toggle = rows.clone();
         let rows_select = rows.clone();
+        let rows_secondary = rows.clone();
 
         let tree = Tree::new("doc-db-tree")
             .rows(items)
@@ -975,6 +1147,22 @@ impl AppState {
                                 this.doc_open_collection(session, db, coll, new_tab, cx)
                             }
                         }
+                    })
+                    .ok();
+            })
+            // Right-click opens the row's action menu; a placeholder row has no
+            // identity and so opens nothing.
+            .on_secondary(move |ix, pos, _window, cx| {
+                let Some(sel) = rows_secondary[ix].sel.clone() else {
+                    return;
+                };
+                let (db, coll) = match sel {
+                    DocTreeSel::Db(db) => (db, None),
+                    DocTreeSel::Coll { db, coll } => (db, Some(coll)),
+                };
+                menu_view
+                    .update(cx, |this, cx| {
+                        this.doc_open_coll_menu(session, db, coll, pos, cx)
                     })
                     .ok();
             });

@@ -7,6 +7,22 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ## [Unreleased]
 
 ### Added
+- Export documents from MongoDB: "Export documents…" on the collection tree's
+  right-click menu and in the Documents toolbar's Actions menu writes the whole
+  collection, or just what the current filter matches, to JSON, NDJSON, CSV or
+  Excel. It streams one `_id`-keyset window at a time, so collection size is not
+  a limit, and the toast's ✕ cancels it and removes the partial file. CSV and
+  Excel flatten onto dotted columns sampled from the collection, and say so when
+  a document carried a field the sample never saw.
+- Import documents into a MongoDB collection from a JSON array, NDJSON, or CSV
+  file. The dialog previews the first documents exactly as they will be written
+  (parsed through the connection, so an extended-JSON `$oid` shows up as one),
+  and you choose whether a repeated `_id` is a collision or an update.
+- Copy a MongoDB collection into another collection, on the same connection or
+  any other open one: append, upsert on `_id`, or replace the target outright.
+  It streams window by window with progress and cancel, like the SQL table copy.
+- A right-click menu on the MongoDB collection tree: open (in this tab or a new
+  one), export, import, copy, drop, and refresh a database's collection list.
 - The row-number gutter now holds the left edge instead of scrolling away with
   the columns, so a row stays identifiable however far right you scroll.
 - Freeze result columns: "Pin <column> left" in the header menu holds a column
@@ -23,6 +39,8 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   screen.
 
 ### Fixed
+- An export that fails now says so and clears its progress toast, instead of
+  leaving "Exporting…" on screen for the rest of the session.
 - The result filter bar belongs to its tab. A term you were typing — a `WHERE`
   expression, a contains term, the column chips you were building — stays with
   the result it was written for instead of following you to the next tab, where

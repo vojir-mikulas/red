@@ -732,6 +732,71 @@ pub enum Command {
         id: red_core::doc::DocValue,
         doc_json: String,
     },
+    /// Stream the documents of `db.coll` matching `filter` to `path` in `format`,
+    /// one `_id`-keyset window at a time. Unbounded (unlike the agent's capped
+    /// `export_result` tool) and cancellable: `id` identifies the export, so the
+    /// shared `ExportProgress` / `ExportFinished` / `ExportCancelled` events and a
+    /// `CancelExport` route to it exactly as a SQL export's do. Runs off the
+    /// dispatch loop under its own `Slot::DocExport`, so a sibling browse fetch
+    /// cannot abort it halfway through a collection.
+    DocExport {
+        epoch: Epoch,
+        id: OpId,
+        db: String,
+        coll: String,
+        filter: Option<String>,
+        format: red_core::doc::DocExportFormat,
+        path: PathBuf,
+    },
+    /// Read the first `limit` documents of `path` and hand them back parsed, for
+    /// the import dialog's preview. The preview is *parsed*, not echoed, so what it
+    /// shows is what would actually be written: an extended-JSON `$oid` that the
+    /// driver rejects shows up here rather than as a failure mid-import. Replied
+    /// with `DocImportPreview`.
+    DocImportPeek {
+        epoch: Epoch,
+        path: PathBuf,
+        format: red_core::doc::DocImportFormat,
+        limit: usize,
+    },
+    /// Stream `path` into `db.coll`, document by document, in chunks. Refused on a
+    /// read-only connection. `id` identifies the import, so the shared
+    /// `ImportProgress` / `ImportFinished` / `ImportFailed` / `ImportCancelled`
+    /// events and a `CancelImport` route to it exactly as a SQL import's do.
+    /// Documents **commit per chunk**, so a mid-file failure leaves earlier chunks
+    /// written and reports how many.
+    DocImport {
+        epoch: Epoch,
+        id: OpId,
+        db: String,
+        coll: String,
+        path: PathBuf,
+        format: red_core::doc::DocImportFormat,
+        mode: red_core::doc::DocImportMode,
+    },
+    /// Stream a collection's documents into another collection: the document arm of
+    /// `CopyToTable`. The envelope's [`SessionId`] is the **source**;
+    /// `target_session` is where the target lives (equal to the source for a
+    /// same-connection copy, another open MongoDB connection for a cross-connection
+    /// one), and both ends are pinned against idle eviction for the copy's lifetime.
+    ///
+    /// `filter` narrows the source exactly as the browse grid's filter does. Reads
+    /// one `_id`-keyset window at a time and writes per chunk, so a copy of any size
+    /// holds one window. `id` routes the shared `Copy*` progress/terminal events and
+    /// a `CancelCopy`.
+    ///
+    /// No column mapping, unlike the SQL copy: a document carries its own shape, so
+    /// there is nothing to map it onto.
+    DocCopyCollection {
+        id: OpId,
+        source_db: String,
+        source_coll: String,
+        filter: Option<String>,
+        target_session: SessionId,
+        target_db: String,
+        target_coll: String,
+        mode: red_core::doc::DocCopyMode,
+    },
     /// Compute a column's aggregate summary over the open result's *filtered* SQL
     /// (the column-stats bar): a single `count`/`distinct`/`min`/`max`(/`sum`/`avg`)
     /// pushdown, like `count` but wider. `epoch` selects the open result (its stored,
@@ -1636,6 +1701,15 @@ pub enum Event {
         coll: String,
         indexes: Vec<IndexInfo>,
     },
+    /// The first documents of an import source, parsed by the target driver, in
+    /// response to `DocImportPeek`. `error` carries a parse/read failure instead of
+    /// a `DocError` so the dialog can show it inline beside the file it belongs to
+    /// rather than as a banner on the collection behind it.
+    DocImportPreview {
+        epoch: Epoch,
+        docs: Vec<String>,
+        error: Option<String>,
+    },
     /// One window of aggregation results, in response to `DocAggregate`.
     DocAggregateReady {
         epoch: Epoch,
@@ -1889,6 +1963,14 @@ pub enum Event {
     /// the export's toast.
     ExportCancelled {
         id: OpId,
+    },
+    /// An export failed (engine read, or writing the file). `id` selects the
+    /// export's toast, which is what makes this its own event rather than a plain
+    /// `Error`: without it the progress toast has nothing telling it to stop, and
+    /// a failed export sits at "Exporting…" for the life of the session.
+    ExportFailed {
+        id: OpId,
+        message: String,
     },
     /// A streamed import made progress: `rows` rows committed so far (throttled).
     /// `id` selects the import's toast.

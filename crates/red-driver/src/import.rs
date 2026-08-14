@@ -218,12 +218,12 @@ impl<R: BufRead> JsonArrayReader<R> {
     }
 }
 
-fn invalid(msg: &str) -> io::Error {
+pub(crate) fn invalid(msg: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, msg.to_string())
 }
 
 /// Read and consume one byte, or `None` at EOF.
-fn read_byte<R: BufRead>(reader: &mut R) -> io::Result<Option<u8>> {
+pub(crate) fn read_byte<R: BufRead>(reader: &mut R) -> io::Result<Option<u8>> {
     let byte = reader.fill_buf()?.first().copied();
     if byte.is_some() {
         reader.consume(1);
@@ -232,12 +232,12 @@ fn read_byte<R: BufRead>(reader: &mut R) -> io::Result<Option<u8>> {
 }
 
 /// Peek the next byte without consuming it, or `None` at EOF.
-fn peek_byte<R: BufRead>(reader: &mut R) -> io::Result<Option<u8>> {
+pub(crate) fn peek_byte<R: BufRead>(reader: &mut R) -> io::Result<Option<u8>> {
     Ok(reader.fill_buf()?.first().copied())
 }
 
 /// Consume any leading ASCII whitespace.
-fn skip_ws<R: BufRead>(reader: &mut R) -> io::Result<()> {
+pub(crate) fn skip_ws<R: BufRead>(reader: &mut R) -> io::Result<()> {
     loop {
         let buf = reader.fill_buf()?;
         if buf.is_empty() {
@@ -260,7 +260,7 @@ fn skip_ws<R: BufRead>(reader: &mut R) -> io::Result<()> {
 /// or whitespace (leaving that delimiter unconsumed). Assumes leading whitespace is
 /// already skipped. Structural characters are ASCII, so depth tracking on raw bytes
 /// is UTF-8 safe.
-fn read_json_value_bytes<R: BufRead>(reader: &mut R) -> io::Result<Vec<u8>> {
+pub(crate) fn read_json_value_bytes<R: BufRead>(reader: &mut R) -> io::Result<Vec<u8>> {
     let mut out = Vec::new();
     let first = peek_byte(reader)?.ok_or_else(|| invalid("expected a JSON value"))?;
     let mut in_str = false;
@@ -323,13 +323,22 @@ fn read_json_value_bytes<R: BufRead>(reader: &mut R) -> io::Result<Vec<u8>> {
 /// an open quote (odd number of `"` so far; doubled `""` escapes count as two and
 /// stay even), keeps appending lines until the quotes balance, so a field with an
 /// embedded newline isn't split across records.
-struct CsvReader<R: BufRead> {
+pub(crate) struct CsvReader<R: BufRead> {
     reader: R,
     done: bool,
 }
 
 impl<R: BufRead> CsvReader<R> {
-    fn next_record(&mut self) -> io::Result<Option<Vec<String>>> {
+    /// A reader positioned at the first record (the header, for a file that has
+    /// one). Callers that want the header pull it with the first `next_record`.
+    pub(crate) fn new(reader: R) -> Self {
+        Self {
+            reader,
+            done: false,
+        }
+    }
+
+    pub(crate) fn next_record(&mut self) -> io::Result<Option<Vec<String>>> {
         if self.done {
             return Ok(None);
         }
@@ -387,7 +396,7 @@ fn parse_csv_record(s: &str) -> Vec<String> {
 /// Read the next non-blank line (trimming the trailing newline), skipping empty
 /// lines (a trailing blank line in a JSONL file isn't an empty record). `None` at
 /// EOF.
-fn read_nonempty_line<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
+pub(crate) fn read_nonempty_line<R: BufRead>(reader: &mut R) -> io::Result<Option<String>> {
     loop {
         let mut line = String::new();
         if reader.read_line(&mut line)? == 0 {

@@ -24,6 +24,8 @@ mod clickhouse;
 #[cfg(test)]
 mod conformance;
 mod doc;
+mod docexport;
+mod docimport;
 mod format;
 mod import;
 mod kv;
@@ -37,6 +39,8 @@ mod sqlite;
 mod xlsx;
 pub use clickhouse::ClickhouseDriver;
 pub use doc::DocDriver;
+pub use docexport::{DocExportRequest, run_doc_export};
+pub use docimport::DocImportReader;
 pub use import::ImportReader;
 pub use kv::{KvDriver, KvMonitorStream, KvSubscription, KvTopology};
 pub use mongo::MongoDriver;

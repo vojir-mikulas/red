@@ -2800,11 +2800,25 @@ impl AppState {
             epoch,
             id,
         });
+        self.push_transfer_toast(id, "Exporting…", total, TransferKind::Export, cx);
+    }
+
+    /// Stand up the persistent progress toast for a transfer (`✕` is its Cancel;
+    /// see [`AppState::close_notification`]). `total` sizes the percentage and is
+    /// `0` when the length is unknown, which the toast reads as a bare count.
+    pub(crate) fn push_transfer_toast(
+        &mut self,
+        id: OpId,
+        message: &'static str,
+        total: usize,
+        kind: TransferKind,
+        cx: &mut Context<Self>,
+    ) {
         self.push_notification(
             Notification {
                 id: 0,
                 variant: ToastVariant::Info,
-                message: "Exporting…".into(),
+                message: message.into(),
                 detail: None,
                 detail_label: None,
                 auto_dismiss: None,
@@ -2812,7 +2826,7 @@ impl AppState {
                     id,
                     rows: 0,
                     total,
-                    kind: TransferKind::Export,
+                    kind,
                 }),
                 expanded: false,
                 hovered: false,
@@ -2903,6 +2917,15 @@ impl AppState {
             self.dismiss(nid, cx);
         }
         self.notify(ToastVariant::Info, "Export cancelled", cx);
+    }
+
+    /// `ExportFailed`: drop the progress toast (nothing else would), and report the
+    /// failure in its place.
+    pub(crate) fn on_export_failed(&mut self, id: OpId, message: String, cx: &mut Context<Self>) {
+        if let Some(nid) = self.export_notification_id(id) {
+            self.dismiss(nid, cx);
+        }
+        self.notify(ToastVariant::Error, message, cx);
     }
 
     // --- import progress events (data import) ---

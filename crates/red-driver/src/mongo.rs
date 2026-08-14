@@ -599,6 +599,35 @@ impl DocDriver for MongoDriver {
         Ok(result.inserted_ids.len() as u64)
     }
 
+    async fn upsert(&self, db: &str, coll: &str, docs: &[Document]) -> Result<u64> {
+        self.ensure_writable()?;
+        let handle = self.client.database(db).collection::<BsonDocument>(coll);
+        // Documents with no `_id` have no identity to match on, so they batch into
+        // one `insertMany` rather than each upserting against a null `_id`.
+        let (identified, anonymous): (Vec<&Document>, Vec<&Document>) =
+            docs.iter().partition(|d| d.id != DocValue::Null);
+        let mut written = 0u64;
+        for doc in identified {
+            handle
+                .replace_one(doc! { "_id": doc_to_bson(&doc.id) }, document_to_bson(doc))
+                .upsert(true)
+                .await
+                .map_err(query_err)?;
+            written += 1;
+        }
+        if !anonymous.is_empty() {
+            let bson: Vec<BsonDocument> =
+                anonymous.into_iter().map(insert_document_to_bson).collect();
+            written += handle
+                .insert_many(bson)
+                .await
+                .map_err(query_err)?
+                .inserted_ids
+                .len() as u64;
+        }
+        Ok(written)
+    }
+
     async fn update(
         &self,
         db: &str,

@@ -261,6 +261,30 @@ impl Document {
         }
         Some(Document { id, fields: rest })
     }
+
+    /// The value at a dotted path (`user.addr.city`), or `None` when a segment is
+    /// missing or its parent is not a sub-document. `_id` addresses the split-out
+    /// identity. An array is a leaf here (no `tags.0` indexing), matching how
+    /// [`DocSchema::from_documents`] records one.
+    pub fn value_at(&self, path: &str) -> Option<&DocValue> {
+        let mut segments = path.split('.');
+        let head = segments.next()?;
+        let mut current = if head == "_id" {
+            &self.id
+        } else {
+            self.fields
+                .iter()
+                .find(|(k, _)| k == head)
+                .map(|(_, v)| v)?
+        };
+        for segment in segments {
+            let DocValue::Document(fields) = current else {
+                return None;
+            };
+            current = fields.iter().find(|(k, _)| k == segment).map(|(_, v)| v)?;
+        }
+        Some(current)
+    }
 }
 
 /// A database in the catalog (`listDatabases`).
@@ -320,6 +344,154 @@ pub struct FindQuery {
     pub skip: u64,
     pub limit: Option<u64>,
     pub batch: usize,
+}
+
+/// A streamed document-export target format.
+///
+/// Two shapes, and the split is load-bearing: the JSON pair writes each document
+/// as extended JSON, so every BSON type survives the round trip; the tabular pair
+/// flattens documents onto a fixed column list, which is what a spreadsheet needs
+/// and what costs the types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocExportFormat {
+    /// One JSON array of extended-JSON documents.
+    Json,
+    /// One extended-JSON document per line (newline-delimited JSON), the format a
+    /// downstream tool can read without holding the whole file.
+    Ndjson,
+    /// Flattened rows against dotted column paths.
+    Csv,
+    /// Flattened rows into an Excel workbook.
+    Xlsx,
+}
+
+impl DocExportFormat {
+    /// The destination file's extension, without the dot.
+    pub fn extension(self) -> &'static str {
+        match self {
+            DocExportFormat::Json => "json",
+            DocExportFormat::Ndjson => "ndjson",
+            DocExportFormat::Csv => "csv",
+            DocExportFormat::Xlsx => "xlsx",
+        }
+    }
+
+    /// Whether the format writes rows against a fixed column list, and therefore
+    /// needs one computed before the first document is written.
+    pub fn is_tabular(self) -> bool {
+        matches!(self, DocExportFormat::Csv | DocExportFormat::Xlsx)
+    }
+}
+
+/// A streamed document-import source format, the read-side mirror of
+/// [`DocExportFormat`]. Narrower than the export set on purpose: XLSX is a write
+/// target, not a source RED parses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocImportFormat {
+    /// One top-level JSON array of objects.
+    Json,
+    /// One JSON object per line.
+    Ndjson,
+    /// A header of dotted field paths over flat records.
+    Csv,
+}
+
+impl DocImportFormat {
+    /// The format a file name suggests, or `None` when the extension says nothing.
+    /// A guess the import dialog pre-selects and the user can override.
+    pub fn from_extension(name: &str) -> Option<DocImportFormat> {
+        let ext = name.rsplit('.').next()?.to_ascii_lowercase();
+        match ext.as_str() {
+            "json" => Some(DocImportFormat::Json),
+            "ndjson" | "jsonl" => Some(DocImportFormat::Ndjson),
+            "csv" => Some(DocImportFormat::Csv),
+            _ => None,
+        }
+    }
+}
+
+/// How a collection copy writes into its target.
+///
+/// The document analogue of [`CopyMode`](crate::CopyMode), with one arm that has no
+/// SQL counterpart: a document store has no schema to preserve, so replacing a
+/// collection wholesale is a drop, not a truncate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocCopyMode {
+    /// Insert the source documents; the target keeps what it already had. A
+    /// duplicate `_id` fails the chunk it is in.
+    Append,
+    /// Replace a target document with the same `_id`, insert when there is none:
+    /// re-runnable without collisions.
+    UpsertOnId,
+    /// Drop the target collection first, then insert: a full refresh. Destructive,
+    /// and gated by the same confirm a drop is.
+    DropAndInsert,
+}
+
+/// How an import writes each document into the target collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocImportMode {
+    /// Insert every document. A duplicate `_id` fails that document.
+    Insert,
+    /// Replace the document with the same `_id`, inserting when there is none
+    /// (`replaceOne` with `upsert`). What makes re-importing an export idempotent.
+    UpsertOnId,
+}
+
+/// The column list a tabular export writes, derived from an inferred schema:
+/// every field path that ever held something other than a sub-document, `_id`
+/// first and the rest in the schema's (sorted) order, capped at `max`.
+///
+/// A path that is *only* ever a sub-document is dropped, because its children
+/// already carry the data. A path with type drift (a string in some documents, a
+/// sub-document in others) is kept, because dropping it would lose the string
+/// case — a schemaless store's whole hazard.
+pub fn tabular_columns(schema: &DocSchema, max: usize) -> Vec<String> {
+    let mut columns = Vec::with_capacity(schema.fields.len().min(max));
+    let scalar = |f: &FieldStat| f.types.iter().any(|(t, _)| *t != DocType::Object);
+    if schema.fields.iter().any(|f| f.path == "_id") {
+        columns.push("_id".to_string());
+    }
+    for field in schema.fields.iter().filter(|f| f.path != "_id") {
+        if columns.len() >= max {
+            break;
+        }
+        if scalar(field) {
+            columns.push(field.path.clone());
+        }
+    }
+    columns
+}
+
+/// Whether a tabular export of `doc` against `columns` would drop something: any
+/// leaf the column list does not address. The signal behind the export's
+/// "documents had fields outside the sampled columns" shortfall, because a
+/// column list sampled from part of a collection cannot cover a schemaless whole.
+pub fn has_unmapped_fields(doc: &Document, columns: &[String]) -> bool {
+    let mut unmapped = false;
+    let mut check = |path: &str| {
+        if !unmapped && !columns.iter().any(|c| c == path) {
+            unmapped = true;
+        }
+    };
+    leaf_paths("_id", &doc.id, &mut check);
+    for (name, value) in &doc.fields {
+        leaf_paths(name, value, &mut check);
+    }
+    unmapped
+}
+
+/// Emit the dotted path of every leaf under `value`: a non-document value, or an
+/// empty sub-document (which has no children to carry it).
+fn leaf_paths(path: &str, value: &DocValue, emit: &mut impl FnMut(&str)) {
+    match value {
+        DocValue::Document(fields) if !fields.is_empty() => {
+            for (name, child) in fields {
+                leaf_paths(&format!("{path}.{name}"), child, emit);
+            }
+        }
+        _ => emit(path),
+    }
 }
 
 /// A keyset seek into an `_id`-ordered browse: which boundary to page from and
@@ -1135,6 +1307,90 @@ mod tests {
         // match the probe would then have to disprove.
         assert_eq!(match_collection("person", &catalog), None);
         assert_eq!(match_collection("invoice", &catalog), None);
+    }
+
+    #[test]
+    fn value_at_walks_dotted_paths() {
+        let doc = Document {
+            id: DocValue::Int32(1),
+            fields: vec![
+                (
+                    "user".into(),
+                    DocValue::Document(vec![
+                        ("city".into(), DocValue::Str("London".into())),
+                        ("meta".into(), DocValue::Document(vec![])),
+                    ]),
+                ),
+                (
+                    "tags".into(),
+                    DocValue::Array(vec![DocValue::Str("x".into())]),
+                ),
+            ],
+        };
+        assert_eq!(doc.value_at("_id"), Some(&DocValue::Int32(1)));
+        assert_eq!(
+            doc.value_at("user.city"),
+            Some(&DocValue::Str("London".into()))
+        );
+        assert_eq!(doc.value_at("user.meta"), Some(&DocValue::Document(vec![])));
+        assert_eq!(doc.value_at("user.missing"), None);
+        // An array is a leaf: no element indexing, matching the schema rollup.
+        assert_eq!(doc.value_at("tags.0"), None);
+        // Descending through a scalar is not a path, it is a mistake.
+        assert_eq!(doc.value_at("user.city.length"), None);
+    }
+
+    #[test]
+    fn tabular_columns_drops_pure_containers_and_leads_with_id() {
+        let docs = vec![
+            Document {
+                id: DocValue::Int32(1),
+                fields: vec![
+                    ("name".into(), DocValue::Str("a".into())),
+                    (
+                        "user".into(),
+                        DocValue::Document(vec![("age".into(), DocValue::Int32(30))]),
+                    ),
+                ],
+            },
+            // `user` is a string here: type drift keeps the column, because
+            // dropping it would lose this document's value entirely.
+            Document {
+                id: DocValue::Int32(2),
+                fields: vec![("drift".into(), DocValue::Str("s".into()))],
+            },
+        ];
+        let schema = DocSchema::from_documents(&docs);
+        let columns = tabular_columns(&schema, 64);
+        assert_eq!(columns, vec!["_id", "drift", "name", "user.age"]);
+        // `user` itself is only ever a sub-document, so its children carry it.
+        assert!(!columns.iter().any(|c| c == "user"));
+        // The cap bounds the header the way `doc.max_columns` bounds the grid.
+        assert_eq!(tabular_columns(&schema, 2), vec!["_id", "drift"]);
+    }
+
+    #[test]
+    fn unmapped_fields_spots_what_a_tabular_export_would_drop() {
+        let doc = Document {
+            id: DocValue::Int32(1),
+            fields: vec![
+                ("name".into(), DocValue::Str("a".into())),
+                (
+                    "user".into(),
+                    DocValue::Document(vec![("age".into(), DocValue::Int32(30))]),
+                ),
+            ],
+        };
+        let covered = [
+            "_id".to_string(),
+            "name".to_string(),
+            "user.age".to_string(),
+        ];
+        assert!(!has_unmapped_fields(&doc, &covered));
+        // The parent path does not stand in for its leaf.
+        let parent_only = ["_id".to_string(), "name".to_string(), "user".to_string()];
+        assert!(has_unmapped_fields(&doc, &parent_only));
+        assert!(has_unmapped_fields(&doc, &["_id".to_string()]));
     }
 
     #[test]

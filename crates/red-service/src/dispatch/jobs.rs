@@ -10,6 +10,7 @@ use std::io::BufReader;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use red_core::doc::{DocCopyMode, DocImportFormat, DocImportMode};
 use red_core::{ColumnMap, CopyMode, FkEdge, ImportFormat, TableRef};
 use red_driver::{DatabaseDriver, ImportReader};
 
@@ -120,6 +121,248 @@ pub(super) fn run_import_blocking(
     }
     flush!();
     (committed, None)
+}
+
+/// Documents written per chunk by [`run_doc_import_blocking`]. One `insertMany` /
+/// upsert batch: large enough that the round trips don't dominate, small enough
+/// that a chunk is a rounding error in memory and a mid-file failure loses little.
+pub(super) const DOC_IMPORT_CHUNK: usize = 500;
+
+/// Stream `path` (JSON array / NDJSON / CSV) into `db.coll` as documents, in chunks
+/// of [`DOC_IMPORT_CHUNK`]. Runs on a blocking thread (file IO + the driver's
+/// synchronous extended-JSON parse); each chunk's async write is driven with
+/// `handle.block_on`. Holds at most one chunk, never the file.
+///
+/// Writes **commit per chunk**, like the SQL import, so the returned count is
+/// meaningful on error or cancel. `cancel` is checked between documents. Returns
+/// `(documents written, error-or-None)`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors run_import_blocking: source, target, and job plumbing all have to arrive"
+)]
+pub(super) fn run_doc_import_blocking(
+    driver: Arc<dyn red_driver::DocDriver>,
+    path: std::path::PathBuf,
+    format: DocImportFormat,
+    db: String,
+    coll: String,
+    mode: DocImportMode,
+    cancel: Arc<AtomicBool>,
+    progress: tokio::sync::mpsc::UnboundedSender<u64>,
+    handle: tokio::runtime::Handle,
+) -> (u64, Option<RedError>) {
+    let file = match File::open(&path) {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                0,
+                Some(RedError::Driver(format!(
+                    "cannot open {}: {e}",
+                    path.display()
+                ))),
+            );
+        }
+    };
+    let mut reader = match red_driver::DocImportReader::begin(BufReader::new(file), format) {
+        Ok(r) => r,
+        Err(e) => return (0, Some(RedError::Query(format!("read error: {e}")))),
+    };
+
+    let mut chunk: Vec<red_core::doc::Document> = Vec::with_capacity(DOC_IMPORT_CHUNK);
+    let mut written = 0u64;
+    let mut doc_no = 0usize;
+
+    macro_rules! flush {
+        () => {{
+            if !chunk.is_empty() {
+                let result = match mode {
+                    DocImportMode::Insert => handle.block_on(driver.insert(&db, &coll, &chunk)),
+                    DocImportMode::UpsertOnId => handle.block_on(driver.upsert(&db, &coll, &chunk)),
+                };
+                match result {
+                    Ok(n) => {
+                        written += n;
+                        chunk.clear();
+                        let _ = progress.send(written);
+                    }
+                    Err(e) => return (written, Some(e)),
+                }
+            }
+        }};
+    }
+
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return (written, Some(RedError::Interrupted));
+        }
+        match reader.next_document() {
+            Ok(None) => break,
+            Ok(Some(text)) => {
+                doc_no += 1;
+                match driver
+                    .parse_ext_json(&text)
+                    .and_then(super::parse_one_document)
+                {
+                    Ok(document) => chunk.push(document),
+                    Err(e) => {
+                        return (
+                            written,
+                            Some(RedError::Query(format!("document {doc_no}: {e}"))),
+                        );
+                    }
+                }
+                if chunk.len() >= DOC_IMPORT_CHUNK {
+                    flush!();
+                }
+            }
+            Err(e) => {
+                return (
+                    written,
+                    Some(RedError::Query(format!("document {}: {e}", doc_no + 1))),
+                );
+            }
+        }
+    }
+    flush!();
+    (written, None)
+}
+
+/// Documents read (and written) per window by [`doc_copy_job`].
+const DOC_COPY_WINDOW: usize = 500;
+
+/// Stream every document of `src_db.src_coll` matching `filter` into
+/// `dst_db.dst_coll`, reading one `_id`-keyset window at a time and writing it
+/// before the next is read. `src` and `dst` may be the same driver (same-connection
+/// copy) or two different connections.
+///
+/// Documents arrive from `find_seek` whole, so unlike the SQL copy there is nothing
+/// to map and no fidelity cap to defeat: what the source holds is what is written.
+/// Writes **commit per chunk**, so the returned count is meaningful on error or
+/// cancel. Emits `CopyProgress` inline, so the caller's terminal event strictly
+/// follows the last progress. Returns `(documents written, error-or-None)`.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "mirrors copy_job: two drivers, two namespaces, and the job plumbing"
+)]
+pub(super) async fn doc_copy_job(
+    src: Arc<dyn red_driver::DocDriver>,
+    dst: Arc<dyn red_driver::DocDriver>,
+    src_db: String,
+    src_coll: String,
+    filter: Option<red_core::doc::Filter>,
+    dst_db: String,
+    dst_coll: String,
+    mode: DocCopyMode,
+    cancel: Arc<AtomicBool>,
+    events: Events,
+    id: OpId,
+) -> (u64, Option<RedError>) {
+    let abort = red_driver::AbortSignal::new();
+    if mode == DocCopyMode::DropAndInsert
+        && let Err(e) = dst.drop_collection(&dst_db, &dst_coll).await
+    {
+        // A target that does not exist yet is exactly what this mode wants; only a
+        // real refusal (permissions, read-only) is worth failing for, and the
+        // create below turns a spurious success into a real one either way.
+        tracing::debug!("copy: dropping {dst_db}.{dst_coll} before refill: {e}");
+    }
+    // Create the target so an empty source still leaves a collection behind; Mongo
+    // would otherwise create it lazily on the first insert, which never comes.
+    if let Err(e) = dst.create_collection(&dst_db, &dst_coll).await {
+        tracing::debug!("copy: creating {dst_db}.{dst_coll}: {e}");
+    }
+
+    let mut after: Option<red_core::doc::DocValue> = None;
+    let mut written = 0u64;
+    loop {
+        if cancel.load(Ordering::Relaxed) {
+            return (written, Some(RedError::Interrupted));
+        }
+        let window = match src
+            .find_seek(
+                &src_db,
+                &src_coll,
+                filter.as_ref(),
+                red_core::doc::DocSeek::Forward {
+                    after: after.clone(),
+                },
+                DOC_COPY_WINDOW,
+                &abort,
+            )
+            .await
+        {
+            Ok(w) => w,
+            Err(e) => return (written, Some(e)),
+        };
+        if window.is_empty() {
+            break;
+        }
+        after = window.last().map(|d| d.id.clone());
+        let result = match mode {
+            DocCopyMode::UpsertOnId => dst.upsert(&dst_db, &dst_coll, &window).await,
+            DocCopyMode::Append | DocCopyMode::DropAndInsert => {
+                dst.insert(&dst_db, &dst_coll, &window).await
+            }
+        };
+        match result {
+            Ok(n) => written += n,
+            Err(e) => return (written, Some(e)),
+        }
+        // One tick per written window, like the SQL copy: no separate forwarder
+        // task, so the caller's terminal event can never be overtaken by a
+        // trailing progress.
+        emit(
+            &events,
+            None,
+            Event::CopyProgress {
+                id,
+                rows: written as usize,
+            },
+        );
+    }
+    (written, None)
+}
+
+/// Read up to `limit` documents from `path`, parsed by `driver` so the preview shows
+/// what would actually be written. Returns the rendered documents and the first
+/// failure, if any: a preview that stops early still shows what it managed to read.
+pub(super) fn peek_documents(
+    driver: &Arc<dyn red_driver::DocDriver>,
+    path: &std::path::Path,
+    format: DocImportFormat,
+    limit: usize,
+) -> (Vec<String>, Option<String>) {
+    let file = match File::open(path) {
+        Ok(f) => f,
+        Err(e) => {
+            return (
+                Vec::new(),
+                Some(format!("cannot open {}: {e}", path.display())),
+            );
+        }
+    };
+    let mut reader = match red_driver::DocImportReader::begin(BufReader::new(file), format) {
+        Ok(r) => r,
+        Err(e) => return (Vec::new(), Some(format!("read error: {e}"))),
+    };
+    let mut out = Vec::with_capacity(limit);
+    while out.len() < limit {
+        match reader.next_document() {
+            Ok(None) => break,
+            Ok(Some(text)) => match driver.parse_ext_json(&text) {
+                Ok(value) => out.push(value.to_extended_json()),
+                Err(e) => {
+                    let at = out.len() + 1;
+                    return (out, Some(format!("document {at}: {e}")));
+                }
+            },
+            Err(e) => {
+                let at = out.len() + 1;
+                return (out, Some(format!("document {at}: {e}")));
+            }
+        }
+    }
+    (out, None)
 }
 
 /// Stream an open result (`source_sql`, already filtered/sorted/wrapped) from `src`

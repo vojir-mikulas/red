@@ -2958,6 +2958,11 @@ pub enum ExportShortfall {
     /// Keys the chosen format cannot represent were left out (a Redis Commands
     /// export of a binary value, which only the DUMP format round-trips).
     SkippedKeys(u64),
+    /// Documents carried fields outside the tabular export's column list. The
+    /// columns come from a *sample* of a schemaless collection, so a later
+    /// document can always hold a field the sample never saw; the rows are still
+    /// written, minus those fields.
+    UnmappedFields(u64),
 }
 
 impl ExportShortfall {
@@ -2970,6 +2975,10 @@ impl ExportShortfall {
             }
             ExportShortfall::SkippedKeys(n) => format!(
                 "{n} key(s) skipped: their values are binary and this format cannot carry them.                  Use the DUMP format for those."
+            ),
+            ExportShortfall::UnmappedFields(n) => format!(
+                "{n} document(s) held fields outside the sampled columns, and those fields are \
+                 not in the file. Export as JSON or NDJSON to keep every field."
             ),
         }
     }

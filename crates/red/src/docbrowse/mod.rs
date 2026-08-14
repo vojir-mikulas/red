@@ -10,9 +10,11 @@
 mod form;
 mod render;
 mod tabs;
+mod transfer;
 mod window;
 
 pub(crate) use form::{DocForm, InspectorMode};
+pub(crate) use transfer::{DocCopyState, DocExportState, DocImportState};
 
 use window::{DocWindow, FetchCtx};
 
@@ -151,6 +153,15 @@ pub(crate) struct MongoView {
     /// open (Explain / New / Drop live here to keep the toolbar uncrowded).
     /// Mirrors the Redis `actions_menu` positioned-menu pattern.
     actions_menu: Option<gpui::Point<gpui::Pixels>>,
+    /// The collection-tree row whose right-click menu is open, as
+    /// `(db, coll, position)`. A `coll` of `None` is a database row.
+    coll_menu: Option<(String, Option<String>, gpui::Point<gpui::Pixels>)>,
+    /// The open "Export documents" modal, if any.
+    pub(crate) export: Option<DocExportState>,
+    /// The open "Import documents" modal, if any.
+    pub(crate) import: Option<DocImportState>,
+    /// The open "Copy collection to…" modal, if any.
+    pub(crate) copy: Option<DocCopyState>,
     /// The `database -> collection` sidebar tree's keyboard focus handle; the
     /// `FocusSchema` action and a tree click plant focus here.
     pub(crate) tree_focus: FocusHandle,
@@ -572,6 +583,10 @@ impl MongoView {
             layout: PaneLayout::new(),
             tab_menu: None,
             actions_menu: None,
+            coll_menu: None,
+            export: None,
+            import: None,
+            copy: None,
             tree_focus: cx.focus_handle(),
             tree_filter: {
                 let filter = cx.new(|cx| {
@@ -1689,6 +1704,60 @@ impl AppState {
             self.service.send_to(session, cmd);
             cx.notify();
         }
+    }
+
+    /// Propose dropping a collection named from the tree, which need not be open
+    /// in a tab. Runs under the catalog epoch for exactly that reason; the
+    /// confirm dance and the `DocWriteDone` refresh are the drop-current path's.
+    fn doc_drop_collection(
+        &mut self,
+        session: SessionId,
+        db: String,
+        coll: String,
+        cx: &mut Context<Self>,
+    ) {
+        let cmd = {
+            let Some(view) = self
+                .conn_mut(Some(session))
+                .and_then(|a| a.doc_view.as_ref())
+            else {
+                return;
+            };
+            if view.read_only {
+                return;
+            }
+            // A tab already open on the namespace owns the refresh that follows,
+            // so the write rides its epoch when there is one.
+            let epoch = view
+                .tabs
+                .iter()
+                .find_map(|t| match &t.state {
+                    MongoTabState::Collection(c) if c.db == db && c.coll == coll => Some(c.epoch),
+                    _ => None,
+                })
+                .unwrap_or(view.epoch);
+            Command::DocApplyWrite {
+                epoch,
+                write: DocWrite::DropCollection { db, coll },
+                confirmed: false,
+            }
+        };
+        self.service.send_to(session, cmd);
+        cx.notify();
+    }
+
+    /// Re-fetch one database's collection list (the tree's context-menu refresh).
+    fn doc_reload_collections(&mut self, session: SessionId, db: String, cx: &mut Context<Self>) {
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_ref())
+        else {
+            return;
+        };
+        let epoch = view.epoch;
+        self.service
+            .send_to(session, Command::DocListCollections { epoch, db });
+        cx.notify();
     }
 
     /// Approve the pending destructive write: re-send it confirmed against the

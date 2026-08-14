@@ -223,6 +223,9 @@ impl DocDriver for DocStub {
     async fn insert(&self, _db: &str, _coll: &str, _docs: &[Document]) -> red_core::Result<u64> {
         Err(RedError::Driver("read-only stub".into()))
     }
+    async fn upsert(&self, _db: &str, _coll: &str, _docs: &[Document]) -> red_core::Result<u64> {
+        Err(RedError::Driver("read-only stub".into()))
+    }
     async fn update(
         &self,
         _db: &str,

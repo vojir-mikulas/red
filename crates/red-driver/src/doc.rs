@@ -189,6 +189,15 @@ pub trait DocDriver: Send + Sync {
     /// Insert documents (`insertMany`), returning how many were inserted.
     async fn insert(&self, db: &str, coll: &str, docs: &[Document]) -> Result<u64>;
 
+    /// Write documents, replacing any that already carry the same `_id`
+    /// (`replaceOne` with `upsert`), and return how many were written. What makes
+    /// re-importing an export idempotent instead of a duplicate-key error.
+    ///
+    /// A document whose `_id` is absent is inserted: there is no identity to match
+    /// on, so upserting against a null `_id` would collapse every such document
+    /// onto one.
+    async fn upsert(&self, db: &str, coll: &str, docs: &[Document]) -> Result<u64>;
+
     /// Update documents matching `filter` (`updateOne`/`updateMany`) — a
     /// `$set` patch or a full replacement per [`DocUpdate`] — returning the
     /// modified count. `many` chooses one vs. all matches.
@@ -445,6 +454,22 @@ mod tests {
                 .entry(coll.to_string())
                 .or_default()
                 .extend(docs.iter().cloned());
+            Ok(docs.len() as u64)
+        }
+        async fn upsert(&self, db: &str, coll: &str, docs: &[Document]) -> Result<u64> {
+            self.ensure_writable()?;
+            let mut data = self.data.lock().unwrap();
+            let slot = data
+                .entry(db.to_string())
+                .or_default()
+                .entry(coll.to_string())
+                .or_default();
+            for doc in docs {
+                match slot.iter_mut().find(|d| d.id == doc.id) {
+                    Some(existing) => *existing = doc.clone(),
+                    None => slot.push(doc.clone()),
+                }
+            }
             Ok(docs.len() as u64)
         }
         async fn update(

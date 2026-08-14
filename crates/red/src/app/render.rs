@@ -828,6 +828,10 @@ impl Render for AppState {
             // The Redis "Import keys" modal, likewise root-mounted.
             .children(self.render_kv_import_modal(cx))
             .children(self.render_kv_export_modal(cx))
+            // The Mongo "Export documents" / "Import documents" modals, likewise.
+            .children(self.render_doc_export_modal(cx))
+            .children(self.render_doc_import_modal(cx))
+            .children(self.render_doc_copy_modal(cx))
             // The Redis delete-key confirmation, likewise root-mounted.
             .children(self.render_kv_delete_modal(cx))
             // The palette renders its own full-screen overlay; last = on top.

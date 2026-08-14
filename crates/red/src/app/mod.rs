@@ -2295,6 +2295,10 @@ impl AppState {
                 shortfall,
             } => self.on_export_finished(id, path, rows, shortfall, cx),
             Event::ExportCancelled { id } => self.on_export_cancelled(id, cx),
+            Event::ExportFailed { id, message } => self.on_export_failed(id, message, cx),
+            Event::DocImportPreview { epoch, docs, error } => {
+                self.on_doc_import_preview(session, epoch, docs, error, cx)
+            }
 
             // --- data import (Track: data import) ---
             Event::ImportProgress { id, rows } => self.on_import_progress(id, rows, cx),

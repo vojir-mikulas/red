@@ -660,6 +660,36 @@ impl AppState {
         }
     }
 
+    /// Open the collection tree's right-click menu on a database (`coll` is
+    /// `None`) or a collection row. `pos` is a window coordinate, so the menu
+    /// renders from the shell root rather than inside the narrow sidebar.
+    pub(crate) fn doc_open_coll_menu(
+        &mut self,
+        session: SessionId,
+        db: String,
+        coll: Option<String>,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+        {
+            view.coll_menu = Some((db, coll, pos));
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn doc_close_coll_menu(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+            && view.coll_menu.take().is_some()
+        {
+            cx.notify();
+        }
+    }
+
     /// ⌘R: reload the databases list and re-seed the focused collection's browse
     /// (back to the first window; the count is re-read too).
     pub(crate) fn doc_refresh(&mut self, session: SessionId, cx: &mut Context<Self>) {
