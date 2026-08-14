@@ -219,11 +219,17 @@ impl Render for AppState {
             }
         }
 
-        // The history popover just opened: focus it so its arrow keys work.
+        // The history popover just opened: focus it so its arrow keys work. Each
+        // shell renders its own dock, so focus follows the one on screen.
         if self.focus_history {
             self.focus_history = false;
             if let Phase::Connected(active) = &self.phase {
-                window.focus(&active.history_panel.focus_handle(cx), cx);
+                let handle = match (&active.kv_view, &active.doc_view) {
+                    (Some(kv), _) => kv.history_panel.focus_handle(cx),
+                    (_, Some(doc)) => doc.history_panel.focus_handle(cx),
+                    _ => active.history_panel.focus_handle(cx),
+                };
+                window.focus(&handle, cx);
             }
         }
 

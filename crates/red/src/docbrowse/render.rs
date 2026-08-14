@@ -39,6 +39,66 @@ impl AppState {
         // about the connection, so it sits outside the collection workspace.
         let workspace = self.with_server_dock(active, "doc-split-server", workspace, cx);
 
+        // The left History dock (⌘Y), outside the Server dock: the same nesting
+        // order the SQL and Redis shells use, so the three shells' left docks line
+        // up column for column.
+        let workspace = if active.history_open {
+            let history_pane = div()
+                .relative()
+                .size_full()
+                .children(
+                    active
+                        .doc_view
+                        .as_ref()
+                        .map(|v| v.history_panel.clone().into_any_element()),
+                )
+                .children(
+                    self.focus_hint(crate::focus::FocusTargetId::History)
+                        .map(|h| crate::focus_overlay::badge(h, cx)),
+                );
+            let (start, resize, end) = (view.clone(), view.clone(), view.clone());
+            SplitPane::new("doc-split-history", Axis::Horizontal)
+                .size(active.history_w)
+                .gutter(px(1.))
+                .drag(active.history_drag)
+                .min_first(px(180.))
+                .max_first(px(480.))
+                .on_drag_start(move |anchor, _, cx| {
+                    start
+                        .update(cx, |this, cx| {
+                            if let Phase::Connected(a) = &mut this.phase {
+                                a.history_drag = Some(anchor);
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                })
+                .on_resize(move |size, _, cx| {
+                    resize
+                        .update(cx, |this, cx| {
+                            if let Phase::Connected(a) = &mut this.phase {
+                                a.history_w = size;
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                })
+                .on_drag_end(move |_, cx| {
+                    end.update(cx, |this, cx| {
+                        if let Phase::Connected(a) = &mut this.phase {
+                            a.history_drag = None;
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .first(history_pane)
+                .second(workspace)
+                .into_any_element()
+        } else {
+            workspace
+        };
+
         // Dock the assistant to the right of the workspace when it's open, the
         // same resizable split the SQL/Redis shells use.
         let body = if self.assistant.is_some() {
@@ -141,6 +201,14 @@ impl AppState {
             .and_then(|c| c.fields_menu)
             .map(|pos| self.render_doc_fields_menu(active, pos, cx));
 
+        // The Query panel's "add stage" operator palette, likewise.
+        let stage_menu = active
+            .doc_view
+            .as_ref()
+            .and_then(|v| v.focused_coll())
+            .and_then(|c| c.stage_menu)
+            .map(|(at, pos)| self.render_doc_stage_menu(active.session, at, pos, cx));
+
         let statusbar = self.render_doc_statusbar(active, &theme, cx);
 
         div()
@@ -158,6 +226,7 @@ impl AppState {
             .children(actions_menu)
             .children(coll_menu)
             .children(fields_menu)
+            .children(stage_menu)
     }
 
     /// The whole work body: the `database -> collection` sidebar tree (a
@@ -279,6 +348,33 @@ impl AppState {
             ))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)));
 
+        // History dock toggle, beside it (mirrors the SQL and Redis shells);
+        // accent-tinted while the dock is open.
+        let history_toggle = div()
+            .id("doc-toggle-history")
+            .mr_1()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(20.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .tooltip(Tooltip::text(crate::keymap::localize_hint(
+                "Toggle history  ⌘Y",
+            )))
+            .hover(|s| s.bg(theme.bg_elevated))
+            .child(crate::icons::icon(
+                "history",
+                theme.scale(14.),
+                if active.history_open {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                },
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx)));
+
         let read_only_badge = config.read_only.then(|| {
             div()
                 .flex()
@@ -375,6 +471,7 @@ impl AppState {
                     .items_center()
                     .overflow_hidden()
                     .child(sidebar_toggle)
+                    .child(history_toggle)
                     .child(status_left),
             )
             .child(
@@ -825,6 +922,7 @@ impl AppState {
                 active.inspector_drag,
                 &theme,
                 &view,
+                cx,
             ),
             None => render_doc_empty(&theme),
         };
@@ -1240,6 +1338,7 @@ impl AppState {
         inspector_drag: Option<DragAnchor>,
         theme: &Theme,
         view: &WeakEntity<AppState>,
+        cx: &gpui::App,
     ) -> gpui::AnyElement {
         let header = self.render_doc_header(session, current, theme, view);
         let body = match current.panel {
@@ -1252,7 +1351,7 @@ impl AppState {
                 theme,
                 view,
             ),
-            DocPanel::Query => self.render_doc_query(session, current, theme, view),
+            DocPanel::Query => self.render_doc_query(session, current, theme, view, cx),
             DocPanel::Schema => render_doc_schema_panel(current, theme),
             DocPanel::Indexes => render_doc_indexes_panel(session, current, read_only, theme, view),
         };
@@ -1823,15 +1922,22 @@ impl AppState {
             .into_any_element()
     }
 
-    /// The Query panel: the aggregation-pipeline editor over its results grid.
+    /// The Query panel: the pipeline (as raw text or a stage list) over its
+    /// results grid.
     fn render_doc_query(
         &self,
         session: SessionId,
         current: &CollView,
         theme: &Theme,
         view: &WeakEntity<AppState>,
+        cx: &gpui::App,
     ) -> gpui::AnyElement {
         let run_view = view.clone();
+        let mode_view = view.clone();
+        let mode_ix = DocQueryMode::ALL
+            .iter()
+            .position(|(m, _)| *m == current.query_mode)
+            .unwrap_or(0);
         let toolbar = div()
             .flex()
             .items_center()
@@ -1848,6 +1954,23 @@ impl AppState {
                     )),
             )
             .child(
+                DocQueryMode::ALL
+                    .iter()
+                    .fold(Segmented::new("doc-query-mode"), |seg, (_, label)| {
+                        seg.segment(*label)
+                    })
+                    .selected(mode_ix)
+                    .on_select(move |ix, _, cx| {
+                        let Some((mode, _)) = DocQueryMode::ALL.get(ix) else {
+                            return;
+                        };
+                        let mode = *mode;
+                        mode_view
+                            .update(cx, |this, cx| this.doc_set_query_mode(session, mode, cx))
+                            .ok();
+                    }),
+            )
+            .child(
                 Button::new("doc-run-agg", "Run")
                     .size(ButtonSize::Sm)
                     .variant(ButtonVariant::Primary)
@@ -1859,12 +1982,28 @@ impl AppState {
                     }),
             );
 
+        let complaint = current.query_error.as_ref().map(|why| {
+            div()
+                .px_3()
+                .pb_2()
+                .text_size(theme.scale(11.))
+                .text_color(theme.red)
+                .child(why.clone())
+        });
+
         let editor = div()
-            .h(px(160.))
+            .h(px(if current.query_mode == DocQueryMode::Stages {
+                260.
+            } else {
+                160.
+            }))
             .flex_shrink_0()
             .border_b_1()
             .border_color(theme.border)
-            .child(current.query_editor.clone());
+            .child(match current.query_mode {
+                DocQueryMode::Text => current.query_editor.clone().into_any_element(),
+                DocQueryMode::Stages => self.render_doc_stages(session, current, theme, view, cx),
+            });
 
         let results = if current.query_docs.is_empty() {
             doc_centered_hint(
@@ -1892,6 +2031,7 @@ impl AppState {
             .flex_1()
             .min_h(px(0.))
             .child(toolbar)
+            .children(complaint)
             .child(editor)
             .child(results)
             .into_any_element()

@@ -1060,23 +1060,38 @@ impl AppState {
         out
     }
 
-    /// ⇧⌘S / "query: save…": open a prompt to name the active tab's query, then
-    /// persist it as a `.sql` file. The prompt's placeholder suggests a name
-    /// derived from the SQL (the history label); submitting empty accepts it.
-    pub(crate) fn open_save_prompt(&mut self, cx: &mut Context<Self>) {
-        let sql = match &self.phase {
-            Phase::Connected(active) => active.active().map(|t| t.editor.read(cx).content()),
-            _ => None,
+    /// The query a "save" should capture, and where it came from: the SQL
+    /// editor's statement, or -- on a MongoDB connection -- whichever of the
+    /// pipeline and the filter the shell is showing, with the collection it was
+    /// written against.
+    ///
+    /// The panel decides, not a mode switch: a save is "keep what I am looking
+    /// at", and on the Query panel that is the pipeline while on Documents it is
+    /// the filter.
+    fn savable_query(&self, cx: &gpui::App) -> Option<(String, Option<String>, bool)> {
+        let Phase::Connected(active) = &self.phase else {
+            return None;
         };
-        let Some(sql) = sql else { return };
-        if sql.trim().is_empty() {
-            self.notify(
-                ToastVariant::Error,
-                "Nothing to save: the editor is empty.",
-                cx,
-            );
-            return;
+        match active.doc_view.as_ref() {
+            Some(_) => self.doc_savable_query(cx).map(|(q, ns)| (q, ns, true)),
+            None => active
+                .active()
+                .map(|t| (t.editor.read(cx).content().to_string(), None, false)),
         }
+    }
+
+    /// ⇧⌘S / "query: save…": open a prompt to name the current query, then persist
+    /// it. The prompt's placeholder suggests a name derived from the query (the
+    /// history label); submitting empty accepts it.
+    pub(crate) fn open_save_prompt(&mut self, cx: &mut Context<Self>) {
+        let sql = self.savable_query(cx).map(|(q, _, _)| q);
+        let Some(sql) = sql.filter(|s| !s.trim().is_empty()) else {
+            // On MongoDB this is the Documents panel with no filter applied:
+            // there is genuinely nothing to keep, and saying so beats a
+            // shortcut that appears to do nothing.
+            self.notify(ToastVariant::Error, "Nothing to save yet.", cx);
+            return;
+        };
         let suggestion = crate::editor::history_label(&sql);
         let placeholder = if suggestion.is_empty() {
             "Name this query…".to_string()
@@ -1099,11 +1114,10 @@ impl AppState {
     /// prompt was submitted empty). Re-reads the editor at submit time so it can't
     /// save stale text.
     fn submit_save(&mut self, name: &str, cx: &mut Context<Self>) {
-        let sql = match &self.phase {
-            Phase::Connected(active) => active.active().map(|t| t.editor.read(cx).content()),
-            _ => None,
-        };
-        let Some(sql) = sql.filter(|s| !s.trim().is_empty()) else {
+        let Some((sql, namespace, is_doc)) = self
+            .savable_query(cx)
+            .filter(|(s, _, _)| !s.trim().is_empty())
+        else {
             self.notify(ToastVariant::Error, "Nothing to save.", cx);
             return;
         };
@@ -1115,7 +1129,12 @@ impl AppState {
             self.notify(ToastVariant::Error, "Give the query a name.", cx);
             return;
         }
-        match red_config::queries::save(&name, None, &sql) {
+        let written = if is_doc {
+            red_config::queries::save_doc(&name, None, namespace.as_deref(), &sql)
+        } else {
+            red_config::queries::save(&name, None, &sql)
+        };
+        match written {
             Ok(_) => {
                 self.notify(ToastVariant::Success, format!("Saved query “{name}”."), cx);
             }
@@ -1177,7 +1196,14 @@ impl AppState {
         let Some(query) = self.saved_queries.get(index).cloned() else {
             return;
         };
-        if !matches!(self.phase, Phase::Connected(_)) {
+        let Phase::Connected(active) = &self.phase else {
+            return;
+        };
+        // A document query has no SQL tab to open into; the Mongo shell seeds it
+        // into the box it belongs in, at the collection it was written against.
+        if active.doc_view.is_some() {
+            let session = active.session;
+            self.doc_open_saved_query(session, &query, cx);
             return;
         }
         let tab = crate::app::QueryTab::new(query.name, self.active_dialect(), cx);

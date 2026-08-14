@@ -44,6 +44,18 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   queries that relied on it become collection scans.
 - The Indexes panel suggests an index when the current filter is scanning the
   whole collection, and creating it is one click.
+- A stage builder for MongoDB aggregations, beside the raw pipeline editor: one
+  editor per stage, reorder with ↑/↓, an operator palette that leads with the
+  stages that fit the position, and "Preview" on any stage to run the pipeline
+  truncated there. The two modes are two views of one pipeline, so switching
+  never loses what you wrote.
+- A History dock for MongoDB (⌘Y), listing the filters and pipelines you have
+  run, badged with the collection each ran against. Clicking one points a tab at
+  that collection and puts the query back.
+- Saved queries now cover MongoDB: ⇧⌘S keeps the pipeline you are looking at (or
+  the applied filter), ⇧⌘O opens it back into the right box at the right
+  collection. They live as readable `.mongo.json` files beside the saved `.sql`
+  ones.
 - The row-number gutter now holds the left edge instead of scrolling away with
   the columns, so a row stays identifiable however far right you scroll.
 - Freeze result columns: "Pin <column> left" in the header menu holds a column

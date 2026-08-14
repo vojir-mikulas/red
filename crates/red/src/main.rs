@@ -18,6 +18,7 @@ mod decode;
 mod dev_stats;
 mod diff_view;
 mod docbrowse;
+mod dochistory;
 mod editor;
 mod env;
 mod er;

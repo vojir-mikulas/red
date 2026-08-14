@@ -1005,6 +1005,85 @@ pub fn classify_doc_op(op: &DocWrite) -> OpClass {
     }
 }
 
+/// Split an aggregation pipeline's text into its top-level stage texts, keeping
+/// each stage exactly as written. `None` when the text is not a bracketed array,
+/// which is the caller's cue to leave it alone rather than mangle it.
+///
+/// A *shallow* split: it tracks bracket depth and string state and nothing else,
+/// so it needs no parser and no BSON knowledge. That is enough to move between the
+/// raw editor and the stage list without either becoming the other's lossy copy --
+/// a stage the split hands back is byte-identical to the one it was given,
+/// comments and formatting included.
+pub fn split_pipeline_stages(text: &str) -> Option<Vec<String>> {
+    let trimmed = text.trim();
+    let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?;
+    let mut stages = Vec::new();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+    for (i, ch) in inner.char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                let stage = inner[start..i].trim();
+                if !stage.is_empty() {
+                    stages.push(stage.to_string());
+                }
+                start = i + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    // An unbalanced pipeline is being typed, not described; refuse rather than
+    // hand back stages that would silently drop the unclosed tail.
+    if depth != 0 || in_str {
+        return None;
+    }
+    let tail = inner[start..].trim();
+    if !tail.is_empty() {
+        stages.push(tail.to_string());
+    }
+    Some(stages)
+}
+
+/// Join stage texts back into a pipeline, one stage per line. The inverse of
+/// [`split_pipeline_stages`] for a stage list that has been reordered or edited.
+pub fn join_pipeline_stages(stages: &[String]) -> String {
+    if stages.is_empty() {
+        return "[]".to_string();
+    }
+    let body = stages
+        .iter()
+        .map(|s| format!("  {}", s.trim()))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!("[\n{body}\n]")
+}
+
+/// The `$`-prefixed operator a stage text leads with (`$match`, `$group`), for the
+/// stage list's row label. `None` when the stage names none, which is a stage the
+/// server will reject anyway.
+pub fn stage_operator(stage: &str) -> Option<&str> {
+    let after_brace = stage.trim().strip_prefix('{')?.trim_start();
+    let quoted = after_brace.strip_prefix('"')?;
+    let end = quoted.find('"')?;
+    let key = &quoted[..end];
+    key.starts_with('$').then_some(key)
+}
+
 /// The index keys a filter would want, when `plan` says the query is scanning the
 /// whole collection. Empty when the plan already uses an index, when the filter
 /// names no fields, or when it is not a document.
@@ -1495,6 +1574,36 @@ mod tests {
         // match the probe would then have to disprove.
         assert_eq!(match_collection("person", &catalog), None);
         assert_eq!(match_collection("invoice", &catalog), None);
+    }
+
+    #[test]
+    fn pipeline_stages_round_trip_without_reformatting_a_stage() {
+        let text =
+            r#"[ { "$match": { "a": 1 } }, { "$group": { "_id": "$k", "n": { "$sum": 1 } } } ]"#;
+        let stages = split_pipeline_stages(text).unwrap();
+        assert_eq!(stages.len(), 2);
+        // A stage comes back exactly as written, commas inside it included.
+        assert_eq!(stages[0], r#"{ "$match": { "a": 1 } }"#);
+        assert_eq!(stage_operator(&stages[0]), Some("$match"));
+        assert_eq!(stage_operator(&stages[1]), Some("$group"));
+        // Re-splitting the joined form yields the same stages.
+        let joined = join_pipeline_stages(&stages);
+        assert_eq!(split_pipeline_stages(&joined).unwrap(), stages);
+    }
+
+    #[test]
+    fn pipeline_split_refuses_what_it_cannot_read() {
+        assert_eq!(split_pipeline_stages("[]"), Some(Vec::new()));
+        // A comma inside a string is not a separator.
+        let quoted = r#"[ { "$match": { "s": "a,b" } } ]"#;
+        assert_eq!(split_pipeline_stages(quoted).unwrap().len(), 1);
+        // Not an array, or still being typed: leave it alone.
+        assert_eq!(split_pipeline_stages("{ \"$match\": {} }"), None);
+        assert_eq!(split_pipeline_stages("[ { \"$match\": {"), None);
+        assert_eq!(split_pipeline_stages("[ \"unclosed ]"), None);
+        assert_eq!(join_pipeline_stages(&[]), "[]");
+        // A stage with no operator is reported as such, not guessed at.
+        assert_eq!(stage_operator("{ \"a\": 1 }"), None);
     }
 
     #[test]

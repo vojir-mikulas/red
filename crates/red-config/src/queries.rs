@@ -21,8 +21,22 @@ use std::path::PathBuf;
 
 use anyhow::{Context, Result};
 
-/// One saved query: its display name, optional metadata, the **full** file body
-/// (runnable verbatim, header included), and the file backing it.
+/// What engine a saved query is written for.
+///
+/// The two are stored differently for one reason: a SQL file carries its metadata
+/// in `--` comments and stays valid SQL, and JSON has no comments, so a document
+/// query carries its metadata in the JSON itself.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SavedQueryKind {
+    /// A `.sql` file whose body is the statement.
+    Sql,
+    /// A `.mongo.json` file whose body is a wrapper object around a filter
+    /// document or a pipeline array.
+    Doc,
+}
+
+/// One saved query: its display name, optional metadata, the query body, and the
+/// file backing it.
 #[derive(Clone, Debug)]
 pub struct SavedQuery {
     /// The header `name:` if present, else the un-slugged filename stem.
@@ -31,9 +45,17 @@ pub struct SavedQuery {
     pub description: Option<String>,
     /// The header `tags:` (comma-separated), retained for a future filter.
     pub tags: Vec<String>,
-    /// The complete file contents: what drops into the editor, runnable as-is.
+    /// The query body. For [`SavedQueryKind::Sql`] this is the **complete** file
+    /// contents (runnable verbatim, header included); for a document query it is
+    /// the filter document or pipeline array on its own, which is what the shell
+    /// seeds into a box and what the engine would accept.
     pub sql: String,
-    /// The backing `.sql` file, for a future rename / delete.
+    pub kind: SavedQueryKind,
+    /// The `db.collection` a document query was written against, when it named
+    /// one. Advisory: it points the shell at the right collection, and nothing
+    /// stops the query being run elsewhere.
+    pub namespace: Option<String>,
+    /// The backing file, for a future rename / delete.
     pub path: PathBuf,
 }
 
@@ -56,13 +78,25 @@ pub fn load() -> Vec<SavedQuery> {
     let mut out = Vec::new();
     for entry in read.flatten() {
         let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("sql") {
+        let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        let doc = name.ends_with(DOC_SUFFIX);
+        if !doc && path.extension().and_then(|e| e.to_str()) != Some("sql") {
             continue;
         }
         let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
             continue;
         };
+        // `file_stem` on `orders.mongo.json` leaves `orders.mongo`; the display
+        // fallback wants the bare slug.
+        let stem = stem.strip_suffix(".mongo").unwrap_or(stem);
         match std::fs::read_to_string(&path) {
+            Ok(contents) if doc => match parse_doc_query(stem, &contents, path.clone()) {
+                Some(q) => out.push(q),
+                None => tracing::warn!(
+                    "ignoring saved query {}: not a RED query file",
+                    path.display()
+                ),
+            },
             Ok(contents) => out.push(parse_saved_query(stem, &contents, path.clone())),
             Err(e) => tracing::warn!("ignoring saved query {}: {e}", path.display()),
         }
@@ -78,22 +112,29 @@ pub fn load() -> Vec<SavedQuery> {
 /// file. The file stem is a slug of the name, so re-saving the same name overwrites
 /// in place.
 pub fn save(name: &str, description: Option<&str>, sql: &str) -> Result<PathBuf> {
-    use std::io::Write;
-
-    let dir = queries_dir().context("no config directory for saved queries")?;
-    std::fs::create_dir_all(&dir).context("creating the queries directory")?;
-    let dest = dir.join(format!("{}.sql", slug(name)));
-
     let body = strip_managed_header(sql);
     let header = match description.map(str::trim).filter(|d| !d.is_empty()) {
         Some(desc) => format!("-- name: {}\n-- description: {desc}\n\n", name.trim()),
         None => format!("-- name: {}\n\n", name.trim()),
     };
-    let contents = format!("{header}{}\n", body.trim_end());
+    write_query_file(
+        &format!("{}.sql", slug(name)),
+        &format!("{header}{}\n", body.trim_end()),
+    )
+}
 
-    let tmp = dest.with_extension(format!("sql.tmp.{}", std::process::id()));
-    // Owner-only on Unix: a saved snippet can embed literal credentials or PII in a
-    // `WHERE` clause, the same content class as the query history (`history.rs`).
+/// Write `contents` to `file_name` in the queries directory, atomically (a temp
+/// file plus a rename) so a crash cannot leave a partial file, and owner-only on
+/// Unix: a saved query can embed literal credentials or PII in a predicate, the
+/// same content class as the query history.
+fn write_query_file(file_name: &str, contents: &str) -> Result<PathBuf> {
+    use std::io::Write;
+
+    let dir = queries_dir().context("no config directory for saved queries")?;
+    std::fs::create_dir_all(&dir).context("creating the queries directory")?;
+    let dest = dir.join(file_name);
+    let tmp = dir.join(format!("{file_name}.tmp.{}", std::process::id()));
+
     let mut opts = std::fs::OpenOptions::new();
     opts.write(true).create(true).truncate(true);
     #[cfg(unix)]
@@ -151,8 +192,92 @@ fn parse_saved_query(stem: &str, contents: &str, path: PathBuf) -> SavedQuery {
         description,
         tags,
         sql: contents.to_string(),
+        kind: SavedQueryKind::Sql,
+        namespace: None,
         path,
     }
+}
+
+/// The extension a saved document query carries. Two dots, so the file is still
+/// obviously JSON to an editor while staying distinguishable from a plain `.json`
+/// somebody dropped in the directory.
+const DOC_SUFFIX: &str = ".mongo.json";
+
+/// Save a document `query` (a filter document or a pipeline array, as extended
+/// JSON) under `name`, tagged with the `namespace` it was written against.
+///
+/// Written as a wrapper object rather than the bare query, because JSON has no
+/// comments and the metadata has to live somewhere: the file stays valid,
+/// greppable JSON that says what it is.
+///
+/// # Errors
+/// Fails when `query` is not valid JSON, when the queries directory cannot be
+/// created, or when the file cannot be written.
+pub fn save_doc(
+    name: &str,
+    description: Option<&str>,
+    namespace: Option<&str>,
+    query: &str,
+) -> Result<PathBuf> {
+    // Parsing first is what keeps the file valid: an unparseable query would
+    // otherwise be written out and then silently skipped on the next load.
+    let parsed: serde_json::Value =
+        serde_json::from_str(query.trim()).context("the query is not valid JSON")?;
+    let mut wrapper = serde_json::Map::new();
+    wrapper.insert("name".into(), name.trim().into());
+    if let Some(desc) = description.map(str::trim).filter(|d| !d.is_empty()) {
+        wrapper.insert("description".into(), desc.into());
+    }
+    if let Some(ns) = namespace.map(str::trim).filter(|n| !n.is_empty()) {
+        wrapper.insert("namespace".into(), ns.into());
+    }
+    wrapper.insert("query".into(), parsed);
+    let contents = serde_json::to_string_pretty(&serde_json::Value::Object(wrapper))
+        .context("rendering the saved query")?;
+    write_query_file(
+        &format!("{}{DOC_SUFFIX}", slug(name)),
+        &format!("{contents}\n"),
+    )
+}
+
+/// Read a `.mongo.json` file back. `None` when it is JSON but not one of ours,
+/// which is the caller's cue to skip it rather than show an entry that opens
+/// nothing.
+fn parse_doc_query(stem: &str, contents: &str, path: PathBuf) -> Option<SavedQuery> {
+    let value: serde_json::Value = serde_json::from_str(contents).ok()?;
+    let obj = value.as_object()?;
+    let query = obj.get("query")?;
+    let text = serde_json::to_string_pretty(query).ok()?;
+    Some(SavedQuery {
+        name: obj
+            .get("name")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| unslug(stem)),
+        description: obj
+            .get("description")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        tags: obj
+            .get("tags")
+            .and_then(|v| v.as_array())
+            .map(|items| {
+                items
+                    .iter()
+                    .filter_map(|t| t.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        sql: text,
+        kind: SavedQueryKind::Doc,
+        namespace: obj
+            .get("namespace")
+            .and_then(|v| v.as_str())
+            .map(str::to_string),
+        path,
+    })
 }
 
 /// Drop the leading run of managed header lines (and the blank lines among them)

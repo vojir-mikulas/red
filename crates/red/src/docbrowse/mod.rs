@@ -7,6 +7,7 @@
 //! service`'s protocol) and never touches the `DocDriver` directly, the same UI/driver
 //! separation the other shells keep.
 
+mod aggregate;
 mod form;
 mod indexes;
 mod render;
@@ -14,6 +15,7 @@ mod tabs;
 mod transfer;
 mod window;
 
+pub(crate) use aggregate::{DocQueryMode, DocStage};
 pub(crate) use form::{DocForm, InspectorMode};
 pub(crate) use indexes::DocIndexForm;
 pub(crate) use transfer::{DocCopyState, DocExportState, DocImportState};
@@ -142,6 +144,12 @@ pub(crate) struct MongoTab {
 /// `epoch` so a page/schema/write reply routes to the tab that asked.
 pub(crate) struct MongoView {
     session: SessionId,
+    /// The shared query log, so a run can record itself without reaching back
+    /// through `AppState`.
+    history_store: Entity<red_config::history::QueryHistory>,
+    /// The left History dock (⌘Y), a view over the shared log; see
+    /// [`crate::dochistory::DocHistoryPanel`].
+    pub(crate) history_panel: Entity<crate::dochistory::DocHistoryPanel>,
     /// The connection's read-only posture, captured at connect. Gates every write
     /// affordance (edit / insert / delete / drop) in the UI.
     read_only: bool,
@@ -327,8 +335,21 @@ pub(crate) struct CollView {
     /// the Indexes panel's suggestion row. Outlives the dismissible plan readout:
     /// the advice is still true after the readout is closed.
     index_advice: Option<Vec<String>>,
-    /// The aggregation-pipeline editor (Query panel).
+    /// The aggregation-pipeline editor (Query panel), holding the whole pipeline
+    /// as text. The source of truth in both query modes: the stage list is split
+    /// out of it and joined back into it.
     query_editor: Entity<CodeEditor>,
+    /// How the Query panel is edited (one editor, or one per stage).
+    query_mode: DocQueryMode,
+    /// The stage list, when the panel is in Stages mode.
+    stages: Vec<DocStage>,
+    /// Which stage the next run previews at, if any: the pipeline is truncated
+    /// after it and a `$limit` appended.
+    preview_stage: Option<usize>,
+    /// The "add stage" palette's insertion point and anchor while it is open.
+    stage_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
+    /// Why the last mode switch or run was refused, shown above the panel.
+    query_error: Option<String>,
     /// The Query panel's last result window, its sampled columns, and whether a
     /// run is in flight.
     query_docs: Vec<Document>,
@@ -483,6 +504,11 @@ impl CollView {
             explain: None,
             index_advice: None,
             query_editor,
+            query_mode: DocQueryMode::Text,
+            stages: Vec::new(),
+            preview_stage: None,
+            stage_menu: None,
+            query_error: None,
             query_docs: Vec::new(),
             query_columns: Vec::new(),
             query_loading: false,
@@ -531,6 +557,36 @@ impl CollView {
             filter: self.filter.as_deref(),
             projection: self.projection_doc.as_deref(),
             sort: self.sort_doc.as_deref(),
+        }
+    }
+
+    /// The pipeline to run: the raw editor's text, or the stage list joined back
+    /// into one, truncated after [`Self::preview_stage`] with a `$limit` appended
+    /// when a stage preview is pinned.
+    ///
+    /// An empty pipeline is `[]` rather than nothing, so "Run" on a fresh tab
+    /// returns the collection instead of a parse error.
+    fn pipeline_text(&self, cx: &gpui::App) -> String {
+        let text = match self.query_mode {
+            DocQueryMode::Text => self.query_editor.read(cx).content().to_string(),
+            DocQueryMode::Stages => {
+                let mut stages: Vec<String> = self
+                    .stages
+                    .iter()
+                    .map(|s| s.editor.read(cx).content().to_string())
+                    .filter(|s| !s.trim().is_empty())
+                    .collect();
+                if let Some(upto) = self.preview_stage {
+                    stages.truncate(upto + 1);
+                    stages.push(format!("{{ \"$limit\": {} }}", aggregate::PREVIEW_LIMIT));
+                }
+                red_core::doc::join_pipeline_stages(&stages)
+            }
+        };
+        if text.trim().is_empty() {
+            "[]".to_string()
+        } else {
+            text
         }
     }
 
@@ -704,10 +760,26 @@ impl MongoView {
     /// `DocListDatabases` fires from [`AppState::doc_start_browse`] once the
     /// session is live. Opens with a single blank tab (the shell always shows
     /// something, and ⌘T / the ＋ button open more).
-    pub(crate) fn new(session: SessionId, read_only: bool, cx: &mut Context<AppState>) -> Self {
+    pub(crate) fn new(
+        session: SessionId,
+        conn_id: String,
+        read_only: bool,
+        history_store: Entity<red_config::history::QueryHistory>,
+        cx: &mut Context<AppState>,
+    ) -> Self {
+        let history_panel = {
+            let store = history_store.clone();
+            cx.new(|cx| crate::dochistory::DocHistoryPanel::new(conn_id, store, cx))
+        };
+        cx.subscribe(&history_panel, move |this, _panel, event, cx| {
+            this.on_doc_history_event(session, event, cx)
+        })
+        .detach();
         Self {
             session,
             read_only,
+            history_store,
+            history_panel,
             epoch: crate::result::next_kv_epoch(),
             databases: Vec::new(),
             collections: BTreeMap::new(),
@@ -1216,9 +1288,15 @@ impl AppState {
                 }
             }
         };
-        current.filter = filter;
+        current.filter = filter.clone();
         current.panel = DocPanel::Documents;
         current.requery();
+        // Record what actually ran (the compiled document), not the shorthand
+        // that produced it: the log is replayed into the JSON box, and a fast
+        // filter reads as nonsense there.
+        if let Some(filter) = filter {
+            self.doc_record_history(session, &filter, cx);
+        }
         cx.notify();
     }
 
@@ -1637,12 +1715,7 @@ impl AppState {
         let Some(current) = view.focused_coll_mut() else {
             return;
         };
-        let pipeline = current.query_editor.read(cx).content();
-        let pipeline = if pipeline.trim().is_empty() {
-            "[]".to_string()
-        } else {
-            pipeline
-        };
+        let pipeline = current.pipeline_text(cx);
         current.query_loading = true;
         let (epoch, db, coll) = (current.epoch, current.db.clone(), current.coll.clone());
         self.service.send_to(
@@ -1651,10 +1724,14 @@ impl AppState {
                 epoch,
                 db,
                 coll,
-                pipeline,
+                pipeline: pipeline.clone(),
                 confirmed: false,
             },
         );
+        // An empty pipeline is the panel's default, not a query worth keeping.
+        if pipeline.trim() != "[]" {
+            self.doc_record_history(session, &pipeline, cx);
+        }
         cx.notify();
     }
 
@@ -2179,6 +2256,174 @@ impl AppState {
         };
         self.service.send_to(session, cmd);
         cx.notify();
+    }
+
+    /// Handle what the History dock asks the shell to do: seed a past filter or
+    /// pipeline back into a tab, clear the log, or hide the dock.
+    fn on_doc_history_event(
+        &mut self,
+        session: SessionId,
+        event: &crate::dochistory::DocHistoryPanelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::dochistory::DocHistoryPanelEvent as E;
+        match event {
+            E::SeedFilter { namespace, filter } => {
+                self.doc_point_at(session, namespace.as_deref(), cx);
+                let Some(current) = self.doc_focused_coll_mut(session) else {
+                    return;
+                };
+                // A recorded filter is a filter document, so the box must be in
+                // the mode that reads one; seeding JSON into the fast box would
+                // produce a confident, wrong query.
+                current.filter_mode = DocFilterMode::Json;
+                current.panel = DocPanel::Documents;
+                let input = current.filter_input.clone();
+                let text = filter.clone();
+                input.update(cx, |input, cx| {
+                    input.set_placeholder(DocFilterMode::Json.placeholder(), cx);
+                    input.set_content(text, cx);
+                });
+                self.doc_apply_filter(session, cx);
+            }
+            E::SeedPipeline {
+                namespace,
+                pipeline,
+            } => {
+                self.doc_point_at(session, namespace.as_deref(), cx);
+                let Some(current) = self.doc_focused_coll_mut(session) else {
+                    return;
+                };
+                // Seeding replaces the pipeline, so the stage list built from the
+                // old one is gone; the text mode holds what just arrived.
+                current.panel = DocPanel::Query;
+                current.query_mode = DocQueryMode::Text;
+                current.stages.clear();
+                current.preview_stage = None;
+                let editor = current.query_editor.clone();
+                let text = pipeline.clone();
+                editor.update(cx, |editor, cx| editor.set_content(text, cx));
+                cx.notify();
+            }
+            E::ClearAll => {
+                let conn_id = self
+                    .conn_for(Some(session))
+                    .map(|a| a.conn_id.clone())
+                    .unwrap_or_default();
+                if let Some(view) = self
+                    .conn_for(Some(session))
+                    .and_then(|a| a.doc_view.as_ref())
+                {
+                    let store = view.history_store.clone();
+                    store.update(cx, |store, _| store.clear_conn(&conn_id));
+                }
+                cx.notify();
+            }
+            E::Close => {
+                if let Phase::Connected(active) = &mut self.phase {
+                    active.history_open = false;
+                }
+                self.refocus_root = true;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Point the focused tab at `namespace` (`db.collection`) when it names one
+    /// the tab is not already on, so a seeded history entry lands on the
+    /// collection it was recorded against rather than whatever is open.
+    fn doc_point_at(
+        &mut self,
+        session: SessionId,
+        namespace: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((db, coll)) = namespace.and_then(|ns| ns.split_once('.')) else {
+            return;
+        };
+        let already = self
+            .conn_for(Some(session))
+            .and_then(|a| a.doc_view.as_ref())
+            .and_then(|v| v.focused_coll())
+            .is_some_and(|c| c.db == db && c.coll == coll);
+        if !already {
+            self.doc_open_collection(session, db.to_string(), coll.to_string(), false, cx);
+        }
+    }
+
+    /// The query a save should capture on a MongoDB connection: the pipeline when
+    /// the Query panel is showing, else the applied filter, with the collection it
+    /// belongs to.
+    pub(crate) fn doc_savable_query(&self, cx: &gpui::App) -> Option<(String, Option<String>)> {
+        let current = self.doc_view().and_then(|v| v.focused_coll())?;
+        let namespace = Some(format!("{}.{}", current.db, current.coll));
+        match current.panel {
+            DocPanel::Query => Some((current.pipeline_text(cx), namespace)),
+            // A filter is what the Documents panel *ran*, not what is half-typed
+            // in the box: saving a draft nobody has applied would be a surprise.
+            _ => current.filter.clone().map(|f| (f, namespace)),
+        }
+    }
+
+    /// Seed a saved query into the shell: a pipeline into the Query panel, a
+    /// filter into the Documents filter box, at the collection it names.
+    pub(crate) fn doc_open_saved_query(
+        &mut self,
+        session: SessionId,
+        query: &red_config::queries::SavedQuery,
+        cx: &mut Context<Self>,
+    ) {
+        let text = query.sql.clone();
+        let namespace = query.namespace.clone();
+        if crate::dochistory::is_pipeline(&text) {
+            self.on_doc_history_event(
+                session,
+                &crate::dochistory::DocHistoryPanelEvent::SeedPipeline {
+                    namespace,
+                    pipeline: text,
+                },
+                cx,
+            );
+        } else {
+            self.on_doc_history_event(
+                session,
+                &crate::dochistory::DocHistoryPanelEvent::SeedFilter {
+                    namespace,
+                    filter: text,
+                },
+                cx,
+            );
+        }
+    }
+
+    /// The MongoDB view of the foreground connection.
+    fn doc_view(&self) -> Option<&MongoView> {
+        match &self.phase {
+            Phase::Connected(a) => a.doc_view.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Record a run in the shared query log, tagged with the namespace it ran
+    /// against. The user's own runs only, like the SQL path: history is grounding
+    /// precisely because it is human-authored.
+    fn doc_record_history(&mut self, session: SessionId, text: &str, cx: &mut Context<Self>) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let Some(active) = self.conn_for(Some(session)) else {
+            return;
+        };
+        let conn_id = active.conn_id.clone();
+        let Some(view) = active.doc_view.as_ref() else {
+            return;
+        };
+        let namespace = view.focused_coll().map(|c| format!("{}.{}", c.db, c.coll));
+        let store = view.history_store.clone();
+        let text = text.to_string();
+        store.update(cx, |store, _| {
+            store.record_scoped(&conn_id, &text, namespace)
+        });
     }
 
     /// Re-fetch one database's collection list (the tree's context-menu refresh).

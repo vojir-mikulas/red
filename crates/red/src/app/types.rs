@@ -1997,8 +1997,15 @@ impl ActiveConn {
                 cx,
             )
         });
-        let doc_view = (config.kind == DbKind::Mongo)
-            .then(|| crate::docbrowse::MongoView::new(session, config.read_only, cx));
+        let doc_view = (config.kind == DbKind::Mongo).then(|| {
+            crate::docbrowse::MongoView::new(
+                session,
+                conn_id.clone(),
+                config.read_only,
+                history_store.clone(),
+                cx,
+            )
+        });
         let schema_tree = cx.new(|cx| SchemaState::new(kind, sender, cx));
         let schema_sub = cx.subscribe(&schema_tree, AppState::on_schema_event);
         let history_panel = {
