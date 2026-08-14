@@ -13,12 +13,14 @@ mod indexes;
 mod render;
 mod tabs;
 mod transfer;
+mod validator;
 mod window;
 
 pub(crate) use aggregate::{DocQueryMode, DocStage};
 pub(crate) use form::{DocForm, InspectorMode};
 pub(crate) use indexes::DocIndexForm;
 pub(crate) use transfer::{DocCopyState, DocExportState, DocImportState};
+pub(crate) use validator::DocValidatorForm;
 
 use window::{DocWindow, FetchCtx};
 
@@ -124,6 +126,26 @@ enum MongoTabState {
     /// A blank tab awaiting a collection choice from the sidebar tree.
     Empty,
     Collection(Box<CollView>),
+    /// A database's inferred-relationship diagram.
+    Relations(Box<RelationsView>),
+}
+
+/// One database's relations diagram: the inferred references, and the ER canvas
+/// built from them.
+///
+/// The references are kept beside the canvas because they carry the *evidence*
+/// (how many sampled values resolved), which the diagram cannot show and the
+/// footer must: an inferred edge is a claim, not a declaration.
+pub(crate) struct RelationsView {
+    /// The epoch the inference runs under, so a reply lands on the tab that asked.
+    epoch: Epoch,
+    db: String,
+    loading: bool,
+    er: Option<crate::er::ErView>,
+    references: Vec<red_core::doc::DocReference>,
+    /// How many collections the inference sampled, for the footer.
+    sampled: usize,
+    error: Option<String>,
 }
 
 /// One tab in the Mongo shell: a title, a stable id, and its per-kind state.
@@ -196,6 +218,8 @@ pub(crate) struct MongoView {
     pub(crate) copy: Option<DocCopyState>,
     /// The open "New index" dialog, if any.
     pub(crate) index_form: Option<DocIndexForm>,
+    /// The open "Validation rules" dialog, if any.
+    pub(crate) validator: Option<DocValidatorForm>,
     /// The `database -> collection` sidebar tree's keyboard focus handle; the
     /// `FocusSchema` action and a tree click plant focus here.
     pub(crate) tree_focus: FocusHandle,
@@ -326,6 +350,10 @@ pub(crate) struct CollView {
     fields_menu: Option<gpui::Point<gpui::Pixels>>,
     /// The inferred schema, lazily fetched the first time the Schema panel opens.
     schema: Option<DocSchema>,
+    /// The collection's storage numbers, fetched with the schema. `None` until
+    /// they arrive, and they may never: an under-privileged role gets no
+    /// `collStats`, which the panel shows by simply omitting the header.
+    stats: Option<red_core::doc::CollStats>,
     /// The collection's indexes, lazily fetched the first time Indexes opens.
     indexes: Option<Vec<IndexInfo>>,
     /// The explain plan for the current filter, shown as a dismissible readout
@@ -500,6 +528,7 @@ impl CollView {
             projection_doc: None,
             fields_menu: None,
             schema: None,
+            stats: None,
             indexes: None,
             explain: None,
             index_advice: None,
@@ -803,6 +832,7 @@ impl MongoView {
             import: None,
             copy: None,
             index_form: None,
+            validator: None,
             tree_focus: cx.focus_handle(),
             tree_filter: {
                 let filter = cx.new(|cx| {
@@ -839,7 +869,7 @@ impl MongoView {
             .iter()
             .filter_map(|t| match &t.state {
                 MongoTabState::Collection(c) => Some((c.db.as_str(), c.coll.as_str())),
-                MongoTabState::Empty => None,
+                MongoTabState::Empty | MongoTabState::Relations(_) => None,
             })
             .collect();
         let mut rows = Vec::new();
@@ -918,8 +948,41 @@ impl MongoView {
     pub(crate) fn coll_at(&self, idx: usize) -> Option<&CollView> {
         match self.tabs.get(idx).map(|t| &t.state)? {
             MongoTabState::Collection(c) => Some(&**c),
-            MongoTabState::Empty => None,
+            MongoTabState::Empty | MongoTabState::Relations(_) => None,
         }
+    }
+
+    /// The relations diagram shown by the tab at `idx`, if that tab is one.
+    pub(crate) fn relations(&self, idx: usize) -> Option<&crate::er::ErView> {
+        match self.tabs.get(idx).map(|t| &t.state)? {
+            MongoTabState::Relations(r) => r.er.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn relations_mut(&mut self, idx: usize) -> Option<&mut crate::er::ErView> {
+        match self.tabs.get_mut(idx).map(|t| &mut t.state)? {
+            MongoTabState::Relations(r) => r.er.as_mut(),
+            _ => None,
+        }
+    }
+
+    /// The relations diagram *state* shown by the tab at `idx` (the canvas plus
+    /// the evidence), where [`relations`](Self::relations) hands back only the
+    /// canvas the shared ER renderer needs.
+    pub(crate) fn relations_at(&self, idx: usize) -> Option<&RelationsView> {
+        match self.tabs.get(idx).map(|t| &t.state)? {
+            MongoTabState::Relations(r) => Some(&**r),
+            _ => None,
+        }
+    }
+
+    /// The relations tab that owns `epoch`, for routing its inference reply.
+    fn relations_by_epoch_mut(&mut self, epoch: Epoch) -> Option<&mut RelationsView> {
+        self.tabs.iter_mut().find_map(|t| match &mut t.state {
+            MongoTabState::Relations(r) if r.epoch == epoch => Some(&mut **r),
+            _ => None,
+        })
     }
 
     /// The focused tab's collection (UI actions target the visible tab).
@@ -931,7 +994,7 @@ impl MongoView {
         let i = self.focused_tab_index()?;
         match self.tabs.get_mut(i).map(|t| &mut t.state)? {
             MongoTabState::Collection(c) => Some(&mut **c),
-            MongoTabState::Empty => None,
+            MongoTabState::Empty | MongoTabState::Relations(_) => None,
         }
     }
 
@@ -1554,11 +1617,25 @@ impl AppState {
         let (epoch, db, coll) = (current.epoch, current.db.clone(), current.coll.clone());
         let filter = current.filter.clone();
         let needs_indexes = current.indexes.is_none();
+        let needs_schema = current.schema.is_none();
+        let needs_stats = current.stats.is_none();
         let needs_advice = current.index_advice.is_none() && filter.is_some();
         match panel {
-            DocPanel::Schema if current.schema.is_none() => {
-                self.service
-                    .send_to(session, Command::DocInferSchema { epoch, db, coll });
+            DocPanel::Schema => {
+                if needs_schema {
+                    self.service.send_to(
+                        session,
+                        Command::DocInferSchema {
+                            epoch,
+                            db: db.clone(),
+                            coll: coll.clone(),
+                        },
+                    );
+                }
+                if needs_stats {
+                    self.service
+                        .send_to(session, Command::DocCollStats { epoch, db, coll });
+                }
             }
             DocPanel::Indexes => {
                 if needs_indexes {
@@ -1677,6 +1754,28 @@ impl AppState {
             && current.coll == coll
         {
             current.schema = Some(schema);
+            cx.notify();
+        }
+    }
+
+    /// `DocStatsReady`: land a collection's storage numbers on the tab that asked.
+    pub(crate) fn on_doc_stats(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        stats: red_core::doc::CollStats,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
+            return;
+        };
+        if let Some(current) = view.coll_by_epoch_mut(epoch)
+            && current.db == db
+            && current.coll == coll
+        {
+            current.stats = Some(stats);
             cx.notify();
         }
     }
@@ -2258,6 +2357,96 @@ impl AppState {
         cx.notify();
     }
 
+    /// Open (or focus) the relations diagram for a database and start the
+    /// inference behind it.
+    ///
+    /// One tab per database: reopening focuses the existing diagram rather than
+    /// re-running a sampling pass whose answer is already on screen.
+    pub(crate) fn doc_open_relations(
+        &mut self,
+        session: SessionId,
+        db: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.doc_close_coll_menu(session, cx);
+        let existing = self
+            .conn_for(Some(session))
+            .and_then(|a| a.doc_view.as_ref())
+            .and_then(|v| {
+                v.tabs.iter().position(|t| match &t.state {
+                    MongoTabState::Relations(r) => r.db == db,
+                    _ => false,
+                })
+            });
+        if let Some(idx) = existing {
+            self.doc_activate_tab(session, idx, cx);
+            return;
+        }
+        let epoch = crate::result::next_kv_epoch();
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+        else {
+            return;
+        };
+        let pane = view.focused_pane();
+        let id = view.tab_seq;
+        view.tab_seq += 1;
+        view.tabs.push(MongoTab {
+            id,
+            title: format!("{db} relations"),
+            state: MongoTabState::Relations(Box::new(RelationsView {
+                epoch,
+                db: db.clone(),
+                loading: true,
+                er: None,
+                references: Vec::new(),
+                sampled: 0,
+                error: None,
+            })),
+            pane,
+            pinned: false,
+        });
+        let idx = view.tabs.len() - 1;
+        view.set_pane_active(pane, idx);
+        view.scroll_tab_into_view(idx);
+        self.service
+            .send_to(session, Command::DocReferenceMap { epoch, db });
+        cx.notify();
+    }
+
+    /// `DocReferencesReady`: build the diagram from the inferred graph.
+    pub(crate) fn on_doc_references(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: Epoch,
+        db: String,
+        collections: Vec<(String, usize)>,
+        references: Vec<red_core::doc::DocReference>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
+            return;
+        };
+        let Some(relations) = view.relations_by_epoch_mut(epoch) else {
+            return;
+        };
+        // Only the references that actually resolved become edges. A weak one is
+        // still listed in the footer count, because "we looked and it did not hold"
+        // is a finding, but drawing it would assert a relationship that is not there.
+        let edges: Vec<(String, String, String)> = references
+            .iter()
+            .filter(|r| r.is_strong())
+            .map(|r| (r.from_coll.clone(), r.field.clone(), r.to_coll.clone()))
+            .collect();
+        relations.sampled = collections.len();
+        relations.er = Some(crate::er::ErView::from_references(db, &collections, &edges));
+        relations.references = references;
+        relations.loading = false;
+        relations.error = None;
+        cx.notify();
+    }
+
     /// Handle what the History dock asks the shell to do: seed a past filter or
     /// pipeline back into a tab, clear the log, or hide the dock.
     fn on_doc_history_event(
@@ -2570,12 +2759,15 @@ impl AppState {
         // re-seed the browse (a write shifts ordinals, so the resident window and
         // its expansions are re-derived from a fresh first window).
         let mut reload_indexes = None;
+        let mut catalog_refresh = None;
         {
             let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
                 return;
             };
             view.pending_write = None;
+            let catalog_epoch = view.epoch;
             if let Some(c) = view.coll_by_epoch_mut(epoch) {
+                catalog_refresh = Some((catalog_epoch, c.db.clone()));
                 c.inspector = None;
                 c.inspector_doc = None;
                 c.inspector_insert = false;
@@ -2596,6 +2788,16 @@ impl AppState {
         {
             self.service
                 .send_to(session, Command::DocListIndexes { epoch, db, coll });
+        }
+        // Re-read the catalog too: a write can change a collection's count, its
+        // validator, or whether it exists at all, and `listCollections` is cheap
+        // metadata. Unconditional rather than guessed at from the summary line,
+        // which is prose meant for a human.
+        if let Some((session, epoch, db)) =
+            session.zip(catalog_refresh).map(|(s, (e, d))| (s, e, d))
+        {
+            self.service
+                .send_to(session, Command::DocListCollections { epoch, db });
         }
         self.notify(ToastVariant::Success, summary, cx);
     }

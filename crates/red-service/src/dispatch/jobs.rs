@@ -227,6 +227,103 @@ pub(super) fn run_doc_import_blocking(
     (written, None)
 }
 
+/// Collections sampled by [`infer_references`], and documents sampled per
+/// collection. Both bounded so one click on a wide database cannot turn into a
+/// scan; the diagram reports what it did not reach rather than pretending.
+const REF_MAX_COLLECTIONS: usize = 60;
+const REF_SAMPLE: usize = 200;
+/// Reference candidates probed at all. A collection of a thousand `*_id` fields
+/// is pathological, and probing every one costs a `find` plus a `count` each.
+const REF_MAX_FIELDS: usize = 120;
+
+/// Infer a database's inter-collection relationships: sample each collection's
+/// schema, guess which fields reference another collection from their names, then
+/// **test** each guess against the target's `_id`.
+///
+/// The same inference the `doc_reference_map` agent tool reports in prose, shaped
+/// for the relations diagram instead. A document store declares no foreign keys,
+/// so every edge here is a claim with a hit rate attached
+/// ([`red_core::doc::DocReference::is_strong`]), never an assertion.
+///
+/// # Errors
+/// Propagates a failure to list the database's collections. A collection that
+/// cannot be sampled is skipped, not fatal: one unreadable namespace must not cost
+/// the whole diagram.
+pub(super) async fn infer_references(
+    driver: &Arc<dyn red_driver::DocDriver>,
+    db: &str,
+) -> red_core::Result<(Vec<(String, usize)>, Vec<red_core::doc::DocReference>)> {
+    use red_core::doc::{DocSeek, DocValue};
+
+    let abort = red_driver::AbortSignal::new();
+    let catalog: Vec<String> = driver
+        .list_collections(db)
+        .await?
+        .into_iter()
+        .map(|c| c.name)
+        .collect();
+
+    let mut collections: Vec<(String, usize)> = Vec::new();
+    let mut candidates: Vec<red_core::doc::RefCandidate> = Vec::new();
+    for coll in catalog.iter().take(REF_MAX_COLLECTIONS) {
+        let Ok(schema) = driver.infer_schema(db, coll, REF_SAMPLE, &abort).await else {
+            continue;
+        };
+        collections.push((coll.clone(), schema.fields.len()));
+        if candidates.len() < REF_MAX_FIELDS {
+            candidates.extend(red_core::doc::reference_candidates(coll, &schema, &catalog));
+        }
+    }
+    candidates.truncate(REF_MAX_FIELDS);
+
+    let mut references = Vec::with_capacity(candidates.len());
+    for c in &candidates {
+        // Distinct values only: a thousand orders pointing at one customer is one
+        // resolved reference, not a thousand, and counting it as a thousand would
+        // make every hit rate look perfect.
+        let window = driver
+            .find_seek(
+                db,
+                &c.coll,
+                None,
+                None,
+                DocSeek::Forward { after: None },
+                REF_SAMPLE,
+                &abort,
+            )
+            .await
+            .unwrap_or_default();
+        let mut values: Vec<DocValue> = Vec::new();
+        for doc in &window {
+            if let Some(v) = doc.value_at(&c.path)
+                && !matches!(v, DocValue::Null)
+                && !values.contains(v)
+            {
+                values.push(v.clone());
+            }
+        }
+        if values.is_empty() {
+            continue;
+        }
+        let filter = DocValue::Document(vec![(
+            "_id".to_string(),
+            DocValue::Document(vec![("$in".to_string(), DocValue::Array(values.clone()))]),
+        )]);
+        let resolved = driver
+            .count(db, &c.target, Some(&filter))
+            .await
+            .unwrap_or(0);
+        references.push(red_core::doc::DocReference {
+            from_coll: c.coll.clone(),
+            field: c.path.clone(),
+            to_coll: c.target.clone(),
+            resolved,
+            sampled: values.len() as u64,
+        });
+    }
+    Ok((collections, references))
+}
+
 /// Documents read (and written) per window by [`doc_copy_job`].
 const DOC_COPY_WINDOW: usize = 500;
 

@@ -70,7 +70,7 @@ impl AppState {
                 .and_then(|v| {
                     v.tabs.iter().position(|t| match &t.state {
                         MongoTabState::Collection(c) => c.db == db && c.coll == coll,
-                        MongoTabState::Empty => false,
+                        MongoTabState::Empty | MongoTabState::Relations(_) => false,
                     })
                 });
             if let Some(idx) = existing {
@@ -154,7 +154,7 @@ impl AppState {
                         MongoTabState::Collection(c) => {
                             Some((c.db.clone(), c.coll.clone(), c.filter.clone()))
                         }
-                        MongoTabState::Empty => None,
+                        MongoTabState::Empty | MongoTabState::Relations(_) => None,
                     })
             });
         let Some((db, coll, filter)) = src else {
@@ -271,7 +271,7 @@ impl AppState {
         // `CloseResult` cancels it at the engine.
         let close_epoch = match &view.tabs[index].state {
             MongoTabState::Collection(c) => Some(c.epoch),
-            MongoTabState::Empty => None,
+            MongoTabState::Empty | MongoTabState::Relations(_) => None,
         };
         if view.tabs.len() <= 1 {
             // Keep at least one tab: reset the only tab to the blank chooser.

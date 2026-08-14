@@ -523,6 +523,7 @@ impl AppState {
         if writable {
             if let Some((db, coll)) = namespace {
                 let (cp_db, cp_coll) = (db.clone(), coll.clone());
+                let (val_db, val_coll) = (db.clone(), coll.clone());
                 menu = menu
                     .item(
                         ContextMenuItem::new("doc-act-import", "Import documents…").on_click(
@@ -535,6 +536,18 @@ impl AppState {
                         ContextMenuItem::new("doc-act-copy", "Copy collection to…").on_click(
                             cx.listener(move |this, _, _, cx| {
                                 this.doc_open_copy(session, cp_db.clone(), cp_coll.clone(), cx);
+                            }),
+                        ),
+                    )
+                    .item(
+                        ContextMenuItem::new("doc-act-validator", "Validation rules…").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.doc_open_validator(
+                                    session,
+                                    val_db.clone(),
+                                    val_coll.clone(),
+                                    cx,
+                                );
                             }),
                         ),
                     );
@@ -573,6 +586,62 @@ impl AppState {
                 floating(div().occlude().child(menu.into_any_element()))
                     .at(pos)
                     .anchor(gpui::Anchor::TopRight),
+            )
+            .into_any_element()
+    }
+
+    /// A database's relations diagram: the ER canvas over its inferred references,
+    /// with a footer saying how strong the inference actually was.
+    fn render_doc_relations(
+        &self,
+        active: &ActiveConn,
+        tab_idx: usize,
+        relations: &super::RelationsView,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        if relations.loading {
+            return doc_centered_hint("Sampling collections for references\u{2026}", theme);
+        }
+        if let Some(why) = &relations.error {
+            return doc_centered_hint(why, theme);
+        }
+        let strong = relations
+            .references
+            .iter()
+            .filter(|r| r.is_strong())
+            .count();
+        let weak = relations.references.len() - strong;
+        // Weak candidates are reported, not hidden: "we tested this and it did not
+        // hold" is a finding about the data, and a diagram that silently dropped
+        // them would look like the inference never considered them.
+        let footer = format!(
+            "{} collection(s) sampled \u{b7} {strong} reference(s) drawn{}",
+            relations.sampled,
+            if weak == 0 {
+                String::new()
+            } else {
+                format!(
+                    " \u{b7} {weak} name(s) looked like references but their values did not resolve"
+                )
+            }
+        );
+        let canvas = self.render_er(active, crate::er::ErSlot::DocTab(tab_idx), cx);
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(div().flex_1().min_h(px(0.)).child(canvas))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .text_size(theme.scale(11.))
+                    .text_color(theme.text_muted)
+                    .child(footer),
             )
             .into_any_element()
     }
@@ -636,6 +705,7 @@ impl AppState {
                 if writable {
                     let (imp_db, imp_coll) = (db.clone(), coll.clone());
                     let (cp_db, cp_coll) = (db.clone(), coll.clone());
+                    let (val_db, val_coll) = (db.clone(), coll.clone());
                     let (drop_db, drop_coll) = (db.clone(), coll.clone());
                     menu = menu
                         .item(
@@ -659,6 +729,17 @@ impl AppState {
                         )
                         .separator()
                         .item(
+                            ContextMenuItem::new("doc-coll-validator", "Validation rules…")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.doc_open_validator(
+                                        session,
+                                        val_db.clone(),
+                                        val_coll.clone(),
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .item(
                             ContextMenuItem::new("doc-coll-drop", "Drop collection…").on_click(
                                 cx.listener(move |this, _, _, cx| {
                                     this.doc_close_coll_menu(session, cx);
@@ -674,7 +755,15 @@ impl AppState {
                 }
             }
             None => {
+                let relations_db = db.clone();
                 let refresh_db = db.clone();
+                menu = menu.item(
+                    ContextMenuItem::new("doc-db-relations", "Show relations\u{2026}").on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.doc_open_relations(session, relations_db.clone(), cx);
+                        }),
+                    ),
+                );
                 menu = menu.item(
                     ContextMenuItem::new("doc-db-refresh", "Refresh collections").on_click(
                         cx.listener(move |this, _, _, cx| {
@@ -924,7 +1013,12 @@ impl AppState {
                 &view,
                 cx,
             ),
-            None => render_doc_empty(&theme),
+            None => match v.relations_at(tab_idx) {
+                Some(relations) => {
+                    self.render_doc_relations(active, tab_idx, relations, &theme, cx)
+                }
+                None => render_doc_empty(&theme),
+            },
         };
 
         let target = v
@@ -2636,6 +2730,78 @@ fn doc_row3(
 /// The Schema panel: one row per inferred field path with its type distribution
 /// (`string 82% . int 18%`) and present-ratio, or a hint while the sample loads.
 fn render_doc_schema_panel(current: &CollView, theme: &Theme) -> gpui::AnyElement {
+    // The storage header sits above whatever the schema half has to say, so a
+    // collection whose sample is still running already shows what it costs.
+    let stats = current.stats.as_ref().map(|s| render_doc_stats(s, theme));
+    let body = render_doc_schema_body(current, theme);
+    div()
+        .flex()
+        .flex_col()
+        .size_full()
+        .children(stats)
+        .child(div().flex_1().min_h(px(0.)).child(body))
+        .into_any_element()
+}
+
+/// The `collStats` header: one line of storage facts, then the per-index bytes.
+/// Each number is omitted rather than zeroed when the server did not report it
+/// (an under-privileged role gets a truncated reply, not an error).
+fn render_doc_stats(stats: &red_core::doc::CollStats, theme: &Theme) -> gpui::AnyElement {
+    use crate::fmt::human_bytes;
+
+    let mut facts: Vec<String> = Vec::new();
+    if let Some(count) = stats.count {
+        facts.push(format!("{} documents", group_digits(count as usize)));
+    }
+    if let Some(size) = stats.size {
+        facts.push(format!("{} data", human_bytes(size)));
+    }
+    if let Some(storage) = stats.storage_size {
+        facts.push(format!("{} on disk", human_bytes(storage)));
+    }
+    if let Some(avg) = stats.avg_obj_size {
+        facts.push(format!("{} average document", human_bytes(avg)));
+    }
+    if let Some(total) = stats.total_index_size {
+        facts.push(format!("{} indexes", human_bytes(total)));
+    }
+    if let Some(shards) = stats.shards {
+        facts.push(format!("sharded across {shards}"));
+    }
+    if stats.capped {
+        facts.push("capped".to_string());
+    }
+    let indexes = (!stats.index_sizes.is_empty()).then(|| {
+        stats
+            .index_sizes
+            .iter()
+            .map(|(name, bytes)| format!("{name} {}", human_bytes(*bytes)))
+            .collect::<Vec<_>>()
+            .join("  \u{b7}  ")
+    });
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .flex_shrink_0()
+        .px_3()
+        .py_2()
+        .border_b_1()
+        .border_color(theme.border)
+        .bg(theme.bg_panel)
+        .text_size(theme.scale(11.))
+        .child(div().text_color(theme.text).child(facts.join("  \u{b7}  ")))
+        .children(indexes.map(|line| {
+            div()
+                .text_color(theme.text_faint)
+                .child(format!("Indexes: {line}"))
+        }))
+        .into_any_element()
+}
+
+/// The per-field half of the Schema panel.
+fn render_doc_schema_body(current: &CollView, theme: &Theme) -> gpui::AnyElement {
     let Some(schema) = current.schema.as_ref() else {
         return doc_centered_hint("Sampling schema...", theme);
     };

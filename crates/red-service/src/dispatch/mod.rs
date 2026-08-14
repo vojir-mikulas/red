@@ -237,6 +237,21 @@ async fn apply_doc_write(
             driver.drop_index(&db, &coll, &name).await?;
             Ok(format!("dropped index {name}"))
         }
+        DocWrite::SetValidator {
+            db,
+            coll,
+            validator,
+        } => {
+            let removing = validator.is_none();
+            driver
+                .set_validator(&db, &coll, validator.as_deref())
+                .await?;
+            Ok(if removing {
+                format!("removed the validator on {coll}")
+            } else {
+                format!("set the validator on {coll}")
+            })
+        }
         DocWrite::CreateIndex { db, coll, spec } => {
             driver.create_index(&db, &coll, &spec).await?;
             Ok("index created".into())
@@ -461,6 +476,19 @@ fn doc_write_prompt(write: &red_core::doc::DocWrite) -> String {
             "Drop index {name} on {db}.{coll}? Queries that relied on it will scan the whole \
              collection until it is rebuilt."
         ),
+        DocWrite::SetValidator {
+            db,
+            coll,
+            validator,
+        } => match validator {
+            Some(_) => format!(
+                "Set the validator on {db}.{coll}? Documents already stored are not re-checked; \
+                 it governs future writes, which it can start rejecting."
+            ),
+            None => format!(
+                "Remove the validator on {db}.{coll}? Nothing will be checked on write after this."
+            ),
+        },
         _ => "Apply this write?".into(),
     }
 }
@@ -3642,6 +3670,94 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 message: e.to_string(),
                             },
                         ),
+                    }
+                });
+            }
+
+            Command::DocReferenceMap { epoch, db } => {
+                let Some(driver) = require_doc_driver(&sessions, session_id, &events) else {
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match jobs::infer_references(&driver, &db).await {
+                        Ok((collections, references)) => emit(
+                            &events,
+                            session_id,
+                            Event::DocReferencesReady {
+                                epoch,
+                                db,
+                                collections,
+                                references,
+                            },
+                        ),
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::DocError {
+                                epoch,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
+            }
+
+            Command::DocValidatorTest {
+                epoch,
+                db,
+                coll,
+                validator,
+            } => {
+                let Some(driver) = require_doc_driver(&sessions, session_id, &events) else {
+                    continue;
+                };
+                let parsed = driver.parse_ext_json(&validator);
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let (matching, total, error) = match parsed {
+                        Err(e) => (0, 0, Some(e.to_string())),
+                        Ok(filter) => {
+                            let total = driver.count(&db, &coll, None).await.unwrap_or(0);
+                            match driver.count(&db, &coll, Some(&filter)).await {
+                                Ok(matching) => (matching, total, None),
+                                Err(e) => (0, total, Some(e.to_string())),
+                            }
+                        }
+                    };
+                    emit(
+                        &events,
+                        session_id,
+                        Event::DocValidatorTested {
+                            epoch,
+                            matching,
+                            total,
+                            error,
+                        },
+                    );
+                });
+            }
+
+            Command::DocCollStats { epoch, db, coll } => {
+                let Some(driver) = require_doc_driver(&sessions, session_id, &events) else {
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    // Silent on failure: the numbers are an enrichment, and a role
+                    // without `collStats` should still be able to read a schema.
+                    match driver.coll_stats(&db, &coll).await {
+                        Ok(stats) => emit(
+                            &events,
+                            session_id,
+                            Event::DocStatsReady {
+                                epoch,
+                                db,
+                                coll,
+                                stats,
+                            },
+                        ),
+                        Err(e) => tracing::debug!("collStats for {db}.{coll}: {e}"),
                     }
                 });
             }

@@ -679,6 +679,37 @@ pub enum Command {
         db: String,
         coll: String,
     },
+    /// Infer the relationships between a database's collections: sample each
+    /// collection's schema, guess which fields reference another collection from
+    /// their names, and *test each guess* against the target's `_id`. The read
+    /// behind the relations diagram. Replied with `DocReferencesReady`.
+    ///
+    /// Bounded by contract (collections sampled, fields probed, values per probe),
+    /// because a wide database would otherwise turn one click into a scan.
+    DocReferenceMap {
+        epoch: Epoch,
+        db: String,
+    },
+    /// Check a candidate validator against the documents already stored: count how
+    /// many match it, and how many there are. A validator document doubles as a
+    /// query (`$jsonSchema` is a query operator, and a plain expression validator
+    /// already is one), so "would this pass" is a `count` and needs no new server
+    /// support. Replied with `DocValidatorTested`.
+    DocValidatorTest {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        validator: String,
+    },
+    /// A collection's storage numbers (`collStats`), for the Schema panel's
+    /// header. Replied with `DocStatsReady`; a failure is silent (the panel simply
+    /// shows no header), because storage numbers are an enrichment and an
+    /// under-privileged user should not get an error banner for reading a schema.
+    DocCollStats {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+    },
     /// A collection's indexes (`listIndexes`), for the indexes panel. Replied with
     /// `DocIndexesReady`, or `DocError` on failure.
     DocListIndexes {
@@ -1701,6 +1732,32 @@ pub enum Event {
         db: String,
         coll: String,
         schema: DocSchema,
+    },
+    /// A database's inferred relationships, in response to `DocReferenceMap`.
+    /// `collections` carries every collection and how many fields its sample
+    /// showed, so the diagram can draw the unrelated ones too rather than only
+    /// what happens to have an edge.
+    DocReferencesReady {
+        epoch: Epoch,
+        db: String,
+        collections: Vec<(String, usize)>,
+        references: Vec<red_core::doc::DocReference>,
+    },
+    /// How a candidate validator scored against the stored documents, in response
+    /// to `DocValidatorTest`. `error` carries a parse or query failure instead of
+    /// a `DocError`, so the dialog shows it beside the schema it belongs to.
+    DocValidatorTested {
+        epoch: Epoch,
+        matching: u64,
+        total: u64,
+        error: Option<String>,
+    },
+    /// A collection's storage numbers, in response to `DocCollStats`.
+    DocStatsReady {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        stats: red_core::doc::CollStats,
     },
     /// A collection's indexes, in response to `DocListIndexes`.
     DocIndexesReady {

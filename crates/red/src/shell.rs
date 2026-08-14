@@ -2007,7 +2007,7 @@ impl AppState {
         }
 
         if active.tabs.get(tab_idx).is_some_and(|t| t.is_er()) {
-            let canvas = self.render_er(active, tab_idx, cx);
+            let canvas = self.render_er(active, crate::er::ErSlot::SqlTab(tab_idx), cx);
             let body = div()
                 .size_full()
                 .flex()
@@ -2021,8 +2021,10 @@ impl AppState {
             // `canvas` in this very frame captured, rather than the previous one's.
             let view = cx.entity().downgrade();
             cx.defer(move |cx| {
-                view.update(cx, |this, cx| this.er_fetch_visible_details(tab_idx, cx))
-                    .ok();
+                view.update(cx, |this, cx| {
+                    this.er_fetch_visible_details(crate::er::ErSlot::SqlTab(tab_idx), cx)
+                })
+                .ok();
             });
             return self.wrap_pane(body, active, pane, is_focused, is_split, &theme, cx);
         }

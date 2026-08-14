@@ -397,6 +397,41 @@ impl DocDriver for MongoDriver {
         Ok(out)
     }
 
+    async fn coll_stats(&self, db: &str, coll: &str) -> Result<red_core::doc::CollStats> {
+        let stats = self
+            .client
+            .database(db)
+            .run_command(doc! { "collStats": coll, "scale": 1 })
+            .await
+            .map_err(query_err)?;
+
+        // Largest first: the point of the per-index breakdown is finding the index
+        // that costs more than the data.
+        let mut index_sizes: Vec<(String, u64)> = stats
+            .get_document("indexSizes")
+            .map(|sizes| {
+                sizes
+                    .iter()
+                    .filter_map(|(name, value)| bson_num(value).map(|bytes| (name.clone(), bytes)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        index_sizes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        Ok(red_core::doc::CollStats {
+            count: get_num(&stats, "count"),
+            size: get_num(&stats, "size"),
+            storage_size: get_num(&stats, "storageSize"),
+            avg_obj_size: get_num(&stats, "avgObjSize"),
+            total_index_size: get_num(&stats, "totalIndexSize"),
+            index_sizes,
+            // A mongos reply carries a per-shard breakdown; a standalone does not,
+            // so its absence is "not sharded" rather than "unknown".
+            shards: stats.get_document("shards").ok().map(|s| s.len()),
+            capped: stats.get_bool("capped").unwrap_or(false),
+        })
+    }
+
     async fn explain(&self, q: &FindQuery) -> Result<DocPlan> {
         let filter = q
             .filter
@@ -772,6 +807,22 @@ impl DocDriver for MongoDriver {
             .map_err(query_err)
     }
 
+    async fn set_validator(&self, db: &str, coll: &str, validator: Option<&str>) -> Result<()> {
+        self.ensure_writable()?;
+        // An empty validator document is how `collMod` is told to remove one; the
+        // command has no "unset" of its own.
+        let value = match validator {
+            Some(text) => doc_to_bson_document(&self.parse_ext_json(text)?),
+            None => BsonDocument::new(),
+        };
+        self.client
+            .database(db)
+            .run_command(doc! { "collMod": coll, "validator": value })
+            .await
+            .map(|_| ())
+            .map_err(query_err)
+    }
+
     async fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<()> {
         self.ensure_writable()?;
         // `_id_` cannot be dropped; the server refuses it, but saying so here
@@ -836,10 +887,15 @@ fn index_order(order: &Bson) -> String {
 /// Read a numeric explain stat as `u64`, tolerating either BSON int width or a
 /// double (explain reports these inconsistently across server versions).
 fn get_num(doc: &BsonDocument, key: &str) -> Option<u64> {
-    match doc.get(key) {
-        Some(Bson::Int64(n)) => Some(*n as u64),
-        Some(Bson::Int32(n)) => Some(*n as u64),
-        Some(Bson::Double(x)) => Some(*x as u64),
+    doc.get(key).and_then(bson_num)
+}
+
+/// The same widening for a value already in hand (an `indexSizes` entry).
+fn bson_num(value: &Bson) -> Option<u64> {
+    match value {
+        Bson::Int64(n) => Some(*n as u64),
+        Bson::Int32(n) => Some(*n as u64),
+        Bson::Double(x) => Some(*x as u64),
         _ => None,
     }
 }

@@ -10,7 +10,7 @@
 use std::sync::Arc;
 
 use red_core::AiLimits;
-use red_core::doc::{DocSchema, DocType, DocValue, Document, FindQuery};
+use red_core::doc::{DocValue, Document, FindQuery};
 use red_driver::{AbortSignal, DocDriver};
 use serde_json::Value as Json;
 
@@ -33,16 +33,6 @@ const DOC_SYSTEM_DBS: &[&str] = &["admin", "local", "config"];
 /// One field that *looks* like a reference, with the target it would resolve
 /// against. Built before any probing so the candidate list can be capped and
 /// reported whole — including the ones that turn out to resolve nothing.
-struct RefCandidate {
-    coll: String,
-    path: String,
-    /// The collection the field name points at, already spelled as the catalog
-    /// spells it.
-    target: String,
-    /// The dominant BSON type of the field, for the report (a `string` field
-    /// pointing at an `objectId` `_id` explains a 0/200 on its own).
-    doc_type: String,
-}
 /// The Mongo analogue of `relationship_map`: guess which fields reference other
 /// collections from their names, then *test each guess* against the target's
 /// `_id` and report the hit rate.
@@ -97,13 +87,13 @@ pub(in crate::ai) async fn doc_reference_map(
             .filter(|c| wanted.is_empty() || wanted.iter().any(|w| w == *c))
             .take(DOC_REF_MAX_COLLECTIONS)
             .collect();
-        let mut candidates: Vec<RefCandidate> = Vec::new();
+        let mut candidates: Vec<red_core::doc::RefCandidate> = Vec::new();
         let mut truncated = scanned.len() < catalog.len();
         for coll in &scanned {
             let Ok(schema) = driver.infer_schema(db, coll, DOC_REF_SAMPLE, &abort).await else {
                 continue;
             };
-            candidates.extend(reference_candidates(coll, &schema, &catalog));
+            candidates.extend(red_core::doc::reference_candidates(coll, &schema, &catalog));
             // Stopping here leaves later collections unexamined whether or not the
             // count lands exactly on the cap, so the truncation is recorded from
             // the break rather than inferred from the length afterwards.
@@ -139,39 +129,12 @@ pub(in crate::ai) async fn doc_reference_map(
     }
     (cap_result_bytes(out, limits.max_result_bytes), true)
 }
-/// The reference candidates in one collection's inferred schema: scalar fields
-/// whose name points at a collection in `catalog`.
-fn reference_candidates(coll: &str, schema: &DocSchema, catalog: &[String]) -> Vec<RefCandidate> {
-    schema
-        .fields
-        .iter()
-        .filter_map(|f| {
-            let name = f.path.rsplit('.').next().unwrap_or(&f.path);
-            // A reference is a scalar handle. A document or array field may
-            // *contain* one, but the field itself is not it, and probing an
-            // array against `_id` would report a meaningless 0.
-            let (doc_type, _) = f.types.first()?;
-            if matches!(doc_type, DocType::Object | DocType::Array | DocType::Null) {
-                return None;
-            }
-            // `order_id` -> `order`, else the bare name (`customer` -> `customers`).
-            let base = red_core::doc::reference_base(&f.path).unwrap_or(name);
-            let target = red_core::doc::match_collection(base, catalog)?;
-            Some(RefCandidate {
-                coll: coll.to_string(),
-                path: f.path.clone(),
-                target: target.to_string(),
-                doc_type: doc_type.label().to_string(),
-            })
-        })
-        .collect()
-}
 /// Sample one candidate field's values and count how many resolve to a document
 /// in the target collection. One `find` and one `count`, both bounded.
 async fn probe_reference(
     driver: &Arc<dyn DocDriver>,
     db: &str,
-    c: &RefCandidate,
+    c: &red_core::doc::RefCandidate,
     abort: &AbortSignal,
 ) -> String {
     let query = FindQuery {
@@ -206,7 +169,7 @@ async fn probe_reference(
             "  {}.{} -> ? no values sampled ({}, {} doc(s) had no value here)\n",
             c.coll,
             c.path,
-            c.doc_type,
+            c.doc_type.label(),
             page.docs.len(),
         );
     }
@@ -218,11 +181,17 @@ async fn probe_reference(
     match driver.count(db, &c.target, Some(&filter)).await {
         Ok(0) => format!(
             "  {}.{} -> ? UNRESOLVED ({}, 0/{sampled} sampled values match any {}._id)\n",
-            c.coll, c.path, c.doc_type, c.target,
+            c.coll,
+            c.path,
+            c.doc_type.label(),
+            c.target,
         ),
         Ok(hits) => format!(
             "  {}.{} -> {}._id ({}, {hits}/{sampled} sampled values resolve)\n",
-            c.coll, c.path, c.target, c.doc_type,
+            c.coll,
+            c.path,
+            c.target,
+            c.doc_type.label(),
         ),
         Err(e) => format!(
             "  {}.{} -> {}._id probe failed: {e}\n",

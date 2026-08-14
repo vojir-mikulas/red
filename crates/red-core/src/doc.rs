@@ -328,6 +328,32 @@ pub struct CollectionInfo {
     pub validator: Option<String>,
 }
 
+/// A collection's storage numbers (`collStats`): what it costs, as opposed to
+/// what it holds.
+///
+/// Every field is `Option` because `collStats` is *truncated* rather than refused
+/// for an under-privileged user, exactly like `serverStatus`: a missing number
+/// means "not reported", which the panel must show as such instead of as a zero.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollStats {
+    /// Documents, exactly (`collStats.count`).
+    pub count: Option<u64>,
+    /// Uncompressed size of the documents in bytes (`size`).
+    pub size: Option<u64>,
+    /// Bytes actually allocated on disk (`storageSize`), which compression can
+    /// make much smaller than `size`.
+    pub storage_size: Option<u64>,
+    /// Mean document size in bytes (`avgObjSize`).
+    pub avg_obj_size: Option<u64>,
+    /// Total bytes across all indexes (`totalIndexSize`).
+    pub total_index_size: Option<u64>,
+    /// Per-index bytes (`indexSizes`), largest first.
+    pub index_sizes: Vec<(String, u64)>,
+    /// Whether the collection is sharded, and across how many shards.
+    pub shards: Option<usize>,
+    pub capped: bool,
+}
+
 /// A `find` filter / projection / sort, passed through as an extended-JSON
 /// [`DocValue::Document`] in v1 (a typed query builder is a later bet). Aliases,
 /// not newtypes, so they read at the call sites without ceremony.
@@ -965,6 +991,14 @@ pub enum DocWrite {
         coll: String,
         name: String,
     },
+    /// Set (or, with `None`, remove) a collection's JSON-Schema validator
+    /// (`collMod`). Extended-JSON **text**, parsed by the driver, for the reason
+    /// [`IndexSpec::partial_filter`] is.
+    SetValidator {
+        db: String,
+        coll: String,
+        validator: Option<String>,
+    },
 }
 
 pub use crate::OpClass;
@@ -993,6 +1027,10 @@ pub fn classify_doc_op(op: &DocWrite) -> OpClass {
         // likely to take a production deployment down: the queries that relied on
         // it silently become collection scans.
         DocWrite::DropIndex { .. } => true,
+        // A validator writes no documents either, and decides whether every
+        // future write is accepted. Removing one is as consequential as adding
+        // one, so both confirm.
+        DocWrite::SetValidator { .. } => true,
         DocWrite::Insert { .. }
         | DocWrite::Replace { .. }
         | DocWrite::CreateCollection { .. }
@@ -1122,6 +1160,83 @@ pub fn pipeline_write_stage(stages: &[DocValue]) -> Option<&'static str> {
         }),
         _ => None,
     })
+}
+
+/// One field that looks like it references another collection: which collection
+/// it lives in, the dotted path, the collection its name points at, and the type
+/// its values actually had.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefCandidate {
+    pub coll: String,
+    pub path: String,
+    pub target: String,
+    pub doc_type: DocType,
+}
+
+/// The reference candidates in one collection's inferred schema: the scalar fields
+/// whose name points at a collection in `catalog`.
+///
+/// Mongo declares no foreign keys, so a reference can only be *guessed* from a
+/// name and then tested; this is the guessing half over a whole collection, and
+/// [`reference_base`] / [`match_collection`] are the naming rules it applies.
+///
+/// Container and null fields are excluded deliberately: a document or array field
+/// may *contain* a reference, but the field itself is not one, and probing an
+/// array against `_id` would report a meaningless zero.
+pub fn reference_candidates(
+    coll: &str,
+    schema: &DocSchema,
+    catalog: &[String],
+) -> Vec<RefCandidate> {
+    schema
+        .fields
+        .iter()
+        .filter_map(|f| {
+            let name = f.path.rsplit('.').next().unwrap_or(&f.path);
+            let (doc_type, _) = f.types.first()?;
+            if matches!(doc_type, DocType::Object | DocType::Array | DocType::Null) {
+                return None;
+            }
+            // `order_id` -> `order`, else the bare name (`customer` -> `customers`).
+            let base = reference_base(&f.path).unwrap_or(name);
+            let target = match_collection(base, catalog)?;
+            Some(RefCandidate {
+                coll: coll.to_string(),
+                path: f.path.clone(),
+                target: target.to_string(),
+                doc_type: *doc_type,
+            })
+        })
+        .collect()
+}
+
+/// One inferred relationship between two collections, with the evidence for it.
+///
+/// `resolved` out of `sampled` is the whole point: Mongo declares nothing, so a
+/// relationship is a *claim*, and a claim that 3 of 200 sampled values resolve is
+/// a coincidence rather than a reference. The UI draws the strong ones and reports
+/// the weak ones as what they are.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocReference {
+    pub from_coll: String,
+    pub field: String,
+    pub to_coll: String,
+    /// Distinct sampled values of the field that matched a document's `_id`.
+    pub resolved: u64,
+    /// Distinct values sampled.
+    pub sampled: u64,
+}
+
+impl DocReference {
+    /// Whether enough of the sampled values resolved to call this a reference
+    /// rather than a naming coincidence.
+    ///
+    /// A majority, not all: a real reference to a collection that has been pruned
+    /// (soft-deleted rows, an archive job) still resolves most of the time, and
+    /// insisting on 100% would hide exactly the relationships worth seeing.
+    pub fn is_strong(&self) -> bool {
+        self.sampled > 0 && self.resolved * 2 > self.sampled
+    }
 }
 
 /// The name a field is probably a reference *to*, or `None` when the field name

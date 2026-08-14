@@ -376,7 +376,8 @@ async fn doc_execute_write(
         DocWrite::CreateCollection { .. }
         | DocWrite::DropCollection { .. }
         | DocWrite::CreateIndex { .. }
-        | DocWrite::DropIndex { .. } => Ok("unsupported write".into()),
+        | DocWrite::DropIndex { .. }
+        | DocWrite::SetValidator { .. } => Ok("unsupported write".into()),
     }
 }
 

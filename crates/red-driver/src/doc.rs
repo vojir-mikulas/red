@@ -121,6 +121,16 @@ pub trait DocDriver: Send + Sync {
     /// partial, for the indexes panel.
     async fn indexes(&self, db: &str, coll: &str) -> Result<Vec<IndexInfo>>;
 
+    /// A collection's storage numbers (`collStats`): size, allocated storage,
+    /// mean document size, per-index bytes. The default reports nothing, for an
+    /// engine with no such command.
+    async fn coll_stats(&self, db: &str, coll: &str) -> Result<red_core::doc::CollStats> {
+        let _ = (db, coll);
+        Err(red_core::RedError::Driver(
+            "this engine reports no collection statistics".to_string(),
+        ))
+    }
+
     /// `explain` a find query: the winning plan, the index used (if any), and the
     /// examined/returned numbers, so the UI can flag a `COLLSCAN` and the "missing
     /// index" case.
@@ -241,6 +251,17 @@ pub trait DocDriver: Send + Sync {
     /// Drop an index by name (`dropIndexes`). Destructive: the queries that relied
     /// on it become collection scans, so the host gate confirms it first.
     async fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<()>;
+
+    /// Set a collection's validator (`collMod`), or remove it with `None`.
+    /// `validator` is extended-JSON text, parsed by the driver. Existing documents
+    /// are **not** re-checked: a validator governs future writes, which is the
+    /// server's semantics and worth knowing before setting one.
+    async fn set_validator(&self, db: &str, coll: &str, validator: Option<&str>) -> Result<()> {
+        let _ = (db, coll, validator);
+        Err(red_core::RedError::Driver(
+            "this engine has no collection validators".to_string(),
+        ))
+    }
 }
 
 #[cfg(test)]

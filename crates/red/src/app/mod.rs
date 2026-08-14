@@ -2121,6 +2121,24 @@ impl AppState {
             } => {
                 self.on_doc_aggregate(session, epoch, db, coll, docs, cx);
             }
+            Event::DocReferencesReady {
+                epoch,
+                db,
+                collections,
+                references,
+            } => self.on_doc_references(session, epoch, db, collections, references, cx),
+            Event::DocValidatorTested {
+                epoch,
+                matching,
+                total,
+                error,
+            } => self.on_doc_validator_tested(session, epoch, matching, total, error, cx),
+            Event::DocStatsReady {
+                epoch,
+                db,
+                coll,
+                stats,
+            } => self.on_doc_stats(session, epoch, db, coll, stats, cx),
             Event::DocPlanReady {
                 epoch,
                 db,

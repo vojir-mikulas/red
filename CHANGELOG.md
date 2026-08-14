@@ -56,6 +56,20 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the applied filter), ⇧⌘O opens it back into the right box at the right
   collection. They live as readable `.mongo.json` files beside the saved `.sql`
   ones.
+- A relations diagram for MongoDB: right-click a database and "Show relations".
+  RED samples each collection, guesses which fields reference another from their
+  names, then tests every guess against the target's `_id`, and draws the ones
+  that hold on the same canvas the SQL ER diagram uses. The footer says how many
+  names looked like references but did not resolve, because an inferred edge is a
+  claim and you should be able to see the evidence.
+- Edit a MongoDB collection's validation rule, with a Test button that counts how
+  many stored documents the rule would accept before you apply it. Setting a
+  validator does not re-check what is already there, so knowing that number up
+  front is the difference between a safe change and a surprise.
+- The MongoDB Schema panel now leads with the collection's storage: documents,
+  data size, size on disk, mean document size, index bytes per index, and whether
+  it is sharded or capped. Numbers the server declines to report are left out
+  rather than shown as zero.
 - The row-number gutter now holds the left edge instead of scrolling away with
   the columns, so a row stays identifiable however far right you scroll.
 - Freeze result columns: "Pin <column> left" in the header menu holds a column
