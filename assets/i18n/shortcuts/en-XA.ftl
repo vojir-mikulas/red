@@ -120,6 +120,8 @@ shortcuts-schema_tree-search_schema_focus_filter = [Séárçh sçhémá (föçú
 
 shortcuts-schema_tree-refresh_schema = [Réfrésh sçhémá]
 
+shortcuts-schema_tree-transfer_selection = [Tráñsfér táblé / dátábásé tö…]
+
 shortcuts-mongodb_browser-title = [MöñgöDB bröwsér]
 
 shortcuts-mongodb_browser-move_selection_collection_tree_document_grid = [Mövé séléçtíöñ (çölléçtíöñ tréé, döçúméñt gríd)]

@@ -1018,6 +1018,20 @@ impl DatabaseDriver for MysqlDriver {
         self.execute(&sql).await
     }
 
+    async fn drop_table(&self, table: &TableRef) -> Result<u64> {
+        let sql = red_core::ddl::drop_table_sql(table, |id| format!("`{}`", escape_ident(id)));
+        self.execute(&sql).await
+    }
+
+    async fn create_namespace(&self, name: &str) -> Result<()> {
+        self.execute(&format!(
+            "CREATE DATABASE IF NOT EXISTS `{}`",
+            escape_ident(name)
+        ))
+        .await
+        .map(|_| ())
+    }
+
     fn quote_table(&self, table: &TableRef) -> String {
         crate::qualify_table(table, |id| format!("`{}`", escape_ident(id)))
     }

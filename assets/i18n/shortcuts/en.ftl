@@ -120,6 +120,8 @@ shortcuts-schema_tree-search_schema_focus_filter = Search schema (focus filter)
 
 shortcuts-schema_tree-refresh_schema = Refresh schema
 
+shortcuts-schema_tree-transfer_selection = Transfer table / database to…
+
 shortcuts-mongodb_browser-title = MongoDB browser
 
 shortcuts-mongodb_browser-move_selection_collection_tree_document_grid = Move selection (collection tree, document grid)

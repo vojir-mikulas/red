@@ -18,8 +18,6 @@ notify-downloading_update = Downloading update…
 
 notify-reset_problems = Reset finished with { $n } problem(s); some data may remain
 
-notify-migrating_tables = Migrating { $n } table(s)…
-
 notify-exported_rows = Exported { $rows } row(s) to { $path }
 
 notify-importing_rows = Importing… { $rows } row(s)

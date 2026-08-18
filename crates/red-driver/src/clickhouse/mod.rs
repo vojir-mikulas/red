@@ -1400,6 +1400,17 @@ impl DatabaseDriver for ClickhouseDriver {
         self.execute(&ch_create_table_sql(table, columns)).await
     }
 
+    async fn drop_table(&self, table: &TableRef) -> Result<u64> {
+        self.execute(&red_core::ddl::drop_table_sql(table, ch_quote))
+            .await
+    }
+
+    async fn create_namespace(&self, name: &str) -> Result<()> {
+        self.execute(&format!("CREATE DATABASE IF NOT EXISTS {}", ch_quote(name)))
+            .await
+            .map(|_| ())
+    }
+
     fn quote_table(&self, table: &TableRef) -> String {
         crate::qualify_table(table, ch_quote)
     }

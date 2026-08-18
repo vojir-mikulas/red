@@ -22,6 +22,7 @@ use red_core::kv::{
     KvStreamPage, KvType, KvValue, PendingEntry, RecycledKey, RespValue, ScanBudget, ScanCursor,
     SlowlogEntry, StreamAction, StreamConsumer, StreamGroup,
 };
+use red_core::transfer::{TransferPlan, TransferSummary};
 use red_core::{
     ActivityId, ActivityKind, ActivityStatus, AiLimits, AiTier, BatchMode, Column, ColumnMap,
     ColumnMeta, ColumnStats, ConnectionConfig, CopyMode, EditOp, ExportFormat, ExportShortfall,
@@ -1138,6 +1139,41 @@ pub enum Command {
         target_session: SessionId,
         target_schema: Option<String>,
     },
+    /// Run one [`TransferPlan`]: the general form of `CopyToTable` and
+    /// `MigrateTables`, and the only one that can express a *subset* ("duplicate
+    /// this database, but `audit_log` empty and `orders` filtered").
+    ///
+    /// The envelope's [`SessionId`] is the **source** session; `target_session` is
+    /// where the plan's items are written (equal to the source for a
+    /// same-connection transfer). Both ends are pinned for the job's lifetime.
+    /// Items run FK-parents-first, each streamed through one resident window and
+    /// committed per chunk, exactly like the two commands it generalises.
+    ///
+    /// With `plan.options.dry_run` set it plans and renders only: nothing is
+    /// written and the answer is a single [`Event::TransferPlanned`] carrying the
+    /// script and per-item row estimates.
+    ///
+    /// Routes `Transfer*` events and a `CancelTransfer { id }`.
+    RunTransfer {
+        id: OpId,
+        plan: Box<TransferPlan>,
+        target_session: SessionId,
+    },
+    /// Abort an in-flight transfer by `id` (the progress step's Cancel). Items
+    /// that already finished stay committed, as do the earlier chunks of the item
+    /// that was running (per-chunk commit, like import).
+    CancelTransfer {
+        id: OpId,
+    },
+    /// Create a namespace (`CREATE DATABASE` / `CREATE SCHEMA`) on the envelope's
+    /// session: the "Duplicate database…" entry point's first step, which has to
+    /// land before a plan can be pointed at the new namespace. Replies
+    /// `NamespaceCreated` on success and `TransferFailed` on refusal (SQLite,
+    /// where a new database is a new file, and any read-only connection).
+    CreateNamespace {
+        id: OpId,
+        name: String,
+    },
     /// Peek a CSV/JSONL file's **source column names** (CSV header / first JSONL
     /// object's keys) without importing, so the UI can build a name-based column
     /// mapping against the target table and preview it before any write. `id`
@@ -2136,6 +2172,69 @@ pub enum Event {
     CopyCancelled {
         id: OpId,
         rows: usize,
+    },
+    /// A transfer is working on item `item` of `items`. `item_rows` is what that
+    /// item has committed; `rows` is the job total across every item so far. Both
+    /// ride because the progress list shows a per-item count *and* a job total,
+    /// and deriving one from the other would need the UI to remember every
+    /// finished item's tally.
+    ///
+    /// No percentage: a plan is not row-counted before it runs (see
+    /// `red_core::transfer`), so a total would be a `count(*)` per table on a job
+    /// whose whole point is to move tables too big to want that.
+    TransferProgress {
+        id: OpId,
+        item: usize,
+        items: usize,
+        table: String,
+        item_rows: u64,
+        rows: u64,
+    },
+    /// One item of a transfer reached a terminal state, successful or not. The
+    /// progress list fills in a line per arrival, so a 40-table job says where it
+    /// is instead of showing one cumulative number.
+    TransferItemDone {
+        id: OpId,
+        item: usize,
+        report: red_core::transfer::ItemReport,
+    },
+    /// A transfer finished. `summary` carries one line per planned item, including
+    /// the ones that were skipped or failed: a failed table is reported, never
+    /// swallowed the way the old migrate job swallowed an already-present one.
+    TransferFinished {
+        id: OpId,
+        summary: TransferSummary,
+    },
+    /// A transfer stopped on an error (`OnError::Stop`, or a failure before any
+    /// item ran). `item` names the item that failed when there was one, `rows` the
+    /// job total committed before it. `summary` carries the items that did finish.
+    TransferFailed {
+        id: OpId,
+        item: Option<usize>,
+        rows: u64,
+        message: String,
+        summary: TransferSummary,
+    },
+    /// An in-flight transfer was cancelled. Finished items and the running item's
+    /// earlier chunks stay committed.
+    TransferCancelled {
+        id: OpId,
+        rows: u64,
+        summary: TransferSummary,
+    },
+    /// A dry run's answer: the full script the plan would execute (creates, drops,
+    /// the per-item `INSERT` shape, then the deferred index and foreign-key
+    /// statements) and a per-item row estimate. Nothing was written.
+    TransferPlanned {
+        id: OpId,
+        script: String,
+        estimates: Vec<(String, Option<u64>)>,
+    },
+    /// A `CreateNamespace` succeeded; `name` is the namespace now available as a
+    /// transfer target.
+    NamespaceCreated {
+        id: OpId,
+        name: String,
     },
     /// A diff is running: `scanned` rows read across both sides so far (progress
     /// only; the diff holds nothing but the bounded result set). Global (`None`

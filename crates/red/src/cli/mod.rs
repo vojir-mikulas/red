@@ -119,6 +119,8 @@ enum Verb {
     Copy(copy::CopyArgs),
     /// Migrate whole tables into another connection (create-fresh, FK-ordered).
     Migrate(copy::MigrateArgs),
+    /// Run a saved transfer plan (the artefact the GUI wizard writes).
+    Transfer(copy::TransferArgs),
     /// Remove all RED data: config + data directories and every keychain secret
     /// (connection passwords, SSH secrets, AI keys). Does not touch the binary.
     Reset(ResetArgs),
@@ -237,6 +239,7 @@ pub fn run() -> Option<u8> {
         Verb::Exec(a) => cmd_exec(a),
         Verb::Copy(a) => copy::cmd_copy(a),
         Verb::Migrate(a) => copy::cmd_migrate(a),
+        Verb::Transfer(a) => copy::cmd_transfer(a),
         Verb::Reset(a) => cmd_reset(a),
         Verb::Mcp(a) => mcp::cmd_mcp(a),
     })

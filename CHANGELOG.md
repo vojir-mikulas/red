@@ -80,6 +80,29 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   tiles instead of as JSON. A block that does not parse is still shown as code,
   so nothing the model wrote is lost. Works in every markdown surface, on every
   engine.
+- Copy, duplicate and migrate are now one flow. A stepped Transfer wizard picks
+  the destination, then lets you say what actually moves: which tables, which of
+  them with their data and which as empty structure, which ones filtered to a
+  `WHERE` clause or capped to the first N rows, and what each is called on the
+  other side. Every table shows whether it will be created or written into a
+  table that already exists, a Review step summarises the whole job before
+  anything is written, and clearing or dropping a target is confirmed once for
+  the plan rather than table by table. It runs streamed and cancellable as
+  before, and reports what happened to each table when it finishes.
+- Reach the transfer wizard from where you are: right-click a table for "Copy
+  table to…" or "Duplicate table…", right-click a database for "Copy database
+  to…" or "Duplicate database…", press F5 on the schema tree, transfer an open
+  result or a selected `SELECT` in the editor, or run it from the command
+  palette.
+- Duplicate a whole database, including into a new one: RED can now create the
+  target database or schema (MySQL, PostgreSQL, ClickHouse) before filling it.
+  Copied tables carry their column defaults when both ends are the same engine.
+- Preview a transfer before running it. "Dry run" writes nothing and opens the
+  full script it would execute - creates, drops, index and foreign-key
+  statements - in a query tab, alongside a row estimate per table.
+- Save a transfer as a named plan and reopen it from the command palette. The
+  same plan file runs headless with `red transfer --plan <file>`, so a transfer
+  you built and reviewed on screen is the one a scheduled job re-runs.
 - The row-number gutter now holds the left edge instead of scrolling away with
   the columns, so a row stays identifiable however far right you scroll.
 - Freeze result columns: "Pin <column> left" in the header menu holds a column
@@ -120,6 +143,13 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   the edit form on the letter `e`.
 - Esc with a settings dropdown open closes the dropdown and leaves the settings
   panel where it was.
+
+### Changed
+- "schema: migrate to…" now opens the Transfer wizard, so migrating a whole
+  database and migrating most of it are the same gesture. A table that already
+  exists on the target is shown and chosen for, instead of being skipped without
+  saying so, and a table that fails is reported in the finished job's summary
+  rather than passing unmentioned.
 
 ## [0.22.0] - 2026-08-12
 

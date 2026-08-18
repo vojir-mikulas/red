@@ -1077,6 +1077,20 @@ impl DatabaseDriver for PostgresDriver {
         self.execute(&sql).await
     }
 
+    async fn drop_table(&self, table: &TableRef) -> Result<u64> {
+        self.execute(&red_core::ddl::drop_table_sql(table, pg_quote))
+            .await
+    }
+
+    async fn create_namespace(&self, name: &str) -> Result<()> {
+        // A Postgres namespace is a schema, not a database: `CREATE DATABASE`
+        // cannot run inside a transaction block and would land the new database
+        // outside the connection the transfer is about to write through.
+        self.execute(&format!("CREATE SCHEMA IF NOT EXISTS {}", pg_quote(name)))
+            .await
+            .map(|_| ())
+    }
+
     fn quote_table(&self, table: &TableRef) -> String {
         crate::qualify_table(table, pg_quote)
     }

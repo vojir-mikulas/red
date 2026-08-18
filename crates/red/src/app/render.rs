@@ -12,11 +12,11 @@ use crate::app::PreflightCount;
 use crate::keymap::{
     About, AddRow, BeginEdit, CloseInspector, ClosePane, CloseTab, CycleFocusNext, CycleFocusPrev,
     DeleteRow, EqualizePanes, Explain, FindInResult, FocusOtherHalf, FormatSql, MaximizePane,
-    NewConnection, NewTab, NextTab, OpenSavedQueries, PinRow, PrevTab, RefreshSchema, ReportBug,
-    RevertChanges, RunQuery, RunScript, SaveQuery, SearchSchema, SelectAll, SetNull, Settings,
-    ShowChangelog, ShowErDiagram, ShowShortcuts, SplitDown, SubmitChanges, SwitchConnection,
-    SwitchToConnectionSlot, SwitchToPreviousConnection, ToggleAssistant, ToggleColumnsPanel,
-    ToggleFilter, ToggleHistory, ToggleInspector, ToggleSidebar, ToggleSplit,
+    NewConnection, NewTab, NextTab, OpenSavedQueries, OpenTransfer, PinRow, PrevTab, RefreshSchema,
+    ReportBug, RevertChanges, RunQuery, RunScript, SaveQuery, SearchSchema, SelectAll, SetNull,
+    Settings, ShowChangelog, ShowErDiagram, ShowShortcuts, SplitDown, SubmitChanges,
+    SwitchConnection, SwitchToConnectionSlot, SwitchToPreviousConnection, ToggleAssistant,
+    ToggleColumnsPanel, ToggleFilter, ToggleHistory, ToggleInspector, ToggleSidebar, ToggleSplit,
 };
 use crate::palette::{CopyResult, GoToObject, GoToRow, ToggleCommandPalette};
 use red_core::sql::RiskLevel;
@@ -475,6 +475,11 @@ impl Render for AppState {
             .as_ref()
             .map(|w| self.render_import_wizard(w, cx));
 
+        // Rendered *before* `confirm` in the child list below, so the
+        // destructive confirm the wizard raises layers over it rather than
+        // under it (siblings paint in order).
+        let transfer_wizard = self.transfer.as_ref().map(|w| self.render_transfer(w, cx));
+
         // The data-compare (table diff) report is a full-screen overlay hung
         // off the connection.
         let diff_report = match &self.phase {
@@ -650,6 +655,14 @@ impl Render for AppState {
                 let ns = this.er_target_namespace(cx);
                 this.open_er_diagram(ns, cx)
             }))
+            // F5: transfer whatever the tree has selected. A table if one is
+            // selected, otherwise the namespace, which is what the key means in
+            // every other tool that binds it.
+            .on_action(cx.listener(|this, _: &OpenTransfer, _, cx| {
+                if this.globals_enabled() {
+                    this.open_transfer_for_selection(cx);
+                }
+            }))
             // Settings panel: ⌘, and the RED → Settings… / About RED menu items.
             .on_action(cx.listener(|this, _: &Settings, _, cx| this.open_settings(cx)))
             .on_action(cx.listener(|this, _: &About, _, cx| this.open_about(cx)))
@@ -805,6 +818,7 @@ impl Render for AppState {
             .text_size(px(self.settings.appearance.ui_font_size))
             .child(screen)
             .children(toast)
+            .children(transfer_wizard)
             .children(confirm)
             .children(confirm_close)
             .children(confirm_kv_delete)
@@ -1983,6 +1997,12 @@ impl AppState {
             PendingWrite::Copy { prose, preview, .. } => {
                 ("Copy to table", prose.clone(), preview.clone(), "Append")
             }
+            PendingWrite::Transfer { prose, preview } => (
+                "Confirm transfer",
+                prose.clone(),
+                preview.clone(),
+                "Transfer",
+            ),
             PendingWrite::KillSession {
                 mode, who, query, ..
             } => (

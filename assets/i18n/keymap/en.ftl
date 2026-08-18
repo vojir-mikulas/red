@@ -25,6 +25,9 @@ keymap-GoToRow =
 keymap-GoToObject =
     .label = Go to table
 
+keymap-OpenTransfer =
+    .label = Transfer to…
+
 keymap-Quit =
     .label = Quit
 

@@ -58,6 +58,10 @@ palette-cmd_unsplit = [víéw: úñsplít (föld páñés báçk íñtö öñé)
 
 palette-cmd_migrate_schema = [sçhémá: mígráté tö…]
 
+palette-cmd_transfer_result = [résúlt: tráñsfér íñtö…]
+
+palette-cmd_open_saved_plan = [tráñsfér: öpéñ sávéd pláñ…]
+
 palette-cmd_compare_table = [táblé: çömpáré ágáíñst…]
 
 palette-cmd_goto_object = [gö tö táblé…]
@@ -139,5 +143,3 @@ palette-search_actions = [Séárçh áçtíöñs ör shörtçúts…]
 palette-no_objects = [Ñö sçhémá öbjéçts löádéd yét. Çöññéçt, ör réfrésh wíth ⌘R.]
 
 palette-goto_object_placeholder = [Gö tö táblé…]
-
-palette-migrate_target = [{ $schema } ({ $table_count } táblé(s))]

@@ -6096,6 +6096,185 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 });
             }
 
+            Command::RunTransfer {
+                id,
+                plan,
+                target_session,
+            } => {
+                // Fail fast with the terminal event, so the wizard's progress step
+                // never strands on a job that never started.
+                macro_rules! transfer_fail {
+                    ($msg:expr_2021) => {{
+                        emit(
+                            &events,
+                            None,
+                            Event::TransferFailed {
+                                id,
+                                item: None,
+                                rows: 0,
+                                message: $msg.into(),
+                                summary: Default::default(),
+                            },
+                        );
+                        continue;
+                    }};
+                }
+                let Some(source_sid) = session_id else {
+                    continue;
+                };
+                let Some(src_state) = sessions.get(&source_sid) else {
+                    transfer_fail!("source connection isn't open")
+                };
+                let Some(src) = src_state.driver.as_sql().cloned() else {
+                    transfer_fail!("source isn't a SQL connection")
+                };
+                let src_kind = src_state.kind;
+                let src_busy = src_state.busy.clone();
+                let exports = src_state.exports.clone();
+                // Snapshot the SQL of every result the plan names, while the
+                // session map is still in hand: the job runs off-loop.
+                let result_sql: HashMap<u64, String> = {
+                    let results = lock(&src_state.results);
+                    plan.items
+                        .iter()
+                        .filter_map(|item| match &item.source {
+                            red_core::transfer::ItemSource::Result { epoch } => results
+                                .get(&crate::Epoch::new(*epoch))
+                                .map(|s| (*epoch, s.sql.clone())),
+                            _ => None,
+                        })
+                        .collect()
+                };
+                let Some(dst_state) = sessions.get(&target_session) else {
+                    transfer_fail!("target connection isn't open")
+                };
+                // Defense in depth alongside the wizard's target filter: never
+                // write to a read-only destination, even if a stale plan gets here.
+                if dst_state.read_only && !plan.options.dry_run {
+                    transfer_fail!("target connection is read-only")
+                }
+                let Some(dst) = dst_state.driver.as_sql().cloned() else {
+                    transfer_fail!("target isn't a SQL connection")
+                };
+                let dst_kind = dst_state.kind;
+                let dst_busy = dst_state.busy.clone();
+                if plan.items.is_empty() {
+                    transfer_fail!("nothing to transfer")
+                }
+
+                // Shares the copy cancel registry (and its id space) so a
+                // `CancelTransfer` flips the same flag the copy path uses.
+                let cancel = Arc::new(AtomicBool::new(false));
+                lock(&exports).insert(id, cancel.clone());
+
+                let events = events.clone();
+                let copy_limit = copy_limit.clone();
+                tokio::spawn(async move {
+                    let _permit = copy_limit.acquire_owned().await;
+                    // Pin both ends for the whole multi-item job; RAII lifts them
+                    // on finish, cancel, or panic.
+                    let _src_pin = PinGuard::new(src_busy);
+                    let _dst_pin = PinGuard::new(dst_busy);
+                    let outcome = transfer_job(TransferJob {
+                        src,
+                        dst,
+                        src_kind,
+                        dst_kind,
+                        plan: *plan,
+                        result_sql,
+                        cancel,
+                        events: events.clone(),
+                        id,
+                    })
+                    .await;
+                    lock(&exports).remove(&id);
+                    let event = match outcome {
+                        TransferOutcome::Finished(summary) => {
+                            Event::TransferFinished { id, summary }
+                        }
+                        TransferOutcome::Failed {
+                            item,
+                            message,
+                            summary,
+                        } => Event::TransferFailed {
+                            id,
+                            item,
+                            rows: summary.rows,
+                            message,
+                            summary,
+                        },
+                        TransferOutcome::Cancelled(summary) => Event::TransferCancelled {
+                            id,
+                            rows: summary.rows,
+                            summary,
+                        },
+                        TransferOutcome::Planned { script, estimates } => Event::TransferPlanned {
+                            id,
+                            script,
+                            estimates,
+                        },
+                    };
+                    emit(&events, None, event);
+                });
+            }
+
+            Command::CancelTransfer { id } => {
+                let Some(sid) = session_id else { continue };
+                // Flip the flag; the job's between-items/between-chunks check
+                // picks it up and replies `TransferCancelled`.
+                if let Some(state) = sessions.get(&sid)
+                    && let Some(cancel) = lock(&state.exports).get(&id)
+                {
+                    cancel.store(true, Ordering::Relaxed);
+                }
+            }
+
+            Command::CreateNamespace { id, name } => {
+                let Some(sid) = session_id else { continue };
+                macro_rules! namespace_fail {
+                    ($msg:expr_2021) => {{
+                        emit(
+                            &events,
+                            None,
+                            Event::TransferFailed {
+                                id,
+                                item: None,
+                                rows: 0,
+                                message: $msg.into(),
+                                summary: Default::default(),
+                            },
+                        );
+                        continue;
+                    }};
+                }
+                let Some(state) = sessions.get(&sid) else {
+                    namespace_fail!("connection isn't open")
+                };
+                if state.read_only {
+                    namespace_fail!("connection is read-only")
+                }
+                let Some(driver) = state.driver.as_sql().cloned() else {
+                    namespace_fail!("not a SQL connection")
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match driver.create_namespace(&name).await {
+                        Ok(()) => emit(&events, None, Event::NamespaceCreated { id, name }),
+                        Err(e) => emit(
+                            &events,
+                            None,
+                            Event::TransferFailed {
+                                id,
+                                item: None,
+                                rows: 0,
+                                message: e.to_string(),
+                                summary: Default::default(),
+                            },
+                        ),
+                    }
+                });
+            }
+
             Command::ImportColumns { path, format, id } => {
                 // Peek the header on a blocking thread (cheap file IO, no session
                 // needed); reply with the source column names or an ImportFailed.
@@ -6285,7 +6464,9 @@ fn export_stamp() -> String {
 }
 
 pub(crate) mod jobs;
+mod transfer;
 use jobs::*;
+use transfer::{TransferJob, TransferOutcome, transfer_job};
 
 /// Commit or roll back a sandbox and tell the UI what happened.
 ///

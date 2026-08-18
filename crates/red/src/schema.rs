@@ -1028,6 +1028,41 @@ impl AppState {
                         )),
                     );
                 }
+                // Where the user is actually looking: the transfer entry points
+                // that used to live only in the command palette.
+                items = items
+                    .separator()
+                    .item(
+                        ContextMenuItem::new("schema-copy-db", "Copy database to…")
+                            .shortcut(crate::keymap::localize_hint("F5"))
+                            .on_click(cx.listener({
+                                let ns = ns.clone();
+                                move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.open_transfer(
+                                        crate::transfer::TransferEntry::Database {
+                                            schema: ns.clone(),
+                                        },
+                                        cx,
+                                    );
+                                }
+                            })),
+                    )
+                    .item(
+                        ContextMenuItem::new("schema-duplicate-db", "Duplicate database…")
+                            .on_click(cx.listener({
+                                let ns = ns.clone();
+                                move |this, _, _, cx| {
+                                    this.close_menu(cx);
+                                    this.open_transfer(
+                                        crate::transfer::TransferEntry::DuplicateDatabase {
+                                            schema: ns.clone(),
+                                        },
+                                        cx,
+                                    );
+                                }
+                            })),
+                    );
                 // Scoped to *this* database: the diagram maps what was right-clicked,
                 // not every database on the connection.
                 items = items.separator().item(
@@ -1111,6 +1146,45 @@ impl AppState {
                             }),
                         ),
                     );
+                }
+                // Write targets only: a view is a relation and is not an INSERT
+                // target, so `Table` is spelled out rather than `is_relation()`.
+                if matches!(kind, ObjectKind::Table) {
+                    items = items
+                        .separator()
+                        .item(
+                            ContextMenuItem::new("schema-copy-table", "Copy table to…")
+                                .shortcut(crate::keymap::localize_hint("F5"))
+                                .on_click(cx.listener({
+                                    let (sc, nm) = (sc.clone(), nm.clone());
+                                    move |this, _, _, cx| {
+                                        this.close_menu(cx);
+                                        this.open_transfer(
+                                            crate::transfer::TransferEntry::Table {
+                                                schema: sc.clone(),
+                                                name: nm.clone(),
+                                            },
+                                            cx,
+                                        );
+                                    }
+                                })),
+                        )
+                        .item(
+                            ContextMenuItem::new("schema-duplicate-table", "Duplicate table…")
+                                .on_click(cx.listener({
+                                    let (sc, nm) = (sc.clone(), nm.clone());
+                                    move |this, _, _, cx| {
+                                        this.close_menu(cx);
+                                        this.open_transfer(
+                                            crate::transfer::TransferEntry::DuplicateTable {
+                                                schema: sc.clone(),
+                                                name: nm.clone(),
+                                            },
+                                            cx,
+                                        );
+                                    }
+                                })),
+                        );
                 }
                 items = items.separator().item(
                     ContextMenuItem::new("schema-copy-qualified", "Copy qualified name").on_click(

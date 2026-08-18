@@ -71,6 +71,7 @@ mod shell;
 mod sql;
 mod tabstrip;
 mod theme;
+mod transfer;
 mod window_chrome;
 mod workspace;
 

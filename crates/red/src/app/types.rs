@@ -1277,6 +1277,10 @@ pub(crate) enum PendingWrite {
         prose: String,
         preview: String,
     },
+    /// A confirmed transfer whose plan clears or drops something on the target.
+    /// Gated **once for the whole plan**, naming the count rather than asking per
+    /// table; the plan itself stays on the wizard, which runs it on accept.
+    Transfer { prose: String, preview: String },
 }
 
 /// A pending `ImportColumns` peek: the chosen file + the target table/columns, held

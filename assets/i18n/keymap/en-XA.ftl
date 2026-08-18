@@ -25,6 +25,9 @@ keymap-GoToRow =
 keymap-GoToObject =
     .label = [Gö tö táblé]
 
+keymap-OpenTransfer =
+    .label = [Tráñsfér tö…]
+
 keymap-Quit =
     .label = [Qúít]
 

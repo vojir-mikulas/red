@@ -535,6 +535,15 @@ impl DatabaseDriver for SqliteDriver {
         self.execute(&sql).await
     }
 
+    async fn drop_table(&self, table: &TableRef) -> Result<u64> {
+        self.execute(&red_core::ddl::drop_table_sql(table, quote_ident))
+            .await
+    }
+
+    // No `create_namespace`: a SQLite namespace is a file (`main` plus whatever is
+    // `ATTACH`ed for this connection), so "make me a new database" is a
+    // connection-form question, not a statement. The trait's default says so.
+
     fn quote_table(&self, table: &TableRef) -> String {
         crate::qualify_table(table, quote_ident)
     }
