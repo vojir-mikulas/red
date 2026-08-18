@@ -563,12 +563,12 @@ notify-exported_rows = { $rows ->
     /// Fluent has no escape character, so a `{` in the source text has to ride as
     /// a string placeable (`{"{"}`). Getting that wrong is quiet: the string still
     /// renders, just with the escaping machinery showing, and the placeholder
-    /// examples in the Mongo filter box are exactly where a user would see it.
+    /// examples in the Mongo aggregation box are exactly where a user would see it.
     #[test]
     fn literal_braces_round_trip() {
         assert_eq!(
-            in_locale(DEFAULT, "doc.filter_e_g_status_active").as_deref(),
-            Some(r#"filter, e.g. { "status": "active" }"#)
+            in_locale(DEFAULT, "doc.aggregation_pipeline_e_g_group_runs").as_deref(),
+            Some("Aggregation pipeline, e.g. [ { \"$group\": \u{2026} } ]. \u{2318}\u{21b5} runs.")
         );
     }
 

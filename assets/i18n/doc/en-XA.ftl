@@ -10,11 +10,13 @@
 #      *[other] { $n } rows
 #   }
 
+doc-aggregation_stage = [Ággrégátíöñ stágé]
+
 doc-field = [fíéld]
 
 doc-value = [válúé]
 
-doc-filter_e_g_status_active = [fíltér, é.g. {"{"} "status": "active" {"}"}]
+doc-new_index = [Ñéw íñdéx]
 
 doc-aggregation_pipeline_e_g_group_runs = [Ággrégátíöñ pípélíñé, é.g. [ {"{"} "$group": … {"}"} ]. ⌘↵ rúñs.]
 
@@ -30,6 +32,20 @@ doc-confirm = [Çöñfírm]
 
 doc-actions = [Áçtíöñs]
 
+doc-fields = [Fíélds]
+
+doc-clear_sort = [çléár sört]
+
 doc-aggregation_pipeline_extended_json_array_of_stag = [Ággrégátíöñ pípélíñé (éxtéñdéd JSÖÑ árráy öf stágés)]
 
 doc-select_a_collection_from_the_sidebar_to_open_it_ = [Séléçt á çölléçtíöñ fröm thé sídébár tö öpéñ ít héré.]
+
+doc-copy_collection = [Çöpy çölléçtíöñ]
+
+doc-import_documents = [Ímpört döçúméñts]
+
+doc-export_documents = [Éxpört döçúméñts]
+
+doc-validation_rule = [MöñgöDB válídátíöñ rúlé]
+
+doc-validation_rules = [Válídátíöñ rúlés]

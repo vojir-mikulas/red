@@ -10,11 +10,13 @@
 #      *[other] { $n } rows
 #   }
 
+doc-aggregation_stage = Aggregation stage
+
 doc-field = field
 
 doc-value = value
 
-doc-filter_e_g_status_active = filter, e.g. {"{"} "status": "active" {"}"}
+doc-new_index = New index
 
 doc-aggregation_pipeline_e_g_group_runs = Aggregation pipeline, e.g. [ {"{"} "$group": … {"}"} ]. ⌘↵ runs.
 
@@ -30,6 +32,20 @@ doc-confirm = Confirm
 
 doc-actions = Actions
 
+doc-fields = Fields
+
+doc-clear_sort = clear sort
+
 doc-aggregation_pipeline_extended_json_array_of_stag = Aggregation pipeline (extended JSON array of stages)
 
 doc-select_a_collection_from_the_sidebar_to_open_it_ = Select a collection from the sidebar to open it here.
+
+doc-copy_collection = Copy collection
+
+doc-import_documents = Import documents
+
+doc-export_documents = Export documents
+
+doc-validation_rule = MongoDB validation rule
+
+doc-validation_rules = Validation rules
