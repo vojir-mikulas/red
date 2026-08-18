@@ -12,6 +12,7 @@ pub(crate) mod autoscroll;
 mod buffer;
 mod copy;
 mod edit;
+mod pinned;
 mod render;
 mod suggest;
 pub(crate) mod watch;
@@ -94,6 +95,11 @@ const CHAR_W: f32 = 7.2;
 /// Horizontal padding a cell adds around its text (`px_2p5` each side, plus the
 /// sort caret's room in the header).
 const CELL_PADDING: f32 = 26.0;
+
+/// The most of the grid's width the frozen band may take. Past this a pin is
+/// refused: the point of freezing a column is to read it against the ones that
+/// scroll, and a band wider than this leaves too few of those to be worth it.
+pub(in crate::result) const MAX_FROZEN_FRACTION: f32 = 0.6;
 
 /// How many draft (insert) rows the zone below the grid shows before it starts
 /// scrolling — it is pinned over the results, so it must never eat the grid.
@@ -272,6 +278,21 @@ pub(crate) struct ResultGrid {
     ///
     /// Kept in step with `columns` by [`sync_columns`](Self::sync_columns).
     pub(in crate::result) visible: Vec<usize>,
+    /// How many of the leading *visible* columns are frozen: they hold the left
+    /// edge while the rest scroll sideways under them. Counted in display slots,
+    /// excluding the row-number gutter, which is always frozen when shown.
+    ///
+    /// Being a count rather than a set is what keeps the rest of the grid honest:
+    /// the frozen columns are simply the front of [`visible`](Self::visible), so
+    /// nothing else has to know about freezing to stay correct.
+    pub(in crate::result) pinned_cols: usize,
+    /// The grid viewport's width as last painted, measured by the renderer.
+    ///
+    /// With columns frozen the rows are no longer inside a horizontal scroll
+    /// container, so `h_scroll.bounds()` is never filled in and the scroll math
+    /// (clamping, scroll-into-view) has nothing to measure against. `Rc<Cell<_>>`
+    /// because the measuring canvas outlives the frame that built it.
+    pub(in crate::result) viewport_w: Rc<Cell<f32>>,
     /// Whether this result has had its one automatic fit.
     ///
     /// Fits once, on the first rows to arrive, and never again: a later page
@@ -330,6 +351,10 @@ pub(crate) struct ResultGrid {
     /// grid shows instead of the affordances.
     pub(in crate::result) edit: RowEditCaps,
     pub(in crate::result) buffer: Rc<RefCell<GridBuffer>>,
+    /// Rows held under the header while the grid scrolls, in result order. Each
+    /// carries its own cell snapshot, so a pinned row keeps drawing once the
+    /// windowed buffer has evicted it (see [`pinned`]).
+    pub(in crate::result) pinned_rows: Vec<pinned::PinnedRow>,
     /// Staged, not-yet-submitted edits for this result, keyed by PK so
     /// they survive the windowed buffer's eviction. Cleared on every (re)open.
     pub(in crate::result) pending: edit::PendingChanges,
@@ -408,6 +433,8 @@ impl ResultGrid {
             widths: Vec::new(),
             column_drag: None,
             visible: Vec::new(),
+            pinned_cols: 0,
+            viewport_w: Rc::new(Cell::new(0.)),
             fitted: false,
             filter: None,
             unfiltered_total: None,
@@ -422,6 +449,7 @@ impl ResultGrid {
             key: None,
             edit: RowEditCaps::default(),
             buffer: Rc::new(RefCell::new(GridBuffer::new(page_size))),
+            pinned_rows: Vec::new(),
             pending: edit::PendingChanges::default(),
             sender,
             page_size,
@@ -1007,7 +1035,70 @@ impl ResultGrid {
             return false;
         }
         self.visible.remove(slot);
+        // Hiding a frozen column shrinks the frozen band with it; leaving the
+        // count alone would silently freeze whichever column slid into its place.
+        if slot < self.pinned_cols {
+            self.pinned_cols -= 1;
+        }
         true
+    }
+
+    /// How many leading display slots are frozen, never more than can leave at
+    /// least one column scrolling (a fully frozen grid has nothing to scroll and
+    /// no way back).
+    pub(in crate::result) fn frozen_slots(&self) -> usize {
+        self.pinned_cols.min(self.visible.len().saturating_sub(1))
+    }
+
+    /// Whether display slot `slot` is inside the frozen band.
+    pub(in crate::result) fn is_frozen_slot(&self, slot: usize) -> bool {
+        slot < self.frozen_slots()
+    }
+
+    /// Freeze the column at `slot`, moving it to the end of the frozen band.
+    ///
+    /// The band is contiguous by construction (it is the front of
+    /// [`visible`](Self::visible)), so pinning a column *moves* it: pinning the
+    /// 5th column of a grid with two frozen already makes it the third frozen
+    /// one, in the order the user pinned them. That is what a column pin means
+    /// everywhere else, and it keeps every other index in the grid honest.
+    /// `gutter` is the gutter's width in columns (0 or 1), since the band it
+    /// leads is part of what has to fit. Returns whether the column was frozen.
+    pub(in crate::result) fn pin_column_at(&mut self, slot: usize, gutter: usize) -> bool {
+        if slot >= self.visible.len() || self.visible.len() < 2 || slot < self.pinned_cols {
+            return false;
+        }
+        // Refuse a band that would leave no room to scroll. A frozen band past
+        // half the pane is not a pin any more: the columns it was supposed to
+        // hold against have nowhere left to move.
+        let viewport = self.viewport_width();
+        if viewport > 0. {
+            let gutter_w = gutter as f32 * gutter_width(self.total);
+            let width = self
+                .data_col_at(slot)
+                .map(|c| self.width_of(c))
+                .unwrap_or(0.);
+            if self.frozen_width(gutter_w) + width > viewport * MAX_FROZEN_FRACTION {
+                return false;
+            }
+        }
+        self.move_column(slot, self.pinned_cols);
+        self.pinned_cols = (self.pinned_cols + 1).min(self.visible.len() - 1);
+        true
+    }
+
+    /// Unfreeze the column at `slot`, leaving it as the first scrolling column
+    /// and the rest of the band frozen.
+    pub(in crate::result) fn unpin_column_at(&mut self, slot: usize) {
+        if slot >= self.pinned_cols || self.pinned_cols == 0 {
+            return;
+        }
+        self.move_column(slot, self.pinned_cols - 1);
+        self.pinned_cols -= 1;
+    }
+
+    pub(in crate::result) fn unpin_all_columns(&mut self) {
+        self.pinned_cols = 0;
     }
 
     /// Show every hidden column, restoring them to data order at the end of the
@@ -1038,6 +1129,18 @@ impl ResultGrid {
             return;
         }
         let to = to.min(self.visible.len() - 1);
+        // A move stays on its own side of the frozen boundary: dragging a column
+        // into the band would freeze it without being asked, and dragging one out
+        // would unfreeze it the same way. Pinning is what crosses the line.
+        let frozen = self.frozen_slots();
+        let to = if slot < frozen {
+            to.min(frozen - 1)
+        } else {
+            to.max(frozen)
+        };
+        if slot == to {
+            return;
+        }
         let col = self.visible.remove(slot);
         self.visible.insert(to, col);
     }
@@ -1131,6 +1234,52 @@ impl ResultGrid {
         gutter_w + self.visible.iter().map(|&c| self.width_of(c)).sum::<f32>()
     }
 
+    /// Width of the band that never scrolls: the gutter (when shown) plus the
+    /// frozen columns. A column's on-screen x is still `content x + offset`, so
+    /// this is only ever the *left bound* of what counts as visible.
+    pub(in crate::result) fn frozen_width(&self, gutter_w: f32) -> f32 {
+        gutter_w
+            + self
+                .visible
+                .iter()
+                .take(self.frozen_slots())
+                .map(|&c| self.width_of(c))
+                .sum::<f32>()
+    }
+
+    /// The grid viewport's painted width, or `0.0` before the first paint.
+    ///
+    /// Prefers the measurement the renderer takes, falling back to the scroll
+    /// handle's own bounds for the frames (and the modes) where the handle is
+    /// attached to a real scrolling container.
+    pub(in crate::result) fn viewport_width(&self) -> f32 {
+        let measured = self.viewport_w.get();
+        if measured > 0. {
+            measured
+        } else {
+            f32::from(self.h_scroll.bounds().size.width)
+        }
+    }
+
+    /// Pull the horizontal offset back into range.
+    ///
+    /// With columns frozen nothing else does: the rows are not in a scrolling
+    /// container, so a hidden column, a narrowed window or a drag-autoscroll can
+    /// otherwise leave the columns parked off in empty space with no way back.
+    pub(in crate::result) fn clamp_h_offset(&self, gutter: usize) {
+        let viewport_w = self.viewport_width();
+        if viewport_w <= 0. {
+            return;
+        }
+        let gutter_w = gutter as f32 * gutter_width(self.total);
+        let max_left = (self.content_width(gutter_w) - viewport_w).max(0.);
+        let off = self.h_scroll.offset();
+        let x = f32::from(off.x).clamp(-max_left, 0.);
+        if x != f32::from(off.x) {
+            self.h_scroll.set_offset(point(px(x), off.y));
+        }
+    }
+
     /// The `(schema, table)` this result browses, or `None` for editor SQL.
     /// Distinct from [`browsed_table`](Self::browsed_table), which drops the
     /// namespace: a workspace snapshot has to re-open the same table in the same
@@ -1194,6 +1343,10 @@ impl ResultGrid {
         self.last_good_filter = self.filter.clone();
         self.ready = true;
         self.error = None;
+        // Pins are display state, so they ride a re-sort / filter change / watch
+        // tick out and are re-homed when their rows land again; a different column
+        // set invalidates their snapshots and drops them.
+        self.carry_pins(shape_changed);
         // A fresh result set starts with a clean change-set + empty stats cache (the
         // summary is keyed to the prior epoch's SQL).
         self.pending = edit::PendingChanges::default();
@@ -1262,6 +1415,10 @@ impl ResultGrid {
     fn reset_buffer(&mut self) {
         *self.buffer.borrow_mut() = GridBuffer::new(self.page_size);
         self.window_base.set(0);
+        // The rows about to arrive may sit anywhere, so a pin's position is a
+        // guess from here until its row is seen again. The snapshots stay: the
+        // strip keeps showing the pinned rows across the re-open.
+        self.forget_pin_positions();
         self.pending = edit::PendingChanges::default();
         // A re-open computes a new epoch's SQL; the prior summary no longer applies.
         self.stats = None;
@@ -1453,26 +1610,34 @@ impl ResultGrid {
     /// Keep the keyboard cursor's *column* on screen after a horizontal move:
     /// the wide-mode counterpart to `scroll_cursor_into_view`. A cell's x-extent
     /// is the running sum of the columns before it
-    /// ([`column_left`](Self::column_left)), so this stays exact once columns
+    /// ([`slot_left`](Self::slot_left)), so this stays exact once columns
     /// differ in width; nudge the horizontal handle by the minimum to bring the
     /// cell fully into the viewport, leaving it untouched when already visible.
     /// `table_col` is in table space (gutter included); `gutter` is its width in
     /// columns (0 or 1).
     pub(in crate::result) fn scroll_col_into_view(&self, table_col: usize, gutter: usize) {
-        let viewport_w = f32::from(self.h_scroll.bounds().size.width);
+        let viewport_w = self.viewport_width();
         if viewport_w <= 0.0 {
             return; // not laid out yet
         }
         let gutter_w = gutter as f32 * gutter_width(self.total);
         let slot = table_col.saturating_sub(gutter);
+        // A frozen column is always on screen, and scrolling to it would drag the
+        // scrolling half somewhere the user did not ask to go.
+        if table_col < gutter || self.is_frozen_slot(slot) {
+            return;
+        }
         let col_left = self.slot_left(slot, gutter_w);
         let col_right = col_left + self.slot_width(slot);
         // The handle's x offset is 0 at the left edge and grows negative as the
         // content scrolls left, so the visible window is `[-off.x, -off.x + w]`.
+        // The frozen band eats into it from the left: a column hiding *under* the
+        // band is as invisible as one past the right edge.
+        let frozen_w = self.frozen_width(gutter_w);
         let off = self.h_scroll.offset();
         let scroll_left = -f32::from(off.x);
-        let new_left = if col_left < scroll_left {
-            col_left
+        let new_left = if col_left < scroll_left + frozen_w {
+            col_left - frozen_w
         } else if col_right > scroll_left + viewport_w {
             col_right - viewport_w
         } else {
@@ -1881,6 +2046,7 @@ impl AppState {
                 .borrow_mut()
                 .apply_run(fetch, rows, estimated, seq, total);
             grid.fit_once();
+            grid.refresh_pins();
         }
         cx.notify();
     }
@@ -1901,6 +2067,7 @@ impl AppState {
         {
             grid.buffer.borrow_mut().insert_page(offset, rows);
             grid.fit_once();
+            grid.refresh_pins();
         }
         cx.notify();
     }
@@ -1931,8 +2098,8 @@ impl AppState {
 
     /// Mutate the focused tab's grid, for the display-only changes the header
     /// menu makes (widths, visibility, order). A thin wrapper over
-    /// [`ActiveConn::with_active_result`] so those call sites read as one line
-    /// and none of them has to re-match on `Phase`.
+    /// [`crate::app::ActiveConn::with_active_result`] so those call sites read
+    /// as one line and none of them has to re-match on `Phase`.
     pub(crate) fn with_grid<R>(
         &mut self,
         cx: &mut App,
@@ -2633,11 +2800,25 @@ impl AppState {
             epoch,
             id,
         });
+        self.push_transfer_toast(id, "Exporting…", total, TransferKind::Export, cx);
+    }
+
+    /// Stand up the persistent progress toast for a transfer (`✕` is its Cancel;
+    /// see [`AppState::close_notification`]). `total` sizes the percentage and is
+    /// `0` when the length is unknown, which the toast reads as a bare count.
+    pub(crate) fn push_transfer_toast(
+        &mut self,
+        id: OpId,
+        message: &'static str,
+        total: usize,
+        kind: TransferKind,
+        cx: &mut Context<Self>,
+    ) {
         self.push_notification(
             Notification {
                 id: 0,
                 variant: ToastVariant::Info,
-                message: "Exporting…".into(),
+                message: message.into(),
                 detail: None,
                 detail_label: None,
                 auto_dismiss: None,
@@ -2645,7 +2826,7 @@ impl AppState {
                     id,
                     rows: 0,
                     total,
-                    kind: TransferKind::Export,
+                    kind,
                 }),
                 expanded: false,
                 hovered: false,
@@ -2736,6 +2917,15 @@ impl AppState {
             self.dismiss(nid, cx);
         }
         self.notify(ToastVariant::Info, "Export cancelled", cx);
+    }
+
+    /// `ExportFailed`: drop the progress toast (nothing else would), and report the
+    /// failure in its place.
+    pub(crate) fn on_export_failed(&mut self, id: OpId, message: String, cx: &mut Context<Self>) {
+        if let Some(nid) = self.export_notification_id(id) {
+            self.dismiss(nid, cx);
+        }
+        self.notify(ToastVariant::Error, message, cx);
     }
 
     // --- import progress events (data import) ---
@@ -4005,5 +4195,144 @@ mod menu_selection_tests {
         let mut g = grid();
         g.selection = None;
         assert!(!g.select_for_menu(3, 1));
+    }
+}
+
+#[cfg(test)]
+mod frozen_column_tests {
+    use super::*;
+    use red_core::Column;
+    use red_service::{SessionId, spawn};
+
+    /// A grid with `n` columns, each 100px wide, and no rows.
+    fn grid(n: usize) -> ResultGrid {
+        let handle = spawn();
+        let sender = handle.command_sender(SessionId::new(1));
+        let mut grid = ResultGrid::new("t".into(), "SELECT * FROM t".into(), None, sender, 100);
+        grid.columns = (0..n)
+            .map(|i| Column {
+                name: format!("c{i}"),
+                decl_type: None,
+            })
+            .collect();
+        grid.sync_columns();
+        for c in 0..n {
+            grid.set_width(c, 100.0);
+        }
+        grid
+    }
+
+    /// Pinning a column moves it to the end of the band, so the frozen columns
+    /// stay the front of the display order in the order they were pinned.
+    #[test]
+    fn pinning_moves_the_column_into_the_band() {
+        let mut g = grid(4);
+        g.pin_column_at(2, 1);
+        assert_eq!(g.visible, vec![2, 0, 1, 3]);
+        assert_eq!(g.frozen_slots(), 1);
+        g.pin_column_at(3, 1);
+        assert_eq!(g.visible, vec![2, 3, 0, 1]);
+        assert_eq!(g.frozen_slots(), 2);
+    }
+
+    /// Unpinning leaves the column as the first scrolling one and keeps the rest
+    /// of the band frozen.
+    #[test]
+    fn unpinning_releases_only_that_column() {
+        let mut g = grid(4);
+        g.pin_column_at(0, 1);
+        g.pin_column_at(1, 1);
+        assert_eq!(g.frozen_slots(), 2);
+        g.unpin_column_at(0);
+        assert_eq!(g.frozen_slots(), 1);
+        assert_eq!(g.visible, vec![1, 0, 2, 3]);
+    }
+
+    /// The band can never swallow every column: something has to be left to
+    /// scroll, or freezing has nothing to hold against.
+    #[test]
+    fn the_last_column_cannot_be_frozen() {
+        let mut g = grid(2);
+        g.pin_column_at(0, 1);
+        g.pin_column_at(1, 1);
+        assert_eq!(g.frozen_slots(), 1);
+    }
+
+    /// Hiding a frozen column shrinks the band with it, instead of silently
+    /// freezing whichever column slid into its place.
+    #[test]
+    fn hiding_a_frozen_column_shrinks_the_band() {
+        let mut g = grid(3);
+        g.pin_column_at(0, 1);
+        g.pin_column_at(1, 1);
+        assert_eq!(g.frozen_slots(), 2);
+        g.hide_slot(0);
+        assert_eq!(g.frozen_slots(), 1);
+    }
+
+    /// A reorder stays on its own side of the boundary: dragging a scrolling
+    /// column to the front puts it after the band, not inside it.
+    #[test]
+    fn a_move_does_not_cross_the_boundary() {
+        let mut g = grid(4);
+        g.pin_column_at(0, 1);
+        g.move_column(3, 0);
+        assert_eq!(g.visible, vec![0, 3, 1, 2]);
+        assert_eq!(g.frozen_slots(), 1);
+    }
+
+    /// A column hidden under the frozen band counts as off screen: the cursor
+    /// scrolls it clear of the band, not merely to the viewport's left edge.
+    #[test]
+    fn scroll_into_view_clears_the_frozen_band() {
+        let mut g = grid(6);
+        g.pin_column_at(0, 1);
+        g.viewport_w.set(300.0);
+        let gutter_w = gutter_width(g.total);
+        // Scrolled far right, then the cursor moves back to the second column.
+        g.h_scroll.set_offset(point(px(-400.0), px(0.0)));
+        g.scroll_col_into_view(2, 1);
+        let scrolled = -f32::from(g.h_scroll.offset().x);
+        // Its left edge now sits exactly clear of the gutter + frozen column.
+        assert_eq!(
+            scrolled,
+            g.slot_left(1, gutter_w) - g.frozen_width(gutter_w)
+        );
+    }
+
+    /// A frozen column is always on screen, so asking to scroll to it does
+    /// nothing rather than dragging the scrolling half somewhere else.
+    #[test]
+    fn scrolling_to_a_frozen_column_is_a_no_op() {
+        let mut g = grid(6);
+        g.pin_column_at(0, 1);
+        g.viewport_w.set(300.0);
+        g.h_scroll.set_offset(point(px(-400.0), px(0.0)));
+        g.scroll_col_into_view(1, 1);
+        assert_eq!(f32::from(g.h_scroll.offset().x), -400.0);
+    }
+
+    /// The band has a ceiling: past it a pin is refused, so freezing can never
+    /// leave the scrolling half too narrow to read.
+    #[test]
+    fn a_frozen_band_cannot_take_the_grid() {
+        let mut g = grid(6);
+        g.viewport_w.set(300.0);
+        assert!(g.pin_column_at(0, 1));
+        assert!(!g.pin_column_at(1, 1));
+        assert_eq!(g.frozen_slots(), 1);
+    }
+
+    /// The offset is pulled back into range when the content shrinks under it,
+    /// which nothing else does once the rows are out of a scroll container.
+    #[test]
+    fn the_offset_is_clamped_to_the_content() {
+        let g = grid(6);
+        g.viewport_w.set(300.0);
+        g.h_scroll.set_offset(point(px(-5000.0), px(0.0)));
+        g.clamp_h_offset(1);
+        let gutter_w = gutter_width(g.total);
+        let max = g.content_width(gutter_w) - 300.0;
+        assert_eq!(f32::from(g.h_scroll.offset().x), -max);
     }
 }

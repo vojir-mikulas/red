@@ -322,6 +322,7 @@ pub(in crate::ai) async fn doc_export(
                 db,
                 coll,
                 filter.as_ref(),
+                None,
                 red_core::doc::DocSeek::Forward {
                     after: after.clone(),
                 },

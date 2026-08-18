@@ -70,7 +70,7 @@ impl AppState {
                 .and_then(|v| {
                     v.tabs.iter().position(|t| match &t.state {
                         MongoTabState::Collection(c) => c.db == db && c.coll == coll,
-                        MongoTabState::Empty => false,
+                        MongoTabState::Empty | MongoTabState::Relations(_) => false,
                     })
                 });
             if let Some(idx) = existing {
@@ -87,6 +87,17 @@ impl AppState {
         let view_mode = self.settings.doc.default_view.into();
         let coll_view = CollView::new(epoch, db.clone(), coll.clone(), sender, page, view_mode, cx);
         coll_view.seed_browse();
+        // Sample the schema up front, not on the Schema panel's first open: it is
+        // what the filter box completes from and the Fields dropdown lists, and a
+        // bounded `$sample` alongside the first window is cheap.
+        self.service.send_to(
+            session,
+            Command::DocInferSchema {
+                epoch,
+                db: db.clone(),
+                coll: coll.clone(),
+            },
+        );
         let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
@@ -143,7 +154,7 @@ impl AppState {
                         MongoTabState::Collection(c) => {
                             Some((c.db.clone(), c.coll.clone(), c.filter.clone()))
                         }
-                        MongoTabState::Empty => None,
+                        MongoTabState::Empty | MongoTabState::Relations(_) => None,
                     })
             });
         let Some((db, coll, filter)) = src else {
@@ -260,7 +271,7 @@ impl AppState {
         // `CloseResult` cancels it at the engine.
         let close_epoch = match &view.tabs[index].state {
             MongoTabState::Collection(c) => Some(c.epoch),
-            MongoTabState::Empty => None,
+            MongoTabState::Empty | MongoTabState::Relations(_) => None,
         };
         if view.tabs.len() <= 1 {
             // Keep at least one tab: reset the only tab to the blank chooser.
@@ -655,6 +666,36 @@ impl AppState {
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
             && view.actions_menu.take().is_some()
+        {
+            cx.notify();
+        }
+    }
+
+    /// Open the collection tree's right-click menu on a database (`coll` is
+    /// `None`) or a collection row. `pos` is a window coordinate, so the menu
+    /// renders from the shell root rather than inside the narrow sidebar.
+    pub(crate) fn doc_open_coll_menu(
+        &mut self,
+        session: SessionId,
+        db: String,
+        coll: Option<String>,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+        {
+            view.coll_menu = Some((db, coll, pos));
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn doc_close_coll_menu(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+            && view.coll_menu.take().is_some()
         {
             cx.notify();
         }

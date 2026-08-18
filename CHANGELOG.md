@@ -6,6 +6,121 @@ follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+- Export documents from MongoDB: "Export documents…" on the collection tree's
+  right-click menu and in the Documents toolbar's Actions menu writes the whole
+  collection, or just what the current filter matches, to JSON, NDJSON, CSV or
+  Excel. It streams one `_id`-keyset window at a time, so collection size is not
+  a limit, and the toast's ✕ cancels it and removes the partial file. CSV and
+  Excel flatten onto dotted columns sampled from the collection, and say so when
+  a document carried a field the sample never saw.
+- Import documents into a MongoDB collection from a JSON array, NDJSON, or CSV
+  file. The dialog previews the first documents exactly as they will be written
+  (parsed through the connection, so an extended-JSON `$oid` shows up as one),
+  and you choose whether a repeated `_id` is a collision or an update.
+- Copy a MongoDB collection into another collection, on the same connection or
+  any other open one: append, upsert on `_id`, or replace the target outright.
+  It streams window by window with progress and cancel, like the SQL table copy.
+- A right-click menu on the MongoDB collection tree: open (in this tab or a new
+  one), export, import, copy, drop, and refresh a database's collection list.
+- A fast filter for MongoDB: `status:active age>30 created:last7d` compiles to a
+  filter document, so the common narrowing costs no JSON. It understands `>`,
+  `>=`, `<`, `<=`, `!=`, `field:*` for "has this field", `field:~text` for a
+  case-insensitive contains, quoted values, relative dates (`last7d`, `last24h`,
+  `today`), and typed scalars including ObjectIds in `_id`. A half-typed term is
+  left alone rather than flagged; only a real mistake is called out. The JSON box
+  is still there behind the Fast/JSON toggle.
+- Field-name completion in the MongoDB filter box, from the collection's sampled
+  schema: type a prefix, pick with ↑/↓ and Enter.
+- Sort a MongoDB browse by clicking a column header (again for descending, a
+  third time to clear); shift-click adds a second key. The active keys show as
+  chips under the toolbar.
+- Choose which MongoDB fields to load with the toolbar's Fields dropdown, so a
+  wide collection can be narrowed to the handful you are reading. `_id` always
+  comes along.
+- Create and drop MongoDB indexes from the Indexes panel. The dialog covers
+  compound keys, ascending/descending/text/hashed/2dsphere, unique, sparse, TTL,
+  a partial filter, and a collation locale. Dropping one asks first, because the
+  queries that relied on it become collection scans.
+- The Indexes panel suggests an index when the current filter is scanning the
+  whole collection, and creating it is one click.
+- A stage builder for MongoDB aggregations, beside the raw pipeline editor: one
+  editor per stage, reorder with ↑/↓, an operator palette that leads with the
+  stages that fit the position, and "Preview" on any stage to run the pipeline
+  truncated there. The two modes are two views of one pipeline, so switching
+  never loses what you wrote.
+- A History dock for MongoDB (⌘Y), listing the filters and pipelines you have
+  run, badged with the collection each ran against. Clicking one points a tab at
+  that collection and puts the query back.
+- Saved queries now cover MongoDB: ⇧⌘S keeps the pipeline you are looking at (or
+  the applied filter), ⇧⌘O opens it back into the right box at the right
+  collection. They live as readable `.mongo.json` files beside the saved `.sql`
+  ones.
+- A relations diagram for MongoDB: right-click a database and "Show relations".
+  RED samples each collection, guesses which fields reference another from their
+  names, then tests every guess against the target's `_id`, and draws the ones
+  that hold on the same canvas the SQL ER diagram uses. The footer says how many
+  names looked like references but did not resolve, because an inferred edge is a
+  claim and you should be able to see the evidence.
+- Edit a MongoDB collection's validation rule, with a Test button that counts how
+  many stored documents the rule would accept before you apply it. Setting a
+  validator does not re-check what is already there, so knowing that number up
+  front is the difference between a safe change and a surprise.
+- The MongoDB Schema panel now leads with the collection's storage: documents,
+  data size, size on disk, mean document size, index bytes per index, and whether
+  it is sharded or capped. Numbers the server declines to report are left out
+  rather than shown as zero.
+- A Watch panel on every MongoDB collection: follow its writes live through a
+  change stream, filter by insert/update/replace/delete, pause without missing
+  anything, and see the resume token a consumer would restart from. Needs a
+  replica set or sharded cluster, and says so on a standalone instead of failing
+  obscurely.
+- The AI assistant can now answer with rendered blocks: a fenced `datatable`,
+  `barchart`, or `stats` draws as a table, a bar comparison, or a row of stat
+  tiles instead of as JSON. A block that does not parse is still shown as code,
+  so nothing the model wrote is lost. Works in every markdown surface, on every
+  engine.
+- The row-number gutter now holds the left edge instead of scrolling away with
+  the columns, so a row stays identifiable however far right you scroll.
+- Freeze result columns: "Pin <column> left" in the header menu holds a column
+  (or several) against the left edge while the rest scroll under it, with
+  "Unpin" and "Unpin all columns" to release them. Frozen columns keep their own
+  order, survive hiding and reordering, and can't take more than half the grid.
+- Pin result rows (⌥⌘P, or "Pin row" in the cell menu) to hold them under the
+  header while you scroll the rest of the result away. A pinned row appears
+  above the grid only once it scrolls out of view, so it is never on screen
+  twice; while it is in view its ordinal carries a pin in the row-number gutter,
+  which releases it on click. Up to six rows can be pinned; they keep their place
+  when you sort, filter or re-run the query, show staged edits and deletions
+  exactly as the grid does, and stay copyable when the row itself is far off
+  screen.
+
+### Fixed
+- An export that fails now says so and clears its progress toast, instead of
+  leaving "Exporting…" on screen for the rest of the session.
+- The result filter bar belongs to its tab. A term you were typing — a `WHERE`
+  expression, a contains term, the column chips you were building — stays with
+  the result it was written for instead of following you to the next tab, where
+  Apply would have run it against a different grid.
+- The SQL editor follows the caret sideways on a line wider than the pane, so
+  typing past the right edge, jumping to the end of the line, or clicking a
+  match no longer leaves the caret off-screen. A sideways trackpad swipe (or
+  Shift+wheel) pans the text, and the line numbers stay put while it does.
+- A sideways swipe over the SQL editor no longer scrolls it up and down
+  instead.
+- Selecting text with the mouse inside a result cell you are editing keeps the
+  selection: releasing the button no longer commits the edit and throws the
+  caret to the end of the value.
+- Clicking near the top or bottom edge of any text field now puts the caret
+  under the pointer instead of jumping it to the start or end of the value.
+- The cell you are editing is drawn on the input background, so the text you
+  have selected inside it stands out against the cell's own highlight.
+- Typing in a dropdown's search field no longer triggers shortcuts underneath
+  it: filtering the welcome screen by "redis" types the word instead of opening
+  the edit form on the letter `e`.
+- Esc with a settings dropdown open closes the dropdown and leaves the settings
+  panel where it was.
+
 ## [0.22.0] - 2026-08-12
 
 ### Added

@@ -137,6 +137,7 @@ pub(in crate::ai) fn finish_system_prompt(
     ctx: &AiContext,
     read_only_note: &str,
 ) -> String {
+    body.push_str(RICH_BLOCKS_NOTE);
     body.push_str(ATTACHED_FILES_NOTE);
     if !ctx.connection.is_empty() {
         body.push_str(&format!("\nConnected to: {}", ctx.connection));
@@ -151,6 +152,23 @@ pub(in crate::ai) fn finish_system_prompt(
     }
     body
 }
+/// The rendered-block vocabulary, offered to every seam.
+///
+/// RED renders three fenced languages as components rather than as code. Told to
+/// the model rather than inferred from its output, because a block only helps if
+/// it is emitted in the shape the renderer reads; the fallback (plain code) is
+/// harmless, so the instruction is an offer, not a requirement.
+const RICH_BLOCKS_NOTE: &str = "\n\nRED renders three fenced code languages as components. \
+    Use them when the shape fits, and ordinary prose otherwise:\n\
+    - ```datatable  {\"title\": \"...\", \"columns\": [\"a\"], \"rows\": [[\"1\"]]}  \
+    for a small result table\n\
+    - ```barchart  {\"title\": \"...\", \"data\": [{\"label\": \"a\", \"value\": 3}]}  \
+    for comparing a handful of magnitudes\n\
+    - ```stats  {\"items\": [{\"label\": \"rows\", \"value\": \"1,200\", \"hint\": \"...\"}]}  \
+    for headline numbers\n\
+    The body must be plain JSON. A block that does not parse is shown as code, so \
+    nothing is lost either way.";
+
 /// How the model should read a file the user attached.
 ///
 /// A CSV or a PDF is untrusted input that reaches a model holding database tools,

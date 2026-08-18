@@ -647,18 +647,26 @@ pub enum Command {
         epoch: Epoch,
         db: String,
     },
-    /// One `_id`-keyset window for the browse grid's continuous scroll: the
-    /// documents at `seek` (relative to a boundary `_id`, or an exact ordinal
-    /// jump), narrowed by the optional extended-JSON `filter` the driver parses (a
-    /// parse error replies `DocError`). `want_total` (the first window of a fresh
-    /// browse) also asks for the collection count. `seq` echoes back on
+    /// One window for the browse grid's continuous scroll: the documents at `seek`
+    /// (relative to a boundary `_id`, or an exact ordinal jump), narrowed by the
+    /// optional extended-JSON `filter` the driver parses (a parse error replies
+    /// `DocError`) and trimmed to `projection`. `want_total` (the first window of a
+    /// fresh browse) also asks for the collection count. `seq` echoes back on
     /// `DocRunReady`/`DocRunFailed` so a stale window is dropped; cancellable and
     /// epoch-superseded like a SQL run fetch.
+    ///
+    /// `sort` changes *how* the window is read, not just its order. Unsorted, the
+    /// window is an `_id`-keyset seek: O(window) at any depth. Sorted, an `_id`
+    /// boundary orders nothing, so the window is read by position instead, and the
+    /// caller must address it with a [`DocSeek::Jump`] (any other arm replies
+    /// `DocError` rather than quietly paging by the wrong key).
     DocFetchRun {
         epoch: Epoch,
         db: String,
         coll: String,
         filter: Option<String>,
+        projection: Option<String>,
+        sort: Option<String>,
         seek: DocSeek,
         limit: usize,
         seq: u64,
@@ -667,6 +675,57 @@ pub enum Command {
     /// A collection's inferred schema (sampled per-field type distribution), for
     /// the schema panel. Replied with `DocSchemaReady`, or `DocError` on failure.
     DocInferSchema {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+    },
+    /// Watch a collection for changes, streaming one `DocChanged` per event until
+    /// a `DocWatchStop` on the same `epoch` (or the tab closing) ends it. Needs a
+    /// replica set or sharded cluster; a standalone replies `DocError` saying so.
+    ///
+    /// `resume_after` restarts from a token a previous run reported, so a viewer
+    /// picks up where it left off rather than from "now".
+    ///
+    /// Long-lived by design, like `KvSubscribe`: it holds its own
+    /// `Slot::DocWatch`, and starting a second watch on the same tab supersedes
+    /// the first.
+    DocWatch {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        resume_after: Option<String>,
+    },
+    /// Stop the `DocWatch` running for `epoch`.
+    DocWatchStop {
+        epoch: Epoch,
+    },
+    /// Infer the relationships between a database's collections: sample each
+    /// collection's schema, guess which fields reference another collection from
+    /// their names, and *test each guess* against the target's `_id`. The read
+    /// behind the relations diagram. Replied with `DocReferencesReady`.
+    ///
+    /// Bounded by contract (collections sampled, fields probed, values per probe),
+    /// because a wide database would otherwise turn one click into a scan.
+    DocReferenceMap {
+        epoch: Epoch,
+        db: String,
+    },
+    /// Check a candidate validator against the documents already stored: count how
+    /// many match it, and how many there are. A validator document doubles as a
+    /// query (`$jsonSchema` is a query operator, and a plain expression validator
+    /// already is one), so "would this pass" is a `count` and needs no new server
+    /// support. Replied with `DocValidatorTested`.
+    DocValidatorTest {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        validator: String,
+    },
+    /// A collection's storage numbers (`collStats`), for the Schema panel's
+    /// header. Replied with `DocStatsReady`; a failure is silent (the panel simply
+    /// shows no header), because storage numbers are an enrichment and an
+    /// under-privileged user should not get an error banner for reading a schema.
+    DocCollStats {
         epoch: Epoch,
         db: String,
         coll: String,
@@ -731,6 +790,71 @@ pub enum Command {
         coll: String,
         id: red_core::doc::DocValue,
         doc_json: String,
+    },
+    /// Stream the documents of `db.coll` matching `filter` to `path` in `format`,
+    /// one `_id`-keyset window at a time. Unbounded (unlike the agent's capped
+    /// `export_result` tool) and cancellable: `id` identifies the export, so the
+    /// shared `ExportProgress` / `ExportFinished` / `ExportCancelled` events and a
+    /// `CancelExport` route to it exactly as a SQL export's do. Runs off the
+    /// dispatch loop under its own `Slot::DocExport`, so a sibling browse fetch
+    /// cannot abort it halfway through a collection.
+    DocExport {
+        epoch: Epoch,
+        id: OpId,
+        db: String,
+        coll: String,
+        filter: Option<String>,
+        format: red_core::doc::DocExportFormat,
+        path: PathBuf,
+    },
+    /// Read the first `limit` documents of `path` and hand them back parsed, for
+    /// the import dialog's preview. The preview is *parsed*, not echoed, so what it
+    /// shows is what would actually be written: an extended-JSON `$oid` that the
+    /// driver rejects shows up here rather than as a failure mid-import. Replied
+    /// with `DocImportPreview`.
+    DocImportPeek {
+        epoch: Epoch,
+        path: PathBuf,
+        format: red_core::doc::DocImportFormat,
+        limit: usize,
+    },
+    /// Stream `path` into `db.coll`, document by document, in chunks. Refused on a
+    /// read-only connection. `id` identifies the import, so the shared
+    /// `ImportProgress` / `ImportFinished` / `ImportFailed` / `ImportCancelled`
+    /// events and a `CancelImport` route to it exactly as a SQL import's do.
+    /// Documents **commit per chunk**, so a mid-file failure leaves earlier chunks
+    /// written and reports how many.
+    DocImport {
+        epoch: Epoch,
+        id: OpId,
+        db: String,
+        coll: String,
+        path: PathBuf,
+        format: red_core::doc::DocImportFormat,
+        mode: red_core::doc::DocImportMode,
+    },
+    /// Stream a collection's documents into another collection: the document arm of
+    /// `CopyToTable`. The envelope's [`SessionId`] is the **source**;
+    /// `target_session` is where the target lives (equal to the source for a
+    /// same-connection copy, another open MongoDB connection for a cross-connection
+    /// one), and both ends are pinned against idle eviction for the copy's lifetime.
+    ///
+    /// `filter` narrows the source exactly as the browse grid's filter does. Reads
+    /// one `_id`-keyset window at a time and writes per chunk, so a copy of any size
+    /// holds one window. `id` routes the shared `Copy*` progress/terminal events and
+    /// a `CancelCopy`.
+    ///
+    /// No column mapping, unlike the SQL copy: a document carries its own shape, so
+    /// there is nothing to map it onto.
+    DocCopyCollection {
+        id: OpId,
+        source_db: String,
+        source_coll: String,
+        filter: Option<String>,
+        target_session: SessionId,
+        target_db: String,
+        target_coll: String,
+        mode: red_core::doc::DocCopyMode,
     },
     /// Compute a column's aggregate summary over the open result's *filtered* SQL
     /// (the column-stats bar): a single `count`/`distinct`/`min`/`max`(/`sum`/`avg`)
@@ -1629,12 +1753,59 @@ pub enum Event {
         coll: String,
         schema: DocSchema,
     },
+    /// One change from a live `DocWatch`.
+    DocChanged {
+        epoch: Epoch,
+        change: red_core::doc::DocChange,
+    },
+    /// A `DocWatch` ended: the stream closed (the collection was dropped or
+    /// renamed, or the connection went), so the panel stops looking live. Not an
+    /// error on its own; `message` says why when the server gave a reason.
+    DocWatchEnded {
+        epoch: Epoch,
+        message: Option<String>,
+    },
+    /// A database's inferred relationships, in response to `DocReferenceMap`.
+    /// `collections` carries every collection and how many fields its sample
+    /// showed, so the diagram can draw the unrelated ones too rather than only
+    /// what happens to have an edge.
+    DocReferencesReady {
+        epoch: Epoch,
+        db: String,
+        collections: Vec<(String, usize)>,
+        references: Vec<red_core::doc::DocReference>,
+    },
+    /// How a candidate validator scored against the stored documents, in response
+    /// to `DocValidatorTest`. `error` carries a parse or query failure instead of
+    /// a `DocError`, so the dialog shows it beside the schema it belongs to.
+    DocValidatorTested {
+        epoch: Epoch,
+        matching: u64,
+        total: u64,
+        error: Option<String>,
+    },
+    /// A collection's storage numbers, in response to `DocCollStats`.
+    DocStatsReady {
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        stats: red_core::doc::CollStats,
+    },
     /// A collection's indexes, in response to `DocListIndexes`.
     DocIndexesReady {
         epoch: Epoch,
         db: String,
         coll: String,
         indexes: Vec<IndexInfo>,
+    },
+    /// The first documents of an import source, parsed by the target driver, in
+    /// response to `DocImportPeek`. `error` carries a parse/read failure instead of
+    /// a `DocError` so the dialog can show it inline beside the file it belongs to
+    /// rather than as a banner on the collection behind it.
+    DocImportPreview {
+        epoch: Epoch,
+        docs: Vec<String>,
+        error: Option<String>,
     },
     /// One window of aggregation results, in response to `DocAggregate`.
     DocAggregateReady {
@@ -1649,6 +1820,11 @@ pub enum Event {
         db: String,
         coll: String,
         plan: DocPlan,
+        /// The index keys this filter would want, when the plan is a collection
+        /// scan (see `red_core::doc::suggested_index_keys`). Empty when the query
+        /// is already covered or the filter names nothing indexable. Computed here
+        /// rather than UI-side because only this layer holds the parsed filter.
+        advice: Vec<String>,
     },
     /// A write succeeded (in response to `DocApplyWrite`); `summary` is a short
     /// human line for a toast, and the UI refreshes the affected browse.
@@ -1889,6 +2065,14 @@ pub enum Event {
     /// the export's toast.
     ExportCancelled {
         id: OpId,
+    },
+    /// An export failed (engine read, or writing the file). `id` selects the
+    /// export's toast, which is what makes this its own event rather than a plain
+    /// `Error`: without it the progress toast has nothing telling it to stop, and
+    /// a failed export sits at "Exporting…" for the life of the session.
+    ExportFailed {
+        id: OpId,
+        message: String,
     },
     /// A streamed import made progress: `rows` rows committed so far (throttled).
     /// `id` selects the import's toast.

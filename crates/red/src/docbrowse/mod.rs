@@ -7,12 +7,22 @@
 //! service`'s protocol) and never touches the `DocDriver` directly, the same UI/driver
 //! separation the other shells keep.
 
+mod aggregate;
 mod form;
+mod indexes;
 mod render;
 mod tabs;
+mod transfer;
+mod validator;
+mod watch;
 mod window;
 
+pub(crate) use aggregate::{DocQueryMode, DocStage};
 pub(crate) use form::{DocForm, InspectorMode};
+pub(crate) use indexes::DocIndexForm;
+pub(crate) use transfer::{DocCopyState, DocExportState, DocImportState};
+pub(crate) use validator::DocValidatorForm;
+pub(crate) use watch::DocWatchState;
 
 use window::{DocWindow, FetchCtx};
 
@@ -44,16 +54,41 @@ enum DocPanel {
     Schema,
     /// The collection's indexes.
     Indexes,
+    /// The live change stream.
+    Watch,
 }
 
 impl DocPanel {
     /// The panels in toolbar order, with their segment labels.
-    const ALL: [(DocPanel, &'static str); 4] = [
+    const ALL: [(DocPanel, &'static str); 5] = [
         (DocPanel::Documents, "Documents"),
         (DocPanel::Query, "Query"),
         (DocPanel::Schema, "Schema"),
         (DocPanel::Indexes, "Indexes"),
+        (DocPanel::Watch, "Watch"),
     ];
+}
+
+/// How the filter box's text is read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DocFilterMode {
+    /// A raw MongoDB filter document in extended JSON.
+    Json,
+    /// The `field:value age>30 created:last7d` shorthand, compiled to a filter
+    /// document (see [`red_core::doc::compile_fast_filter`]).
+    Fast,
+}
+
+impl DocFilterMode {
+    const ALL: [(DocFilterMode, &'static str); 2] =
+        [(DocFilterMode::Fast, "Fast"), (DocFilterMode::Json, "JSON")];
+
+    fn placeholder(self) -> &'static str {
+        match self {
+            DocFilterMode::Fast => "status:active age>30 created:last7d",
+            DocFilterMode::Json => "{ \"status\": \"active\" }",
+        }
+    }
 }
 
 /// How the Documents panel renders each document (Compass-style modes).
@@ -96,6 +131,26 @@ enum MongoTabState {
     /// A blank tab awaiting a collection choice from the sidebar tree.
     Empty,
     Collection(Box<CollView>),
+    /// A database's inferred-relationship diagram.
+    Relations(Box<RelationsView>),
+}
+
+/// One database's relations diagram: the inferred references, and the ER canvas
+/// built from them.
+///
+/// The references are kept beside the canvas because they carry the *evidence*
+/// (how many sampled values resolved), which the diagram cannot show and the
+/// footer must: an inferred edge is a claim, not a declaration.
+pub(crate) struct RelationsView {
+    /// The epoch the inference runs under, so a reply lands on the tab that asked.
+    epoch: Epoch,
+    db: String,
+    loading: bool,
+    er: Option<crate::er::ErView>,
+    references: Vec<red_core::doc::DocReference>,
+    /// How many collections the inference sampled, for the footer.
+    sampled: usize,
+    error: Option<String>,
 }
 
 /// One tab in the Mongo shell: a title, a stable id, and its per-kind state.
@@ -116,6 +171,12 @@ pub(crate) struct MongoTab {
 /// `epoch` so a page/schema/write reply routes to the tab that asked.
 pub(crate) struct MongoView {
     session: SessionId,
+    /// The shared query log, so a run can record itself without reaching back
+    /// through `AppState`.
+    history_store: Entity<red_config::history::QueryHistory>,
+    /// The left History dock (⌘Y), a view over the shared log; see
+    /// [`crate::dochistory::DocHistoryPanel`].
+    pub(crate) history_panel: Entity<crate::dochistory::DocHistoryPanel>,
     /// The connection's read-only posture, captured at connect. Gates every write
     /// affordance (edit / insert / delete / drop) in the UI.
     read_only: bool,
@@ -151,6 +212,19 @@ pub(crate) struct MongoView {
     /// open (Explain / New / Drop live here to keep the toolbar uncrowded).
     /// Mirrors the Redis `actions_menu` positioned-menu pattern.
     actions_menu: Option<gpui::Point<gpui::Pixels>>,
+    /// The collection-tree row whose right-click menu is open, as
+    /// `(db, coll, position)`. A `coll` of `None` is a database row.
+    coll_menu: Option<(String, Option<String>, gpui::Point<gpui::Pixels>)>,
+    /// The open "Export documents" modal, if any.
+    pub(crate) export: Option<DocExportState>,
+    /// The open "Import documents" modal, if any.
+    pub(crate) import: Option<DocImportState>,
+    /// The open "Copy collection to…" modal, if any.
+    pub(crate) copy: Option<DocCopyState>,
+    /// The open "New index" dialog, if any.
+    pub(crate) index_form: Option<DocIndexForm>,
+    /// The open "Validation rules" dialog, if any.
+    pub(crate) validator: Option<DocValidatorForm>,
     /// The `database -> collection` sidebar tree's keyboard focus handle; the
     /// `FocusSchema` action and a tree click plant focus here.
     pub(crate) tree_focus: FocusHandle,
@@ -254,16 +328,61 @@ pub(crate) struct CollView {
     /// The extended-JSON filter input; its text is applied on Enter or "Run".
     filter_input: Entity<TextInput>,
     /// The applied filter (re-sent when paging), or `None` for the whole collection.
+    /// Always an extended-JSON document, whichever mode wrote it.
     filter: Option<String>,
+    /// How [`Self::filter_input`]'s text is read.
+    filter_mode: DocFilterMode,
+    /// What the current filter text compiles to, recomputed as it is typed. Drives
+    /// the inline hint; `Incomplete` deliberately shows nothing.
+    filter_status: red_core::doc::FastFilter,
+    /// Schema field paths matching the token being typed, and which is
+    /// highlighted. Empty when the popup is closed.
+    suggestions: Vec<String>,
+    suggestion_ix: usize,
+    /// The browse order as `(field, ascending)` keys in priority order. Empty is
+    /// the `_id` order the keyset scroll assumes; anything else switches the run to
+    /// ordinal paging (see [`window::FetchCtx`]).
+    sort: Vec<(String, bool)>,
+    /// The chosen field subset, or `None` for whole documents. `_id` always rides
+    /// along, so a projected row is still addressable.
+    projection: Option<Vec<String>>,
+    /// [`Self::sort`] / [`Self::projection`] rendered as the extended JSON the
+    /// fetch path sends. Cached rather than rebuilt per paint: the grid's
+    /// `on_visible_range` closure borrows them every frame.
+    sort_doc: Option<String>,
+    projection_doc: Option<String>,
+    /// The "Fields" projection dropdown's anchor while it is open.
+    fields_menu: Option<gpui::Point<gpui::Pixels>>,
     /// The inferred schema, lazily fetched the first time the Schema panel opens.
     schema: Option<DocSchema>,
+    /// The collection's storage numbers, fetched with the schema. `None` until
+    /// they arrive, and they may never: an under-privileged role gets no
+    /// `collStats`, which the panel shows by simply omitting the header.
+    stats: Option<red_core::doc::CollStats>,
     /// The collection's indexes, lazily fetched the first time Indexes opens.
     indexes: Option<Vec<IndexInfo>>,
     /// The explain plan for the current filter, shown as a dismissible readout
     /// on the Documents panel; `None` when not requested / dismissed.
     explain: Option<DocPlan>,
-    /// The aggregation-pipeline editor (Query panel).
+    /// The index keys the last explain suggested (empty when it needs none), for
+    /// the Indexes panel's suggestion row. Outlives the dismissible plan readout:
+    /// the advice is still true after the readout is closed.
+    index_advice: Option<Vec<String>>,
+    /// The aggregation-pipeline editor (Query panel), holding the whole pipeline
+    /// as text. The source of truth in both query modes: the stage list is split
+    /// out of it and joined back into it.
     query_editor: Entity<CodeEditor>,
+    /// How the Query panel is edited (one editor, or one per stage).
+    query_mode: DocQueryMode,
+    /// The stage list, when the panel is in Stages mode.
+    stages: Vec<DocStage>,
+    /// Which stage the next run previews at, if any: the pipeline is truncated
+    /// after it and a `$limit` appended.
+    preview_stage: Option<usize>,
+    /// The "add stage" palette's insertion point and anchor while it is open.
+    stage_menu: Option<(usize, gpui::Point<gpui::Pixels>)>,
+    /// Why the last mode switch or run was refused, shown above the panel.
+    query_error: Option<String>,
     /// The Query panel's last result window, its sampled columns, and whether a
     /// run is in flight.
     query_docs: Vec<Document>,
@@ -292,6 +411,9 @@ pub(crate) struct CollView {
     /// Shared "who owns the live selection" cell for the List/JSON blocks.
     selection_group: SelectionGroup,
     pub(crate) list_focus: FocusHandle,
+    /// The change stream's state: whether it is running, what it has seen, and
+    /// which operations the viewer shows.
+    watch: DocWatchState,
     /// The keyboard row cursor as an absolute ordinal (arrow / vim motions), or
     /// `None` before the grid has been touched. Drives the grid highlight and the
     /// Enter-to-inspect target, falling back to the inspected row.
@@ -312,18 +434,29 @@ impl CollView {
         cx: &mut Context<AppState>,
     ) -> Self {
         let filter_input = cx.new(|cx| {
-            TextInput::new(cx).with_placeholder(crate::i18n::tr!(
-                "doc.filter_e_g_status_active",
-                "filter, e.g. { \"status\": \"active\" }"
-            ))
+            TextInput::new(cx)
+                .with_placeholder(DocFilterMode::Fast.placeholder())
+                // Up/Down move the field-name suggestion popup instead of leaving
+                // the field, the same opt-in the in-cell FK picker uses.
+                .emit_nav()
         });
-        // Apply the filter on Enter, mirroring the SQL/Redis filter bars.
         cx.subscribe(&filter_input, |this, _input, event: &TextInputEvent, cx| {
-            if !matches!(event, TextInputEvent::Submit) {
+            let Some(session) = this.doc_active_session() else {
                 return;
-            }
-            if let Some(session) = this.doc_active_session() {
-                this.doc_apply_filter(session, cx);
+            };
+            match event {
+                // Enter takes the highlighted suggestion when the popup is open,
+                // and applies the filter otherwise: the popup is transient, the
+                // filter is the field's real job.
+                TextInputEvent::Submit => {
+                    if !this.doc_accept_suggestion(session, cx) {
+                        this.doc_apply_filter(session, cx);
+                    }
+                }
+                TextInputEvent::Change => this.doc_filter_changed(session, cx),
+                TextInputEvent::Up => this.doc_move_suggestion(session, -1, cx),
+                TextInputEvent::Down => this.doc_move_suggestion(session, 1, cx),
+                _ => {}
             }
         })
         .detach();
@@ -393,10 +526,26 @@ impl CollView {
             panel: DocPanel::Documents,
             filter_input,
             filter: None,
+            filter_mode: DocFilterMode::Fast,
+            filter_status: red_core::doc::FastFilter::Empty,
+            suggestions: Vec::new(),
+            suggestion_ix: 0,
+            sort: Vec::new(),
+            projection: None,
+            sort_doc: None,
+            projection_doc: None,
+            fields_menu: None,
             schema: None,
+            stats: None,
             indexes: None,
             explain: None,
+            index_advice: None,
             query_editor,
+            query_mode: DocQueryMode::Text,
+            stages: Vec::new(),
+            preview_stage: None,
+            stage_menu: None,
+            query_error: None,
             query_docs: Vec::new(),
             query_columns: Vec::new(),
             query_loading: false,
@@ -409,6 +558,7 @@ impl CollView {
             list_labels: BTreeMap::new(),
             selection_group: SelectionGroup::default(),
             list_focus: cx.focus_handle(),
+            watch: DocWatchState::default(),
             cursor: None,
         }
     }
@@ -443,7 +593,65 @@ impl CollView {
             db: &self.db,
             coll: &self.coll,
             filter: self.filter.as_deref(),
+            projection: self.projection_doc.as_deref(),
+            sort: self.sort_doc.as_deref(),
         }
+    }
+
+    /// The pipeline to run: the raw editor's text, or the stage list joined back
+    /// into one, truncated after [`Self::preview_stage`] with a `$limit` appended
+    /// when a stage preview is pinned.
+    ///
+    /// An empty pipeline is `[]` rather than nothing, so "Run" on a fresh tab
+    /// returns the collection instead of a parse error.
+    fn pipeline_text(&self, cx: &gpui::App) -> String {
+        let text = match self.query_mode {
+            DocQueryMode::Text => self.query_editor.read(cx).content().to_string(),
+            DocQueryMode::Stages => {
+                let mut stages: Vec<String> = self
+                    .stages
+                    .iter()
+                    .map(|s| s.editor.read(cx).content().to_string())
+                    .filter(|s| !s.trim().is_empty())
+                    .collect();
+                if let Some(upto) = self.preview_stage {
+                    stages.truncate(upto + 1);
+                    stages.push(format!("{{ \"$limit\": {} }}", aggregate::PREVIEW_LIMIT));
+                }
+                red_core::doc::join_pipeline_stages(&stages)
+            }
+        };
+        if text.trim().is_empty() {
+            "[]".to_string()
+        } else {
+            text
+        }
+    }
+
+    /// Re-render the cached `sort` / `projection` documents after either changes.
+    fn refresh_query_docs(&mut self) {
+        self.sort_doc = (!self.sort.is_empty()).then(|| red_core::doc::sort_json(&self.sort));
+        self.projection_doc = self
+            .projection
+            .as_ref()
+            .filter(|fields| !fields.is_empty())
+            .map(|fields| red_core::doc::projection_json(fields));
+    }
+
+    /// Restart the browse after the query shape changed (filter, sort, projection):
+    /// forget the resident run, the accumulated columns and anything addressed by
+    /// an ordinal that no longer means the same row.
+    fn requery(&mut self) {
+        self.loading = true;
+        self.inspector = None;
+        self.inspector_doc = None;
+        self.cursor = None;
+        self.expanded_rows.clear();
+        self.columns.clear();
+        // The plan and its index advice belong to the filter that earned them.
+        self.explain = None;
+        self.index_advice = None;
+        self.seed_browse();
     }
 
     /// Seed (or re-seed) the browse: reset the run and fetch the first window,
@@ -480,6 +688,46 @@ impl CollView {
             window::place_window(&handle, &self.scroll, total, ord, row_height);
         }
     }
+}
+
+/// Field-name suggestions offered at once. A popup taller than this stops being a
+/// hint and starts being a list to read.
+const SUGGESTION_MAX: usize = 8;
+
+/// The field-name token at the end of `text`, or `None` when the tail is not one
+/// (a value, a closing brace, whitespace).
+///
+/// Completion follows the *end* of the line rather than the caret, because
+/// [`TextInput`] does not expose one. That covers typing, which is where
+/// completion earns its keep, and does nothing at all when the caret is elsewhere,
+/// which is the right kind of wrong.
+fn field_prefix(text: &str) -> Option<String> {
+    // A field name runs back to whatever introduced it: whitespace, or the JSON
+    // punctuation a key sits behind.
+    let start = text
+        .rfind(|c: char| c.is_whitespace() || matches!(c, '{' | ',' | '"' | ':' | '(' | '['))
+        .map_or(0, |i| i + 1);
+    let tail = &text[start..];
+    if tail.is_empty() {
+        return None;
+    }
+    // A dotted path is one token; anything else non-identifier ends it.
+    if !tail
+        .chars()
+        .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '$'))
+    {
+        return None;
+    }
+    Some(tail.to_string())
+}
+
+/// Milliseconds since the Unix epoch, for the fast filter's relative dates. The
+/// clock lives here rather than in `red-core` so the compiler stays pure.
+fn unix_millis() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 /// A fresh top-aligned [`ListState`] for a document window, with enough overdraw
@@ -550,10 +798,26 @@ impl MongoView {
     /// `DocListDatabases` fires from [`AppState::doc_start_browse`] once the
     /// session is live. Opens with a single blank tab (the shell always shows
     /// something, and ⌘T / the ＋ button open more).
-    pub(crate) fn new(session: SessionId, read_only: bool, cx: &mut Context<AppState>) -> Self {
+    pub(crate) fn new(
+        session: SessionId,
+        conn_id: String,
+        read_only: bool,
+        history_store: Entity<red_config::history::QueryHistory>,
+        cx: &mut Context<AppState>,
+    ) -> Self {
+        let history_panel = {
+            let store = history_store.clone();
+            cx.new(|cx| crate::dochistory::DocHistoryPanel::new(conn_id, store, cx))
+        };
+        cx.subscribe(&history_panel, move |this, _panel, event, cx| {
+            this.on_doc_history_event(session, event, cx)
+        })
+        .detach();
         Self {
             session,
             read_only,
+            history_store,
+            history_panel,
             epoch: crate::result::next_kv_epoch(),
             databases: Vec::new(),
             collections: BTreeMap::new(),
@@ -572,6 +836,12 @@ impl MongoView {
             layout: PaneLayout::new(),
             tab_menu: None,
             actions_menu: None,
+            coll_menu: None,
+            export: None,
+            import: None,
+            copy: None,
+            index_form: None,
+            validator: None,
             tree_focus: cx.focus_handle(),
             tree_filter: {
                 let filter = cx.new(|cx| {
@@ -608,7 +878,7 @@ impl MongoView {
             .iter()
             .filter_map(|t| match &t.state {
                 MongoTabState::Collection(c) => Some((c.db.as_str(), c.coll.as_str())),
-                MongoTabState::Empty => None,
+                MongoTabState::Empty | MongoTabState::Relations(_) => None,
             })
             .collect();
         let mut rows = Vec::new();
@@ -687,8 +957,41 @@ impl MongoView {
     pub(crate) fn coll_at(&self, idx: usize) -> Option<&CollView> {
         match self.tabs.get(idx).map(|t| &t.state)? {
             MongoTabState::Collection(c) => Some(&**c),
-            MongoTabState::Empty => None,
+            MongoTabState::Empty | MongoTabState::Relations(_) => None,
         }
+    }
+
+    /// The relations diagram shown by the tab at `idx`, if that tab is one.
+    pub(crate) fn relations(&self, idx: usize) -> Option<&crate::er::ErView> {
+        match self.tabs.get(idx).map(|t| &t.state)? {
+            MongoTabState::Relations(r) => r.er.as_ref(),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn relations_mut(&mut self, idx: usize) -> Option<&mut crate::er::ErView> {
+        match self.tabs.get_mut(idx).map(|t| &mut t.state)? {
+            MongoTabState::Relations(r) => r.er.as_mut(),
+            _ => None,
+        }
+    }
+
+    /// The relations diagram *state* shown by the tab at `idx` (the canvas plus
+    /// the evidence), where [`relations`](Self::relations) hands back only the
+    /// canvas the shared ER renderer needs.
+    pub(crate) fn relations_at(&self, idx: usize) -> Option<&RelationsView> {
+        match self.tabs.get(idx).map(|t| &t.state)? {
+            MongoTabState::Relations(r) => Some(&**r),
+            _ => None,
+        }
+    }
+
+    /// The relations tab that owns `epoch`, for routing its inference reply.
+    fn relations_by_epoch_mut(&mut self, epoch: Epoch) -> Option<&mut RelationsView> {
+        self.tabs.iter_mut().find_map(|t| match &mut t.state {
+            MongoTabState::Relations(r) if r.epoch == epoch => Some(&mut **r),
+            _ => None,
+        })
     }
 
     /// The focused tab's collection (UI actions target the visible tab).
@@ -700,7 +1003,7 @@ impl MongoView {
         let i = self.focused_tab_index()?;
         match self.tabs.get_mut(i).map(|t| &mut t.state)? {
             MongoTabState::Collection(c) => Some(&mut **c),
-            MongoTabState::Empty => None,
+            MongoTabState::Empty | MongoTabState::Relations(_) => None,
         }
     }
 
@@ -1021,10 +1324,15 @@ impl AppState {
         }
     }
 
-    /// Apply the filter box's current text: set the (trimmed) filter, or clear it
-    /// when the box is empty, and re-seed the browse from the first window. The
-    /// grid's continuous scroll takes over from there.
+    /// Apply the filter box's current text: set the filter (compiling it first in
+    /// Fast mode), or clear it when the box is empty, and re-seed the browse from
+    /// the first window. The grid's continuous scroll takes over from there.
+    ///
+    /// A filter that does not compile is not applied: the inline hint already says
+    /// why, and replacing the visible result with an error would lose the rows the
+    /// user was looking at.
     fn doc_apply_filter(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let now = unix_millis();
         let Some(view) = self
             .conn_mut(Some(session))
             .and_then(|a| a.doc_view.as_mut())
@@ -1035,15 +1343,269 @@ impl AppState {
             return;
         };
         let text = current.filter_input.read(cx).content().trim().to_string();
-        current.filter = (!text.is_empty()).then_some(text);
-        current.loading = true;
-        current.inspector = None;
-        current.inspector_doc = None;
-        current.cursor = None;
-        current.expanded_rows.clear();
-        current.columns.clear();
+        current.suggestions.clear();
+        let filter = match (current.filter_mode, text.is_empty()) {
+            (_, true) => None,
+            (DocFilterMode::Json, false) => Some(text),
+            (DocFilterMode::Fast, false) => {
+                match red_core::doc::compile_fast_filter(&text, now) {
+                    red_core::doc::FastFilter::Ready(json) => Some(json),
+                    red_core::doc::FastFilter::Empty => None,
+                    // Nothing to apply yet; the hint is already on screen.
+                    red_core::doc::FastFilter::Incomplete
+                    | red_core::doc::FastFilter::Invalid(_) => {
+                        cx.notify();
+                        return;
+                    }
+                }
+            }
+        };
+        current.filter = filter.clone();
         current.panel = DocPanel::Documents;
-        current.seed_browse();
+        current.requery();
+        // Record what actually ran (the compiled document), not the shorthand
+        // that produced it: the log is replayed into the JSON box, and a fast
+        // filter reads as nonsense there.
+        if let Some(filter) = filter {
+            self.doc_record_history(session, &filter, cx);
+        }
+        cx.notify();
+    }
+
+    /// Switch how the filter box reads its text. The box is cleared rather than
+    /// reinterpreted: a JSON document is not a fast-filter line and vice versa, and
+    /// carrying the text across would produce a confident, wrong filter.
+    fn doc_set_filter_mode(
+        &mut self,
+        session: SessionId,
+        mode: DocFilterMode,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = self.doc_focused_coll_mut(session) else {
+            return;
+        };
+        if current.filter_mode == mode {
+            return;
+        }
+        current.filter_mode = mode;
+        current.filter_status = red_core::doc::FastFilter::Empty;
+        current.suggestions.clear();
+        let input = current.filter_input.clone();
+        input.update(cx, |input, cx| {
+            input.set_content("", cx);
+            input.set_placeholder(mode.placeholder(), cx);
+        });
+        cx.notify();
+    }
+
+    /// Recompute the inline hint and the field-name suggestions as the box is typed.
+    fn doc_filter_changed(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let now = unix_millis();
+        let Some(current) = self.doc_focused_coll_mut(session) else {
+            return;
+        };
+        let text = current.filter_input.read(cx).content().to_string();
+        current.filter_status = match current.filter_mode {
+            DocFilterMode::Fast => red_core::doc::compile_fast_filter(&text, now),
+            // The JSON box's own errors surface from the driver's parser on Run;
+            // guessing at half-typed JSON here would only cry wolf.
+            DocFilterMode::Json => red_core::doc::FastFilter::Empty,
+        };
+        let prefix = field_prefix(&text);
+        current.suggestions = match (&prefix, &current.schema) {
+            (Some(prefix), Some(schema)) => schema
+                .fields
+                .iter()
+                .map(|f| f.path.as_str())
+                .filter(|path| path.len() > prefix.len() && path.starts_with(prefix.as_str()))
+                .take(SUGGESTION_MAX)
+                .map(str::to_string)
+                .collect(),
+            _ => Vec::new(),
+        };
+        current.suggestion_ix = 0;
+        cx.notify();
+    }
+
+    /// Move the suggestion highlight by `delta`, wrapping at both ends.
+    fn doc_move_suggestion(&mut self, session: SessionId, delta: i32, cx: &mut Context<Self>) {
+        let Some(current) = self.doc_focused_coll_mut(session) else {
+            return;
+        };
+        let n = current.suggestions.len();
+        if n == 0 {
+            return;
+        }
+        let next = current.suggestion_ix as i32 + delta;
+        current.suggestion_ix = next.rem_euclid(n as i32) as usize;
+        cx.notify();
+    }
+
+    /// Replace the token being typed with the highlighted suggestion. Returns
+    /// whether a suggestion was taken, so Enter can fall through to applying the
+    /// filter when the popup is closed.
+    fn doc_accept_suggestion(&mut self, session: SessionId, cx: &mut Context<Self>) -> bool {
+        self.doc_take_suggestion(session, None, cx)
+    }
+
+    /// Accept `which` (or the highlighted one), rewriting the trailing field token.
+    fn doc_take_suggestion(
+        &mut self,
+        session: SessionId,
+        which: Option<usize>,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(current) = self.doc_focused_coll_mut(session) else {
+            return false;
+        };
+        let ix = which.unwrap_or(current.suggestion_ix);
+        let Some(path) = current.suggestions.get(ix).cloned() else {
+            return false;
+        };
+        let input = current.filter_input.clone();
+        let text = input.read(cx).content().to_string();
+        let Some(prefix) = field_prefix(&text) else {
+            return false;
+        };
+        let head = &text[..text.len() - prefix.len()];
+        let replaced = format!("{head}{path}");
+        input.update(cx, |input, cx| input.set_content(replaced, cx));
+        current.suggestions.clear();
+        // The accepted path may complete a term, so the hint is recomputed.
+        self.doc_filter_changed(session, cx);
+        true
+    }
+
+    /// Dismiss the suggestion popup. The popup belongs to the filter box, so it
+    /// closes as soon as attention moves elsewhere (another panel, another pane).
+    fn doc_dismiss_suggestions(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(current) = self.doc_focused_coll_mut(session)
+            && !current.suggestions.is_empty()
+        {
+            current.suggestions.clear();
+            cx.notify();
+        }
+    }
+
+    /// Toggle the browse sort on `field`, cycling ascending -> descending -> off.
+    /// `additive` (a shift-click) keeps the existing keys and appends this one, so
+    /// a multi-key sort is built by shift-clicking headers in priority order.
+    fn doc_toggle_sort(
+        &mut self,
+        session: SessionId,
+        field: String,
+        additive: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = self.doc_focused_coll_mut(session) else {
+            return;
+        };
+        let existing = current.sort.iter().position(|(f, _)| *f == field);
+        match existing {
+            // Ascending -> descending -> gone, so a third click on a header is the
+            // way back to the collection's natural order.
+            Some(i) if current.sort[i].1 => current.sort[i].1 = false,
+            Some(i) => {
+                current.sort.remove(i);
+            }
+            None => {
+                if !additive {
+                    current.sort.clear();
+                }
+                current.sort.push((field, true));
+            }
+        }
+        current.refresh_query_docs();
+        current.requery();
+        cx.notify();
+    }
+
+    fn doc_clear_sort(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(current) = self.doc_focused_coll_mut(session) else {
+            return;
+        };
+        current.sort.clear();
+        current.refresh_query_docs();
+        current.requery();
+        cx.notify();
+    }
+
+    /// Add or remove one field from the projection. The first toggle starts from
+    /// the sampled schema's full field list, so unticking one field keeps the rest
+    /// rather than projecting down to a single column.
+    fn doc_toggle_projection_field(
+        &mut self,
+        session: SessionId,
+        field: String,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = self.doc_focused_coll_mut(session) else {
+            return;
+        };
+        let all: Vec<String> = current
+            .schema
+            .as_ref()
+            .map(|s| {
+                s.fields
+                    .iter()
+                    .map(|f| f.path.clone())
+                    .filter(|p| p != "_id")
+                    .collect()
+            })
+            .unwrap_or_default();
+        let fields = current.projection.get_or_insert(all);
+        match fields.iter().position(|f| *f == field) {
+            Some(i) => {
+                fields.remove(i);
+            }
+            None => fields.push(field),
+        }
+        // An empty projection is no projection: `{}` would return `_id` alone,
+        // which reads as a bug rather than as a choice.
+        if fields.is_empty() {
+            current.projection = None;
+        }
+        current.refresh_query_docs();
+        current.requery();
+        cx.notify();
+    }
+
+    fn doc_clear_projection(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        let Some(current) = self.doc_focused_coll_mut(session) else {
+            return;
+        };
+        current.projection = None;
+        current.refresh_query_docs();
+        current.requery();
+        cx.notify();
+    }
+
+    /// Open / close the toolbar's "Fields" projection dropdown. Opening it fetches
+    /// the inferred schema when the tab has not needed it yet: the field list is
+    /// the menu.
+    fn doc_open_fields_menu(
+        &mut self,
+        session: SessionId,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(current) = self.doc_focused_coll_mut(session) else {
+            return;
+        };
+        current.fields_menu = Some(pos);
+        let needs_schema = current.schema.is_none();
+        let (epoch, db, coll) = (current.epoch, current.db.clone(), current.coll.clone());
+        if needs_schema {
+            self.service
+                .send_to(session, Command::DocInferSchema { epoch, db, coll });
+        }
+        cx.notify();
+    }
+
+    fn doc_close_fields_menu(&mut self, session: SessionId, cx: &mut Context<Self>) {
+        if let Some(current) = self.doc_focused_coll_mut(session) {
+            current.fields_menu = None;
+        }
         cx.notify();
     }
 
@@ -1060,15 +1622,55 @@ impl AppState {
             return;
         };
         current.panel = panel;
+        current.suggestions.clear();
         let (epoch, db, coll) = (current.epoch, current.db.clone(), current.coll.clone());
+        let filter = current.filter.clone();
+        let needs_indexes = current.indexes.is_none();
+        let needs_schema = current.schema.is_none();
+        let needs_stats = current.stats.is_none();
+        let needs_advice = current.index_advice.is_none() && filter.is_some();
         match panel {
-            DocPanel::Schema if current.schema.is_none() => {
-                self.service
-                    .send_to(session, Command::DocInferSchema { epoch, db, coll });
+            DocPanel::Schema => {
+                if needs_schema {
+                    self.service.send_to(
+                        session,
+                        Command::DocInferSchema {
+                            epoch,
+                            db: db.clone(),
+                            coll: coll.clone(),
+                        },
+                    );
+                }
+                if needs_stats {
+                    self.service
+                        .send_to(session, Command::DocCollStats { epoch, db, coll });
+                }
             }
-            DocPanel::Indexes if current.indexes.is_none() => {
-                self.service
-                    .send_to(session, Command::DocListIndexes { epoch, db, coll });
+            DocPanel::Indexes => {
+                if needs_indexes {
+                    self.service.send_to(
+                        session,
+                        Command::DocListIndexes {
+                            epoch,
+                            db: db.clone(),
+                            coll: coll.clone(),
+                        },
+                    );
+                }
+                // Explain the applied filter so the panel can offer the index it
+                // wants. Only worth asking when there *is* a filter: an unfiltered
+                // browse scans by definition and needs no advice about it.
+                if needs_advice {
+                    self.service.send_to(
+                        session,
+                        Command::DocExplain {
+                            epoch,
+                            db,
+                            coll,
+                            filter,
+                        },
+                    );
+                }
             }
             _ => {}
         }
@@ -1165,6 +1767,28 @@ impl AppState {
         }
     }
 
+    /// `DocStatsReady`: land a collection's storage numbers on the tab that asked.
+    pub(crate) fn on_doc_stats(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: Epoch,
+        db: String,
+        coll: String,
+        stats: red_core::doc::CollStats,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
+            return;
+        };
+        if let Some(current) = view.coll_by_epoch_mut(epoch)
+            && current.db == db
+            && current.coll == coll
+        {
+            current.stats = Some(stats);
+            cx.notify();
+        }
+    }
+
     pub(crate) fn on_doc_indexes(
         &mut self,
         session: Option<SessionId>,
@@ -1199,12 +1823,7 @@ impl AppState {
         let Some(current) = view.focused_coll_mut() else {
             return;
         };
-        let pipeline = current.query_editor.read(cx).content();
-        let pipeline = if pipeline.trim().is_empty() {
-            "[]".to_string()
-        } else {
-            pipeline
-        };
+        let pipeline = current.pipeline_text(cx);
         current.query_loading = true;
         let (epoch, db, coll) = (current.epoch, current.db.clone(), current.coll.clone());
         self.service.send_to(
@@ -1213,10 +1832,14 @@ impl AppState {
                 epoch,
                 db,
                 coll,
-                pipeline,
+                pipeline: pipeline.clone(),
                 confirmed: false,
             },
         );
+        // An empty pipeline is the panel's default, not a query worth keeping.
+        if pipeline.trim() != "[]" {
+            self.doc_record_history(session, &pipeline, cx);
+        }
         cx.notify();
     }
 
@@ -1285,6 +1908,10 @@ impl AppState {
         }
     }
 
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the args mirror the DocPlanReady event's fields 1:1, like the other on_doc_* handlers"
+    )]
     pub(crate) fn on_doc_plan(
         &mut self,
         session: Option<SessionId>,
@@ -1292,6 +1919,7 @@ impl AppState {
         db: String,
         coll: String,
         plan: DocPlan,
+        advice: Vec<String>,
         cx: &mut Context<Self>,
     ) {
         let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
@@ -1302,6 +1930,7 @@ impl AppState {
             && current.coll == coll
         {
             current.explain = Some(plan);
+            current.index_advice = Some(advice);
             cx.notify();
         }
     }
@@ -1446,6 +2075,12 @@ impl AppState {
             _ => return,
         };
         let Some(handle) = handle else { return };
+        // Leaving the filter box takes its suggestion popup with it.
+        if pane != Pane::Editor
+            && let Some(session) = self.doc_active_session()
+        {
+            self.doc_dismiss_suggestions(session, cx);
+        }
         window.focus(&handle, cx);
         cx.notify();
     }
@@ -1691,6 +2326,318 @@ impl AppState {
         }
     }
 
+    /// Propose dropping a collection named from the tree, which need not be open
+    /// in a tab. Runs under the catalog epoch for exactly that reason; the
+    /// confirm dance and the `DocWriteDone` refresh are the drop-current path's.
+    fn doc_drop_collection(
+        &mut self,
+        session: SessionId,
+        db: String,
+        coll: String,
+        cx: &mut Context<Self>,
+    ) {
+        let cmd = {
+            let Some(view) = self
+                .conn_mut(Some(session))
+                .and_then(|a| a.doc_view.as_ref())
+            else {
+                return;
+            };
+            if view.read_only {
+                return;
+            }
+            // A tab already open on the namespace owns the refresh that follows,
+            // so the write rides its epoch when there is one.
+            let epoch = view
+                .tabs
+                .iter()
+                .find_map(|t| match &t.state {
+                    MongoTabState::Collection(c) if c.db == db && c.coll == coll => Some(c.epoch),
+                    _ => None,
+                })
+                .unwrap_or(view.epoch);
+            Command::DocApplyWrite {
+                epoch,
+                write: DocWrite::DropCollection { db, coll },
+                confirmed: false,
+            }
+        };
+        self.service.send_to(session, cmd);
+        cx.notify();
+    }
+
+    /// Open (or focus) the relations diagram for a database and start the
+    /// inference behind it.
+    ///
+    /// One tab per database: reopening focuses the existing diagram rather than
+    /// re-running a sampling pass whose answer is already on screen.
+    pub(crate) fn doc_open_relations(
+        &mut self,
+        session: SessionId,
+        db: String,
+        cx: &mut Context<Self>,
+    ) {
+        self.doc_close_coll_menu(session, cx);
+        let existing = self
+            .conn_for(Some(session))
+            .and_then(|a| a.doc_view.as_ref())
+            .and_then(|v| {
+                v.tabs.iter().position(|t| match &t.state {
+                    MongoTabState::Relations(r) => r.db == db,
+                    _ => false,
+                })
+            });
+        if let Some(idx) = existing {
+            self.doc_activate_tab(session, idx, cx);
+            return;
+        }
+        let epoch = crate::result::next_kv_epoch();
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_mut())
+        else {
+            return;
+        };
+        let pane = view.focused_pane();
+        let id = view.tab_seq;
+        view.tab_seq += 1;
+        view.tabs.push(MongoTab {
+            id,
+            title: format!("{db} relations"),
+            state: MongoTabState::Relations(Box::new(RelationsView {
+                epoch,
+                db: db.clone(),
+                loading: true,
+                er: None,
+                references: Vec::new(),
+                sampled: 0,
+                error: None,
+            })),
+            pane,
+            pinned: false,
+        });
+        let idx = view.tabs.len() - 1;
+        view.set_pane_active(pane, idx);
+        view.scroll_tab_into_view(idx);
+        self.service
+            .send_to(session, Command::DocReferenceMap { epoch, db });
+        cx.notify();
+    }
+
+    /// `DocReferencesReady`: build the diagram from the inferred graph.
+    pub(crate) fn on_doc_references(
+        &mut self,
+        session: Option<SessionId>,
+        epoch: Epoch,
+        db: String,
+        collections: Vec<(String, usize)>,
+        references: Vec<red_core::doc::DocReference>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
+            return;
+        };
+        let Some(relations) = view.relations_by_epoch_mut(epoch) else {
+            return;
+        };
+        // Only the references that actually resolved become edges. A weak one is
+        // still listed in the footer count, because "we looked and it did not hold"
+        // is a finding, but drawing it would assert a relationship that is not there.
+        let edges: Vec<(String, String, String)> = references
+            .iter()
+            .filter(|r| r.is_strong())
+            .map(|r| (r.from_coll.clone(), r.field.clone(), r.to_coll.clone()))
+            .collect();
+        relations.sampled = collections.len();
+        relations.er = Some(crate::er::ErView::from_references(db, &collections, &edges));
+        relations.references = references;
+        relations.loading = false;
+        relations.error = None;
+        cx.notify();
+    }
+
+    /// Handle what the History dock asks the shell to do: seed a past filter or
+    /// pipeline back into a tab, clear the log, or hide the dock.
+    fn on_doc_history_event(
+        &mut self,
+        session: SessionId,
+        event: &crate::dochistory::DocHistoryPanelEvent,
+        cx: &mut Context<Self>,
+    ) {
+        use crate::dochistory::DocHistoryPanelEvent as E;
+        match event {
+            E::SeedFilter { namespace, filter } => {
+                self.doc_point_at(session, namespace.as_deref(), cx);
+                let Some(current) = self.doc_focused_coll_mut(session) else {
+                    return;
+                };
+                // A recorded filter is a filter document, so the box must be in
+                // the mode that reads one; seeding JSON into the fast box would
+                // produce a confident, wrong query.
+                current.filter_mode = DocFilterMode::Json;
+                current.panel = DocPanel::Documents;
+                let input = current.filter_input.clone();
+                let text = filter.clone();
+                input.update(cx, |input, cx| {
+                    input.set_placeholder(DocFilterMode::Json.placeholder(), cx);
+                    input.set_content(text, cx);
+                });
+                self.doc_apply_filter(session, cx);
+            }
+            E::SeedPipeline {
+                namespace,
+                pipeline,
+            } => {
+                self.doc_point_at(session, namespace.as_deref(), cx);
+                let Some(current) = self.doc_focused_coll_mut(session) else {
+                    return;
+                };
+                // Seeding replaces the pipeline, so the stage list built from the
+                // old one is gone; the text mode holds what just arrived.
+                current.panel = DocPanel::Query;
+                current.query_mode = DocQueryMode::Text;
+                current.stages.clear();
+                current.preview_stage = None;
+                let editor = current.query_editor.clone();
+                let text = pipeline.clone();
+                editor.update(cx, |editor, cx| editor.set_content(text, cx));
+                cx.notify();
+            }
+            E::ClearAll => {
+                let conn_id = self
+                    .conn_for(Some(session))
+                    .map(|a| a.conn_id.clone())
+                    .unwrap_or_default();
+                if let Some(view) = self
+                    .conn_for(Some(session))
+                    .and_then(|a| a.doc_view.as_ref())
+                {
+                    let store = view.history_store.clone();
+                    store.update(cx, |store, _| store.clear_conn(&conn_id));
+                }
+                cx.notify();
+            }
+            E::Close => {
+                if let Phase::Connected(active) = &mut self.phase {
+                    active.history_open = false;
+                }
+                self.refocus_root = true;
+                cx.notify();
+            }
+        }
+    }
+
+    /// Point the focused tab at `namespace` (`db.collection`) when it names one
+    /// the tab is not already on, so a seeded history entry lands on the
+    /// collection it was recorded against rather than whatever is open.
+    fn doc_point_at(
+        &mut self,
+        session: SessionId,
+        namespace: Option<&str>,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((db, coll)) = namespace.and_then(|ns| ns.split_once('.')) else {
+            return;
+        };
+        let already = self
+            .conn_for(Some(session))
+            .and_then(|a| a.doc_view.as_ref())
+            .and_then(|v| v.focused_coll())
+            .is_some_and(|c| c.db == db && c.coll == coll);
+        if !already {
+            self.doc_open_collection(session, db.to_string(), coll.to_string(), false, cx);
+        }
+    }
+
+    /// The query a save should capture on a MongoDB connection: the pipeline when
+    /// the Query panel is showing, else the applied filter, with the collection it
+    /// belongs to.
+    pub(crate) fn doc_savable_query(&self, cx: &gpui::App) -> Option<(String, Option<String>)> {
+        let current = self.doc_view().and_then(|v| v.focused_coll())?;
+        let namespace = Some(format!("{}.{}", current.db, current.coll));
+        match current.panel {
+            DocPanel::Query => Some((current.pipeline_text(cx), namespace)),
+            // A filter is what the Documents panel *ran*, not what is half-typed
+            // in the box: saving a draft nobody has applied would be a surprise.
+            _ => current.filter.clone().map(|f| (f, namespace)),
+        }
+    }
+
+    /// Seed a saved query into the shell: a pipeline into the Query panel, a
+    /// filter into the Documents filter box, at the collection it names.
+    pub(crate) fn doc_open_saved_query(
+        &mut self,
+        session: SessionId,
+        query: &red_config::queries::SavedQuery,
+        cx: &mut Context<Self>,
+    ) {
+        let text = query.sql.clone();
+        let namespace = query.namespace.clone();
+        if crate::dochistory::is_pipeline(&text) {
+            self.on_doc_history_event(
+                session,
+                &crate::dochistory::DocHistoryPanelEvent::SeedPipeline {
+                    namespace,
+                    pipeline: text,
+                },
+                cx,
+            );
+        } else {
+            self.on_doc_history_event(
+                session,
+                &crate::dochistory::DocHistoryPanelEvent::SeedFilter {
+                    namespace,
+                    filter: text,
+                },
+                cx,
+            );
+        }
+    }
+
+    /// The MongoDB view of the foreground connection.
+    fn doc_view(&self) -> Option<&MongoView> {
+        match &self.phase {
+            Phase::Connected(a) => a.doc_view.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Record a run in the shared query log, tagged with the namespace it ran
+    /// against. The user's own runs only, like the SQL path: history is grounding
+    /// precisely because it is human-authored.
+    fn doc_record_history(&mut self, session: SessionId, text: &str, cx: &mut Context<Self>) {
+        if text.trim().is_empty() {
+            return;
+        }
+        let Some(active) = self.conn_for(Some(session)) else {
+            return;
+        };
+        let conn_id = active.conn_id.clone();
+        let Some(view) = active.doc_view.as_ref() else {
+            return;
+        };
+        let namespace = view.focused_coll().map(|c| format!("{}.{}", c.db, c.coll));
+        let store = view.history_store.clone();
+        let text = text.to_string();
+        store.update(cx, |store, _| {
+            store.record_scoped(&conn_id, &text, namespace)
+        });
+    }
+
+    /// Re-fetch one database's collection list (the tree's context-menu refresh).
+    fn doc_reload_collections(&mut self, session: SessionId, db: String, cx: &mut Context<Self>) {
+        let Some(view) = self
+            .conn_mut(Some(session))
+            .and_then(|a| a.doc_view.as_ref())
+        else {
+            return;
+        };
+        let epoch = view.epoch;
+        self.service
+            .send_to(session, Command::DocListCollections { epoch, db });
+        cx.notify();
+    }
+
     /// Approve the pending destructive write: re-send it confirmed against the
     /// originating collection's epoch.
     fn doc_confirm_write(&mut self, session: SessionId, cx: &mut Context<Self>) {
@@ -1817,16 +2764,19 @@ impl AppState {
         summary: String,
         cx: &mut Context<Self>,
     ) {
-        let _ = session;
         // Close the inspector on the writing tab, clear any pending confirm, and
         // re-seed the browse (a write shifts ordinals, so the resident window and
         // its expansions are re-derived from a fresh first window).
+        let mut reload_indexes = None;
+        let mut catalog_refresh = None;
         {
             let Some(view) = self.conn_mut(session).and_then(|a| a.doc_view.as_mut()) else {
                 return;
             };
             view.pending_write = None;
+            let catalog_epoch = view.epoch;
             if let Some(c) = view.coll_by_epoch_mut(epoch) {
+                catalog_refresh = Some((catalog_epoch, c.db.clone()));
                 c.inspector = None;
                 c.inspector_doc = None;
                 c.inspector_insert = false;
@@ -1834,7 +2784,29 @@ impl AppState {
                 c.expanded_rows.clear();
                 c.loading = true;
                 c.seed_browse();
+                // An index write changes the Indexes panel, not the documents, and
+                // the panel only fetches on its first open; re-fetch so a created
+                // or dropped index shows without reopening the tab.
+                if c.indexes.is_some() {
+                    reload_indexes = Some((c.epoch, c.db.clone(), c.coll.clone()));
+                }
             }
+        }
+        if let Some((epoch, db, coll)) = reload_indexes
+            && let Some(session) = session
+        {
+            self.service
+                .send_to(session, Command::DocListIndexes { epoch, db, coll });
+        }
+        // Re-read the catalog too: a write can change a collection's count, its
+        // validator, or whether it exists at all, and `listCollections` is cheap
+        // metadata. Unconditional rather than guessed at from the summary line,
+        // which is prose meant for a human.
+        if let Some((session, epoch, db)) =
+            session.zip(catalog_refresh).map(|(s, (e, d))| (s, e, d))
+        {
+            self.service
+                .send_to(session, Command::DocListCollections { epoch, db });
         }
         self.notify(ToastVariant::Success, summary, cx);
     }

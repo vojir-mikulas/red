@@ -15,8 +15,8 @@
 //! silently into a session the user may point at a different server.
 //!
 //! Capture is driven from `AppState` on tab lifecycle events plus a debounced
-//! editor tick, and [`LocalState::set_workspace`] no-ops when nothing changed,
-//! so an idle app does no disk I/O.
+//! editor tick, and [`crate::local_state::LocalState::set_workspace`] no-ops
+//! when nothing changed, so an idle app does no disk I/O.
 
 use gpui::{App, Context};
 

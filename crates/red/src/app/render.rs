@@ -12,7 +12,7 @@ use crate::app::PreflightCount;
 use crate::keymap::{
     About, AddRow, BeginEdit, CloseInspector, ClosePane, CloseTab, CycleFocusNext, CycleFocusPrev,
     DeleteRow, EqualizePanes, Explain, FindInResult, FocusOtherHalf, FormatSql, MaximizePane,
-    NewConnection, NewTab, NextTab, OpenSavedQueries, PrevTab, RefreshSchema, ReportBug,
+    NewConnection, NewTab, NextTab, OpenSavedQueries, PinRow, PrevTab, RefreshSchema, ReportBug,
     RevertChanges, RunQuery, RunScript, SaveQuery, SearchSchema, SelectAll, SetNull, Settings,
     ShowChangelog, ShowErDiagram, ShowShortcuts, SplitDown, SubmitChanges, SwitchConnection,
     SwitchToConnectionSlot, SwitchToPreviousConnection, ToggleAssistant, ToggleColumnsPanel,
@@ -219,11 +219,17 @@ impl Render for AppState {
             }
         }
 
-        // The history popover just opened: focus it so its arrow keys work.
+        // The history popover just opened: focus it so its arrow keys work. Each
+        // shell renders its own dock, so focus follows the one on screen.
         if self.focus_history {
             self.focus_history = false;
             if let Phase::Connected(active) = &self.phase {
-                window.focus(&active.history_panel.focus_handle(cx), cx);
+                let handle = match (&active.kv_view, &active.doc_view) {
+                    (Some(kv), _) => kv.history_panel.focus_handle(cx),
+                    (_, Some(doc)) => doc.history_panel.focus_handle(cx),
+                    _ => active.history_panel.focus_handle(cx),
+                };
+                window.focus(&handle, cx);
             }
         }
 
@@ -242,7 +248,7 @@ impl Render for AppState {
         // the current mode shows, so typing lands in it at once.
         if self.focus_filter {
             self.focus_filter = false;
-            if let Some(bar) = &self.filter_bar {
+            if let Some(bar) = self.filter_bar() {
                 window.focus(&bar.focus_handle(cx), cx);
             }
         }
@@ -676,6 +682,7 @@ impl Render for AppState {
             }))
             .on_action(cx.listener(|this, _: &RevertChanges, _, cx| this.revert_changes(cx)))
             .on_action(cx.listener(|this, _: &DeleteRow, _, cx| this.toggle_delete_rows(cx)))
+            .on_action(cx.listener(|this, _: &PinRow, _, cx| this.toggle_pin_rows(cx)))
             .on_action(cx.listener(|this, _: &AddRow, _, cx| this.add_draft_row(cx)))
             .on_action(cx.listener(|this, _: &SetNull, _, cx| this.set_cell_null(cx)))
             .on_action(cx.listener(|this, _: &SelectAll, _, cx| this.result_select_all(cx)))
@@ -717,6 +724,18 @@ impl Render for AppState {
                 {
                     return;
                 }
+                // While the search box has focus, letters/backspace must edit the
+                // query; only the navigation keys act as card shortcuts there.
+                let search_focused = this.connect_search.focus_handle(cx).is_focused(window);
+                // Any *other* text-entry surface owns the keyboard outright until
+                // it loses focus: this listener sits at the root, so it also sees
+                // keys typed into the engine/env filter combos several levels
+                // down, where "redis" used to fire `e` mid-word and open the edit
+                // form. The search box is the one exception — it belongs to this
+                // screen, so ↑/↓/↵ keep driving the cards while you type in it.
+                if !search_focused && crate::focus::text_entry_focused(window) {
+                    return;
+                }
                 // Navigate the *visible* (filtered + sorted) list; `connect_sel` is a
                 // position within it, mapped back to the stored index for actions.
                 let visible = this.visible_connections(cx);
@@ -724,9 +743,6 @@ impl Render for AppState {
                 if n == 0 {
                     return;
                 }
-                // While the search box has focus, letters/backspace must edit the
-                // query; only the navigation keys act as card shortcuts there.
-                let search_focused = this.connect_search.focus_handle(cx).is_focused(window);
                 // A bare keystroke. Shift is allowed (the hints spell these as
                 // capitals), but a ⌘/⌥/⌃ combination belongs to a real binding —
                 // ⌘/ opens the shortcut reference — and must not be swallowed
@@ -818,6 +834,12 @@ impl Render for AppState {
             // The Redis "Import keys" modal, likewise root-mounted.
             .children(self.render_kv_import_modal(cx))
             .children(self.render_kv_export_modal(cx))
+            // The Mongo "Export documents" / "Import documents" modals, likewise.
+            .children(self.render_doc_export_modal(cx))
+            .children(self.render_doc_import_modal(cx))
+            .children(self.render_doc_copy_modal(cx))
+            .children(self.render_doc_index_modal(cx))
+            .children(self.render_doc_validator_modal(cx))
             // The Redis delete-key confirmation, likewise root-mounted.
             .children(self.render_kv_delete_modal(cx))
             // The palette renders its own full-screen overlay; last = on top.

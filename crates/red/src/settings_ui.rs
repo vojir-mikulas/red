@@ -160,7 +160,7 @@ impl AppState {
             .key_context("Modal")
             .on_action(|_: &flint::components::modal::FocusNext, window, cx| window.focus_next(cx))
             .on_action(|_: &flint::components::modal::FocusPrev, window, cx| window.focus_prev(cx))
-            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, _, cx| {
+            .on_key_down(cx.listener(|this, event: &gpui::KeyDownEvent, window, cx| {
                 // While the keymap recorder is live it owns the keyboard (its
                 // interceptor ran first and stopped propagation, but this listener
                 // fires regardless), so stand down; Esc/Enter there cancel/confirm
@@ -174,6 +174,13 @@ impl AppState {
                 // of the confirmation, not close the panel underneath it, and the
                 // panel has to still be there to go back to.
                 if this.confirm_reset {
+                    return;
+                }
+                // And likewise while a theme / font dropdown is open over the
+                // panel. Its search field cancels on Esc but does not swallow the
+                // key, so without this the one press closed the dropdown *and* the
+                // panel behind it.
+                if crate::focus::combo_popover_focused(window) {
                     return;
                 }
                 match event.keystroke.key.as_str() {

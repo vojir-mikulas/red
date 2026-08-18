@@ -10,6 +10,10 @@
 #      *[other] { $n } rows
 #   }
 
+result-pin_limit = [Síx píññéd röws ís thé máxímúm; úñpíñ öñé tö píñ áñöthér]
+
+result-unpin_row = [Úñpíñ röw]
+
 result-empty_hint = [Döúblé-çlíçk á táblé ör rúñ á qúéry tö séé röws]
 
 result-query_failed = [Qúéry fáíléd]
@@ -31,6 +35,8 @@ result-stats_distinct = [dístíñçt]
 result-column_computed = [çömpútéd]
 
 result-column_default = [défáúlt]
+
+result-pin_column_too_wide = [Frözéñ çölúmñs çáñ táké át möst hálf thé gríd; ñárröw öñé ör úñpíñ áñöthér fírst]
 
 result-loading = [Löádíñg…]
 

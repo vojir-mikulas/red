@@ -76,4 +76,8 @@ allow-git = [
     "https://github.com/zed-industries/font-kit",
     "https://github.com/zed-industries/scap",
     "https://github.com/zed-industries/xim-rs",
+    # proptest + proptest-macro: a git rev the pinned Zed tree patches in for
+    # gpui's property tests. Test-only, and not ours to unpin — it moves with
+    # the gpui rev.
+    "https://github.com/proptest-rs/proptest",
 ]

@@ -14,9 +14,9 @@
 //! # Generic over the host view
 //!
 //! Every callback is generic over `V`, the view that hosts the dock, rather than
-//! hardwired to [`AppState`]. That is what lets the SQL dock be its own
-//! [`crate::history::HistoryPanel`] view (which handles its own clicks) while
-//! the Redis dock still renders from `AppState`, with **one** copy of the
+//! hardwired to [`crate::app::AppState`]. That is what lets the SQL dock be its
+//! own [`crate::history::HistoryPanel`] view (which handles its own clicks)
+//! while the Redis dock still renders from `AppState`, with **one** copy of the
 //! chrome serving both. Converting the Redis dock later is a change of `V`, not
 //! a second renderer.
 

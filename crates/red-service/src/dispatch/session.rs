@@ -193,6 +193,17 @@ pub(crate) enum Slot {
     /// The latest `DocFetchPage` (the MongoDB browse grid): selecting a new
     /// collection, or paging the current one, supersedes the in-flight `find`.
     DocPage,
+    /// A running `DocExport` ("Export documents…"). Its own slot for the same
+    /// reason as [`Slot::KvExport`]: a sibling browse fetch on the same epoch must
+    /// not abort an export halfway through a collection.
+    DocExport,
+    /// A running `DocImport` ("Import documents…"), kept apart from every read on
+    /// the same epoch for the reason [`Slot::KvImport`] is.
+    DocImport,
+    /// A live `DocWatch` (a collection's change stream). Long-lived by design,
+    /// like [`Slot::KvSubscribe`]: it stays armed while the panel is open rather
+    /// than being superseded by a follow-up read.
+    DocWatch,
 }
 
 /// The cancellable work in flight for one open result. Each detached fetch carries

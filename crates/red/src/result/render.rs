@@ -79,14 +79,14 @@ fn stat_dot(color: Hsla) -> gpui::AnyElement {
 /// Colors a result cell carries, keyed by value kind (so the grid reads at a
 /// glance the way the design does: numbers orange, UUIDs dimmed, JSON cyan).
 #[derive(Clone, Copy)]
-struct CellColors {
-    text: Hsla,
-    muted: Hsla,
-    num: Hsla,
-    cyan: Hsla,
-    faint: Hsla,
+pub(in crate::result) struct CellColors {
+    pub(in crate::result) text: Hsla,
+    pub(in crate::result) muted: Hsla,
+    pub(in crate::result) num: Hsla,
+    pub(in crate::result) cyan: Hsla,
+    pub(in crate::result) faint: Hsla,
     /// The brand accent, used to mark a foreign-key cell as navigable.
-    accent: Hsla,
+    pub(in crate::result) accent: Hsla,
 }
 
 /// One grid cell, colored by its pre-classified [`CellKind`] (NULL italic-faint,
@@ -94,7 +94,7 @@ struct CellColors {
 /// typed cells). The display string and kind were computed once when the row
 /// landed in the buffer, so this only picks a color and clones a `SharedString`
 /// (an `Arc` bump); no per-frame formatting, copying, or classification.
-fn render_cell(
+pub(in crate::result) fn render_cell(
     cell: &DisplayCell,
     c: CellColors,
     null_display: &SharedString,
@@ -261,6 +261,10 @@ impl AppState {
             theme.text,
         );
         let (num, cyan, red, accent) = (theme.orange, theme.cyan, theme.red, theme.accent);
+        // The surface an open inline editor sits on (see the `inline` branch in
+        // the row renderer): the app's input background, so the cell reads as a
+        // field rather than as a tinted cell.
+        let edit_bg = theme.bg_input;
         // Watch-mode change flash (see `result::watch`).
         let watch_green = theme.green;
         // Scaled chrome sizes snapshotted here (Pixels is Copy) so the result
@@ -567,6 +571,10 @@ impl AppState {
         let null_display: SharedString = self.settings.data.null_display.clone().into();
         let win = grid.prepare_window(row_height);
         let base = win.base;
+        // Nothing else bounds the horizontal offset once a band is frozen (see
+        // `clamp_h_offset`), and the things that can invalidate it — hiding a
+        // column, resizing one, resizing the window — all land here as a repaint.
+        grid.clamp_h_offset(gutter);
         // The selection is stored in absolute ordinals; translate it into the
         // window's local rows for highlighting (off-window rows just aren't
         // painted). The TSV copy reads the buffer in absolute space, so it stays
@@ -639,6 +647,12 @@ impl AppState {
             a: 0.22,
             ..watch_green
         };
+        // The pinned rows' positions, snapshotted for the gutter marker so the
+        // paint path is a set lookup rather than a walk of the pins per row.
+        let pinned_ords = grid.pinned_ordinals();
+        // The row renderer runs outside this method's borrow, so its unpin glyph
+        // reaches the app through a handle rather than a listener.
+        let unpin_view = view.clone();
         // The open inline editor's target cell (existing rows only; draft rows host
         // their own editor in the bottom zone), so the renderer swaps in its field.
         let inline: Option<(usize, usize, Entity<TextInput>)> = is_focused
@@ -648,6 +662,13 @@ impl AppState {
                 EditSlot::Row { row, data_col, .. } => Some((*row, *data_col, e.input.clone())),
                 EditSlot::Draft { .. } => None,
             });
+        // The same cell in the *table* coordinates the click handler speaks, so a
+        // click that lands inside the open editor can be left to the field (see
+        // `on_cell_click`). `None` while no editor is open, or when its column is
+        // hidden and it therefore draws nowhere.
+        let edit_cell: Option<(usize, usize)> = inline
+            .as_ref()
+            .and_then(|(row, data_col, _)| Some((*row, grid.slot_of(*data_col)? + gutter)));
         // When the FK picker is open, the editor cell also hosts a
         // bounds-capturing canvas so the dropdown can anchor below it.
         let suggest_anchor: Option<Entity<Option<gpui::Bounds<Pixels>>>> = is_focused
@@ -693,6 +714,15 @@ impl AppState {
         let table = Table::<()>::new("result-grid", columns)
             .row_count(win.len)
             .row_height(row_height)
+            // Pinned rows ride between the header and the list, inside the
+            // table's horizontal track, so they stay column-aligned as the grid
+            // scrolls sideways and hold still as it scrolls down. Grid state, not
+            // app state, so both split panes show their own.
+            .pinned_rows(self.render_pinned_rows(grid, cx))
+            // The row-number gutter is frozen whenever it is shown: an ordinal
+            // that scrolls away with its row leaves the grid with no fixed
+            // reference at all. Pinned columns extend the same band.
+            .pinned_columns(gutter + grid.frozen_slots())
             .font_family(mono_family.clone())
             .text_size(cell_size)
             .grid_lines(true)
@@ -856,6 +886,14 @@ impl AppState {
                 let extend = event.modifiers().shift;
                 let inspect = event.click_count() >= 2;
                 let abs_row = base + row;
+                // A click inside the open inline editor is the *field's*: it places
+                // the caret or ends a drag-selection. The cell's own handling would
+                // pull focus back to the table, and the commit-on-blur listener
+                // would then close the editor the moment the mouse came up, so a
+                // mouse selection could never survive its own release.
+                if edit_cell == Some((abs_row, table_col)) {
+                    return;
+                }
                 cell_view
                     .update(cx, |this, cx| {
                         // Aim subsequent actions at this pane before they resolve.
@@ -918,7 +956,51 @@ impl AppState {
                         } else {
                             group_digits(abs + 1)
                         };
-                        out.push(div().text_color(faint).child(label).into_any_element());
+                        // A pinned row is also up in the strip, so its ordinal in the
+                        // grid carries the same pin glyph: without it the two copies
+                        // of the row read as two rows.
+                        out.push(if pinned_ords.contains(&abs) {
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_end()
+                                .gap_1()
+                                .child(
+                                    // The glyph is also the release: while the row
+                                    // is on screen the strip does not carry it, so
+                                    // this is the unpin control the user can see.
+                                    // It stops the click there, or the cell under
+                                    // it would select the row on the way past.
+                                    div()
+                                        .id(("row-unpin", abs))
+                                        .cursor_pointer()
+                                        .tooltip(Tooltip::text(crate::i18n::tr!(
+                                            "result.unpin_row",
+                                            "Unpin row"
+                                        )))
+                                        .child(
+                                            gpui::svg()
+                                                .path("icons/pin.svg")
+                                                .size(px(11.))
+                                                .flex_none()
+                                                .text_color(accent),
+                                        )
+                                        .on_click({
+                                            let view = unpin_view.clone();
+                                            move |_, _, cx| {
+                                                cx.stop_propagation();
+                                                view.update(cx, |this, cx| {
+                                                    this.unpin_row_at(abs, cx)
+                                                })
+                                                .ok();
+                                            }
+                                        }),
+                                )
+                                .child(div().text_color(faint).child(label))
+                                .into_any_element()
+                        } else {
+                            div().text_color(faint).child(label).into_any_element()
+                        });
                     }
                 }
                 let resident = buffer.row(abs);
@@ -931,20 +1013,29 @@ impl AppState {
                     // The open inline editor takes over its cell. The field is
                     // `bare`, so it fills the cell (the Flint cell wrapper supplies
                     // the height/padding) rather than drawing a smaller box inside.
+                    // It carries the input background so it reads as a field, and
+                    // so the text selection inside it has an opaque, untinted
+                    // surface to contrast against: the cell-cursor wash the cell
+                    // paints underneath is close enough in hue to the selection
+                    // highlight that the two cancelled each other out.
                     if let Some((er, ec, input)) = &inline
                         && *er == abs
                         && *ec == c
                     {
+                        let field = div()
+                            .size_full()
+                            .flex()
+                            .items_center()
+                            .bg(edit_bg)
+                            .child(input.clone());
                         match &suggest_anchor {
                             Some(anchor) => out.push(
-                                div()
+                                field
                                     .relative()
-                                    .size_full()
-                                    .child(input.clone())
                                     .child(super::suggest::anchor_canvas(anchor.clone()))
                                     .into_any_element(),
                             ),
-                            None => out.push(input.clone().into_any_element()),
+                            None => out.push(field.into_any_element()),
                         }
                         continue;
                     }
@@ -1117,6 +1208,20 @@ impl AppState {
                         }
                     })
                     .child(table)
+                    // The grid's own width, for the horizontal scroll maths: with
+                    // a frozen band the rows sit in no scrolling container, so the
+                    // handle's bounds are never filled in and this is the only
+                    // measurement of the viewport there is.
+                    .child(
+                        gpui::canvas(|_, _, _| (), {
+                            let measured = grid.viewport_w.clone();
+                            move |bounds: gpui::Bounds<Pixels>, _, _, _| {
+                                measured.set(f32::from(bounds.size.width));
+                            }
+                        })
+                        .absolute()
+                        .size_full(),
+                    )
                     .child(scrollbar)
                     .children(
                         self.focus_hint(crate::focus::FocusTargetId::Body {
@@ -1346,6 +1451,9 @@ impl AppState {
             theme.border_soft,
             theme.bg_panel,
         );
+        // Matches the grid's open editor (see `render_grid`): the cell being typed
+        // into wears the input background, so both editors read the same.
+        let edit_bg = theme.bg_input;
         let null_display: SharedString = self.settings.data.null_display.clone().into();
         let cell_colors = CellColors {
             text,
@@ -1367,6 +1475,22 @@ impl AppState {
         // The draft zone lays its cells out against the same display order and
         // per-column widths as the grid above it.
         let draft_cols: Vec<usize> = grid.visible.clone();
+        // The frozen band, mirrored from the grid: the draft rows' leading cells
+        // have to hold the same left edge, or a staged insert's cells would slide
+        // out from under the columns they belong to. The leading action cell rides
+        // with the band (it is the gutter's counterpart here), so the split always
+        // holds at least one cell.
+        let frozen_lead = if grid.frozen_slots() > 0 || self.settings.data.row_numbers {
+            1 + grid.frozen_slots()
+        } else {
+            0
+        };
+        let scroll_w: f32 = draft_cols
+            .iter()
+            .skip(grid.frozen_slots())
+            .map(|&c| grid.width_of(c))
+            .sum();
+        let offset_x = grid.h_scroll.offset().x;
         // Indexed by *data* column, like the loop variable below, so a reordered
         // grid still gives each cell the width of the column it holds.
         let widths: Vec<f32> = (0..ncols).map(|c| grid.width_of(c)).collect();
@@ -1431,6 +1555,7 @@ impl AppState {
                             .items_center()
                             .border_r_1()
                             .border_color(line)
+                            .bg(edit_bg)
                             .child(input.clone())
                             // Anchor the FK picker below this draft cell.
                             .when_some(
@@ -1503,11 +1628,17 @@ impl AppState {
                 div()
                     .flex()
                     .items_center()
-                    .w(px(content_w))
+                    // Whole-width while the zone is the thing that x-scrolls; with
+                    // a band frozen the row carries its own track instead and fills
+                    // the pane, exactly like the rows above it.
+                    .when(frozen_lead == 0, |d| d.w(px(content_w)))
+                    .when(frozen_lead > 0, |d| d.w_full())
                     .h(row_height)
                     .border_b_1()
                     .border_color(line)
-                    .children(cells),
+                    .map(|row| {
+                        super::pinned::split_row(row, cells, frozen_lead, scroll_w, offset_x)
+                    }),
             );
         }
 
@@ -1524,8 +1655,12 @@ impl AppState {
             // of being squeezed to fit it — that extent is what x-scrolls. At
             // least the viewport's width, so a wheel over the strip beside
             // narrower columns still lands on this (the vertical) container.
-            .w(px(content_w))
-            .min_w(gpui::relative(1.))
+            // Frozen columns move that extent inside each row, so the zone itself
+            // is then just as wide as the pane.
+            .when(frozen_lead == 0, |d| {
+                d.w(px(content_w)).min_w(gpui::relative(1.))
+            })
+            .when(frozen_lead > 0, |d| d.w_full())
             .flex_shrink_0()
             .max_h(px(row_h * DRAFT_ZONE_ROWS))
             .flex()
@@ -1534,14 +1669,26 @@ impl AppState {
             .track_scroll(&grid.draft_scroll)
             .children(rows);
         vscroll.style().restrict_scroll_to_axis = Some(true);
-        let mut hscroll = div()
-            .id("draft-rows")
-            .w_full()
-            .flex_shrink_0()
-            .overflow_x_scroll()
-            .track_scroll(&grid.h_scroll)
-            .child(vscroll);
-        hscroll.style().restrict_scroll_to_axis = Some(true);
+        // The x-scrolling wrapper exists only while the zone scrolls as a whole.
+        // With a band frozen, wrapping the split rows in it would scroll the band
+        // away with them.
+        let scroller = if frozen_lead > 0 {
+            div()
+                .id("draft-rows")
+                .w_full()
+                .flex_shrink_0()
+                .child(vscroll)
+        } else {
+            let mut hscroll = div()
+                .id("draft-rows")
+                .w_full()
+                .flex_shrink_0()
+                .overflow_x_scroll()
+                .track_scroll(&grid.h_scroll)
+                .child(vscroll);
+            hscroll.style().restrict_scroll_to_axis = Some(true);
+            hscroll
+        };
 
         // The zone's own scrollbar, so a change-set taller than the zone reads as
         // scrollable rather than truncated. Every draft row is exactly
@@ -1572,7 +1719,7 @@ impl AppState {
                 .border_color(border)
                 .font_family(mono_family)
                 .text_size(cell_size)
-                .child(hscroll)
+                .child(scroller)
                 .child(
                     Scrollbar::new("draft-scrollbar", &grid.draft_scrollbar)
                         .fraction(fraction)
@@ -1863,6 +2010,25 @@ impl AppState {
                         })),
                 );
         }
+        // Pinning is display-only, so it is offered on every result (editor SQL
+        // included) and never gated on the edit contract. The label names what the
+        // click will do to the row under the cursor.
+        menu = menu.separator().item(
+            ContextMenuItem::new(
+                "row-pin",
+                if self.cursor_row_pinned() {
+                    "Unpin row"
+                } else {
+                    "Pin row"
+                },
+            )
+            .shortcut(crate::keymap::localize_hint("⌥⌘P"))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.cell_menu = None;
+                this.toggle_pin_rows(cx);
+                cx.notify();
+            })),
+        );
         if editable_browse {
             menu = menu.item(
                 ContextMenuItem::new("row-delete", "Toggle row deletion")
@@ -1917,6 +2083,7 @@ impl AppState {
             ),
             None => (String::new(), 0, Vec::new()),
         };
+        let frozen = grid.map(|g| g.frozen_slots()).unwrap_or(0);
 
         let mut menu = ContextMenu::new("result-header-menu")
             .item(
@@ -1986,6 +2153,63 @@ impl AppState {
                     },
                 )),
             );
+        }
+
+        // Freezing. A frozen column holds the left edge while the rest scrolls
+        // under it; the band is contiguous, so pinning the n-th column pins
+        // everything up to it and unpinning one releases it and everything after.
+        // Withheld when there is only one column, where a frozen band would leave
+        // nothing to scroll.
+        if visible_len > 1 {
+            menu = menu.separator();
+            menu = if slot < frozen {
+                menu.item(
+                    ContextMenuItem::new("header-unpin", format!("Unpin {name}")).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.header_menu = None;
+                            this.with_grid(cx, |grid| grid.unpin_column_at(slot));
+                            cx.notify();
+                        }),
+                    ),
+                )
+            } else {
+                menu.item(
+                    ContextMenuItem::new("header-pin", format!("Pin {name} left")).on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.header_menu = None;
+                            let gutter = this.gutter();
+                            let pinned =
+                                this.with_grid(cx, |grid| grid.pin_column_at(slot, gutter));
+                            // The band has a ceiling (see `MAX_FROZEN_FRACTION`);
+                            // a refusal that said nothing would read as a dead menu
+                            // item.
+                            if pinned == Some(false) {
+                                this.notify(
+                                    ToastVariant::Info,
+                                    crate::i18n::tr!(
+                                        "result.pin_column_too_wide",
+                                        "Frozen columns can take at most half the grid; \
+                                         narrow one or unpin another first"
+                                    ),
+                                    cx,
+                                );
+                            }
+                            cx.notify();
+                        }),
+                    ),
+                )
+            };
+            if frozen > 0 {
+                menu = menu.item(
+                    ContextMenuItem::new("header-unpin-all", "Unpin all columns").on_click(
+                        cx.listener(|this, _, _, cx| {
+                            this.header_menu = None;
+                            this.with_grid(cx, |grid| grid.unpin_all_columns());
+                            cx.notify();
+                        }),
+                    ),
+                );
+            }
         }
 
         // Hiding the last visible column would leave no header to right-click, so
@@ -2136,6 +2360,19 @@ impl AppState {
                     cx.notify();
                 }),
             ));
+        }
+        // Offered only with rows pinned: the strip is the only thing this entry
+        // acts on, and an always-present "Unpin all" would imply pinning lives here.
+        let pinned = self.pinned_row_count();
+        if pinned > 0 {
+            menu = menu.item(
+                ContextMenuItem::new("more-unpin-all", format!("Unpin all rows ({pinned})"))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.more_menu = None;
+                        this.unpin_all_rows(cx);
+                        cx.notify();
+                    })),
+            );
         }
         div()
             .absolute()

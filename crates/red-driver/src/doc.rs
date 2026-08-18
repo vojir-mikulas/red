@@ -16,7 +16,18 @@ use red_core::doc::{
     DocUpdate, DocValue, Document, Filter, FindQuery, IndexInfo, IndexSpec,
 };
 
+use std::pin::Pin;
+
+use futures_util::Stream;
+
 use crate::AbortSignal;
+
+/// A live change stream over a collection (see [`DocDriver::watch`]). Boxed
+/// because the concrete stream type is engine-specific, exactly like
+/// [`KvSubscription`](crate::KvSubscription).
+pub struct DocChangeStream {
+    pub stream: Pin<Box<dyn Stream<Item = red_core::doc::DocChange> + Send>>,
+}
 
 /// One open document-store session. The parallel seam to [`DatabaseDriver`](crate::DatabaseDriver)
 /// and [`KvDriver`](crate::KvDriver) for engines that are document-shaped.
@@ -54,16 +65,26 @@ pub trait DocDriver: Send + Sync {
 
     /// One `_id`-keyset window for the browse grid's continuous scroll: the docs
     /// ordered by `_id` ascending, seeked relative to a boundary `_id` per
-    /// [`DocSeek`], narrowed by the same `filter` a `find` takes. O(window) at any
-    /// depth on the always present `_id` index (unlike the O(skip) `find`), except
-    /// a [`DocSeek::Jump`] which pays one `skip` to land at an exact ordinal.
-    /// Returns at most `limit` documents, always in ascending `_id` order.
-    /// Cancellable via `abort`; never materializes more than the window.
+    /// [`DocSeek`], narrowed by the same `filter` a `find` takes and trimmed to
+    /// `projection` when one is given. O(window) at any depth on the always present
+    /// `_id` index (unlike the O(skip) `find`), except a [`DocSeek::Jump`] which
+    /// pays one `skip` to land at an exact ordinal. Returns at most `limit`
+    /// documents, always in ascending `_id` order. Cancellable via `abort`; never
+    /// materializes more than the window.
+    ///
+    /// A *sorted* browse does not come through here: the keyset boundary is an
+    /// `_id`, which orders nothing once another key leads. That case pages by
+    /// position through [`find`](Self::find).
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a window is addressed by namespace, narrowing, seek and bound; bundling them into a struct would only move the same fields behind a name the call sites do not need"
+    )]
     async fn find_seek(
         &self,
         db: &str,
         coll: &str,
         filter: Option<&Filter>,
+        projection: Option<&red_core::doc::Projection>,
         seek: DocSeek,
         limit: usize,
         abort: &AbortSignal,
@@ -110,6 +131,16 @@ pub trait DocDriver: Send + Sync {
     /// A collection's indexes (`listIndexes`) with keys / unique / sparse / ttl /
     /// partial, for the indexes panel.
     async fn indexes(&self, db: &str, coll: &str) -> Result<Vec<IndexInfo>>;
+
+    /// A collection's storage numbers (`collStats`): size, allocated storage,
+    /// mean document size, per-index bytes. The default reports nothing, for an
+    /// engine with no such command.
+    async fn coll_stats(&self, db: &str, coll: &str) -> Result<red_core::doc::CollStats> {
+        let _ = (db, coll);
+        Err(red_core::RedError::Driver(
+            "this engine reports no collection statistics".to_string(),
+        ))
+    }
 
     /// `explain` a find query: the winning plan, the index used (if any), and the
     /// examined/returned numbers, so the UI can flag a `COLLSCAN` and the "missing
@@ -189,6 +220,15 @@ pub trait DocDriver: Send + Sync {
     /// Insert documents (`insertMany`), returning how many were inserted.
     async fn insert(&self, db: &str, coll: &str, docs: &[Document]) -> Result<u64>;
 
+    /// Write documents, replacing any that already carry the same `_id`
+    /// (`replaceOne` with `upsert`), and return how many were written. What makes
+    /// re-importing an export idempotent instead of a duplicate-key error.
+    ///
+    /// A document whose `_id` is absent is inserted: there is no identity to match
+    /// on, so upserting against a null `_id` would collapse every such document
+    /// onto one.
+    async fn upsert(&self, db: &str, coll: &str, docs: &[Document]) -> Result<u64>;
+
     /// Update documents matching `filter` (`updateOne`/`updateMany`) — a
     /// `$set` patch or a full replacement per [`DocUpdate`] — returning the
     /// modified count. `many` chooses one vs. all matches.
@@ -218,6 +258,43 @@ pub trait DocDriver: Send + Sync {
 
     /// Create an index (`createIndex`).
     async fn create_index(&self, db: &str, coll: &str, spec: &IndexSpec) -> Result<()>;
+
+    /// Drop an index by name (`dropIndexes`). Destructive: the queries that relied
+    /// on it become collection scans, so the host gate confirms it first.
+    async fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<()>;
+
+    /// Watch a collection for changes (`watch`), yielding one event per change
+    /// until the returned stream is dropped.
+    ///
+    /// Requires a replica set or a sharded cluster: change streams read the
+    /// oplog, which a standalone does not keep. The caller checks
+    /// [`topology`](Self::topology) first so the refusal is a sentence rather
+    /// than a driver error.
+    ///
+    /// `resume_after` restarts from a token a previous stream reported, which is
+    /// how a viewer picks up where it left off instead of from "now".
+    async fn watch(
+        &self,
+        db: &str,
+        coll: &str,
+        resume_after: Option<&str>,
+    ) -> Result<DocChangeStream> {
+        let _ = (db, coll, resume_after);
+        Err(red_core::RedError::Driver(
+            "this engine has no change streams".to_string(),
+        ))
+    }
+
+    /// Set a collection's validator (`collMod`), or remove it with `None`.
+    /// `validator` is extended-JSON text, parsed by the driver. Existing documents
+    /// are **not** re-checked: a validator governs future writes, which is the
+    /// server's semantics and worth knowing before setting one.
+    async fn set_validator(&self, db: &str, coll: &str, validator: Option<&str>) -> Result<()> {
+        let _ = (db, coll, validator);
+        Err(red_core::RedError::Driver(
+            "this engine has no collection validators".to_string(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -316,6 +393,7 @@ mod tests {
             db: &str,
             coll: &str,
             _filter: Option<&Filter>,
+            _projection: Option<&red_core::doc::Projection>,
             seek: DocSeek,
             limit: usize,
             _abort: &AbortSignal,
@@ -447,6 +525,22 @@ mod tests {
                 .extend(docs.iter().cloned());
             Ok(docs.len() as u64)
         }
+        async fn upsert(&self, db: &str, coll: &str, docs: &[Document]) -> Result<u64> {
+            self.ensure_writable()?;
+            let mut data = self.data.lock().unwrap();
+            let slot = data
+                .entry(db.to_string())
+                .or_default()
+                .entry(coll.to_string())
+                .or_default();
+            for doc in docs {
+                match slot.iter_mut().find(|d| d.id == doc.id) {
+                    Some(existing) => *existing = doc.clone(),
+                    None => slot.push(doc.clone()),
+                }
+            }
+            Ok(docs.len() as u64)
+        }
         async fn update(
             &self,
             _db: &str,
@@ -519,6 +613,10 @@ mod tests {
             Ok(())
         }
         async fn create_index(&self, _db: &str, _coll: &str, _spec: &IndexSpec) -> Result<()> {
+            self.ensure_writable()?;
+            Ok(())
+        }
+        async fn drop_index(&self, _db: &str, _coll: &str, _name: &str) -> Result<()> {
             self.ensure_writable()?;
             Ok(())
         }

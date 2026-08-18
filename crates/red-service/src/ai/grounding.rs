@@ -431,6 +431,7 @@ mod tests {
             sql: sql.to_string(),
             conn_id: "a".into(),
             ran_unix: 0,
+            namespace: None,
         }
     }
 

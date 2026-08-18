@@ -48,6 +48,11 @@ pub struct HistoryEntry {
     /// Unix seconds when it ran (0 if the clock was before the epoch).
     #[serde(default)]
     pub ran_unix: u64,
+    /// The `db.collection` a document-store entry ran against. `None` for SQL and
+    /// Redis, which address nothing this way -- their statement carries its own
+    /// target. Defaulted, so a file written before this field reads back fine.
+    #[serde(default)]
+    pub namespace: Option<String>,
 }
 
 /// The on-disk shape: a wrapper object (not a bare array) so the format can grow
@@ -118,12 +123,20 @@ impl QueryHistory {
     /// human-authored, and feeding the agent's own output back in is a confidence
     /// loop with no ground truth.
     pub fn record(&mut self, conn_id: &str, sql: &str) {
+        self.record_scoped(conn_id, sql, None);
+    }
+
+    /// [`record`](Self::record) for a document store, tagging the entry with the
+    /// `db.collection` it ran against. The same statement text against two
+    /// collections is two different queries, so the namespace takes part in the
+    /// de-dupe rather than only in the label.
+    pub fn record_scoped(&mut self, conn_id: &str, sql: &str, namespace: Option<String>) {
         // The first entry matching this connection is its most recent one.
         let dup = self
             .entries
             .iter()
             .find(|e| e.conn_id == conn_id)
-            .is_some_and(|e| e.sql == sql);
+            .is_some_and(|e| e.sql == sql && e.namespace == namespace);
         if dup {
             return;
         }
@@ -136,6 +149,7 @@ impl QueryHistory {
                 sql: cap_entry_sql(sql),
                 conn_id: conn_id.to_string(),
                 ran_unix: crate::config::now(),
+                namespace,
             },
         );
         self.prune();
@@ -353,12 +367,27 @@ mod tests {
     }
 
     #[test]
+    fn a_namespace_is_part_of_a_document_entry_s_identity() {
+        let mut h = QueryHistory::in_memory();
+        h.record_scoped("a", "{}", Some("app.orders".into()));
+        // The same text against another collection is another query.
+        h.record_scoped("a", "{}", Some("app.customers".into()));
+        // The same text against the same collection is the same query.
+        h.record_scoped("a", "{}", Some("app.customers".into()));
+        let entries = h.for_conn("a");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].namespace.as_deref(), Some("app.customers"));
+        assert_eq!(entries[1].namespace.as_deref(), Some("app.orders"));
+    }
+
+    #[test]
     fn round_trips_through_json() {
         let entries = vec![HistoryEntry {
             id: 7,
             sql: "select 1".into(),
             conn_id: "a".into(),
             ran_unix: 123,
+            namespace: None,
         }];
         let json = serde_json::to_string_pretty(&HistoryFile {
             entries: entries.clone(),

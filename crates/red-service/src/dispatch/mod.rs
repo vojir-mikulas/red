@@ -233,6 +233,25 @@ async fn apply_doc_write(
             driver.drop_collection(&db, &coll).await?;
             Ok(format!("dropped collection {coll}"))
         }
+        DocWrite::DropIndex { db, coll, name } => {
+            driver.drop_index(&db, &coll, &name).await?;
+            Ok(format!("dropped index {name}"))
+        }
+        DocWrite::SetValidator {
+            db,
+            coll,
+            validator,
+        } => {
+            let removing = validator.is_none();
+            driver
+                .set_validator(&db, &coll, validator.as_deref())
+                .await?;
+            Ok(if removing {
+                format!("removed the validator on {coll}")
+            } else {
+                format!("set the validator on {coll}")
+            })
+        }
         DocWrite::CreateIndex { db, coll, spec } => {
             driver.create_index(&db, &coll, &spec).await?;
             Ok("index created".into())
@@ -453,6 +472,23 @@ fn doc_write_prompt(write: &red_core::doc::DocWrite) -> String {
         DocWrite::Update { db, coll, .. } => {
             format!("Update all matching documents in {db}.{coll}?")
         }
+        DocWrite::DropIndex { db, coll, name } => format!(
+            "Drop index {name} on {db}.{coll}? Queries that relied on it will scan the whole \
+             collection until it is rebuilt."
+        ),
+        DocWrite::SetValidator {
+            db,
+            coll,
+            validator,
+        } => match validator {
+            Some(_) => format!(
+                "Set the validator on {db}.{coll}? Documents already stored are not re-checked; \
+                 it governs future writes, which it can start rejecting."
+            ),
+            None => format!(
+                "Remove the validator on {db}.{coll}? Nothing will be checked on write after this."
+            ),
+        },
         _ => "Apply this write?".into(),
     }
 }
@@ -2543,7 +2579,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         Err(RedError::Interrupted) => {
                             emit(&events, session_id, Event::ExportCancelled { id })
                         }
-                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::ExportFailed {
+                                id,
+                                message: e.to_string(),
+                            },
+                        ),
                     }
                 });
             }
@@ -3451,6 +3494,8 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 db,
                 coll,
                 filter,
+                projection,
+                sort,
                 seek,
                 limit,
                 seq,
@@ -3461,22 +3506,49 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 else {
                     continue;
                 };
-                // Parse the extended-JSON filter up front so a syntax error is a
-                // clean `DocError` rather than a failed find deep in the spawn.
-                let filter = match filter.as_deref().map(|f| driver.parse_ext_json(f)) {
-                    Some(Ok(f)) => Some(f),
-                    Some(Err(e)) => {
+                // Parse every extended-JSON document up front so a syntax error is
+                // a clean `DocError` rather than a failed find deep in the spawn.
+                macro_rules! parse_opt {
+                    ($text:expr_2021) => {
+                        match $text.as_deref().map(|t| driver.parse_ext_json(t)) {
+                            Some(Ok(v)) => Some(v),
+                            Some(Err(e)) => {
+                                emit(
+                                    &events,
+                                    session_id,
+                                    Event::DocError {
+                                        epoch,
+                                        message: e.to_string(),
+                                    },
+                                );
+                                continue;
+                            }
+                            None => None,
+                        }
+                    };
+                }
+                let filter = parse_opt!(filter);
+                let projection = parse_opt!(projection);
+                let sort = parse_opt!(sort);
+                // A sorted browse pages by position, because the `_id` boundary a
+                // keyset seek carries orders nothing once another key leads. The
+                // window buffer only ever sends `Jump` in that mode; anything else
+                // is a bug worth naming rather than silently mispaging.
+                let skip = match (&sort, &seek) {
+                    (None, _) => None,
+                    (Some(_), red_core::doc::DocSeek::Jump { skip }) => Some(*skip),
+                    (Some(_), red_core::doc::DocSeek::Forward { after: None }) => Some(0),
+                    (Some(_), _) => {
                         emit(
                             &events,
                             session_id,
                             Event::DocError {
                                 epoch,
-                                message: e.to_string(),
+                                message: "a sorted browse pages by position, not by _id".into(),
                             },
                         );
                         continue;
                     }
-                    None => None,
                 };
                 // A new window (or a new collection selection) supersedes the
                 // in-flight seek, like a flung SQL scrollbar.
@@ -3484,10 +3556,38 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                 let abort = entry.supersede(Slot::DocPage);
                 let events = events.clone();
                 tokio::spawn(async move {
-                    let docs = match driver
-                        .find_seek(&db, &coll, filter.as_ref(), seek.clone(), limit, &abort)
-                        .await
-                    {
+                    let window = match skip {
+                        Some(skip) => driver
+                            .find(
+                                &red_core::doc::FindQuery {
+                                    db: db.clone(),
+                                    coll: coll.clone(),
+                                    filter: filter.clone(),
+                                    projection,
+                                    sort,
+                                    skip,
+                                    limit: Some(limit as u64),
+                                    batch: limit,
+                                },
+                                &abort,
+                            )
+                            .await
+                            .map(|page| page.docs),
+                        None => {
+                            driver
+                                .find_seek(
+                                    &db,
+                                    &coll,
+                                    filter.as_ref(),
+                                    projection.as_ref(),
+                                    seek.clone(),
+                                    limit,
+                                    &abort,
+                                )
+                                .await
+                        }
+                    };
+                    let docs = match window {
                         Ok(docs) => docs,
                         // A superseded fetch emits nothing; a real failure both
                         // surfaces (banner) and frees the buffer's in-flight slot.
@@ -3570,6 +3670,206 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                                 message: e.to_string(),
                             },
                         ),
+                    }
+                });
+            }
+
+            Command::DocWatch {
+                epoch,
+                db,
+                coll,
+                resume_after,
+            } => {
+                let Some((state, driver)) =
+                    require_doc_driver_mut(&mut sessions, session_id, &events)
+                else {
+                    continue;
+                };
+                let entry = state.inflight.entry(epoch).or_default();
+                let abort = entry.supersede(Slot::DocWatch);
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let mut watch = match driver.watch(&db, &coll, resume_after.as_deref()).await {
+                        Ok(w) => w,
+                        Err(e) => {
+                            emit(
+                                &events,
+                                session_id,
+                                Event::DocError {
+                                    epoch,
+                                    message: e.to_string(),
+                                },
+                            );
+                            emit(
+                                &events,
+                                session_id,
+                                Event::DocWatchEnded {
+                                    epoch,
+                                    message: None,
+                                },
+                            );
+                            return;
+                        }
+                    };
+                    // A change stream has no native cancel, like a Redis Pub/Sub
+                    // subscription: poll with a bounded timeout so a stop is
+                    // noticed within a tick rather than blocking on a change that
+                    // may never come.
+                    let mut rate = StreamRate::new();
+                    loop {
+                        if abort.is_aborted() {
+                            return;
+                        }
+                        match tokio::time::timeout(Duration::from_millis(500), watch.stream.next())
+                            .await
+                        {
+                            Ok(Some(change)) => {
+                                let terminal = change.op.is_terminal();
+                                // Rate-limit a busy collection so it cannot
+                                // outgrow the event channel.
+                                let (admit, dropped) = rate.admit();
+                                if let Some(n) = dropped {
+                                    emit(
+                                        &events,
+                                        session_id,
+                                        Event::DocError {
+                                            epoch,
+                                            message: format!(
+                                                "{n} change(s) dropped: they arrived faster than \
+                                                 the viewer can show them"
+                                            ),
+                                        },
+                                    );
+                                }
+                                if admit {
+                                    emit(&events, session_id, Event::DocChanged { epoch, change });
+                                }
+                                if terminal {
+                                    emit(
+                                        &events,
+                                        session_id,
+                                        Event::DocWatchEnded {
+                                            epoch,
+                                            message: Some(
+                                                "the collection was dropped or renamed".into(),
+                                            ),
+                                        },
+                                    );
+                                    return;
+                                }
+                            }
+                            // The stream closed on its own.
+                            Ok(None) => {
+                                emit(
+                                    &events,
+                                    session_id,
+                                    Event::DocWatchEnded {
+                                        epoch,
+                                        message: None,
+                                    },
+                                );
+                                return;
+                            }
+                            Err(_) => continue,
+                        }
+                    }
+                });
+            }
+
+            Command::DocWatchStop { epoch } => {
+                let Some(sid) = session_id else { continue };
+                if let Some(state) = sessions.get_mut(&sid)
+                    && let Some(entry) = state.inflight.get(&epoch)
+                    && let Some(sig) = entry.slot(Slot::DocWatch)
+                {
+                    sig.abort();
+                }
+            }
+
+            Command::DocReferenceMap { epoch, db } => {
+                let Some(driver) = require_doc_driver(&sessions, session_id, &events) else {
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    match jobs::infer_references(&driver, &db).await {
+                        Ok((collections, references)) => emit(
+                            &events,
+                            session_id,
+                            Event::DocReferencesReady {
+                                epoch,
+                                db,
+                                collections,
+                                references,
+                            },
+                        ),
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::DocError {
+                                epoch,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
+            }
+
+            Command::DocValidatorTest {
+                epoch,
+                db,
+                coll,
+                validator,
+            } => {
+                let Some(driver) = require_doc_driver(&sessions, session_id, &events) else {
+                    continue;
+                };
+                let parsed = driver.parse_ext_json(&validator);
+                let events = events.clone();
+                tokio::spawn(async move {
+                    let (matching, total, error) = match parsed {
+                        Err(e) => (0, 0, Some(e.to_string())),
+                        Ok(filter) => {
+                            let total = driver.count(&db, &coll, None).await.unwrap_or(0);
+                            match driver.count(&db, &coll, Some(&filter)).await {
+                                Ok(matching) => (matching, total, None),
+                                Err(e) => (0, total, Some(e.to_string())),
+                            }
+                        }
+                    };
+                    emit(
+                        &events,
+                        session_id,
+                        Event::DocValidatorTested {
+                            epoch,
+                            matching,
+                            total,
+                            error,
+                        },
+                    );
+                });
+            }
+
+            Command::DocCollStats { epoch, db, coll } => {
+                let Some(driver) = require_doc_driver(&sessions, session_id, &events) else {
+                    continue;
+                };
+                let events = events.clone();
+                tokio::spawn(async move {
+                    // Silent on failure: the numbers are an enrichment, and a role
+                    // without `collStats` should still be able to read a schema.
+                    match driver.coll_stats(&db, &coll).await {
+                        Ok(stats) => emit(
+                            &events,
+                            session_id,
+                            Event::DocStatsReady {
+                                epoch,
+                                db,
+                                coll,
+                                stats,
+                            },
+                        ),
+                        Err(e) => tracing::debug!("collStats for {db}.{coll}: {e}"),
                     }
                 });
             }
@@ -3755,16 +4055,24 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         batch: DOC_PAGE_ROWS,
                     };
                     match driver.explain(&query).await {
-                        Ok(plan) => emit(
-                            &events,
-                            session_id,
-                            Event::DocPlanReady {
-                                epoch,
-                                db,
-                                coll,
-                                plan,
-                            },
-                        ),
+                        Ok(plan) => {
+                            let advice = query
+                                .filter
+                                .as_ref()
+                                .map(|f| red_core::doc::suggested_index_keys(f, &plan))
+                                .unwrap_or_default();
+                            emit(
+                                &events,
+                                session_id,
+                                Event::DocPlanReady {
+                                    epoch,
+                                    db,
+                                    coll,
+                                    plan,
+                                    advice,
+                                },
+                            )
+                        }
                         Err(e) => emit(
                             &events,
                             session_id,
@@ -3890,6 +4198,222 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         Err(e) => Err(e),
                     };
                     emit_doc_write_outcome(&events, session_id, epoch, outcome);
+                });
+            }
+
+            Command::DocExport {
+                epoch,
+                id,
+                db,
+                coll,
+                filter,
+                format,
+                path,
+            } => {
+                let Some((state, driver)) =
+                    require_doc_driver_mut(&mut sessions, session_id, &events)
+                else {
+                    continue;
+                };
+                // Parse the filter up front, like `DocFetchRun`, so a syntax error
+                // is a clean refusal rather than a toast that opens and then fails.
+                let filter = match filter.as_deref().map(|f| driver.parse_ext_json(f)) {
+                    Some(Ok(f)) => Some(f),
+                    Some(Err(e)) => {
+                        emit(
+                            &events,
+                            session_id,
+                            Event::DocError {
+                                epoch,
+                                message: e.to_string(),
+                            },
+                        );
+                        continue;
+                    }
+                    None => None,
+                };
+                // Register the cancel flag before the task starts, so a fast
+                // `CancelExport` cannot race ahead of it (see `Command::Export`).
+                let cancel = Arc::new(AtomicBool::new(false));
+                lock(&state.exports).insert(id, cancel.clone());
+                let entry = state.inflight.entry(epoch).or_default();
+                entry.supersede(Slot::DocExport);
+
+                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                {
+                    let events = events.clone();
+                    tokio::spawn(async move {
+                        while let Some(rows) = progress_rx.recv().await {
+                            emit(
+                                &events,
+                                session_id,
+                                Event::ExportProgress {
+                                    id,
+                                    rows: rows as usize,
+                                },
+                            );
+                        }
+                    });
+                }
+                let exports = state.exports.clone();
+                let events = events.clone();
+                // Pin against idle eviction: a whole-collection export runs for
+                // minutes with no commands, and an eviction would flip the cancel
+                // flag and toast "cancelled" out of nowhere.
+                let pin = PinGuard::new(state.busy.clone());
+                tokio::spawn(async move {
+                    let _pin = pin;
+                    let path_str = path.to_string_lossy().into_owned();
+                    let req = red_driver::DocExportRequest {
+                        format,
+                        filter,
+                        columns: Vec::new(),
+                    };
+                    let result = red_driver::run_doc_export(
+                        &driver,
+                        &db,
+                        &coll,
+                        &path,
+                        req,
+                        &cancel,
+                        progress_tx,
+                    )
+                    .await;
+                    lock(&exports).remove(&id);
+                    match result {
+                        Ok(outcome) => emit(
+                            &events,
+                            session_id,
+                            Event::ExportFinished {
+                                id,
+                                path: path_str,
+                                rows: outcome.rows as usize,
+                                shortfall: outcome.shortfall,
+                            },
+                        ),
+                        Err(RedError::Interrupted) => {
+                            emit(&events, session_id, Event::ExportCancelled { id });
+                        }
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::ExportFailed {
+                                id,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
+            }
+
+            Command::DocImportPeek {
+                epoch,
+                path,
+                format,
+                limit,
+            } => {
+                let Some(driver) = require_doc_driver(&sessions, session_id, &events) else {
+                    continue;
+                };
+                let events = events.clone();
+                // Off the loop and off the async threads: the peek opens a file and
+                // parses, both blocking.
+                tokio::task::spawn_blocking(move || {
+                    let (docs, error) = jobs::peek_documents(&driver, &path, format, limit);
+                    emit(
+                        &events,
+                        session_id,
+                        Event::DocImportPreview { epoch, docs, error },
+                    );
+                });
+            }
+
+            Command::DocImport {
+                epoch,
+                id,
+                db,
+                coll,
+                path,
+                format,
+                mode,
+            } => {
+                let Some((state, driver)) =
+                    require_doc_driver_mut(&mut sessions, session_id, &events)
+                else {
+                    continue;
+                };
+                // Defense in depth, matching `Command::Import`: the driver refuses
+                // writes too, but only once the job is under way, so without this
+                // the user gets a mid-import failure instead of a clean refusal.
+                if state.read_only {
+                    emit(
+                        &events,
+                        session_id,
+                        Event::ImportFailed {
+                            id,
+                            rows: 0,
+                            message: "this connection is read-only".into(),
+                        },
+                    );
+                    continue;
+                }
+                // The session's shared transfer-cancel registry (one id space with
+                // exports), so a `CancelImport` flips this flag.
+                let cancel = Arc::new(AtomicBool::new(false));
+                lock(&state.exports).insert(id, cancel.clone());
+                let entry = state.inflight.entry(epoch).or_default();
+                entry.supersede(Slot::DocImport);
+
+                let (progress_tx, mut progress_rx) = tokio::sync::mpsc::unbounded_channel::<u64>();
+                {
+                    let events = events.clone();
+                    tokio::spawn(async move {
+                        while let Some(rows) = progress_rx.recv().await {
+                            emit(
+                                &events,
+                                session_id,
+                                Event::ImportProgress {
+                                    id,
+                                    rows: rows as usize,
+                                },
+                            );
+                        }
+                    });
+                }
+                let imports = state.exports.clone();
+                let events = events.clone();
+                let pin = PinGuard::new(state.busy.clone());
+                let handle = tokio::runtime::Handle::current();
+                tokio::task::spawn_blocking(move || {
+                    let _pin = pin;
+                    let (rows, error) = jobs::run_doc_import_blocking(
+                        driver,
+                        path,
+                        format,
+                        db,
+                        coll,
+                        mode,
+                        cancel,
+                        progress_tx,
+                        handle,
+                    );
+                    lock(&imports).remove(&id);
+                    let rows = rows as usize;
+                    match error {
+                        None => emit(&events, session_id, Event::ImportFinished { id, rows }),
+                        Some(RedError::Interrupted) => {
+                            emit(&events, session_id, Event::ImportCancelled { id, rows });
+                        }
+                        Some(e) => emit(
+                            &events,
+                            session_id,
+                            Event::ImportFailed {
+                                id,
+                                rows,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
                 });
             }
 
@@ -4946,7 +5470,14 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                         Err(RedError::Interrupted) => {
                             emit(&events, session_id, Event::ExportCancelled { id })
                         }
-                        Err(e) => emit(&events, session_id, Event::Error(e.to_string())),
+                        Err(e) => emit(
+                            &events,
+                            session_id,
+                            Event::ExportFailed {
+                                id,
+                                message: e.to_string(),
+                            },
+                        ),
                     }
                 });
             }
@@ -5243,6 +5774,107 @@ pub(crate) async fn dispatch(mut commands: CmdReceiver<Envelope>, events: Events
                     .await;
                     lock(&exports).remove(&id);
                     let rows = committed as usize;
+                    match err {
+                        None => emit(&events, None, Event::CopyFinished { id, rows }),
+                        Some(RedError::Interrupted) => {
+                            emit(&events, None, Event::CopyCancelled { id, rows })
+                        }
+                        Some(e) => emit(
+                            &events,
+                            None,
+                            Event::CopyFailed {
+                                id,
+                                rows,
+                                message: e.to_string(),
+                            },
+                        ),
+                    }
+                });
+            }
+
+            Command::DocCopyCollection {
+                id,
+                source_db,
+                source_coll,
+                filter,
+                target_session,
+                target_db,
+                target_coll,
+                mode,
+            } => {
+                // Fail fast with a `CopyFailed` on any missing piece, so the UI
+                // never strands a "Copying…" toast (mirrors `CopyToTable`).
+                macro_rules! copy_fail {
+                    ($msg:expr_2021) => {{
+                        emit(
+                            &events,
+                            None,
+                            Event::CopyFailed {
+                                id,
+                                rows: 0,
+                                message: $msg.into(),
+                            },
+                        );
+                        continue;
+                    }};
+                }
+                let Some(source_sid) = session_id else {
+                    continue;
+                };
+                let Some(src_state) = sessions.get(&source_sid) else {
+                    copy_fail!("source connection isn't open")
+                };
+                let Some(src) = src_state.driver.as_doc().cloned() else {
+                    copy_fail!("source isn't a MongoDB connection")
+                };
+                let filter = match filter.as_deref().map(|f| src.parse_ext_json(f)) {
+                    Some(Ok(f)) => Some(f),
+                    Some(Err(e)) => copy_fail!(e.to_string()),
+                    None => None,
+                };
+                let src_busy = src_state.busy.clone();
+                let exports = src_state.exports.clone();
+
+                let Some(dst_state) = sessions.get(&target_session) else {
+                    copy_fail!("target connection isn't open")
+                };
+                // Defense in depth alongside the UI's target filter: never write to
+                // a read-only destination, even if a stale command reaches here.
+                if dst_state.read_only {
+                    copy_fail!("target connection is read-only")
+                }
+                let Some(dst) = dst_state.driver.as_doc().cloned() else {
+                    copy_fail!("target isn't a MongoDB connection")
+                };
+                let dst_busy = dst_state.busy.clone();
+
+                let cancel = Arc::new(AtomicBool::new(false));
+                lock(&exports).insert(id, cancel.clone());
+
+                // Copy events route globally (`None` session): the op spans two
+                // connections and its toast survives a `⌘P` switch.
+                let events = events.clone();
+                let copy_limit = copy_limit.clone();
+                tokio::spawn(async move {
+                    let _permit = copy_limit.acquire_owned().await;
+                    let _src_pin = PinGuard::new(src_busy);
+                    let _dst_pin = PinGuard::new(dst_busy);
+                    let (written, err) = jobs::doc_copy_job(
+                        src,
+                        dst,
+                        source_db,
+                        source_coll,
+                        filter,
+                        target_db,
+                        target_coll,
+                        mode,
+                        cancel,
+                        events.clone(),
+                        id,
+                    )
+                    .await;
+                    lock(&exports).remove(&id);
+                    let rows = written as usize;
                     match err {
                         None => emit(&events, None, Event::CopyFinished { id, rows }),
                         Some(RedError::Interrupted) => {

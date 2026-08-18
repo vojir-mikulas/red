@@ -4,6 +4,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod aiblocks;
 mod app;
 mod assets;
 mod assistant;
@@ -18,6 +19,7 @@ mod decode;
 mod dev_stats;
 mod diff_view;
 mod docbrowse;
+mod dochistory;
 mod editor;
 mod env;
 mod er;

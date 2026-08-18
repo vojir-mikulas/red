@@ -119,6 +119,16 @@ impl AppState {
         if vx != 0.0 {
             let off = a.h_scroll.offset();
             a.h_scroll.set_offset(point(off.x - px(vx), off.y));
+            // A grid with a frozen band is not inside a horizontal scroll
+            // container, so this nudge is unbounded unless the grid bounds it:
+            // hold-to-autoscroll would otherwise run the columns off into empty
+            // space and keep going.
+            let gutter = self.gutter();
+            if let crate::app::Phase::Connected(active) = &self.phase
+                && let Some(grid) = active.active_result()
+            {
+                grid.clamp_h_offset(gutter);
+            }
         }
         if vy != 0.0 {
             let off = a.scroll.offset();

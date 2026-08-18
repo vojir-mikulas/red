@@ -18,7 +18,7 @@ use mongodb::results::CollectionType;
 use mongodb::{Client, Cursor, IndexModel};
 use red_core::doc::{
     CollKind, CollectionInfo, DbInfo, DocCursor, DocPage, DocPlan, DocSchema, DocSeek, DocTopology,
-    DocUpdate, DocValue, Document, Filter, FindQuery, IndexInfo, IndexSpec, PlanStage,
+    DocUpdate, DocValue, Document, Filter, FindQuery, IndexInfo, IndexKey, IndexSpec, PlanStage,
 };
 use red_core::{RedError, Result};
 
@@ -236,6 +236,7 @@ impl DocDriver for MongoDriver {
         db: &str,
         coll: &str,
         filter: Option<&Filter>,
+        projection: Option<&red_core::doc::Projection>,
         seek: DocSeek,
         limit: usize,
         abort: &AbortSignal,
@@ -264,6 +265,9 @@ impl DocDriver for MongoDriver {
 
         let sort = doc! { "_id": if ascending { 1 } else { -1 } };
         let mut find = coll_h.find(query).sort(sort).limit(limit as i64);
+        if let Some(p) = projection {
+            find = find.projection(doc_to_bson_document(p));
+        }
         if let DocSeek::Jump { skip } = seek {
             find = find.skip(skip);
         }
@@ -391,6 +395,41 @@ impl DocDriver for MongoDriver {
             });
         }
         Ok(out)
+    }
+
+    async fn coll_stats(&self, db: &str, coll: &str) -> Result<red_core::doc::CollStats> {
+        let stats = self
+            .client
+            .database(db)
+            .run_command(doc! { "collStats": coll, "scale": 1 })
+            .await
+            .map_err(query_err)?;
+
+        // Largest first: the point of the per-index breakdown is finding the index
+        // that costs more than the data.
+        let mut index_sizes: Vec<(String, u64)> = stats
+            .get_document("indexSizes")
+            .map(|sizes| {
+                sizes
+                    .iter()
+                    .filter_map(|(name, value)| bson_num(value).map(|bytes| (name.clone(), bytes)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        index_sizes.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        Ok(red_core::doc::CollStats {
+            count: get_num(&stats, "count"),
+            size: get_num(&stats, "size"),
+            storage_size: get_num(&stats, "storageSize"),
+            avg_obj_size: get_num(&stats, "avgObjSize"),
+            total_index_size: get_num(&stats, "totalIndexSize"),
+            index_sizes,
+            // A mongos reply carries a per-shard breakdown; a standalone does not,
+            // so its absence is "not sharded" rather than "unknown".
+            shards: stats.get_document("shards").ok().map(|s| s.len()),
+            capped: stats.get_bool("capped").unwrap_or(false),
+        })
     }
 
     async fn explain(&self, q: &FindQuery) -> Result<DocPlan> {
@@ -599,6 +638,35 @@ impl DocDriver for MongoDriver {
         Ok(result.inserted_ids.len() as u64)
     }
 
+    async fn upsert(&self, db: &str, coll: &str, docs: &[Document]) -> Result<u64> {
+        self.ensure_writable()?;
+        let handle = self.client.database(db).collection::<BsonDocument>(coll);
+        // Documents with no `_id` have no identity to match on, so they batch into
+        // one `insertMany` rather than each upserting against a null `_id`.
+        let (identified, anonymous): (Vec<&Document>, Vec<&Document>) =
+            docs.iter().partition(|d| d.id != DocValue::Null);
+        let mut written = 0u64;
+        for doc in identified {
+            handle
+                .replace_one(doc! { "_id": doc_to_bson(&doc.id) }, document_to_bson(doc))
+                .upsert(true)
+                .await
+                .map_err(query_err)?;
+            written += 1;
+        }
+        if !anonymous.is_empty() {
+            let bson: Vec<BsonDocument> =
+                anonymous.into_iter().map(insert_document_to_bson).collect();
+            written += handle
+                .insert_many(bson)
+                .await
+                .map_err(query_err)?
+                .inserted_ids
+                .len() as u64;
+        }
+        Ok(written)
+    }
+
     async fn update(
         &self,
         db: &str,
@@ -702,12 +770,33 @@ impl DocDriver for MongoDriver {
         let keys: BsonDocument = spec
             .keys
             .iter()
-            .map(|(field, dir)| (field.clone(), Bson::Int32(*dir)))
+            .map(|(field, kind)| {
+                let value = match kind {
+                    IndexKey::Asc => Bson::Int32(1),
+                    IndexKey::Desc => Bson::Int32(-1),
+                    // A special index names its type where a direction would go.
+                    other => Bson::String(other.spec_value().to_string()),
+                };
+                (field.clone(), value)
+            })
             .collect();
-        let options = IndexOptions::builder()
+        let mut options = IndexOptions::builder()
             .unique(spec.unique)
+            .sparse(spec.sparse)
             .name(spec.name.clone())
             .build();
+        options.expire_after = spec
+            .ttl_seconds
+            .map(|secs| std::time::Duration::from_secs(secs.max(0) as u64));
+        options.partial_filter_expression = match &spec.partial_filter {
+            Some(text) => Some(doc_to_bson_document(&self.parse_ext_json(text)?)),
+            None => None,
+        };
+        options.collation = spec.collation_locale.as_ref().map(|locale| {
+            mongodb::options::Collation::builder()
+                .locale(locale)
+                .build()
+        });
         let model = IndexModel::builder().keys(keys).options(options).build();
         self.client
             .database(db)
@@ -717,9 +806,142 @@ impl DocDriver for MongoDriver {
             .map(|_| ())
             .map_err(query_err)
     }
+
+    async fn watch(
+        &self,
+        db: &str,
+        coll: &str,
+        resume_after: Option<&str>,
+    ) -> Result<crate::DocChangeStream> {
+        if self.topology == DocTopology::Standalone {
+            return Err(RedError::Query(
+                "change streams need a replica set or a sharded cluster: a standalone mongod \
+                 keeps no oplog to read them from"
+                    .to_string(),
+            ));
+        }
+        // The handle is bound first: `watch()` borrows the collection, and a
+        // temporary would not outlive the builder chain.
+        let handle = self.client.database(db).collection::<BsonDocument>(coll);
+        let mut watch = handle
+            .watch()
+            // Without this an update reports only its changed fields, and the
+            // panel would show "update" with nothing to look at.
+            .full_document(mongodb::options::FullDocumentType::UpdateLookup);
+        if let Some(token) = resume_after {
+            let parsed = doc_to_bson_document(&self.parse_ext_json(token)?);
+            // `ResumeToken` wraps its raw BSON privately, so it is reached through
+            // its `Deserialize` rather than a constructor.
+            let token: mongodb::change_stream::event::ResumeToken =
+                mongodb::bson::from_bson(Bson::Document(parsed))
+                    .map_err(|e| RedError::Query(format!("that is not a resume token: {e}")))?;
+            watch = watch.resume_after(token);
+        }
+        let stream = watch.await.map_err(query_err)?;
+        let namespace = format!("{db}.{coll}");
+        Ok(crate::DocChangeStream {
+            stream: Box::pin(stream.filter_map(move |event| {
+                let namespace = namespace.clone();
+                // A failed event ends nothing: the driver resumes a resumable
+                // error itself, and a non-resumable one closes the stream, which
+                // the caller sees as the stream ending.
+                async move { event.ok().map(|e| change_event(e, &namespace)) }
+            })),
+        })
+    }
+
+    async fn set_validator(&self, db: &str, coll: &str, validator: Option<&str>) -> Result<()> {
+        self.ensure_writable()?;
+        // An empty validator document is how `collMod` is told to remove one; the
+        // command has no "unset" of its own.
+        let value = match validator {
+            Some(text) => doc_to_bson_document(&self.parse_ext_json(text)?),
+            None => BsonDocument::new(),
+        };
+        self.client
+            .database(db)
+            .run_command(doc! { "collMod": coll, "validator": value })
+            .await
+            .map(|_| ())
+            .map_err(query_err)
+    }
+
+    async fn drop_index(&self, db: &str, coll: &str, name: &str) -> Result<()> {
+        self.ensure_writable()?;
+        // `_id_` cannot be dropped; the server refuses it, but saying so here
+        // names the reason instead of relaying a code.
+        if name == "_id_" {
+            return Err(RedError::Query(
+                "the _id index cannot be dropped".to_string(),
+            ));
+        }
+        self.client
+            .database(db)
+            .collection::<BsonDocument>(coll)
+            .drop_index(name)
+            .await
+            .map_err(query_err)
+    }
 }
 
 // --- topology / error mapping ------------------------------------------------
+
+/// Convert one change-stream event into the engine-free [`DocChange`] mirror.
+/// `fallback_ns` is the watched namespace, used when the event names none (a
+/// collection-level event such as `invalidate`).
+fn change_event(
+    event: mongodb::change_stream::event::ChangeStreamEvent<BsonDocument>,
+    fallback_ns: &str,
+) -> red_core::doc::DocChange {
+    use mongodb::change_stream::event::OperationType as Op;
+    use red_core::doc::DocChangeOp;
+
+    let op = match event.operation_type {
+        Op::Insert => DocChangeOp::Insert,
+        Op::Update => DocChangeOp::Update,
+        Op::Replace => DocChangeOp::Replace,
+        Op::Delete => DocChangeOp::Delete,
+        Op::Drop => DocChangeOp::Drop,
+        Op::Rename => DocChangeOp::Rename,
+        Op::Invalidate => DocChangeOp::Invalidate,
+        _ => DocChangeOp::Other,
+    };
+    let namespace = event
+        .ns
+        .as_ref()
+        .map(|ns| match &ns.coll {
+            Some(coll) => format!("{}.{coll}", ns.db),
+            None => ns.db.clone(),
+        })
+        .unwrap_or_else(|| fallback_ns.to_string());
+    let id = event
+        .document_key
+        .as_ref()
+        .and_then(|k| k.get("_id"))
+        .map(|v| bson_to_doc(v.clone()));
+    let (updated, removed) = event
+        .update_description
+        .as_ref()
+        .map(|d| {
+            (
+                d.updated_fields.keys().cloned().collect(),
+                d.removed_fields.clone(),
+            )
+        })
+        .unwrap_or_default();
+    red_core::doc::DocChange {
+        op,
+        namespace,
+        id,
+        full: event.full_document.map(split_document),
+        updated,
+        removed,
+        at_ms: event.wall_time.map(|t| t.timestamp_millis()),
+        resume_token: mongodb::bson::to_bson(&event.id)
+            .ok()
+            .map(|b| bson_to_doc(b).to_extended_json()),
+    }
+}
 
 /// Read the deployment topology off a `hello` reply: a mongos router announces
 /// itself via `msg: "isdbgrid"`, a replica-set member carries a `setName`, and
@@ -765,10 +987,15 @@ fn index_order(order: &Bson) -> String {
 /// Read a numeric explain stat as `u64`, tolerating either BSON int width or a
 /// double (explain reports these inconsistently across server versions).
 fn get_num(doc: &BsonDocument, key: &str) -> Option<u64> {
-    match doc.get(key) {
-        Some(Bson::Int64(n)) => Some(*n as u64),
-        Some(Bson::Int32(n)) => Some(*n as u64),
-        Some(Bson::Double(x)) => Some(*x as u64),
+    doc.get(key).and_then(bson_num)
+}
+
+/// The same widening for a value already in hand (an `indexSizes` entry).
+fn bson_num(value: &Bson) -> Option<u64> {
+    match value {
+        Bson::Int64(n) => Some(*n as u64),
+        Bson::Int32(n) => Some(*n as u64),
+        Bson::Double(x) => Some(*x as u64),
         _ => None,
     }
 }

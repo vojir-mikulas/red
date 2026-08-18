@@ -39,6 +39,66 @@ impl AppState {
         // about the connection, so it sits outside the collection workspace.
         let workspace = self.with_server_dock(active, "doc-split-server", workspace, cx);
 
+        // The left History dock (⌘Y), outside the Server dock: the same nesting
+        // order the SQL and Redis shells use, so the three shells' left docks line
+        // up column for column.
+        let workspace = if active.history_open {
+            let history_pane = div()
+                .relative()
+                .size_full()
+                .children(
+                    active
+                        .doc_view
+                        .as_ref()
+                        .map(|v| v.history_panel.clone().into_any_element()),
+                )
+                .children(
+                    self.focus_hint(crate::focus::FocusTargetId::History)
+                        .map(|h| crate::focus_overlay::badge(h, cx)),
+                );
+            let (start, resize, end) = (view.clone(), view.clone(), view.clone());
+            SplitPane::new("doc-split-history", Axis::Horizontal)
+                .size(active.history_w)
+                .gutter(px(1.))
+                .drag(active.history_drag)
+                .min_first(px(180.))
+                .max_first(px(480.))
+                .on_drag_start(move |anchor, _, cx| {
+                    start
+                        .update(cx, |this, cx| {
+                            if let Phase::Connected(a) = &mut this.phase {
+                                a.history_drag = Some(anchor);
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                })
+                .on_resize(move |size, _, cx| {
+                    resize
+                        .update(cx, |this, cx| {
+                            if let Phase::Connected(a) = &mut this.phase {
+                                a.history_w = size;
+                            }
+                            cx.notify();
+                        })
+                        .ok();
+                })
+                .on_drag_end(move |_, cx| {
+                    end.update(cx, |this, cx| {
+                        if let Phase::Connected(a) = &mut this.phase {
+                            a.history_drag = None;
+                        }
+                        cx.notify();
+                    })
+                    .ok();
+                })
+                .first(history_pane)
+                .second(workspace)
+                .into_any_element()
+        } else {
+            workspace
+        };
+
         // Dock the assistant to the right of the workspace when it's open, the
         // same resizable split the SQL/Redis shells use.
         let body = if self.assistant.is_some() {
@@ -124,6 +184,31 @@ impl AppState {
             .and_then(|v| v.actions_menu)
             .map(|pos| self.render_doc_actions_menu(active, pos, cx));
 
+        // The collection tree's right-click menu, rendered from the shell root for
+        // the reason the schema sidebar's is: the narrow dock would clip it and
+        // offset its window-coordinate anchor.
+        let coll_menu = active
+            .doc_view
+            .as_ref()
+            .and_then(|v| v.coll_menu.clone())
+            .map(|(db, coll, pos)| self.render_doc_coll_menu(active, db, coll, pos, cx));
+
+        // The toolbar's "Fields" projection dropdown, on the same terms.
+        let fields_menu = active
+            .doc_view
+            .as_ref()
+            .and_then(|v| v.focused_coll())
+            .and_then(|c| c.fields_menu)
+            .map(|pos| self.render_doc_fields_menu(active, pos, cx));
+
+        // The Query panel's "add stage" operator palette, likewise.
+        let stage_menu = active
+            .doc_view
+            .as_ref()
+            .and_then(|v| v.focused_coll())
+            .and_then(|c| c.stage_menu)
+            .map(|(at, pos)| self.render_doc_stage_menu(active.session, at, pos, cx));
+
         let statusbar = self.render_doc_statusbar(active, &theme, cx);
 
         div()
@@ -139,6 +224,9 @@ impl AppState {
             .children(confirm)
             .children(tab_menu)
             .children(actions_menu)
+            .children(coll_menu)
+            .children(fields_menu)
+            .children(stage_menu)
     }
 
     /// The whole work body: the `database -> collection` sidebar tree (a
@@ -260,6 +348,33 @@ impl AppState {
             ))
             .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)));
 
+        // History dock toggle, beside it (mirrors the SQL and Redis shells);
+        // accent-tinted while the dock is open.
+        let history_toggle = div()
+            .id("doc-toggle-history")
+            .mr_1()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .justify_center()
+            .size(px(20.))
+            .rounded(px(4.))
+            .cursor_pointer()
+            .tooltip(Tooltip::text(crate::keymap::localize_hint(
+                "Toggle history  ⌘Y",
+            )))
+            .hover(|s| s.bg(theme.bg_elevated))
+            .child(crate::icons::icon(
+                "history",
+                theme.scale(14.),
+                if active.history_open {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                },
+            ))
+            .on_click(cx.listener(|this, _, _, cx| this.toggle_history(cx)));
+
         let read_only_badge = config.read_only.then(|| {
             div()
                 .flex()
@@ -356,6 +471,7 @@ impl AppState {
                     .items_center()
                     .overflow_hidden()
                     .child(sidebar_toggle)
+                    .child(history_toggle)
                     .child(status_left),
             )
             .child(
@@ -389,7 +505,53 @@ impl AppState {
                 },
             )),
         );
+        // Not gated on `writable`: an export only reads.
+        let namespace = active
+            .doc_view
+            .as_ref()
+            .and_then(|v| v.focused_coll())
+            .map(|c| (c.db.clone(), c.coll.clone()));
+        if let Some((db, coll)) = namespace.clone() {
+            menu = menu.item(
+                ContextMenuItem::new("doc-act-export", "Export documents…").on_click(cx.listener(
+                    move |this, _, _, cx| {
+                        this.doc_open_export(session, db.clone(), coll.clone(), cx);
+                    },
+                )),
+            );
+        }
         if writable {
+            if let Some((db, coll)) = namespace {
+                let (cp_db, cp_coll) = (db.clone(), coll.clone());
+                let (val_db, val_coll) = (db.clone(), coll.clone());
+                menu = menu
+                    .item(
+                        ContextMenuItem::new("doc-act-import", "Import documents…").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.doc_open_import(session, db.clone(), coll.clone(), cx);
+                            }),
+                        ),
+                    )
+                    .item(
+                        ContextMenuItem::new("doc-act-copy", "Copy collection to…").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.doc_open_copy(session, cp_db.clone(), cp_coll.clone(), cx);
+                            }),
+                        ),
+                    )
+                    .item(
+                        ContextMenuItem::new("doc-act-validator", "Validation rules…").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.doc_open_validator(
+                                    session,
+                                    val_db.clone(),
+                                    val_coll.clone(),
+                                    cx,
+                                );
+                            }),
+                        ),
+                    );
+            }
             menu = menu
                 .separator()
                 .item(
@@ -419,6 +581,237 @@ impl AppState {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, _, _, cx| this.doc_close_actions_menu(session, cx)),
+            )
+            .child(
+                floating(div().occlude().child(menu.into_any_element()))
+                    .at(pos)
+                    .anchor(gpui::Anchor::TopRight),
+            )
+            .into_any_element()
+    }
+
+    /// A database's relations diagram: the ER canvas over its inferred references,
+    /// with a footer saying how strong the inference actually was.
+    fn render_doc_relations(
+        &self,
+        active: &ActiveConn,
+        tab_idx: usize,
+        relations: &super::RelationsView,
+        theme: &Theme,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        if relations.loading {
+            return doc_centered_hint("Sampling collections for references\u{2026}", theme);
+        }
+        if let Some(why) = &relations.error {
+            return doc_centered_hint(why, theme);
+        }
+        let strong = relations
+            .references
+            .iter()
+            .filter(|r| r.is_strong())
+            .count();
+        let weak = relations.references.len() - strong;
+        // Weak candidates are reported, not hidden: "we tested this and it did not
+        // hold" is a finding about the data, and a diagram that silently dropped
+        // them would look like the inference never considered them.
+        let footer = format!(
+            "{} collection(s) sampled \u{b7} {strong} reference(s) drawn{}",
+            relations.sampled,
+            if weak == 0 {
+                String::new()
+            } else {
+                format!(
+                    " \u{b7} {weak} name(s) looked like references but their values did not resolve"
+                )
+            }
+        );
+        let canvas = self.render_er(active, crate::er::ErSlot::DocTab(tab_idx), cx);
+        div()
+            .flex()
+            .flex_col()
+            .size_full()
+            .child(div().flex_1().min_h(px(0.)).child(canvas))
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .px_3()
+                    .py_1()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .text_size(theme.scale(11.))
+                    .text_color(theme.text_muted)
+                    .child(footer),
+            )
+            .into_any_element()
+    }
+
+    /// The collection tree's right-click menu. A collection row offers open /
+    /// data movement / drop; a database row offers only what applies to a whole
+    /// database, which today is refreshing its collection list.
+    fn render_doc_coll_menu(
+        &self,
+        active: &ActiveConn,
+        db: String,
+        coll: Option<String>,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let session = active.session;
+        let writable = !active.config.read_only;
+        let mut menu = ContextMenu::new("doc-coll-menu");
+        match coll.clone() {
+            Some(coll) => {
+                let (open_db, open_coll) = (db.clone(), coll.clone());
+                let (tab_db, tab_coll) = (db.clone(), coll.clone());
+                let (exp_db, exp_coll) = (db.clone(), coll.clone());
+                menu = menu
+                    .item(
+                        ContextMenuItem::new("doc-coll-open", "Open").on_click(cx.listener(
+                            move |this, _, _, cx| {
+                                this.doc_close_coll_menu(session, cx);
+                                this.doc_open_collection(
+                                    session,
+                                    open_db.clone(),
+                                    open_coll.clone(),
+                                    false,
+                                    cx,
+                                );
+                            },
+                        )),
+                    )
+                    .item(
+                        ContextMenuItem::new("doc-coll-open-tab", "Open in new tab").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.doc_close_coll_menu(session, cx);
+                                this.doc_open_collection(
+                                    session,
+                                    tab_db.clone(),
+                                    tab_coll.clone(),
+                                    true,
+                                    cx,
+                                );
+                            }),
+                        ),
+                    )
+                    .separator()
+                    .item(
+                        ContextMenuItem::new("doc-coll-export", "Export documents…").on_click(
+                            cx.listener(move |this, _, _, cx| {
+                                this.doc_open_export(session, exp_db.clone(), exp_coll.clone(), cx);
+                            }),
+                        ),
+                    );
+                if writable {
+                    let (imp_db, imp_coll) = (db.clone(), coll.clone());
+                    let (cp_db, cp_coll) = (db.clone(), coll.clone());
+                    let (val_db, val_coll) = (db.clone(), coll.clone());
+                    let (drop_db, drop_coll) = (db.clone(), coll.clone());
+                    menu = menu
+                        .item(
+                            ContextMenuItem::new("doc-coll-import", "Import documents…").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.doc_open_import(
+                                        session,
+                                        imp_db.clone(),
+                                        imp_coll.clone(),
+                                        cx,
+                                    );
+                                }),
+                            ),
+                        )
+                        .item(
+                            ContextMenuItem::new("doc-coll-copy", "Copy collection to…").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.doc_open_copy(session, cp_db.clone(), cp_coll.clone(), cx);
+                                }),
+                            ),
+                        )
+                        .separator()
+                        .item(
+                            ContextMenuItem::new("doc-coll-validator", "Validation rules…")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.doc_open_validator(
+                                        session,
+                                        val_db.clone(),
+                                        val_coll.clone(),
+                                        cx,
+                                    );
+                                })),
+                        )
+                        .item(
+                            ContextMenuItem::new("doc-coll-drop", "Drop collection…").on_click(
+                                cx.listener(move |this, _, _, cx| {
+                                    this.doc_close_coll_menu(session, cx);
+                                    this.doc_drop_collection(
+                                        session,
+                                        drop_db.clone(),
+                                        drop_coll.clone(),
+                                        cx,
+                                    );
+                                }),
+                            ),
+                        );
+                }
+            }
+            None => {
+                let relations_db = db.clone();
+                let refresh_db = db.clone();
+                menu = menu.item(
+                    ContextMenuItem::new("doc-db-relations", "Show relations\u{2026}").on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.doc_open_relations(session, relations_db.clone(), cx);
+                        }),
+                    ),
+                );
+                menu = menu.item(
+                    ContextMenuItem::new("doc-db-refresh", "Refresh collections").on_click(
+                        cx.listener(move |this, _, _, cx| {
+                            this.doc_close_coll_menu(session, cx);
+                            this.doc_reload_collections(session, refresh_db.clone(), cx);
+                        }),
+                    ),
+                );
+            }
+        }
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.doc_close_coll_menu(session, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| this.doc_close_coll_menu(session, cx)),
+            )
+            .child(
+                floating(div().occlude().child(menu.into_any_element()))
+                    .at(pos)
+                    .anchor(gpui::Anchor::TopLeft),
+            )
+            .into_any_element()
+    }
+
+    /// Float `menu` at `pos` over a full-window backdrop that dismisses it, the
+    /// shape every positioned Mongo dropdown shares.
+    fn dismissable_menu(
+        &self,
+        menu: ContextMenu,
+        pos: gpui::Point<gpui::Pixels>,
+        session: SessionId,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .absolute()
+            .inset_0()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| this.doc_close_fields_menu(session, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _, _, cx| this.doc_close_fields_menu(session, cx)),
             )
             .child(
                 floating(div().occlude().child(menu.into_any_element()))
@@ -618,8 +1011,14 @@ impl AppState {
                 active.inspector_drag,
                 &theme,
                 &view,
+                cx,
             ),
-            None => render_doc_empty(&theme),
+            None => match v.relations_at(tab_idx) {
+                Some(relations) => {
+                    self.render_doc_relations(active, tab_idx, relations, &theme, cx)
+                }
+                None => render_doc_empty(&theme),
+            },
         };
 
         let target = v
@@ -919,9 +1318,11 @@ impl AppState {
             .map(|e| div().px_2().py_1().text_color(theme.red).child(e.clone()));
 
         let (nav_view, toggle_view, select_view) = (view.clone(), view.clone(), view.clone());
+        let menu_view = view.clone();
         let rows_render = rows.clone();
         let rows_toggle = rows.clone();
         let rows_select = rows.clone();
+        let rows_secondary = rows.clone();
 
         let tree = Tree::new("doc-db-tree")
             .rows(items)
@@ -977,6 +1378,22 @@ impl AppState {
                         }
                     })
                     .ok();
+            })
+            // Right-click opens the row's action menu; a placeholder row has no
+            // identity and so opens nothing.
+            .on_secondary(move |ix, pos, _window, cx| {
+                let Some(sel) = rows_secondary[ix].sel.clone() else {
+                    return;
+                };
+                let (db, coll) = match sel {
+                    DocTreeSel::Db(db) => (db, None),
+                    DocTreeSel::Coll { db, coll } => (db, Some(coll)),
+                };
+                menu_view
+                    .update(cx, |this, cx| {
+                        this.doc_open_coll_menu(session, db, coll, pos, cx)
+                    })
+                    .ok();
             });
 
         // The search box narrows the tree live (see `flatten_doc_tree`); ⌘F from
@@ -1015,6 +1432,7 @@ impl AppState {
         inspector_drag: Option<DragAnchor>,
         theme: &Theme,
         view: &WeakEntity<AppState>,
+        cx: &gpui::App,
     ) -> gpui::AnyElement {
         let header = self.render_doc_header(session, current, theme, view);
         let body = match current.panel {
@@ -1027,9 +1445,10 @@ impl AppState {
                 theme,
                 view,
             ),
-            DocPanel::Query => self.render_doc_query(session, current, theme, view),
+            DocPanel::Query => self.render_doc_query(session, current, theme, view, cx),
             DocPanel::Schema => render_doc_schema_panel(current, theme),
-            DocPanel::Indexes => render_doc_indexes_panel(current, theme),
+            DocPanel::Indexes => render_doc_indexes_panel(session, current, read_only, theme, view),
+            DocPanel::Watch => self.render_doc_watch(session, current, theme, view),
         };
         div()
             .flex()
@@ -1152,6 +1571,73 @@ impl AppState {
                     theme.text_muted,
                 ));
 
+            let fields_view = view.clone();
+            let projecting = current.projection.is_some();
+            let fields_button = div()
+                .id("doc-fields")
+                .flex_shrink_0()
+                .flex()
+                .items_center()
+                .gap_1()
+                .h(px(24.))
+                .px(px(8.))
+                .rounded(px(4.))
+                .border_1()
+                .border_color(if projecting {
+                    theme.accent
+                } else {
+                    theme.border
+                })
+                .bg(theme.bg_panel)
+                .cursor_pointer()
+                .hover(|s| s.bg(theme.bg_elevated))
+                .text_color(if projecting {
+                    theme.accent
+                } else {
+                    theme.text_muted
+                })
+                .text_size(theme.scale(12.))
+                .on_mouse_down(
+                    MouseButton::Left,
+                    move |ev: &gpui::MouseDownEvent, _, cx| {
+                        let pos = ev.position;
+                        fields_view
+                            .update(cx, |this, cx| this.doc_open_fields_menu(session, pos, cx))
+                            .ok();
+                    },
+                )
+                .child(crate::i18n::tr!("doc.fields", "Fields"))
+                .child(crate::icons::icon(
+                    "chevron-down",
+                    theme.scale(11.),
+                    if projecting {
+                        theme.accent
+                    } else {
+                        theme.text_muted
+                    },
+                ));
+
+            let filter_mode_view = view.clone();
+            let filter_mode_ix = DocFilterMode::ALL
+                .iter()
+                .position(|(m, _)| *m == current.filter_mode)
+                .unwrap_or(0);
+            let filter_mode = DocFilterMode::ALL
+                .iter()
+                .fold(Segmented::new("doc-filter-mode"), |seg, (_, label)| {
+                    seg.segment(*label)
+                })
+                .selected(filter_mode_ix)
+                .on_select(move |ix, _, cx| {
+                    let Some((mode, _)) = DocFilterMode::ALL.get(ix) else {
+                        return;
+                    };
+                    let mode = *mode;
+                    filter_mode_view
+                        .update(cx, |this, cx| this.doc_set_filter_mode(session, mode, cx))
+                        .ok();
+                });
+
             let toolbar = div()
                 .flex()
                 .items_center()
@@ -1159,11 +1645,16 @@ impl AppState {
                 .px_3()
                 .pb_2()
                 .child(mode)
+                .child(filter_mode)
                 .child(
+                    // The suggestion popup anchors to this cell, so the box and its
+                    // dropdown move together as the toolbar reflows.
                     div()
+                        .relative()
                         .flex_1()
                         .min_w(px(120.))
-                        .child(current.filter_input.clone()),
+                        .child(current.filter_input.clone())
+                        .children(self.render_doc_suggestions(session, current, theme, view)),
                 )
                 .child(
                     Button::new("doc-run-filter", "Run")
@@ -1175,10 +1666,241 @@ impl AppState {
                                 .ok();
                         }),
                 )
+                .child(fields_button)
                 .child(actions_button);
             header = header.child(toolbar);
+            if let Some(chips) = self.render_doc_query_chips(session, current, theme, view) {
+                header = header.child(chips);
+            }
         }
         header.into_any_element()
+    }
+
+    /// The field-name suggestion popup, floating under the filter box. Absent
+    /// unless the token being typed matches something in the sampled schema.
+    fn render_doc_suggestions(
+        &self,
+        session: SessionId,
+        current: &CollView,
+        theme: &Theme,
+        view: &WeakEntity<AppState>,
+    ) -> Option<gpui::AnyElement> {
+        if current.suggestions.is_empty() {
+            return None;
+        }
+        let highlighted = current.suggestion_ix;
+        let mut list = div()
+            .flex()
+            .flex_col()
+            .py(px(2.))
+            .rounded(px(4.))
+            .bg(theme.bg_elevated)
+            .border_1()
+            .border_color(theme.border)
+            .shadow_md()
+            .text_size(theme.scale(12.));
+        for (i, path) in current.suggestions.iter().enumerate() {
+            let take_view = view.clone();
+            list = list.child(
+                div()
+                    .id(gpui::SharedString::from(format!("doc-suggest-{i}")))
+                    .px_2()
+                    .py(px(3.))
+                    .cursor_pointer()
+                    .when(i == highlighted, |d| d.bg(theme.bg_selected))
+                    .hover(|s| s.bg(theme.bg_selected))
+                    .text_color(theme.text)
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        take_view
+                            .update(cx, |this, cx| {
+                                this.doc_take_suggestion(session, Some(i), cx);
+                            })
+                            .ok();
+                    })
+                    .child(path.clone()),
+            );
+        }
+        Some(
+            div()
+                .occlude()
+                .absolute()
+                .top(px(28.))
+                .left_0()
+                .w_full()
+                .child(list)
+                .into_any_element(),
+        )
+    }
+
+    /// The row of active sort keys and the projection badge, under the toolbar.
+    /// Absent entirely when the browse is in its natural shape, so the common case
+    /// costs no vertical space.
+    fn render_doc_query_chips(
+        &self,
+        session: SessionId,
+        current: &CollView,
+        theme: &Theme,
+        view: &WeakEntity<AppState>,
+    ) -> Option<gpui::AnyElement> {
+        // A fast filter that cannot compile says so here. `Incomplete` prints
+        // nothing: the user is still typing, and a bar that scolds mid-word is
+        // worse than one that waits.
+        let complaint = match &current.filter_status {
+            red_core::doc::FastFilter::Invalid(why) => Some(why.clone()),
+            _ => None,
+        };
+        if current.sort.is_empty() && current.projection.is_none() && complaint.is_none() {
+            return None;
+        }
+        let mut row = div()
+            .flex()
+            .flex_wrap()
+            .items_center()
+            .gap_1()
+            .px_3()
+            .pb_2()
+            .text_size(theme.scale(11.))
+            .children(complaint.map(|why| div().text_color(theme.red).child(why)));
+
+        for (i, (field, ascending)) in current.sort.iter().enumerate() {
+            let chip_view = view.clone();
+            let field_name = field.clone();
+            row = row.child(
+                div()
+                    .id(gpui::SharedString::from(format!("doc-sort-chip-{i}")))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px(px(6.))
+                    .h(px(20.))
+                    .rounded(px(10.))
+                    .bg(theme.bg_elevated)
+                    .border_1()
+                    .border_color(theme.border)
+                    .text_color(theme.text_muted)
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(theme.accent))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        // A click on the chip cycles the same key the header
+                        // does, so the chip is a control and not just a label.
+                        let field = field_name.clone();
+                        chip_view
+                            .update(cx, |this, cx| {
+                                this.doc_toggle_sort(session, field, true, cx)
+                            })
+                            .ok();
+                    })
+                    .child(format!(
+                        "{} {} {}",
+                        if i == 0 { "sort" } else { "then" },
+                        field,
+                        if *ascending { "\u{2191}" } else { "\u{2193}" }
+                    )),
+            );
+        }
+        if !current.sort.is_empty() {
+            let clear_view = view.clone();
+            row = row.child(
+                div()
+                    .id("doc-sort-clear")
+                    .px(px(4.))
+                    .text_color(theme.text_faint)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme.text))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        clear_view
+                            .update(cx, |this, cx| this.doc_clear_sort(session, cx))
+                            .ok();
+                    })
+                    .child(crate::i18n::tr!("doc.clear_sort", "clear sort")),
+            );
+        }
+        if let Some(fields) = &current.projection {
+            let clear_view = view.clone();
+            row = row.child(
+                div()
+                    .id("doc-projection-clear")
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px(px(6.))
+                    .h(px(20.))
+                    .rounded(px(10.))
+                    .bg(theme.bg_elevated)
+                    .border_1()
+                    .border_color(theme.accent)
+                    .text_color(theme.text_muted)
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(theme.text))
+                    .on_mouse_down(MouseButton::Left, move |_, _, cx| {
+                        clear_view
+                            .update(cx, |this, cx| this.doc_clear_projection(session, cx))
+                            .ok();
+                    })
+                    .child(format!("{} field(s) \u{00d7}", fields.len())),
+            );
+        }
+        Some(row.into_any_element())
+    }
+
+    /// The "Fields" dropdown: one toggle per inferred schema path, so a wide
+    /// collection can be narrowed to the handful of fields being looked at.
+    fn render_doc_fields_menu(
+        &self,
+        active: &ActiveConn,
+        pos: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let session = active.session;
+        let current = active.doc_view.as_ref().and_then(|v| v.focused_coll());
+        let mut menu = ContextMenu::new("doc-fields-menu");
+        let chosen: Option<&Vec<String>> = current.and_then(|c| c.projection.as_ref());
+        let paths: Vec<String> = current
+            .and_then(|c| c.schema.as_ref())
+            .map(|s| {
+                s.fields
+                    .iter()
+                    .map(|f| f.path.clone())
+                    .filter(|p| p != "_id")
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        menu = menu.item(
+            ContextMenuItem::new("doc-fields-all", "All fields").on_click(cx.listener(
+                move |this, _, _, cx| {
+                    this.doc_close_fields_menu(session, cx);
+                    this.doc_clear_projection(session, cx);
+                },
+            )),
+        );
+        if paths.is_empty() {
+            // The schema request the dropdown fired is still in flight (or the
+            // sample found nothing); say so rather than showing an empty menu.
+            return self.dismissable_menu(
+                menu.separator().item(
+                    ContextMenuItem::new("doc-fields-loading", "Sampling fields\u{2026}")
+                        .disabled(true),
+                ),
+                pos,
+                session,
+                cx,
+            );
+        }
+        menu = menu.separator();
+        for (i, path) in paths.into_iter().enumerate() {
+            // No projection means every field is shown, so every row reads ticked.
+            let on = chosen.is_none_or(|fields| fields.contains(&path));
+            let label = format!("{} {path}", if on { "\u{2713}" } else { " " });
+            let field = path.clone();
+            menu = menu.item(
+                ContextMenuItem::new(gpui::SharedString::from(format!("doc-field-{i}")), label)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.doc_toggle_projection_field(session, field.clone(), cx);
+                    })),
+            );
+        }
+        self.dismissable_menu(menu, pos, session, cx)
     }
 
     /// The Documents panel: the explain readout (when requested) over the chosen
@@ -1295,15 +2017,22 @@ impl AppState {
             .into_any_element()
     }
 
-    /// The Query panel: the aggregation-pipeline editor over its results grid.
+    /// The Query panel: the pipeline (as raw text or a stage list) over its
+    /// results grid.
     fn render_doc_query(
         &self,
         session: SessionId,
         current: &CollView,
         theme: &Theme,
         view: &WeakEntity<AppState>,
+        cx: &gpui::App,
     ) -> gpui::AnyElement {
         let run_view = view.clone();
+        let mode_view = view.clone();
+        let mode_ix = DocQueryMode::ALL
+            .iter()
+            .position(|(m, _)| *m == current.query_mode)
+            .unwrap_or(0);
         let toolbar = div()
             .flex()
             .items_center()
@@ -1320,6 +2049,23 @@ impl AppState {
                     )),
             )
             .child(
+                DocQueryMode::ALL
+                    .iter()
+                    .fold(Segmented::new("doc-query-mode"), |seg, (_, label)| {
+                        seg.segment(*label)
+                    })
+                    .selected(mode_ix)
+                    .on_select(move |ix, _, cx| {
+                        let Some((mode, _)) = DocQueryMode::ALL.get(ix) else {
+                            return;
+                        };
+                        let mode = *mode;
+                        mode_view
+                            .update(cx, |this, cx| this.doc_set_query_mode(session, mode, cx))
+                            .ok();
+                    }),
+            )
+            .child(
                 Button::new("doc-run-agg", "Run")
                     .size(ButtonSize::Sm)
                     .variant(ButtonVariant::Primary)
@@ -1331,12 +2077,28 @@ impl AppState {
                     }),
             );
 
+        let complaint = current.query_error.as_ref().map(|why| {
+            div()
+                .px_3()
+                .pb_2()
+                .text_size(theme.scale(11.))
+                .text_color(theme.red)
+                .child(why.clone())
+        });
+
         let editor = div()
-            .h(px(160.))
+            .h(px(if current.query_mode == DocQueryMode::Stages {
+                260.
+            } else {
+                160.
+            }))
             .flex_shrink_0()
             .border_b_1()
             .border_color(theme.border)
-            .child(current.query_editor.clone());
+            .child(match current.query_mode {
+                DocQueryMode::Text => current.query_editor.clone().into_any_element(),
+                DocQueryMode::Stages => self.render_doc_stages(session, current, theme, view, cx),
+            });
 
         let results = if current.query_docs.is_empty() {
             doc_centered_hint(
@@ -1364,6 +2126,7 @@ impl AppState {
             .flex_1()
             .min_h(px(0.))
             .child(toolbar)
+            .children(complaint)
             .child(editor)
             .child(results)
             .into_any_element()
@@ -1382,13 +2145,23 @@ impl AppState {
             .iter()
             .enumerate()
             .map(|(i, name)| {
-                if i == 0 {
+                let column = if i == 0 {
                     Column::new(name.clone()).width(px(220.))
                 } else {
                     Column::new(name.clone()).flex()
-                }
+                };
+                column.sortable()
             })
             .collect();
+        // The caret marks the *primary* key only: a multi-key sort has one leading
+        // column, and painting a caret on each would suggest they are peers.
+        let sort_caret = current.sort.first().and_then(|(field, ascending)| {
+            current
+                .columns
+                .iter()
+                .position(|c| c == field)
+                .map(|ix| (ix, *ascending))
+        });
 
         // Resolve (and possibly re-center) the virtual-scroll window for this
         // frame; the list lays out only `win.len` rows offset by `base`, so it
@@ -1434,6 +2207,7 @@ impl AppState {
             current.filter.clone(),
             current.epoch,
         );
+        let (projection_doc, sort_doc) = (current.projection_doc.clone(), current.sort_doc.clone());
 
         let table = Table::<()>::new("doc-grid", columns)
             .row_count(win.len)
@@ -1449,6 +2223,34 @@ impl AppState {
                 nav_view
                     .update(cx, |this, cx| this.doc_grid_nav(session, nav, cx))
                     .ok();
+            })
+            .sort(sort_caret)
+            .sort_carets(
+                {
+                    let (accent, size) = (theme.accent, theme.scale(10.));
+                    move || crate::icons::icon("sort-asc", size, accent).into_any_element()
+                },
+                {
+                    let (accent, size) = (theme.accent, theme.scale(10.));
+                    move || crate::icons::icon("sort-desc", size, accent).into_any_element()
+                },
+            )
+            .on_sort({
+                let sort_view = view.clone();
+                let sort_cols = cols.clone();
+                move |table_col, window, cx| {
+                    let Some(field) = sort_cols.get(table_col).cloned() else {
+                        return;
+                    };
+                    // Shift-click appends a key instead of replacing the sort, the
+                    // convention every grid that supports multi-sort uses.
+                    let additive = window.modifiers().shift;
+                    sort_view
+                        .update(cx, |this, cx| {
+                            this.doc_toggle_sort(session, field, additive, cx)
+                        })
+                        .ok();
+                }
             })
             .selected(selected)
             .on_select(move |ix, _click, window, cx| {
@@ -1474,6 +2276,8 @@ impl AppState {
                     db: &db,
                     coll: &coll,
                     filter: filter.as_deref(),
+                    projection: projection_doc.as_deref(),
+                    sort: sort_doc.as_deref(),
                 };
                 let settled = window_rc.borrow_mut().ensure(abs, &ctx, &sender);
                 // Mid-fling we skipped fetching; ask for another paint so the
@@ -1869,6 +2673,11 @@ fn render_doc_empty(theme: &Theme) -> gpui::AnyElement {
 }
 
 /// A centered muted hint filling the panel body (loading / empty states).
+/// [`doc_centered_hint`] for the sibling panel modules.
+pub(super) fn doc_hint(text: &str, theme: &Theme) -> gpui::AnyElement {
+    doc_centered_hint(text, theme)
+}
+
 fn doc_centered_hint(text: &str, theme: &Theme) -> gpui::AnyElement {
     div()
         .flex()
@@ -1927,6 +2736,78 @@ fn doc_row3(
 /// The Schema panel: one row per inferred field path with its type distribution
 /// (`string 82% . int 18%`) and present-ratio, or a hint while the sample loads.
 fn render_doc_schema_panel(current: &CollView, theme: &Theme) -> gpui::AnyElement {
+    // The storage header sits above whatever the schema half has to say, so a
+    // collection whose sample is still running already shows what it costs.
+    let stats = current.stats.as_ref().map(|s| render_doc_stats(s, theme));
+    let body = render_doc_schema_body(current, theme);
+    div()
+        .flex()
+        .flex_col()
+        .size_full()
+        .children(stats)
+        .child(div().flex_1().min_h(px(0.)).child(body))
+        .into_any_element()
+}
+
+/// The `collStats` header: one line of storage facts, then the per-index bytes.
+/// Each number is omitted rather than zeroed when the server did not report it
+/// (an under-privileged role gets a truncated reply, not an error).
+fn render_doc_stats(stats: &red_core::doc::CollStats, theme: &Theme) -> gpui::AnyElement {
+    use crate::fmt::human_bytes;
+
+    let mut facts: Vec<String> = Vec::new();
+    if let Some(count) = stats.count {
+        facts.push(format!("{} documents", group_digits(count as usize)));
+    }
+    if let Some(size) = stats.size {
+        facts.push(format!("{} data", human_bytes(size)));
+    }
+    if let Some(storage) = stats.storage_size {
+        facts.push(format!("{} on disk", human_bytes(storage)));
+    }
+    if let Some(avg) = stats.avg_obj_size {
+        facts.push(format!("{} average document", human_bytes(avg)));
+    }
+    if let Some(total) = stats.total_index_size {
+        facts.push(format!("{} indexes", human_bytes(total)));
+    }
+    if let Some(shards) = stats.shards {
+        facts.push(format!("sharded across {shards}"));
+    }
+    if stats.capped {
+        facts.push("capped".to_string());
+    }
+    let indexes = (!stats.index_sizes.is_empty()).then(|| {
+        stats
+            .index_sizes
+            .iter()
+            .map(|(name, bytes)| format!("{name} {}", human_bytes(*bytes)))
+            .collect::<Vec<_>>()
+            .join("  \u{b7}  ")
+    });
+
+    div()
+        .flex()
+        .flex_col()
+        .gap_1()
+        .flex_shrink_0()
+        .px_3()
+        .py_2()
+        .border_b_1()
+        .border_color(theme.border)
+        .bg(theme.bg_panel)
+        .text_size(theme.scale(11.))
+        .child(div().text_color(theme.text).child(facts.join("  \u{b7}  ")))
+        .children(indexes.map(|line| {
+            div()
+                .text_color(theme.text_faint)
+                .child(format!("Indexes: {line}"))
+        }))
+        .into_any_element()
+}
+
+/// The per-field half of the Schema panel.
+fn render_doc_schema_body(current: &CollView, theme: &Theme) -> gpui::AnyElement {
     let Some(schema) = current.schema.as_ref() else {
         return doc_centered_hint("Sampling schema...", theme);
     };
@@ -1970,42 +2851,168 @@ fn render_doc_schema_panel(current: &CollView, theme: &Theme) -> gpui::AnyElemen
 
 /// The Indexes panel: one row per index with its keys and properties, or a hint
 /// while the list loads.
-fn render_doc_indexes_panel(current: &CollView, theme: &Theme) -> gpui::AnyElement {
-    let Some(indexes) = current.indexes.as_ref() else {
-        return doc_centered_hint("Loading indexes...", theme);
+fn render_doc_indexes_panel(
+    session: SessionId,
+    current: &CollView,
+    read_only: bool,
+    theme: &Theme,
+    view: &WeakEntity<AppState>,
+) -> gpui::AnyElement {
+    // The panel's own toolbar, present even while the list loads: creating the
+    // first index on an unindexed collection is exactly when it is wanted.
+    let new_view = view.clone();
+    let toolbar = div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_3()
+        .py_2()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(div().flex_1())
+        .when(!read_only, |d| {
+            d.child(
+                Button::new("doc-index-new", "New index\u{2026}")
+                    .size(ButtonSize::Sm)
+                    .variant(ButtonVariant::Secondary)
+                    .on_click(move |_, _, cx| {
+                        new_view
+                            .update(cx, |this, cx| {
+                                this.doc_open_index_form(session, Vec::new(), cx)
+                            })
+                            .ok();
+                    }),
+            )
+        });
+
+    // The suggestion the last explain earned: a COLLSCAN over a filter that names
+    // fields. Offered here rather than only to the agent, because this is the
+    // panel a user opens when a query is slow.
+    let suggestion = current
+        .index_advice
+        .as_ref()
+        .filter(|keys| !keys.is_empty())
+        .map(|keys| {
+            let create_view = view.clone();
+            let seed = keys.clone();
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .border_b_1()
+                .border_color(theme.border)
+                .bg(theme.bg_panel)
+                .text_size(theme.scale(12.))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w(px(0.))
+                        .text_color(theme.yellow)
+                        .child(format!(
+                            "The current filter scans the whole collection. Suggested index: {}",
+                            keys.join(", ")
+                        )),
+                )
+                .when(!read_only, |d| {
+                    d.child(
+                        Button::new("doc-index-suggested", "Create it\u{2026}")
+                            .size(ButtonSize::Sm)
+                            .variant(ButtonVariant::Secondary)
+                            .on_click(move |_, _, cx| {
+                                let seed = seed.clone();
+                                create_view
+                                    .update(cx, |this, cx| {
+                                        this.doc_open_index_form(session, seed, cx)
+                                    })
+                                    .ok();
+                            }),
+                    )
+                })
+        });
+
+    let body = match current.indexes.as_ref() {
+        None => doc_centered_hint("Loading indexes...", theme),
+        Some(indexes) if indexes.is_empty() => doc_centered_hint("No indexes.", theme),
+        Some(indexes) => {
+            let rows = indexes.iter().enumerate().map(|(i, idx)| {
+                let keys = idx
+                    .keys
+                    .iter()
+                    .map(|(field, order)| format!("{field}: {order}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let mut props = Vec::new();
+                if idx.unique {
+                    props.push("unique".to_string());
+                }
+                if idx.sparse {
+                    props.push("sparse".to_string());
+                }
+                if idx.partial {
+                    props.push("partial".to_string());
+                }
+                if let Some(ttl) = idx.ttl {
+                    props.push(format!("ttl {ttl}s"));
+                }
+                // `_id_` is not droppable, so it carries no drop affordance: an
+                // offer the server would refuse is worse than no offer.
+                let droppable = !read_only && idx.name != "_id_";
+                let drop_view = view.clone();
+                let name = idx.name.clone();
+                div()
+                    .flex()
+                    .items_center()
+                    .child(div().flex_1().min_w(px(0.)).child(doc_row3(
+                        idx.name.clone(),
+                        keys,
+                        props.join(", "),
+                        theme,
+                        false,
+                    )))
+                    .child(
+                        div()
+                            .w(px(70.))
+                            .flex_shrink_0()
+                            .pr_2()
+                            .when(droppable, |d| {
+                                d.child(
+                                    Button::new(format!("doc-index-drop-{i}"), "Drop")
+                                        .size(ButtonSize::Sm)
+                                        .variant(ButtonVariant::Ghost)
+                                        .on_click(move |_, _, cx| {
+                                            let name = name.clone();
+                                            drop_view
+                                                .update(cx, |this, cx| {
+                                                    this.doc_drop_index(session, name, cx)
+                                                })
+                                                .ok();
+                                        }),
+                                )
+                            }),
+                    )
+                    .into_any_element()
+            });
+            div()
+                .id("doc-indexes")
+                .flex_1()
+                .min_h(px(0.))
+                .overflow_y_scroll()
+                .text_size(theme.scale(12.))
+                .child(doc_row3("Index", "Keys", "Properties", theme, true))
+                .children(rows)
+                .into_any_element()
+        }
     };
-    if indexes.is_empty() {
-        return doc_centered_hint("No indexes.", theme);
-    }
-    let rows = indexes.iter().map(|idx| {
-        let keys = idx
-            .keys
-            .iter()
-            .map(|(field, order)| format!("{field}: {order}"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let mut props = Vec::new();
-        if idx.unique {
-            props.push("unique".to_string());
-        }
-        if idx.sparse {
-            props.push("sparse".to_string());
-        }
-        if idx.partial {
-            props.push("partial".to_string());
-        }
-        if let Some(ttl) = idx.ttl {
-            props.push(format!("ttl {ttl}s"));
-        }
-        doc_row3(idx.name.clone(), keys, props.join(", "), theme, false)
-    });
+
     div()
-        .id("doc-indexes")
+        .flex()
+        .flex_col()
         .size_full()
-        .overflow_y_scroll()
-        .text_size(theme.scale(12.))
-        .child(doc_row3("Index", "Keys", "Properties", theme, true))
-        .children(rows)
+        .child(toolbar)
+        .children(suggestion)
+        .child(body)
         .into_any_element()
 }
 

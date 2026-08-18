@@ -222,14 +222,27 @@ pub(super) fn doc_index_spec(input: &Json) -> Result<IndexSpec, String> {
     let keys = keys
         .iter()
         .map(|(field, dir)| {
+            // The agent's `keys` object speaks directions only. A special index
+            // type (text, hashed, 2dsphere) is a deliberate choice a human makes
+            // in the index dialog, not one a model should reach for from a filter
+            // it has just explained.
             let d = dir.as_i64().unwrap_or(1);
-            (field.clone(), if d < 0 { -1 } else { 1 })
+            let kind = if d < 0 {
+                red_core::doc::IndexKey::Desc
+            } else {
+                red_core::doc::IndexKey::Asc
+            };
+            (field.clone(), kind)
         })
         .collect();
     Ok(IndexSpec {
         keys,
         unique: input.get("unique").and_then(Json::as_bool).unwrap_or(false),
         name: input.get("name").and_then(Json::as_str).map(str::to_string),
+        sparse: false,
+        ttl_seconds: None,
+        partial_filter: None,
+        collation_locale: None,
     })
 }
 /// Execute an approved `propose_doc_write` by building the [`DocWrite`] and
@@ -362,7 +375,9 @@ async fn doc_execute_write(
         // The DDL writes ride their own tools; not reachable from propose_doc_write.
         DocWrite::CreateCollection { .. }
         | DocWrite::DropCollection { .. }
-        | DocWrite::CreateIndex { .. } => Ok("unsupported write".into()),
+        | DocWrite::CreateIndex { .. }
+        | DocWrite::DropIndex { .. }
+        | DocWrite::SetValidator { .. } => Ok("unsupported write".into()),
     }
 }
 

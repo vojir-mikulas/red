@@ -199,12 +199,10 @@ pub struct AppState {
     /// filter bar's visibility). When on, selecting a column requests its
     /// pushed-down aggregate summary; the per-column result lives on the grid.
     pub(crate) stats_bar: bool,
-    /// The result filter bar, when open. The transient editing UI; the
-    /// *applied* filter lives on the grid (`ResultGrid::filter`).
-    pub(crate) filter_bar: Option<crate::filter::FilterBarState>,
     /// The mode the filter bar last opened / switched to, so a `WHERE` user isn't
-    /// thrown back to `Contains` on every new result. Session-scoped, like the
-    /// bar's visibility.
+    /// thrown back to `Contains` on every new result. Session-scoped: it seeds the
+    /// *next* bar, while an open bar carries its own mode on the tab that owns it
+    /// (`QueryTab::filter_bar`).
     pub(crate) filter_mode: crate::filter::FilterMode,
     /// Recent result filters per `(connection, browsed table)` (see `filters.rs`),
     /// loaded once at startup: what the filter bar's recall dropdown lists and
@@ -1378,7 +1376,6 @@ impl AppState {
             focus_login_code: false,
             next_conversation_id: 0,
             stats_bar: false,
-            filter_bar: None,
             filter_mode: crate::filter::FilterMode::default(),
             filter_history: crate::filters::FilterHistory::load(),
             find_bar: None,
@@ -2124,13 +2121,36 @@ impl AppState {
             } => {
                 self.on_doc_aggregate(session, epoch, db, coll, docs, cx);
             }
+            Event::DocChanged { epoch, change } => self.on_doc_changed(session, epoch, change, cx),
+            Event::DocWatchEnded { epoch, message } => {
+                self.on_doc_watch_ended(session, epoch, message, cx)
+            }
+            Event::DocReferencesReady {
+                epoch,
+                db,
+                collections,
+                references,
+            } => self.on_doc_references(session, epoch, db, collections, references, cx),
+            Event::DocValidatorTested {
+                epoch,
+                matching,
+                total,
+                error,
+            } => self.on_doc_validator_tested(session, epoch, matching, total, error, cx),
+            Event::DocStatsReady {
+                epoch,
+                db,
+                coll,
+                stats,
+            } => self.on_doc_stats(session, epoch, db, coll, stats, cx),
             Event::DocPlanReady {
                 epoch,
                 db,
                 coll,
                 plan,
+                advice,
             } => {
-                self.on_doc_plan(session, epoch, db, coll, plan, cx);
+                self.on_doc_plan(session, epoch, db, coll, plan, advice, cx);
             }
             Event::DocWriteDone { epoch, summary } => {
                 self.on_doc_write_done(session, epoch, summary, cx);
@@ -2298,6 +2318,10 @@ impl AppState {
                 shortfall,
             } => self.on_export_finished(id, path, rows, shortfall, cx),
             Event::ExportCancelled { id } => self.on_export_cancelled(id, cx),
+            Event::ExportFailed { id, message } => self.on_export_failed(id, message, cx),
+            Event::DocImportPreview { epoch, docs, error } => {
+                self.on_doc_import_preview(session, epoch, docs, error, cx)
+            }
 
             // --- data import (Track: data import) ---
             Event::ImportProgress { id, rows } => self.on_import_progress(id, rows, cx),

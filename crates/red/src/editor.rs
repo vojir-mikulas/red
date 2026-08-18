@@ -1712,35 +1712,52 @@ impl AppState {
         self.refresh_filter_completions(cx);
     }
 
-    /// (Re)install completion + diagnostics on the filter bar's `WHERE` box, from
-    /// the active connection's schema and the *active result's* columns. Called
-    /// when the bar opens, when the active result changes, and as the schema grows.
-    /// A no-op with the bar closed or before a connection is up.
+    /// (Re)install completion + diagnostics on every open filter bar's `WHERE`
+    /// box, from the connection's schema and — per bar — *its own tab's* result
+    /// columns. Called when a bar opens and as the schema grows. A no-op with no
+    /// bar open or before a connection is up.
+    ///
+    /// Every tab, like [`refresh_completions`](Self::refresh_completions): a bar
+    /// belongs to a tab (`QueryTab::filter_bar`), so a background one is still
+    /// open and still has to complete against the grid it filters, not against
+    /// whatever result happens to be on screen when the schema lands.
     pub(crate) fn refresh_filter_completions(&mut self, cx: &mut Context<Self>) {
         let Phase::Connected(active) = &self.phase else {
             return;
         };
-        let Some(bar) = &self.filter_bar else {
+        let bars: Vec<_> = active
+            .tabs
+            .iter()
+            .filter_map(|tab| {
+                let expr = tab.filter_bar.as_ref()?.expr.clone();
+                let (table, columns) = match &tab.result {
+                    Some(grid) => (grid.browsed_table(), grid.column_names()),
+                    None => (None, Vec::new()),
+                };
+                Some((expr, table, columns))
+            })
+            .collect();
+        // Before building the index: it walks the whole catalog, and with no bar
+        // open there is nothing to install it on.
+        if bars.is_empty() {
             return;
-        };
+        }
         let index = Rc::new(build_index(
             &active.schema.read(cx).schemas,
             &active.schema.read(cx).details,
             &active.schema.read(cx).fk_graph,
             active.config.kind,
         ));
-        let (table, columns) = match active.active_result() {
-            Some(grid) => (grid.browsed_table(), grid.column_names()),
-            None => (None, Vec::new()),
-        };
-        let expr = bar.expr.clone();
-        expr.update(cx, |editor, cx| {
-            editor.set_rich_completions(
-                filter_completion_provider(index.clone(), table.clone(), columns),
-                cx,
-            );
-            editor.set_decorations(filter_decoration_provider(index, table), cx);
-        });
+        for (expr, table, columns) in bars {
+            let index = index.clone();
+            expr.update(cx, |editor, cx| {
+                editor.set_rich_completions(
+                    filter_completion_provider(index.clone(), table.clone(), columns),
+                    cx,
+                );
+                editor.set_decorations(filter_decoration_provider(index, table), cx);
+            });
+        }
     }
 
     /// The tab strip's right-click menu: Pin/Unpin, then Close / Close Others /

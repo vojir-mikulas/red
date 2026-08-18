@@ -103,6 +103,18 @@ struct Rect {
     h: f32,
 }
 
+/// Which diagram a handler acts on.
+///
+/// The canvas is shared by two shells: the SQL one draws declared foreign keys in
+/// a query tab, the MongoDB one draws *inferred* references in a Mongo tab. An
+/// enum rather than a bare index, because the two index different tab lists and a
+/// swap would silently drive the wrong diagram.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ErSlot {
+    SqlTab(usize),
+    DocTab(usize),
+}
+
 /// One table box on the canvas. `pos`/`size` are world-space (before pan/zoom).
 pub(crate) struct ErNode {
     pub schema: String,
@@ -252,6 +264,23 @@ impl ErView {
 
         // Undirected adjacency: the component split and the barycentre ordering both
         // care that two tables are related, not which way the FK points.
+        Self::assemble(nodes, edges, parents, namespace)
+    }
+
+    /// Lay out a prepared graph and wrap it in a view: the half of the build that
+    /// knows nothing about where the boxes came from.
+    ///
+    /// Split out so the MongoDB relations diagram can reuse it. A document store
+    /// declares no foreign keys, so its edges are *inferred* rather than read, but
+    /// once inferred they are the same graph and deserve the same layout.
+    fn assemble(
+        mut nodes: Vec<ErNode>,
+        edges: Vec<ErEdge>,
+        parents: Vec<Vec<usize>>,
+        namespace: Option<String>,
+    ) -> Self {
+        // Undirected adjacency: the component split and the barycentre ordering
+        // both care that two boxes are related, not which way the edge points.
         let mut adj: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
         for e in &edges {
             adj[e.from].push(e.to);
@@ -274,6 +303,61 @@ impl ErView {
             requested: RefCell::new(HashSet::new()),
             viewport: Rc::new(RefCell::new(None)),
         }
+    }
+
+    /// Build a diagram from **inferred** relationships: one box per collection,
+    /// one edge per reference that resolved. The MongoDB relations view.
+    ///
+    /// `collections` are the boxes (with their sampled field counts, so a box is
+    /// sized like a table's); `references` are `(from, field, to)` triples naming
+    /// collections in `collections`. A reference to something not in the list is
+    /// dropped rather than drawn to nowhere.
+    pub(crate) fn from_references(
+        db: String,
+        collections: &[(String, usize)],
+        references: &[(String, String, String)],
+    ) -> Self {
+        let nodes: Vec<ErNode> = collections
+            .iter()
+            .map(|(name, fields)| ErNode {
+                schema: db.clone(),
+                table: name.clone(),
+                pos: Vec2::default(),
+                w: NODE_W,
+                h: node_height(Some(*fields)),
+                fk_cols: HashSet::new(),
+            })
+            .collect();
+        let index: HashMap<String, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.table.to_lowercase(), i))
+            .collect();
+
+        let mut nodes = nodes;
+        let mut parents: Vec<Vec<usize>> = vec![Vec::new(); nodes.len()];
+        let mut edges: Vec<ErEdge> = Vec::new();
+        for (from, field, to) in references {
+            let (Some(&a), Some(&b)) = (
+                index.get(&from.to_lowercase()),
+                index.get(&to.to_lowercase()),
+            ) else {
+                continue;
+            };
+            nodes[a].fk_cols.insert(field.to_lowercase());
+            if a != b {
+                parents[a].push(b);
+                edges.push(ErEdge {
+                    from: a,
+                    to: b,
+                    from_col: field.to_lowercase(),
+                    // Every inferred reference points at `_id`: that is what the
+                    // inference tested, and it is the only key Mongo guarantees.
+                    to_col: "_id".to_string(),
+                });
+            }
+        }
+        Self::assemble(nodes, edges, parents, Some(db))
     }
 
     /// Adopt a table's freshly-arrived column count: resize its box and re-stack, so
@@ -931,11 +1015,22 @@ impl AppState {
         })
     }
 
-    /// The ER view held by tab `tab_idx`, if that tab is a diagram.
-    fn er_mut(&mut self, tab_idx: usize) -> Option<&mut ErView> {
-        match &mut self.phase {
-            Phase::Connected(active) => active.tabs.get_mut(tab_idx)?.er_mut(),
-            _ => None,
+    /// The ER view `at` names, if it is there.
+    fn er_mut(&mut self, at: ErSlot) -> Option<&mut ErView> {
+        let Phase::Connected(active) = &mut self.phase else {
+            return None;
+        };
+        match at {
+            ErSlot::SqlTab(i) => active.tabs.get_mut(i)?.er_mut(),
+            ErSlot::DocTab(i) => active.doc_view.as_mut()?.relations_mut(i),
+        }
+    }
+
+    /// The same by shared reference, for the render half.
+    fn er_at<'a>(&self, active: &'a crate::app::ActiveConn, at: ErSlot) -> Option<&'a ErView> {
+        match at {
+            ErSlot::SqlTab(i) => active.tabs.get(i).and_then(|t| t.er()),
+            ErSlot::DocTab(i) => active.doc_view.as_ref().and_then(|v| v.relations(i)),
         }
     }
 
@@ -954,8 +1049,8 @@ impl AppState {
     }
 
     /// Zoom the diagram around its centre (the +/− buttons).
-    fn er_zoom(&mut self, tab_idx: usize, factor: f32, cx: &mut Context<Self>) {
-        if let Some(er) = self.er_mut(tab_idx) {
+    fn er_zoom(&mut self, at: ErSlot, factor: f32, cx: &mut Context<Self>) {
+        if let Some(er) = self.er_mut(at) {
             let c = er.center();
             er.zoom_at(factor, c);
             cx.notify();
@@ -963,8 +1058,8 @@ impl AppState {
     }
 
     /// Reset zoom to 100% around the centre.
-    fn er_reset_zoom(&mut self, tab_idx: usize, cx: &mut Context<Self>) {
-        if let Some(er) = self.er_mut(tab_idx) {
+    fn er_reset_zoom(&mut self, at: ErSlot, cx: &mut Context<Self>) {
+        if let Some(er) = self.er_mut(at) {
             let c = er.center();
             let factor = 1.0 / er.zoom;
             er.zoom_at(factor, c);
@@ -973,8 +1068,8 @@ impl AppState {
     }
 
     /// Fit the whole diagram into view.
-    fn er_fit(&mut self, tab_idx: usize, cx: &mut Context<Self>) {
-        if let Some(er) = self.er_mut(tab_idx) {
+    fn er_fit(&mut self, at: ErSlot, cx: &mut Context<Self>) {
+        if let Some(er) = self.er_mut(at) {
             er.fit();
             cx.notify();
         }
@@ -986,11 +1081,11 @@ impl AppState {
     pub(crate) fn render_er(
         &self,
         active: &ActiveConn,
-        tab_idx: usize,
+        at: ErSlot,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let Some(er) = active.tabs.get(tab_idx).and_then(|t| t.er()) else {
+        let Some(er) = self.er_at(active, at) else {
             return div().into_any_element();
         };
         let z = er.zoom;
@@ -1038,31 +1133,27 @@ impl AppState {
                         Button::new("er-zoom-out", "−")
                             .size(ButtonSize::Sm)
                             .variant(ButtonVariant::Secondary)
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.er_zoom(tab_idx, 0.9, cx)),
-                            ),
+                            .on_click(cx.listener(move |this, _, _, cx| this.er_zoom(at, 0.9, cx))),
                     )
                     .child(
                         Button::new("er-zoom-pct", pct)
                             .size(ButtonSize::Sm)
                             .variant(ButtonVariant::Secondary)
                             .on_click(
-                                cx.listener(move |this, _, _, cx| this.er_reset_zoom(tab_idx, cx)),
+                                cx.listener(move |this, _, _, cx| this.er_reset_zoom(at, cx)),
                             ),
                     )
                     .child(
                         Button::new("er-zoom-in", "+")
                             .size(ButtonSize::Sm)
                             .variant(ButtonVariant::Secondary)
-                            .on_click(
-                                cx.listener(move |this, _, _, cx| this.er_zoom(tab_idx, 1.1, cx)),
-                            ),
+                            .on_click(cx.listener(move |this, _, _, cx| this.er_zoom(at, 1.1, cx))),
                     )
                     .child(
                         Button::new("er-fit", "Fit")
                             .size(ButtonSize::Sm)
                             .variant(ButtonVariant::Secondary)
-                            .on_click(cx.listener(move |this, _, _, cx| this.er_fit(tab_idx, cx))),
+                            .on_click(cx.listener(move |this, _, _, cx| this.er_fit(at, cx))),
                     ),
             );
 
@@ -1278,7 +1369,7 @@ impl AppState {
                                 );
                                 return;
                             }
-                            if let Some(er) = this.er_mut(tab_idx) {
+                            if let Some(er) = this.er_mut(at) {
                                 er.selected = Some(i);
                                 er.hand_placed = true;
                                 er.drag = Some(Drag::Node {
@@ -1328,7 +1419,7 @@ impl AppState {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                    if let Some(er) = this.er_mut(tab_idx) {
+                    if let Some(er) = this.er_mut(at) {
                         er.selected = None;
                         er.drag = Some(Drag::Pan {
                             last: pos_of(ev.position),
@@ -1339,7 +1430,7 @@ impl AppState {
             )
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
                 let p = pos_of(ev.position);
-                if let Some(er) = this.er_mut(tab_idx) {
+                if let Some(er) = this.er_mut(at) {
                     match &mut er.drag {
                         Some(Drag::Pan { last }) => {
                             er.pan.x += p.x - last.x;
@@ -1364,7 +1455,7 @@ impl AppState {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseUpEvent, _, cx| {
-                    if let Some(er) = this.er_mut(tab_idx)
+                    if let Some(er) = this.er_mut(at)
                         && er.drag.take().is_some()
                     {
                         cx.notify();
@@ -1376,7 +1467,7 @@ impl AppState {
             // feel smooth and coarse mouse-wheel notches still move meaningfully.
             .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _, cx| {
                 let p = pos_of(ev.position);
-                if let Some(er) = this.er_mut(tab_idx) {
+                if let Some(er) = this.er_mut(at) {
                     let dy = match ev.delta {
                         ScrollDelta::Pixels(d) => f32::from(d.y),
                         ScrollDelta::Lines(d) => d.y * 20.,
@@ -1412,11 +1503,11 @@ impl AppState {
     /// Called after the frame is built, not during it: `render_er` takes `&self` and
     /// this needs `&mut`. Nothing is lost by being a frame late, since the boxes it
     /// fills in were already going to be drawn empty on this frame.
-    pub(crate) fn er_fetch_visible_details(&mut self, tab_idx: usize, cx: &mut Context<Self>) {
+    pub(crate) fn er_fetch_visible_details(&mut self, at: ErSlot, cx: &mut Context<Self>) {
         let Phase::Connected(active) = &self.phase else {
             return;
         };
-        let Some(er) = active.tabs.get(tab_idx).and_then(|t| t.er()) else {
+        let Some(er) = self.er_at(active, at) else {
             return;
         };
         let wanted = er.missing_details(&active.schema.read(cx).details);

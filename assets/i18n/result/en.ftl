@@ -10,6 +10,10 @@
 #      *[other] { $n } rows
 #   }
 
+result-pin_limit = Six pinned rows is the maximum; unpin one to pin another
+
+result-unpin_row = Unpin row
+
 result-empty_hint = Double-click a table or run a query to see rows
 
 result-query_failed = Query failed
@@ -31,6 +35,8 @@ result-stats_distinct = distinct
 result-column_computed = computed
 
 result-column_default = default
+
+result-pin_column_too_wide = Frozen columns can take at most half the grid; narrow one or unpin another first
 
 result-loading = Loading…
 

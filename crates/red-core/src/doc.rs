@@ -7,6 +7,10 @@
 //! KV families). Extended-JSON rendering is hand-rolled below so this crate stays
 //! dependency-light (no `serde_json`).
 
+mod fastfilter;
+
+pub use fastfilter::{FastFilter, compile_fast_filter};
+
 use std::fmt::Write as _;
 
 use crate::Value;
@@ -261,6 +265,30 @@ impl Document {
         }
         Some(Document { id, fields: rest })
     }
+
+    /// The value at a dotted path (`user.addr.city`), or `None` when a segment is
+    /// missing or its parent is not a sub-document. `_id` addresses the split-out
+    /// identity. An array is a leaf here (no `tags.0` indexing), matching how
+    /// [`DocSchema::from_documents`] records one.
+    pub fn value_at(&self, path: &str) -> Option<&DocValue> {
+        let mut segments = path.split('.');
+        let head = segments.next()?;
+        let mut current = if head == "_id" {
+            &self.id
+        } else {
+            self.fields
+                .iter()
+                .find(|(k, _)| k == head)
+                .map(|(_, v)| v)?
+        };
+        for segment in segments {
+            let DocValue::Document(fields) = current else {
+                return None;
+            };
+            current = fields.iter().find(|(k, _)| k == segment).map(|(_, v)| v)?;
+        }
+        Some(current)
+    }
 }
 
 /// A database in the catalog (`listDatabases`).
@@ -300,6 +328,104 @@ pub struct CollectionInfo {
     pub validator: Option<String>,
 }
 
+/// What a change stream reported happening.
+///
+/// The CRUD four plus the collection-level events, because those are what end a
+/// stream: a dropped or renamed collection invalidates it, and a viewer that
+/// showed nothing would just look frozen.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocChangeOp {
+    Insert,
+    Update,
+    Replace,
+    Delete,
+    Drop,
+    Rename,
+    /// The stream can no longer continue (the collection was dropped or renamed).
+    Invalidate,
+    /// Anything the server reports that this list does not name, rather than
+    /// dropping it: an unrecognized event is still evidence something happened.
+    Other,
+}
+
+impl DocChangeOp {
+    pub fn label(self) -> &'static str {
+        match self {
+            DocChangeOp::Insert => "insert",
+            DocChangeOp::Update => "update",
+            DocChangeOp::Replace => "replace",
+            DocChangeOp::Delete => "delete",
+            DocChangeOp::Drop => "drop",
+            DocChangeOp::Rename => "rename",
+            DocChangeOp::Invalidate => "invalidate",
+            DocChangeOp::Other => "other",
+        }
+    }
+
+    /// Whether this event ends the stream. A viewer must say so rather than sit
+    /// there looking live.
+    pub fn is_terminal(self) -> bool {
+        matches!(self, DocChangeOp::Invalidate | DocChangeOp::Drop)
+    }
+
+    /// The operations a viewer can filter by, in menu order.
+    pub const FILTERABLE: [DocChangeOp; 4] = [
+        DocChangeOp::Insert,
+        DocChangeOp::Update,
+        DocChangeOp::Replace,
+        DocChangeOp::Delete,
+    ];
+}
+
+/// One event from a collection's change stream.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocChange {
+    pub op: DocChangeOp,
+    /// `db.collection` the change happened on.
+    pub namespace: String,
+    /// The `_id` of the document that changed, when the event names one.
+    pub id: Option<DocValue>,
+    /// The document after the change, for an insert or a replace (and for an
+    /// update when the stream was opened with full-document lookup).
+    pub full: Option<Document>,
+    /// Fields an update set, as dotted paths.
+    pub updated: Vec<String>,
+    /// Fields an update removed.
+    pub removed: Vec<String>,
+    /// Server wall-clock time of the change, in milliseconds since the epoch.
+    pub at_ms: Option<i64>,
+    /// The resume token *after* this event, as extended JSON. Surfaced so a user
+    /// can see (and copy) the point a consumer would restart from, which is the
+    /// one thing a change-stream UI can offer that a log tail cannot.
+    pub resume_token: Option<String>,
+}
+
+/// A collection's storage numbers (`collStats`): what it costs, as opposed to
+/// what it holds.
+///
+/// Every field is `Option` because `collStats` is *truncated* rather than refused
+/// for an under-privileged user, exactly like `serverStatus`: a missing number
+/// means "not reported", which the panel must show as such instead of as a zero.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CollStats {
+    /// Documents, exactly (`collStats.count`).
+    pub count: Option<u64>,
+    /// Uncompressed size of the documents in bytes (`size`).
+    pub size: Option<u64>,
+    /// Bytes actually allocated on disk (`storageSize`), which compression can
+    /// make much smaller than `size`.
+    pub storage_size: Option<u64>,
+    /// Mean document size in bytes (`avgObjSize`).
+    pub avg_obj_size: Option<u64>,
+    /// Total bytes across all indexes (`totalIndexSize`).
+    pub total_index_size: Option<u64>,
+    /// Per-index bytes (`indexSizes`), largest first.
+    pub index_sizes: Vec<(String, u64)>,
+    /// Whether the collection is sharded, and across how many shards.
+    pub shards: Option<usize>,
+    pub capped: bool,
+}
+
 /// A `find` filter / projection / sort, passed through as an extended-JSON
 /// [`DocValue::Document`] in v1 (a typed query builder is a later bet). Aliases,
 /// not newtypes, so they read at the call sites without ceremony.
@@ -320,6 +446,201 @@ pub struct FindQuery {
     pub skip: u64,
     pub limit: Option<u64>,
     pub batch: usize,
+}
+
+/// Render a browse sort as an extended-JSON document (`{"age":-1,"name":1}`), the
+/// spelling [`FindQuery::sort`] wants. Keys ride in the order given: a document
+/// store's sort is ordered, so the first key is the primary one.
+///
+/// `_id` is appended as a final tiebreaker unless it is already a key, so a sort on
+/// a field with repeats has a *total* order. Without it, two windows of a paged
+/// browse can disagree about which of two equal-keyed documents comes first, and the
+/// grid shows a document twice while another never appears.
+pub fn sort_json(keys: &[(String, bool)]) -> String {
+    let mut out = String::from("{");
+    for (i, (field, ascending)) in keys.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        write_json_string(&mut out, field);
+        out.push_str(if *ascending { ":1" } else { ":-1" });
+    }
+    if !keys.iter().any(|(f, _)| f == "_id") {
+        if !keys.is_empty() {
+            out.push(',');
+        }
+        out.push_str("\"_id\":1");
+    }
+    out.push('}');
+    out
+}
+
+/// Render a projection over `fields` as extended JSON (`{"name":1,"user.city":1}`).
+///
+/// `_id` is never listed: MongoDB includes it unless explicitly excluded, and every
+/// RED surface addresses a document by it, so a projection that dropped it would
+/// leave rows the inspector, the editor and the delete path cannot identify.
+pub fn projection_json(fields: &[String]) -> String {
+    let mut out = String::from("{");
+    let mut first = true;
+    for field in fields.iter().filter(|f| f.as_str() != "_id") {
+        if !first {
+            out.push(',');
+        }
+        first = false;
+        write_json_string(&mut out, field);
+        out.push_str(":1");
+    }
+    out.push('}');
+    out
+}
+
+/// A streamed document-export target format.
+///
+/// Two shapes, and the split is load-bearing: the JSON pair writes each document
+/// as extended JSON, so every BSON type survives the round trip; the tabular pair
+/// flattens documents onto a fixed column list, which is what a spreadsheet needs
+/// and what costs the types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocExportFormat {
+    /// One JSON array of extended-JSON documents.
+    Json,
+    /// One extended-JSON document per line (newline-delimited JSON), the format a
+    /// downstream tool can read without holding the whole file.
+    Ndjson,
+    /// Flattened rows against dotted column paths.
+    Csv,
+    /// Flattened rows into an Excel workbook.
+    Xlsx,
+}
+
+impl DocExportFormat {
+    /// The destination file's extension, without the dot.
+    pub fn extension(self) -> &'static str {
+        match self {
+            DocExportFormat::Json => "json",
+            DocExportFormat::Ndjson => "ndjson",
+            DocExportFormat::Csv => "csv",
+            DocExportFormat::Xlsx => "xlsx",
+        }
+    }
+
+    /// Whether the format writes rows against a fixed column list, and therefore
+    /// needs one computed before the first document is written.
+    pub fn is_tabular(self) -> bool {
+        matches!(self, DocExportFormat::Csv | DocExportFormat::Xlsx)
+    }
+}
+
+/// A streamed document-import source format, the read-side mirror of
+/// [`DocExportFormat`]. Narrower than the export set on purpose: XLSX is a write
+/// target, not a source RED parses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocImportFormat {
+    /// One top-level JSON array of objects.
+    Json,
+    /// One JSON object per line.
+    Ndjson,
+    /// A header of dotted field paths over flat records.
+    Csv,
+}
+
+impl DocImportFormat {
+    /// The format a file name suggests, or `None` when the extension says nothing.
+    /// A guess the import dialog pre-selects and the user can override.
+    pub fn from_extension(name: &str) -> Option<DocImportFormat> {
+        let ext = name.rsplit('.').next()?.to_ascii_lowercase();
+        match ext.as_str() {
+            "json" => Some(DocImportFormat::Json),
+            "ndjson" | "jsonl" => Some(DocImportFormat::Ndjson),
+            "csv" => Some(DocImportFormat::Csv),
+            _ => None,
+        }
+    }
+}
+
+/// How a collection copy writes into its target.
+///
+/// The document analogue of [`CopyMode`](crate::CopyMode), with one arm that has no
+/// SQL counterpart: a document store has no schema to preserve, so replacing a
+/// collection wholesale is a drop, not a truncate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocCopyMode {
+    /// Insert the source documents; the target keeps what it already had. A
+    /// duplicate `_id` fails the chunk it is in.
+    Append,
+    /// Replace a target document with the same `_id`, insert when there is none:
+    /// re-runnable without collisions.
+    UpsertOnId,
+    /// Drop the target collection first, then insert: a full refresh. Destructive,
+    /// and gated by the same confirm a drop is.
+    DropAndInsert,
+}
+
+/// How an import writes each document into the target collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocImportMode {
+    /// Insert every document. A duplicate `_id` fails that document.
+    Insert,
+    /// Replace the document with the same `_id`, inserting when there is none
+    /// (`replaceOne` with `upsert`). What makes re-importing an export idempotent.
+    UpsertOnId,
+}
+
+/// The column list a tabular export writes, derived from an inferred schema:
+/// every field path that ever held something other than a sub-document, `_id`
+/// first and the rest in the schema's (sorted) order, capped at `max`.
+///
+/// A path that is *only* ever a sub-document is dropped, because its children
+/// already carry the data. A path with type drift (a string in some documents, a
+/// sub-document in others) is kept, because dropping it would lose the string
+/// case — a schemaless store's whole hazard.
+pub fn tabular_columns(schema: &DocSchema, max: usize) -> Vec<String> {
+    let mut columns = Vec::with_capacity(schema.fields.len().min(max));
+    let scalar = |f: &FieldStat| f.types.iter().any(|(t, _)| *t != DocType::Object);
+    if schema.fields.iter().any(|f| f.path == "_id") {
+        columns.push("_id".to_string());
+    }
+    for field in schema.fields.iter().filter(|f| f.path != "_id") {
+        if columns.len() >= max {
+            break;
+        }
+        if scalar(field) {
+            columns.push(field.path.clone());
+        }
+    }
+    columns
+}
+
+/// Whether a tabular export of `doc` against `columns` would drop something: any
+/// leaf the column list does not address. The signal behind the export's
+/// "documents had fields outside the sampled columns" shortfall, because a
+/// column list sampled from part of a collection cannot cover a schemaless whole.
+pub fn has_unmapped_fields(doc: &Document, columns: &[String]) -> bool {
+    let mut unmapped = false;
+    let mut check = |path: &str| {
+        if !unmapped && !columns.iter().any(|c| c == path) {
+            unmapped = true;
+        }
+    };
+    leaf_paths("_id", &doc.id, &mut check);
+    for (name, value) in &doc.fields {
+        leaf_paths(name, value, &mut check);
+    }
+    unmapped
+}
+
+/// Emit the dotted path of every leaf under `value`: a non-document value, or an
+/// empty sub-document (which has no children to carry it).
+fn leaf_paths(path: &str, value: &DocValue, emit: &mut impl FnMut(&str)) {
+    match value {
+        DocValue::Document(fields) if !fields.is_empty() => {
+            for (name, child) in fields {
+                leaf_paths(&format!("{path}.{name}"), child, emit);
+            }
+        }
+        _ => emit(path),
+    }
 }
 
 /// A keyset seek into an `_id`-ordered browse: which boundary to page from and
@@ -580,15 +901,118 @@ pub enum DocUpdate {
     Replace(Document),
 }
 
-/// A new index to create (`createIndex`). v1 covers b-tree keys with an optional
-/// unique constraint and name; ttl/partial creation is a later refinement.
+/// How one index key is spelled: a b-tree direction, or the index type that
+/// replaces a direction for a special index.
+///
+/// A **wildcard** index has no variant here because it is not a key type: it is a
+/// key *path* (`"$**"`, or `"user.$**"`) with an ordinary ascending direction, so
+/// it is expressed by the field name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IndexKey {
+    Asc,
+    Desc,
+    /// A text index over the field (`"text"`). At most one per collection, which
+    /// is the server's rule, not RED's.
+    Text,
+    /// A hashed index (`"hashed"`), the shard-key shape.
+    Hashed,
+    /// A 2dsphere geospatial index (`"2dsphere"`).
+    Sphere2d,
+}
+
+impl IndexKey {
+    /// The value the key takes in a `createIndex` key document, as Mongo spells
+    /// it: a number for a b-tree direction, a string for a special type.
+    pub fn spec_value(self) -> &'static str {
+        match self {
+            IndexKey::Asc => "1",
+            IndexKey::Desc => "-1",
+            IndexKey::Text => "text",
+            IndexKey::Hashed => "hashed",
+            IndexKey::Sphere2d => "2dsphere",
+        }
+    }
+
+    /// Whether the key is a b-tree direction rather than a special type. Only a
+    /// b-tree key can carry a sort, so this is what decides whether an index can
+    /// serve one.
+    pub fn is_btree(self) -> bool {
+        matches!(self, IndexKey::Asc | IndexKey::Desc)
+    }
+
+    /// The label the index dialog shows.
+    pub fn label(self) -> &'static str {
+        match self {
+            IndexKey::Asc => "ascending",
+            IndexKey::Desc => "descending",
+            IndexKey::Text => "text",
+            IndexKey::Hashed => "hashed",
+            IndexKey::Sphere2d => "2dsphere",
+        }
+    }
+
+    /// The kinds the dialog offers, in menu order.
+    pub const ALL: [IndexKey; 5] = [
+        IndexKey::Asc,
+        IndexKey::Desc,
+        IndexKey::Text,
+        IndexKey::Hashed,
+        IndexKey::Sphere2d,
+    ];
+}
+
+/// A new index to create (`createIndex`).
 #[derive(Debug, Clone, PartialEq)]
 pub struct IndexSpec {
-    /// `(field, direction)` pairs; direction is `1` (ascending) or `-1`.
-    pub keys: Vec<(String, i32)>,
+    /// `(field, kind)` pairs, in key order. Order is load-bearing for a compound
+    /// index: only a prefix of the keys can serve a query.
+    pub keys: Vec<(String, IndexKey)>,
     pub unique: bool,
+    /// Skip documents that lack the indexed field entirely.
+    pub sparse: bool,
     /// An explicit index name, or `None` to let the server derive one.
     pub name: Option<String>,
+    /// Delete a document this many seconds after its indexed date value: a TTL
+    /// index. Only meaningful on a single date-valued key, which is the server's
+    /// constraint.
+    pub ttl_seconds: Option<i64>,
+    /// Index only the documents matching this filter: a partial index.
+    ///
+    /// Carried as extended-JSON **text**, not a parsed [`Filter`], for the reason
+    /// `Command::DocFetchRun`'s filter is: it is typed by a user in a UI that has
+    /// no parser, and the driver owns the extended-JSON dialect. The driver parses
+    /// it, and a syntax error surfaces as the write failing rather than as a
+    /// silently ignored option.
+    pub partial_filter: Option<String>,
+    /// An ICU locale for a case- and accent-aware index (`"en"`, `"de@collation=phonebook"`).
+    pub collation_locale: Option<String>,
+}
+
+impl IndexSpec {
+    /// A plain b-tree index over `keys`, ascending, with every option off. The
+    /// shape most indexes actually are, so the dialog and the agent both start
+    /// here and set what they need.
+    pub fn ascending(keys: impl IntoIterator<Item = String>) -> IndexSpec {
+        IndexSpec {
+            keys: keys.into_iter().map(|k| (k, IndexKey::Asc)).collect(),
+            unique: false,
+            sparse: false,
+            name: None,
+            ttl_seconds: None,
+            partial_filter: None,
+            collation_locale: None,
+        }
+    }
+
+    /// The name Mongo would derive for this spec (`field_1_other_-1`), which the
+    /// dialog shows as the placeholder so the user can see what they will get.
+    pub fn derived_name(&self) -> String {
+        self.keys
+            .iter()
+            .map(|(field, kind)| format!("{field}_{}", kind.spec_value()))
+            .collect::<Vec<_>>()
+            .join("_")
+    }
 }
 
 /// One document-store write, the unit the classifier ([`classify_doc_op`]) and
@@ -634,6 +1058,19 @@ pub enum DocWrite {
         coll: String,
         spec: IndexSpec,
     },
+    DropIndex {
+        db: String,
+        coll: String,
+        name: String,
+    },
+    /// Set (or, with `None`, remove) a collection's JSON-Schema validator
+    /// (`collMod`). Extended-JSON **text**, parsed by the driver, for the reason
+    /// [`IndexSpec::partial_filter`] is.
+    SetValidator {
+        db: String,
+        coll: String,
+        validator: Option<String>,
+    },
 }
 
 pub use crate::OpClass;
@@ -658,6 +1095,14 @@ pub fn classify_doc_op(op: &DocWrite) -> OpClass {
         DocWrite::DropCollection { .. } => true,
         DocWrite::Delete { filter, many, .. } => *many || filter_is_empty(filter),
         DocWrite::Update { filter, many, .. } => *many || filter_is_empty(filter),
+        // Dropping an index writes no documents and is still the write most
+        // likely to take a production deployment down: the queries that relied on
+        // it silently become collection scans.
+        DocWrite::DropIndex { .. } => true,
+        // A validator writes no documents either, and decides whether every
+        // future write is accepted. Removing one is as consequential as adding
+        // one, so both confirm.
+        DocWrite::SetValidator { .. } => true,
         DocWrite::Insert { .. }
         | DocWrite::Replace { .. }
         | DocWrite::CreateCollection { .. }
@@ -668,6 +1113,110 @@ pub fn classify_doc_op(op: &DocWrite) -> OpClass {
     } else {
         OpClass::Write
     }
+}
+
+/// Split an aggregation pipeline's text into its top-level stage texts, keeping
+/// each stage exactly as written. `None` when the text is not a bracketed array,
+/// which is the caller's cue to leave it alone rather than mangle it.
+///
+/// A *shallow* split: it tracks bracket depth and string state and nothing else,
+/// so it needs no parser and no BSON knowledge. That is enough to move between the
+/// raw editor and the stage list without either becoming the other's lossy copy --
+/// a stage the split hands back is byte-identical to the one it was given,
+/// comments and formatting included.
+pub fn split_pipeline_stages(text: &str) -> Option<Vec<String>> {
+    let trimmed = text.trim();
+    let inner = trimmed.strip_prefix('[')?.strip_suffix(']')?;
+    let mut stages = Vec::new();
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+    for (i, ch) in inner.char_indices() {
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' | '[' | '(' => depth += 1,
+            '}' | ']' | ')' => depth -= 1,
+            ',' if depth == 0 => {
+                let stage = inner[start..i].trim();
+                if !stage.is_empty() {
+                    stages.push(stage.to_string());
+                }
+                start = i + ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    // An unbalanced pipeline is being typed, not described; refuse rather than
+    // hand back stages that would silently drop the unclosed tail.
+    if depth != 0 || in_str {
+        return None;
+    }
+    let tail = inner[start..].trim();
+    if !tail.is_empty() {
+        stages.push(tail.to_string());
+    }
+    Some(stages)
+}
+
+/// Join stage texts back into a pipeline, one stage per line. The inverse of
+/// [`split_pipeline_stages`] for a stage list that has been reordered or edited.
+pub fn join_pipeline_stages(stages: &[String]) -> String {
+    if stages.is_empty() {
+        return "[]".to_string();
+    }
+    let body = stages
+        .iter()
+        .map(|s| format!("  {}", s.trim()))
+        .collect::<Vec<_>>()
+        .join(",\n");
+    format!("[\n{body}\n]")
+}
+
+/// The `$`-prefixed operator a stage text leads with (`$match`, `$group`), for the
+/// stage list's row label. `None` when the stage names none, which is a stage the
+/// server will reject anyway.
+pub fn stage_operator(stage: &str) -> Option<&str> {
+    let after_brace = stage.trim().strip_prefix('{')?.trim_start();
+    let quoted = after_brace.strip_prefix('"')?;
+    let end = quoted.find('"')?;
+    let key = &quoted[..end];
+    key.starts_with('$').then_some(key)
+}
+
+/// The index keys a filter would want, when `plan` says the query is scanning the
+/// whole collection. Empty when the plan already uses an index, when the filter
+/// names no fields, or when it is not a document.
+///
+/// The same reasoning the `index_advice` agent tool applies, lifted here so the
+/// Indexes panel can offer the suggestion without asking a model. Deliberately
+/// shallow: the equality fields at the top level, in the order they appear.
+/// Ordering a compound key well needs the selectivity numbers neither an `explain`
+/// nor a sample supplies, so RED suggests the keys and leaves the ordering to a
+/// human who knows the data.
+pub fn suggested_index_keys(filter: &Filter, plan: &DocPlan) -> Vec<String> {
+    if !plan.collscan {
+        return Vec::new();
+    }
+    let DocValue::Document(fields) = filter else {
+        return Vec::new();
+    };
+    fields
+        .iter()
+        .map(|(k, _)| k.clone())
+        // `$and` / `$or` / `$where` name no field to index.
+        .filter(|k| !k.starts_with('$'))
+        .collect()
 }
 
 /// The first pipeline stage that writes (`$out`/`$merge`), if any. Aggregation is
@@ -683,6 +1232,83 @@ pub fn pipeline_write_stage(stages: &[DocValue]) -> Option<&'static str> {
         }),
         _ => None,
     })
+}
+
+/// One field that looks like it references another collection: which collection
+/// it lives in, the dotted path, the collection its name points at, and the type
+/// its values actually had.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RefCandidate {
+    pub coll: String,
+    pub path: String,
+    pub target: String,
+    pub doc_type: DocType,
+}
+
+/// The reference candidates in one collection's inferred schema: the scalar fields
+/// whose name points at a collection in `catalog`.
+///
+/// Mongo declares no foreign keys, so a reference can only be *guessed* from a
+/// name and then tested; this is the guessing half over a whole collection, and
+/// [`reference_base`] / [`match_collection`] are the naming rules it applies.
+///
+/// Container and null fields are excluded deliberately: a document or array field
+/// may *contain* a reference, but the field itself is not one, and probing an
+/// array against `_id` would report a meaningless zero.
+pub fn reference_candidates(
+    coll: &str,
+    schema: &DocSchema,
+    catalog: &[String],
+) -> Vec<RefCandidate> {
+    schema
+        .fields
+        .iter()
+        .filter_map(|f| {
+            let name = f.path.rsplit('.').next().unwrap_or(&f.path);
+            let (doc_type, _) = f.types.first()?;
+            if matches!(doc_type, DocType::Object | DocType::Array | DocType::Null) {
+                return None;
+            }
+            // `order_id` -> `order`, else the bare name (`customer` -> `customers`).
+            let base = reference_base(&f.path).unwrap_or(name);
+            let target = match_collection(base, catalog)?;
+            Some(RefCandidate {
+                coll: coll.to_string(),
+                path: f.path.clone(),
+                target: target.to_string(),
+                doc_type: *doc_type,
+            })
+        })
+        .collect()
+}
+
+/// One inferred relationship between two collections, with the evidence for it.
+///
+/// `resolved` out of `sampled` is the whole point: Mongo declares nothing, so a
+/// relationship is a *claim*, and a claim that 3 of 200 sampled values resolve is
+/// a coincidence rather than a reference. The UI draws the strong ones and reports
+/// the weak ones as what they are.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DocReference {
+    pub from_coll: String,
+    pub field: String,
+    pub to_coll: String,
+    /// Distinct sampled values of the field that matched a document's `_id`.
+    pub resolved: u64,
+    /// Distinct values sampled.
+    pub sampled: u64,
+}
+
+impl DocReference {
+    /// Whether enough of the sampled values resolved to call this a reference
+    /// rather than a naming coincidence.
+    ///
+    /// A majority, not all: a real reference to a collection that has been pruned
+    /// (soft-deleted rows, an archive job) still resolves most of the time, and
+    /// insisting on 100% would hide exactly the relationships worth seeing.
+    pub fn is_strong(&self) -> bool {
+        self.sampled > 0 && self.resolved * 2 > self.sampled
+    }
 }
 
 /// The name a field is probably a reference *to*, or `None` when the field name
@@ -776,7 +1402,7 @@ pub fn server_js_operator(value: &DocValue) -> Option<&'static str> {
 
 /// Append `s` as a JSON string literal (quotes + minimal escaping), matching
 /// `serde_json`'s escaping so the output parses cleanly downstream.
-fn write_json_string(out: &mut String, s: &str) {
+pub(super) fn write_json_string(out: &mut String, s: &str) {
     out.push('"');
     for c in s.chars() {
         match c {
@@ -1135,6 +1761,141 @@ mod tests {
         // match the probe would then have to disprove.
         assert_eq!(match_collection("person", &catalog), None);
         assert_eq!(match_collection("invoice", &catalog), None);
+    }
+
+    #[test]
+    fn pipeline_stages_round_trip_without_reformatting_a_stage() {
+        let text =
+            r#"[ { "$match": { "a": 1 } }, { "$group": { "_id": "$k", "n": { "$sum": 1 } } } ]"#;
+        let stages = split_pipeline_stages(text).unwrap();
+        assert_eq!(stages.len(), 2);
+        // A stage comes back exactly as written, commas inside it included.
+        assert_eq!(stages[0], r#"{ "$match": { "a": 1 } }"#);
+        assert_eq!(stage_operator(&stages[0]), Some("$match"));
+        assert_eq!(stage_operator(&stages[1]), Some("$group"));
+        // Re-splitting the joined form yields the same stages.
+        let joined = join_pipeline_stages(&stages);
+        assert_eq!(split_pipeline_stages(&joined).unwrap(), stages);
+    }
+
+    #[test]
+    fn pipeline_split_refuses_what_it_cannot_read() {
+        assert_eq!(split_pipeline_stages("[]"), Some(Vec::new()));
+        // A comma inside a string is not a separator.
+        let quoted = r#"[ { "$match": { "s": "a,b" } } ]"#;
+        assert_eq!(split_pipeline_stages(quoted).unwrap().len(), 1);
+        // Not an array, or still being typed: leave it alone.
+        assert_eq!(split_pipeline_stages("{ \"$match\": {} }"), None);
+        assert_eq!(split_pipeline_stages("[ { \"$match\": {"), None);
+        assert_eq!(split_pipeline_stages("[ \"unclosed ]"), None);
+        assert_eq!(join_pipeline_stages(&[]), "[]");
+        // A stage with no operator is reported as such, not guessed at.
+        assert_eq!(stage_operator("{ \"a\": 1 }"), None);
+    }
+
+    #[test]
+    fn sort_json_keeps_key_order_and_totalizes_with_id() {
+        assert_eq!(
+            sort_json(&[("age".into(), false), ("name".into(), true)]),
+            r#"{"age":-1,"name":1,"_id":1}"#
+        );
+        // An explicit `_id` key is not doubled.
+        assert_eq!(sort_json(&[("_id".into(), false)]), r#"{"_id":-1}"#);
+        assert_eq!(sort_json(&[]), r#"{"_id":1}"#);
+    }
+
+    #[test]
+    fn projection_never_drops_id() {
+        assert_eq!(
+            projection_json(&["name".into(), "user.city".into()]),
+            r#"{"name":1,"user.city":1}"#
+        );
+        // Listing `_id` changes nothing: it rides along regardless.
+        assert_eq!(projection_json(&["_id".into()]), "{}");
+    }
+
+    #[test]
+    fn value_at_walks_dotted_paths() {
+        let doc = Document {
+            id: DocValue::Int32(1),
+            fields: vec![
+                (
+                    "user".into(),
+                    DocValue::Document(vec![
+                        ("city".into(), DocValue::Str("London".into())),
+                        ("meta".into(), DocValue::Document(vec![])),
+                    ]),
+                ),
+                (
+                    "tags".into(),
+                    DocValue::Array(vec![DocValue::Str("x".into())]),
+                ),
+            ],
+        };
+        assert_eq!(doc.value_at("_id"), Some(&DocValue::Int32(1)));
+        assert_eq!(
+            doc.value_at("user.city"),
+            Some(&DocValue::Str("London".into()))
+        );
+        assert_eq!(doc.value_at("user.meta"), Some(&DocValue::Document(vec![])));
+        assert_eq!(doc.value_at("user.missing"), None);
+        // An array is a leaf: no element indexing, matching the schema rollup.
+        assert_eq!(doc.value_at("tags.0"), None);
+        // Descending through a scalar is not a path, it is a mistake.
+        assert_eq!(doc.value_at("user.city.length"), None);
+    }
+
+    #[test]
+    fn tabular_columns_drops_pure_containers_and_leads_with_id() {
+        let docs = vec![
+            Document {
+                id: DocValue::Int32(1),
+                fields: vec![
+                    ("name".into(), DocValue::Str("a".into())),
+                    (
+                        "user".into(),
+                        DocValue::Document(vec![("age".into(), DocValue::Int32(30))]),
+                    ),
+                ],
+            },
+            // `user` is a string here: type drift keeps the column, because
+            // dropping it would lose this document's value entirely.
+            Document {
+                id: DocValue::Int32(2),
+                fields: vec![("drift".into(), DocValue::Str("s".into()))],
+            },
+        ];
+        let schema = DocSchema::from_documents(&docs);
+        let columns = tabular_columns(&schema, 64);
+        assert_eq!(columns, vec!["_id", "drift", "name", "user.age"]);
+        // `user` itself is only ever a sub-document, so its children carry it.
+        assert!(!columns.iter().any(|c| c == "user"));
+        // The cap bounds the header the way `doc.max_columns` bounds the grid.
+        assert_eq!(tabular_columns(&schema, 2), vec!["_id", "drift"]);
+    }
+
+    #[test]
+    fn unmapped_fields_spots_what_a_tabular_export_would_drop() {
+        let doc = Document {
+            id: DocValue::Int32(1),
+            fields: vec![
+                ("name".into(), DocValue::Str("a".into())),
+                (
+                    "user".into(),
+                    DocValue::Document(vec![("age".into(), DocValue::Int32(30))]),
+                ),
+            ],
+        };
+        let covered = [
+            "_id".to_string(),
+            "name".to_string(),
+            "user.age".to_string(),
+        ];
+        assert!(!has_unmapped_fields(&doc, &covered));
+        // The parent path does not stand in for its leaf.
+        let parent_only = ["_id".to_string(), "name".to_string(), "user".to_string()];
+        assert!(has_unmapped_fields(&doc, &parent_only));
+        assert!(has_unmapped_fields(&doc, &["_id".to_string()]));
     }
 
     #[test]

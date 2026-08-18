@@ -34,7 +34,7 @@
 //! ⌃Tab and by click, and a four-pane split with full strips would put thirty
 //! badges on screen for surfaces that all lead to the same few bodies.
 
-use gpui::{App, FocusHandle, Focusable, SharedString};
+use gpui::{App, FocusHandle, Focusable, SharedString, Window};
 
 use crate::app::{ActiveConn, AppState, Phase, TabWorkspace};
 use crate::i18n::tr;
@@ -144,6 +144,57 @@ pub(crate) fn all_hint_keys() -> impl Iterator<Item = char> {
     DIGIT_HINTS.iter().copied()
 }
 
+/// The Flint key contexts that mean "this surface turns printable keys into
+/// text". Every one of them either *is* a text field or embeds one.
+///
+/// `TextInput` alone would cover most of these (the palette, the switcher and a
+/// combo box all focus an inner field), but a surface can also park focus on its
+/// own wrapper — an open `ComboBox` popover holds the shared handle before its
+/// field takes it — so each is named.
+const TEXT_ENTRY_CONTEXTS: &[&str] = &[
+    "TextInput",
+    "ComboBox",
+    "CodeEditor",
+    "MarkdownEditor",
+    "Palette",
+    "Switcher",
+];
+
+/// Whether a text-entry surface currently owns the keyboard.
+///
+/// The guard for bare-key shortcuts (`e` edits the highlighted connection, `/`
+/// jumps to the search box). GPUI dispatches a `on_key_down` listener to *every*
+/// node from the focused element up to the root, so a root-level listener sees
+/// keys that were meant for a field several levels down: typing "redis" into the
+/// welcome screen's engine filter used to fire the `e` shortcut mid-word and open
+/// the edit form. A binding cannot have this problem — the deeper context wins —
+/// so only hand-written key listeners need to ask.
+///
+/// Reads the focused element's live key-context stack rather than a list of
+/// focus handles the caller happens to know about, so a field added later is
+/// covered without anyone remembering to add it here.
+pub(crate) fn text_entry_focused(window: &Window) -> bool {
+    window
+        .context_stack()
+        .iter()
+        .any(|ctx| TEXT_ENTRY_CONTEXTS.iter().any(|name| ctx.contains(name)))
+}
+
+/// Whether an open `ComboBox` popover holds the keyboard (the context exists only
+/// while the dropdown is up — a closed trigger carries none).
+///
+/// Narrower than [`text_entry_focused`], and for the other half of the same
+/// problem: Esc. The dropdown is a layer over whatever opened it, so Esc there
+/// means "close the dropdown" — but the field's own Esc binding doesn't stop the
+/// key from bubbling, so a panel's hand-written Esc listener would close the panel
+/// out from under it too.
+pub(crate) fn combo_popover_focused(window: &Window) -> bool {
+    window
+        .context_stack()
+        .iter()
+        .any(|ctx| ctx.contains("ComboBox"))
+}
+
 impl AppState {
     /// Every surface that can take keyboard focus right now, in cycle order.
     ///
@@ -184,7 +235,7 @@ impl AppState {
                 handle,
             ));
         }
-        if let Some(bar) = &self.filter_bar {
+        if let Some(bar) = self.filter_bar() {
             out.push(FocusTarget::new(
                 FocusTargetId::FilterBar,
                 tr!("focus.filter_bar", "Filter"),
@@ -395,5 +446,77 @@ mod tests {
                 assert!(bound.contains(&h), "{h:?} is never bound");
             }
         }
+    }
+
+    /// Three surfaces, laid out like the real thing: a grid that types nothing, a
+    /// bare field, and a field inside an open combo popover. Enough tree for the
+    /// guards to read a real context stack.
+    struct Probe {
+        grid: FocusHandle,
+        field: FocusHandle,
+        combo_field: FocusHandle,
+    }
+
+    impl gpui::Render for Probe {
+        fn render(
+            &mut self,
+            _window: &mut Window,
+            _cx: &mut gpui::Context<Self>,
+        ) -> impl gpui::IntoElement {
+            use gpui::{InteractiveElement, ParentElement, div};
+            div()
+                .child(div().key_context("Table").track_focus(&self.grid))
+                .child(div().key_context("TextInput").track_focus(&self.field))
+                .child(
+                    div().key_context("ComboBox").child(
+                        div()
+                            .key_context("TextInput")
+                            .track_focus(&self.combo_field),
+                    ),
+                )
+        }
+    }
+
+    /// The guards read the *focused* element's context stack, which is the whole
+    /// point: a root-level key listener asks one question and gets the right
+    /// answer for a field nested any number of levels down.
+    #[gpui::test]
+    fn the_guards_follow_focus(cx: &mut gpui::TestAppContext) {
+        let (grid, field, combo_field) =
+            cx.update(|cx| (cx.focus_handle(), cx.focus_handle(), cx.focus_handle()));
+        let window = cx.add_window({
+            let (grid, field, combo_field) = (grid.clone(), field.clone(), combo_field.clone());
+            move |_window, _cx| Probe {
+                grid,
+                field,
+                combo_field,
+            }
+        });
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let ask = |cx: &mut gpui::VisualTestContext, handle: &FocusHandle| {
+            let handle = handle.clone();
+            cx.update(move |window, cx| {
+                window.focus(&handle, cx);
+                (text_entry_focused(window), combo_popover_focused(window))
+            })
+        };
+
+        assert_eq!(
+            ask(cx, &grid),
+            (false, false),
+            "a focused grid types nothing: bare-key shortcuts stay live"
+        );
+        assert_eq!(
+            ask(cx, &field),
+            (true, false),
+            "a focused field owns every printable key, but not Esc"
+        );
+        assert_eq!(
+            ask(cx, &combo_field),
+            (true, true),
+            "an open dropdown's search field owns the keyboard and Esc"
+        );
     }
 }
