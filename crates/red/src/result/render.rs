@@ -656,7 +656,7 @@ impl AppState {
         // The open inline editor's target cell (existing rows only; draft rows host
         // their own editor in the bottom zone), so the renderer swaps in its field.
         let inline: Option<(usize, usize, Entity<TextInput>)> = is_focused
-            .then_some(self.grid_edit.as_ref())
+            .then_some(grid.grid_edit.as_ref())
             .flatten()
             .and_then(|e| match &e.slot {
                 EditSlot::Row { row, data_col, .. } => Some((*row, *data_col, e.input.clone())),
@@ -672,9 +672,9 @@ impl AppState {
         // When the FK picker is open, the editor cell also hosts a
         // bounds-capturing canvas so the dropdown can anchor below it.
         let suggest_anchor: Option<Entity<Option<gpui::Bounds<Pixels>>>> = is_focused
-            .then_some(self.cell_suggest.as_ref())
+            .then_some(grid.cell_suggest.as_ref())
             .flatten()
-            .map(|_| self.cell_suggest_bounds.clone());
+            .and_then(|_| grid.cell_suggest_bounds.clone());
 
         // The focused cell, spoken aloud: the grid reports this as its accessible
         // name (a `Grid` landmark), so a screen reader announces "<column>:
@@ -906,7 +906,7 @@ impl AppState {
                         //; otherwise it reveals the detail inspector.
                         if inspect {
                             this.begin_grid_edit(cx);
-                            if this.grid_edit.is_none() {
+                            if this.grid(cx).is_none_or(|g| g.grid_edit.is_none()) {
                                 this.open_inspector(cx);
                             }
                         }
@@ -1492,7 +1492,7 @@ impl AppState {
         let widths: Vec<f32> = (0..ncols).map(|c| grid.width_of(c)).collect();
         // The cell of an open editor that targets a draft row.
         let draft_inline: Option<(usize, usize, Entity<TextInput>)> =
-            self.grid_edit.as_ref().and_then(|e| match &e.slot {
+            grid.grid_edit.as_ref().and_then(|e| match &e.slot {
                 EditSlot::Draft { index, data_col } => Some((*index, *data_col, e.input.clone())),
                 EditSlot::Row { .. } => None,
             });
@@ -1555,9 +1555,9 @@ impl AppState {
                             .child(input.clone())
                             // Anchor the FK picker below this draft cell.
                             .when_some(
-                                self.cell_suggest
+                                grid.cell_suggest
                                     .as_ref()
-                                    .map(|_| self.cell_suggest_bounds.clone()),
+                                    .and_then(|_| grid.cell_suggest_bounds.clone()),
                                 |d, anchor| d.child(super::suggest::anchor_canvas(anchor)),
                             )
                             .into_any_element(),

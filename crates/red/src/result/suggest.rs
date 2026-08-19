@@ -149,8 +149,8 @@ impl AppState {
     ) {
         // The current field text seeds the filter so the list reflects the cell.
         let seed = self
-            .grid_edit
-            .as_ref()
+            .grid(cx)
+            .and_then(|g| g.grid_edit.as_ref())
             .map(|e| e.input.read(cx).content().to_string())
             .unwrap_or_default();
 
@@ -178,8 +178,13 @@ impl AppState {
                 scroll: ScrollHandle::new(),
             };
             suggest.recompute(&seed);
-            self.cell_suggest = Some(suggest);
-            self.cell_suggest_bounds.update(cx, |b, _| *b = None);
+            // A fresh anchor slot per picker: the previous one holds the last
+            // editor's rect until its canvas paints again.
+            let bounds = cx.new(|_| None);
+            self.with_grid(cx, |grid| {
+                grid.cell_suggest = Some(suggest);
+                grid.cell_suggest_bounds = Some(bounds);
+            });
             if loading {
                 self.request_lookup(spec, epoch);
             }
@@ -208,15 +213,18 @@ impl AppState {
                 scroll: ScrollHandle::new(),
             };
             suggest.recompute(&seed);
-            self.cell_suggest = Some(suggest);
-            self.cell_suggest_bounds.update(cx, |b, _| *b = None);
+            let bounds = cx.new(|_| None);
+            self.with_grid(cx, |grid| {
+                grid.cell_suggest = Some(suggest);
+                grid.cell_suggest_bounds = Some(bounds);
+            });
             cx.notify();
             return;
         }
 
         // 3) Neither (yet): no picker, but make sure the table's enums are loading so a
         // re-check on `EnumsLoaded` can surface an enum column's values.
-        self.cell_suggest = None;
+        self.with_grid(cx, |grid| grid.cell_suggest = None);
         self.ensure_enums_requested(cx);
         cx.notify();
     }
@@ -295,13 +303,16 @@ impl AppState {
                 s.enum_cache.insert(key, columns);
             });
         }
-        if self.cell_suggest.is_none()
-            && let Some((epoch, data_col)) = self.grid_edit.as_ref().map(|e| {
-                let col = match &e.slot {
-                    EditSlot::Row { data_col, .. } | EditSlot::Draft { data_col, .. } => *data_col,
-                };
-                (e.epoch, col)
-            })
+        if self.grid(cx).is_none_or(|g| g.cell_suggest.is_none())
+            && let Some((epoch, data_col)) =
+                self.grid(cx).and_then(|g| g.grid_edit.as_ref()).map(|e| {
+                    let col = match &e.slot {
+                        EditSlot::Row { data_col, .. } | EditSlot::Draft { data_col, .. } => {
+                            *data_col
+                        }
+                    };
+                    (e.epoch, col)
+                })
         {
             self.open_cell_suggest(epoch, data_col, cx);
         }
@@ -350,16 +361,18 @@ impl AppState {
         }
         // The epoch is process-unique, so an epoch+target match is unambiguously this
         // editor's picker regardless of which session replied.
-        if let Some(s) = &mut self.cell_suggest
-            && s.from_lookup
-            && s.epoch == epoch
-            && s.target == key
-        {
-            s.items = rows;
-            s.loading = false;
-            let q = s.query.clone();
-            s.recompute(&q);
-        }
+        self.with_grid(cx, |grid| {
+            if let Some(s) = &mut grid.cell_suggest
+                && s.from_lookup
+                && s.epoch == epoch
+                && s.target == key
+            {
+                s.items = rows;
+                s.loading = false;
+                let q = s.query.clone();
+                s.recompute(&q);
+            }
+        });
         cx.notify();
     }
 
@@ -372,40 +385,47 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let key = (target.schema.unwrap_or_default(), target.name);
-        if let Some(s) = &mut self.cell_suggest
-            && s.epoch == epoch
-            && s.target == key
-        {
-            s.loading = false;
-        }
+        self.with_grid(cx, |grid| {
+            if let Some(s) = &mut grid.cell_suggest
+                && s.epoch == epoch
+                && s.target == key
+            {
+                s.loading = false;
+            }
+        });
         cx.notify();
     }
 
     /// Re-filter the picker from the editor's current text (the field emitted `Change`).
     pub(crate) fn on_grid_edit_change(&mut self, cx: &mut Context<Self>) {
-        if self.cell_suggest.is_none() {
+        if self.grid(cx).is_none_or(|g| g.cell_suggest.is_none()) {
             return;
         }
         let Some(text) = self
-            .grid_edit
-            .as_ref()
+            .grid(cx)
+            .and_then(|g| g.grid_edit.as_ref())
             .map(|e| e.input.read(cx).content().to_string())
         else {
             return;
         };
-        if let Some(s) = &mut self.cell_suggest {
-            s.recompute(&text);
-        }
+        self.with_grid(cx, |grid| {
+            if let Some(s) = &mut grid.cell_suggest {
+                s.recompute(&text);
+            }
+        });
         cx.notify();
     }
 
     /// Move the picker's highlight by `delta` (↑/↓), wrapping; from no selection, Down
     /// lands on the first row and Up on the last.
     pub(crate) fn suggest_move(&mut self, delta: i32, cx: &mut Context<Self>) {
-        if let Some(s) = &mut self.cell_suggest {
+        let moved = self.with_grid(cx, |grid| {
+            let Some(s) = &mut grid.cell_suggest else {
+                return false;
+            };
             let n = s.filtered.len();
             if n == 0 {
-                return;
+                return false;
             }
             let next = match s.selected {
                 None => {
@@ -419,21 +439,31 @@ impl AppState {
             };
             s.selected = Some(next);
             s.scroll.scroll_to_item(next);
+            true
+        });
+        if moved == Some(true) {
             cx.notify();
         }
     }
 
     /// The highlighted suggestion's id value, when one is highlighted — the value a
     /// commit/advance writes instead of coercing the typed text.
-    pub(crate) fn suggest_selected_value(&self) -> Option<Value> {
-        Some(self.cell_suggest.as_ref()?.highlighted()?.id.clone())
+    pub(crate) fn suggest_selected_value(&self, cx: &App) -> Option<Value> {
+        Some(
+            self.grid(cx)?
+                .cell_suggest
+                .as_ref()?
+                .highlighted()?
+                .id
+                .clone(),
+        )
     }
 
     /// Esc from the cell editor: if the suggestion list is open, close *just the list*
     /// (so the typed value can then be committed as-is), IDE-completion style; otherwise
     /// cancel the whole edit.
     pub(crate) fn suggest_escape_or_cancel(&mut self, cx: &mut Context<Self>) {
-        if self.cell_suggest.take().is_some() {
+        if self.with_grid(cx, |grid| grid.cell_suggest.take().is_some()) == Some(true) {
             cx.notify();
         } else {
             self.cancel_grid_edit(cx);
@@ -444,9 +474,11 @@ impl AppState {
     /// the editor, which reads it back through `suggest_selected_value`. The list is
     /// non-focusable, so the click doesn't blur the field before this runs.
     pub(crate) fn accept_suggest(&mut self, pos: usize, cx: &mut Context<Self>) {
-        if let Some(s) = &mut self.cell_suggest {
-            s.selected = Some(pos);
-        }
+        self.with_grid(cx, |grid| {
+            if let Some(s) = &mut grid.cell_suggest {
+                s.selected = Some(pos);
+            }
+        });
         self.commit_grid_edit(cx);
     }
 
@@ -459,8 +491,9 @@ impl AppState {
         window: &Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let s = self.cell_suggest.as_ref()?;
-        let bounds: Bounds<Pixels> = (*self.cell_suggest_bounds.read(cx))?;
+        let grid = self.grid(cx)?;
+        let s = grid.cell_suggest.as_ref()?;
+        let bounds: Bounds<Pixels> = (*grid.cell_suggest_bounds.as_ref()?.read(cx))?;
         if s.filtered.is_empty() && !s.loading {
             return None;
         }

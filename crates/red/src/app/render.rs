@@ -298,38 +298,44 @@ impl Render for AppState {
             }
         }
 
-        // An inline cell edit just opened in the grid; focus its field.
-        if self.focus_grid_edit {
-            self.focus_grid_edit = false;
-            if let Some(handle) = self.grid_edit_focus(cx) {
-                window.focus(&handle, cx);
-            }
+        // An inline cell edit just opened in the grid; focus its field. The flag and
+        // the editor both live on the grid now, so this drains the *focused* tab's
+        // grid: a background tab that opened one keeps its flag until it is shown.
+        if self.with_grid(cx, |grid| std::mem::take(&mut grid.focus_grid_edit)) == Some(true)
+            && let Some(handle) = self.grid_edit_focus(cx)
+        {
+            window.focus(&handle, cx);
         }
 
         // Commit-on-blur: while an inline editor is open, a focus-out listener on its
         // field stages the edit when the user clicks away (like a spreadsheet); the
         // cell then shows as dirty. Registered once when an editor opens, dropped when
         // it closes. Mirrors `modal_focus_trap`.
-        if self.grid_edit.is_some() {
-            if self.grid_edit_blur.is_none()
-                && let Some(handle) = self.grid_edit_focus(cx)
-            {
-                let weak = cx.entity().downgrade();
-                let sub = window.on_focus_out(&handle, cx, move |_event, _window, cx| {
-                    if let Some(app) = weak.upgrade() {
-                        // Commit only if an editor is still open (a Submit/Cancel
-                        // already cleared it, so its focus move is a no-op here).
-                        app.update(cx, |this, cx| {
-                            if this.grid_edit.is_some() {
-                                this.commit_grid_edit(cx);
-                            }
-                        });
-                    }
-                });
-                self.grid_edit_blur = Some(sub);
+        let editor = self
+            .grid(cx)
+            .map(|g| (g.grid_edit.is_some(), g.grid_edit_blur.is_some()));
+        match editor {
+            Some((true, false)) => {
+                if let Some(handle) = self.grid_edit_focus(cx) {
+                    let weak = cx.entity().downgrade();
+                    let sub = window.on_focus_out(&handle, cx, move |_event, _window, cx| {
+                        if let Some(app) = weak.upgrade() {
+                            // Commit only if an editor is still open (a Submit/Cancel
+                            // already cleared it, so its focus move is a no-op here).
+                            app.update(cx, |this, cx| {
+                                if this.grid(cx).is_some_and(|g| g.grid_edit.is_some()) {
+                                    this.commit_grid_edit(cx);
+                                }
+                            });
+                        }
+                    });
+                    self.with_grid(cx, |grid| grid.grid_edit_blur = Some(sub));
+                }
             }
-        } else {
-            self.grid_edit_blur = None;
+            Some((false, true)) => {
+                self.with_grid(cx, |grid| grid.grid_edit_blur = None);
+            }
+            _ => {}
         }
 
         // The palette's "switch connection" command: open the switcher popover

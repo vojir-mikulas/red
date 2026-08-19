@@ -388,6 +388,27 @@ pub(crate) struct ResultGrid {
     /// Frozen wall-clock time the query took, set once it lands (ready or error).
     /// `None` while still running, so the elapsed time keeps counting up.
     query_elapsed: Option<Duration>,
+    /// The open inline cell editor over *this* result, when the user is editing a
+    /// cell in place. Per grid because the edit targets this result's rows: a
+    /// split with two grids can hold two open editors, each committing into its
+    /// own staged change-set. The change-set itself lives in `pending`; this is
+    /// just the live `TextInput`.
+    pub(crate) grid_edit: Option<GridEdit>,
+    /// The in-cell foreign-key suggestion picker for the open editor, when that
+    /// editor targets an FK (or enum) column. `None` for a plain cell.
+    pub(in crate::result) cell_suggest: Option<CellSuggest>,
+    /// The open editor cell's on-screen rect, recorded by a `canvas` in the cell so
+    /// the suggestion dropdown can anchor below it. Created lazily when a picker
+    /// opens: `ResultGrid::new` runs in plain unit tests with no `App` to make an
+    /// entity from.
+    pub(in crate::result) cell_suggest_bounds: Option<gpui::Entity<Option<gpui::Bounds<Pixels>>>>,
+    /// Render-time focus drain: focus the open inline editor's field on the next
+    /// frame (set when one opens).
+    pub(crate) focus_grid_edit: bool,
+    /// Focus-out listener on the open inline editor: clicking away commits (stages)
+    /// the edit, like a spreadsheet. Held while an editor is open, dropped when it
+    /// closes.
+    pub(crate) grid_edit_blur: Option<gpui::Subscription>,
     /// Whether this result's column-stats bar is on. Per grid rather than per
     /// window: the bar reports *this* result's columns, so leaving it on while
     /// the user reads another tab would show a summary of a result they are not
@@ -467,6 +488,11 @@ impl ResultGrid {
             epoch: next_epoch(),
             query_started: Instant::now(),
             query_elapsed: None,
+            grid_edit: None,
+            cell_suggest: None,
+            cell_suggest_bounds: None,
+            focus_grid_edit: false,
+            grid_edit_blur: None,
             stats_bar: false,
             stats: None,
             stats_cache: HashMap::new(),
@@ -2107,6 +2133,18 @@ impl AppState {
     /// `d + gutter`; selection/copy/sort all map through this offset.
     pub(crate) fn gutter(&self) -> usize {
         self.settings.data.row_numbers as usize
+    }
+
+    /// Read the focused tab's grid. The read twin of [`with_grid`](Self::with_grid),
+    /// for the many callers that only need to look at grid-local state.
+    ///
+    /// The returned reference borrows from `cx`, not from the handle, so the
+    /// temporary handle this resolves through is fine to drop.
+    pub(crate) fn grid<'a>(&self, cx: &'a App) -> Option<&'a ResultGrid> {
+        match &self.phase {
+            Phase::Connected(active) => Some(active.active_result()?.read(cx)),
+            _ => None,
+        }
     }
 
     /// Mutate the focused tab's grid, for the display-only changes the header

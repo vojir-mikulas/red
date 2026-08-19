@@ -258,25 +258,6 @@ pub struct AppState {
     /// A data-import header peek in flight (file chosen, awaiting the source columns
     /// from the backend so the import confirm can be built). At most one at a time.
     pub(crate) pending_import: Option<PendingImportPeek>,
-    /// The open inline cell editor, when the user is editing a grid cell
-    /// in place. `None` when no editor is open. The staged change-set itself lives
-    /// on the result; this is just the live `TextInput`.
-    pub(crate) grid_edit: Option<crate::result::GridEdit>,
-    /// The in-cell foreign-key suggestion picker, when the open editor
-    /// targets an FK column: the fetched id/label list plus the live query and
-    /// highlighted row. `None` for a plain cell. See [`crate::result::CellSuggest`].
-    pub(crate) cell_suggest: Option<crate::result::CellSuggest>,
-    /// The open editor cell's on-screen rect, recorded by a `canvas` in the cell so
-    /// the suggestion dropdown can anchor below it (the ComboBox/CodeEditor pattern).
-    /// One frame behind, like every `canvas`-measured bound; the popover just waits.
-    pub(crate) cell_suggest_bounds: gpui::Entity<Option<gpui::Bounds<gpui::Pixels>>>,
-    /// Render-time focus drain: focus the open inline editor's field on the next
-    /// frame (set when one opens, like `focus_inspector_edit`).
-    pub(crate) focus_grid_edit: bool,
-    /// Focus-out listener on the open inline editor: clicking away commits (stages)
-    /// the edit, like a spreadsheet. Held while an editor is open, dropped when it
-    /// closes (mirrors `modal_focus_trap`).
-    pub(crate) grid_edit_blur: Option<gpui::Subscription>,
     /// A non-pristine query tab the user asked to close, awaiting confirmation.
     pub(crate) confirm_close_tab: Option<usize>,
     /// A Redis key the user asked to delete from a browse list (via its
@@ -1394,11 +1375,6 @@ impl AppState {
             confirm_review: None,
             confirm_count_token: 0,
             pending_import: None,
-            grid_edit: None,
-            cell_suggest: None,
-            cell_suggest_bounds: cx.new(|_| None),
-            focus_grid_edit: false,
-            grid_edit_blur: None,
             confirm_close_tab: None,
             confirm_kv_delete: None,
             confirm_close_batch: None,

@@ -576,17 +576,19 @@ impl AppState {
         let data_col = match &slot {
             EditSlot::Row { data_col, .. } | EditSlot::Draft { data_col, .. } => *data_col,
         };
-        self.grid_edit = Some(GridEdit {
-            input,
-            slot,
-            decl_type,
-            epoch,
-            _sub: sub,
+        self.with_grid(cx, |grid| {
+            grid.grid_edit = Some(GridEdit {
+                input,
+                slot,
+                decl_type,
+                epoch,
+                _sub: sub,
+            });
+            // Drop any prior commit-on-blur listener so render re-registers it against
+            // this new field's focus handle (moving straight from one cell to another).
+            grid.grid_edit_blur = None;
+            grid.focus_grid_edit = true;
         });
-        // Drop any prior commit-on-blur listener so render re-registers it against
-        // this new field's focus handle (moving straight from one cell to another).
-        self.grid_edit_blur = None;
-        self.focus_grid_edit = true;
         // Set up (or clear) the FK suggestion picker for this cell; needs `grid_edit`
         // in place so it can seed the filter from the field's current text.
         self.open_cell_suggest(epoch, data_col, cx);
@@ -597,12 +599,12 @@ impl AppState {
     /// stage it (no DB round-trip). A coercion failure toasts the reason and keeps
     /// the editor open to fix.
     pub(crate) fn commit_grid_edit(&mut self, cx: &mut Context<Self>) {
-        let Some(edit) = self.grid_edit.take() else {
+        let Some(edit) = self.with_grid(cx, |grid| grid.grid_edit.take()).flatten() else {
             return;
         };
         // A highlighted FK suggestion wins over the typed text — its id is
         // already a typed `Value`, no coercion needed.
-        let value = match self.suggest_selected_value() {
+        let value = match self.suggest_selected_value(cx) {
             Some(v) => v,
             None => {
                 let text = edit.input.read(cx).content().to_string();
@@ -610,13 +612,14 @@ impl AppState {
                     Ok(v) => v,
                     Err(reason) => {
                         self.notify(ToastVariant::Error, reason, cx);
-                        self.grid_edit = Some(edit); // keep it open to correct the value
+                        // keep it open to correct the value
+                        self.with_grid(cx, |grid| grid.grid_edit = Some(edit));
                         return;
                     }
                 }
             }
         };
-        self.cell_suggest = None;
+        self.with_grid(cx, |grid| grid.cell_suggest = None);
         match edit.slot {
             EditSlot::Row {
                 row,
@@ -638,8 +641,12 @@ impl AppState {
 
     /// Abandon the open inline editor without staging.
     pub(crate) fn cancel_grid_edit(&mut self, cx: &mut Context<Self>) {
-        if self.grid_edit.take().is_some() {
-            self.cell_suggest = None;
+        let had = self.with_grid(cx, |grid| {
+            let had = grid.grid_edit.take().is_some();
+            grid.cell_suggest = None;
+            had
+        });
+        if had == Some(true) {
             self.pending_focus = Some(Pane::Grid);
             cx.notify();
         }
@@ -647,7 +654,7 @@ impl AppState {
 
     /// The focus handle of the open inline editor, for the render-time focus drain.
     pub(crate) fn grid_edit_focus(&self, cx: &Context<Self>) -> Option<gpui::FocusHandle> {
-        Some(self.grid_edit.as_ref()?.input.focus_handle(cx))
+        Some(self.grid(cx)?.grid_edit.as_ref()?.input.focus_handle(cx))
     }
 
     /// Tab / Shift-Tab from the open inline editor: commit the current cell, then
@@ -656,11 +663,11 @@ impl AppState {
     /// (mirrors `commit_grid_edit`). Tab past the last cell of the last draft row
     /// starts a fresh draft; Shift-Tab off the first cell just returns to the grid.
     pub(crate) fn advance_grid_edit(&mut self, forward: bool, cx: &mut Context<Self>) {
-        let Some(edit) = self.grid_edit.take() else {
+        let Some(edit) = self.with_grid(cx, |grid| grid.grid_edit.take()).flatten() else {
             return;
         };
         // A highlighted FK suggestion wins over the typed text (as in `commit`).
-        let value = match self.suggest_selected_value() {
+        let value = match self.suggest_selected_value(cx) {
             Some(v) => v,
             None => {
                 let text = edit.input.read(cx).content().to_string();
@@ -668,7 +675,8 @@ impl AppState {
                     Ok(v) => v,
                     Err(reason) => {
                         self.notify(ToastVariant::Error, reason, cx);
-                        self.grid_edit = Some(edit); // keep it open to correct the value
+                        // keep it open to correct the value
+                        self.with_grid(cx, |grid| grid.grid_edit = Some(edit));
                         return;
                     }
                 }
@@ -676,7 +684,7 @@ impl AppState {
         };
         // The next cell's `open_cell_editor` resets the picker; clear it here so an
         // intermediate frame can't show a stale list against the wrong field.
-        self.cell_suggest = None;
+        self.with_grid(cx, |grid| grid.cell_suggest = None);
         match edit.slot {
             EditSlot::Row {
                 row,
@@ -960,10 +968,10 @@ impl AppState {
     /// Drop a draft row (its ✕). Cancels an open editor first so a shifting index
     /// can't leave the editor pointing at the wrong draft.
     pub(crate) fn remove_draft_row(&mut self, index: usize, cx: &mut Context<Self>) {
-        self.grid_edit = None;
-        self.cell_suggest = None;
         if let Phase::Connected(active) = &mut self.phase {
             active.with_active_result(cx, |grid| {
+                grid.grid_edit = None;
+                grid.cell_suggest = None;
                 if index < grid.pending.inserts.len() {
                     grid.pending.inserts.remove(index);
                 }
@@ -1029,7 +1037,7 @@ impl AppState {
     /// moment earlier, so it opens the dialog straight away.
     pub(crate) fn submit_changes(&mut self, cx: &mut Context<Self>) {
         // Flush a half-typed cell first so it isn't silently dropped.
-        if self.grid_edit.is_some() {
+        if self.grid(cx).is_some_and(|g| g.grid_edit.is_some()) {
             self.commit_grid_edit(cx);
         }
         let staged = match &self.phase {
@@ -1141,10 +1149,10 @@ impl AppState {
 
     /// Drop the whole staged change-set (Revert).
     pub(crate) fn revert_changes(&mut self, cx: &mut Context<Self>) {
-        self.grid_edit = None;
-        self.cell_suggest = None;
         if let Phase::Connected(active) = &mut self.phase {
             active.with_active_result(cx, |grid| {
+                grid.grid_edit = None;
+                grid.cell_suggest = None;
                 grid.pending = PendingChanges::default();
             });
         }
