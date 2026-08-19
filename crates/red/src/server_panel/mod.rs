@@ -37,6 +37,56 @@ use red_service::{Command, Epoch};
 
 use crate::app::{ActiveConn, AppState, PendingWrite, Phase};
 
+/// The Server dock's state, owned by the panel rather than scattered across the
+/// connection: what it is showing, its two metric samples, its listings, and the
+/// cadence it re-samples at.
+///
+/// One connection has one of these. It is `Default`-constructed with the panel
+/// closed, no samples and no refresh, which is the state a fresh connection is in.
+#[derive(Default)]
+pub(crate) struct ServerPanel {
+    /// Whether the dock is shown. Offered on every engine with a server behind it,
+    /// which is all of them but SQLite (see `AppState::has_server_panel`).
+    pub open: bool,
+    /// Which view the dock shows (Overview / Sessions / Mutations).
+    pub view: ServerView,
+    /// The latest metrics sample, and the one before it.
+    ///
+    /// The previous sample is kept for exactly one reason: a monotonic counter such
+    /// as MySQL `Questions` or Postgres `xact_commit` is unreadable on its own, and
+    /// the *rate* is what the user wants. The panel is the only place that knows the
+    /// interval between two refreshes, so it is the only place that can derive one.
+    /// It is not a history and must not grow into one.
+    pub metrics: Option<red_core::server::ServerSnapshot>,
+    pub metrics_prev: Option<red_core::server::ServerSnapshot>,
+    /// The in-flight sample's epoch; a reply carrying any other is dropped, so a slow
+    /// sample cannot land after a newer one and corrupt the rate pair.
+    pub metrics_epoch: Epoch,
+    pub metrics_loading: bool,
+    /// The sample failed outright, as opposed to individual metrics being invisible
+    /// to this role (which the snapshot carries in `unavailable`).
+    pub metrics_error: Option<String>,
+    /// How often the panel re-samples on its own; `None` (the default) is off.
+    /// Floored at [`MIN_REFRESH_SECS`]: polling `CLIENT LIST` or `pg_stat_activity`
+    /// against production is real load, so this is opt-in and its interval is shown.
+    pub refresh: Option<Duration>,
+    /// Bumped whenever the interval changes, so a timer armed under the old one
+    /// retires instead of firing once more at the wrong cadence.
+    pub refresh_gen: u64,
+    /// The last server-session listing, longest-running first.
+    pub sessions: Vec<ServerSession>,
+    /// The connected role could not see other sessions' SQL, so the panel says so
+    /// rather than reading as an idle server.
+    pub sessions_restricted: bool,
+    /// A listing is in flight.
+    pub sessions_loading: bool,
+    /// The last `system.mutations` listing, unfinished first. Refreshed on open, on
+    /// every submit, and while anything is still running.
+    pub mutations: Vec<red_core::MutationInfo>,
+    /// A listing is in flight (the panel shows it instead of an empty state).
+    pub mutations_loading: bool,
+}
+
 /// Which view the Server dock is showing.
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ServerView {
@@ -112,18 +162,18 @@ impl AppState {
         }
         let opened = match &mut self.phase {
             Phase::Connected(active) => {
-                active.server_open = !active.server_open;
+                active.server.open = !active.server.open;
                 // Land on a view the engine can actually populate, so a Postgres
                 // user is not shown a Mutations tab that can never fill and a
                 // SQLite-shaped engine is not shown an Overview with nothing in
                 // it. Only re-lands when the retained view has become invalid,
                 // so switching connections does not fight the user's choice.
-                if !active.server_view.supported_by(active.config.kind) {
-                    active.server_view = ServerView::available(active.config.kind)
+                if !active.server.view.supported_by(active.config.kind) {
+                    active.server.view = ServerView::available(active.config.kind)
                         .next()
                         .unwrap_or_default();
                 }
-                active.server_open
+                active.server.open
             }
             _ => false,
         };
@@ -136,7 +186,7 @@ impl AppState {
 
     pub(crate) fn set_server_view(&mut self, view: ServerView, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase {
-            active.server_view = view;
+            active.server.view = view;
         }
         self.refresh_server_panel(cx);
         cx.notify();
@@ -145,14 +195,14 @@ impl AppState {
     /// Refresh whichever view is showing.
     pub(crate) fn refresh_server_panel(&mut self, cx: &mut Context<Self>) {
         let view = match &self.phase {
-            Phase::Connected(a) => a.server_view,
+            Phase::Connected(a) => a.server.view,
             _ => return,
         };
         match view {
             ServerView::Mutations => self.refresh_mutations(cx),
             ServerView::Sessions => {
                 if let Phase::Connected(active) = &mut self.phase {
-                    active.sessions_loading = true;
+                    active.server.sessions_loading = true;
                 }
                 self.send_active(Command::ListServerSessions);
                 cx.notify();
@@ -160,8 +210,8 @@ impl AppState {
             ServerView::Overview => {
                 let epoch = crate::result::new_epoch();
                 if let Phase::Connected(active) = &mut self.phase {
-                    active.metrics_epoch = epoch;
-                    active.metrics_loading = true;
+                    active.server.metrics_epoch = epoch;
+                    active.server.metrics_loading = true;
                 }
                 self.send_active(Command::FetchServerMetrics { epoch });
                 cx.notify();
@@ -178,9 +228,9 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         if let Some(active) = self.conn_mut(session) {
-            active.sessions = sessions;
-            active.sessions_restricted = restricted;
-            active.sessions_loading = false;
+            active.server.sessions = sessions;
+            active.server.sessions_restricted = restricted;
+            active.server.sessions_loading = false;
         }
         cx.notify();
     }
@@ -196,14 +246,14 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         if let Some(active) = self.conn_mut(session)
-            && active.metrics_epoch == epoch
+            && active.server.metrics_epoch == epoch
         {
             // Superseding rather than swapping: a sample that arrived out of
             // order would otherwise become the baseline for the *next* rate.
-            active.metrics_prev = active.metrics.take();
-            active.metrics = Some(snapshot);
-            active.metrics_error = None;
-            active.metrics_loading = false;
+            active.server.metrics_prev = active.server.metrics.take();
+            active.server.metrics = Some(snapshot);
+            active.server.metrics_error = None;
+            active.server.metrics_loading = false;
         }
         cx.notify();
     }
@@ -216,10 +266,10 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         if let Some(active) = self.conn_mut(session)
-            && active.metrics_epoch == epoch
+            && active.server.metrics_epoch == epoch
         {
-            active.metrics_loading = false;
-            active.metrics_error = Some(message);
+            active.server.metrics_loading = false;
+            active.server.metrics_error = Some(message);
         }
         cx.notify();
     }
@@ -237,7 +287,7 @@ impl AppState {
         let Phase::Connected(active) = &self.phase else {
             return;
         };
-        let Some(s) = active.sessions.iter().find(|s| s.key == key) else {
+        let Some(s) = active.server.sessions.iter().find(|s| s.key == key) else {
             return;
         };
         // Never RED's own connection: stopping it produces a reconnect dance and
@@ -284,11 +334,11 @@ impl AppState {
     /// [`MIN_REFRESH_SECS`].
     pub(crate) fn set_server_refresh(&mut self, secs: u64, cx: &mut Context<Self>) {
         if let Phase::Connected(active) = &mut self.phase {
-            active.server_refresh =
+            active.server.refresh =
                 (secs > 0).then(|| Duration::from_secs(secs.max(MIN_REFRESH_SECS)));
             // Bumped on every change so an in-flight timer from the previous
             // interval retires instead of firing once more at the old cadence.
-            active.server_refresh_gen = active.server_refresh_gen.wrapping_add(1);
+            active.server.refresh_gen = active.server.refresh_gen.wrapping_add(1);
         }
         self.arm_server_refresh(cx);
         cx.notify();
@@ -300,9 +350,10 @@ impl AppState {
     /// user's back.
     fn arm_server_refresh(&mut self, cx: &mut Context<Self>) {
         let armed = match &self.phase {
-            Phase::Connected(a) if a.server_open => a
-                .server_refresh
-                .map(|i| (i, a.server_refresh_gen, a.session)),
+            Phase::Connected(a) if a.server.open => a
+                .server
+                .refresh
+                .map(|i| (i, a.server.refresh_gen, a.session)),
             _ => None,
         };
         let Some((interval, generation, session)) = armed else {
@@ -313,10 +364,10 @@ impl AppState {
             this.update(cx, |this, cx| {
                 let still = match &this.phase {
                     Phase::Connected(a) => {
-                        a.server_open
+                        a.server.open
                             && a.session == session
-                            && a.server_refresh == Some(interval)
-                            && a.server_refresh_gen == generation
+                            && a.server.refresh == Some(interval)
+                            && a.server.refresh_gen == generation
                     }
                     _ => false,
                 };
@@ -338,7 +389,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
-        let view = active.server_view;
+        let view = active.server.view;
         let kind = active.config.kind;
 
         // The view switch, offered only where more than one view exists. On an
@@ -424,7 +475,7 @@ impl AppState {
         body: gpui::AnyElement,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        if !active.server_open {
+        if !active.server.open {
             return body;
         }
         let pane = self.render_server_panel(active, cx);
@@ -499,7 +550,7 @@ impl AppState {
                 .child(crate::icons::icon(
                     "activity",
                     theme.scale(14.),
-                    if active.server_open {
+                    if active.server.open {
                         theme.accent
                     } else {
                         theme.text_muted
@@ -520,7 +571,7 @@ impl AppState {
         theme: &flint::Theme,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let current = active.server_refresh.map(|d| d.as_secs());
+        let current = active.server.refresh.map(|d| d.as_secs());
         let label = match current {
             Some(secs) => format!("every {secs}s"),
             None => "auto".to_string(),

@@ -33,7 +33,7 @@ impl AppState {
         // A role that cannot see other sessions is a normal, common state on a
         // locked-down server. Explaining it is the difference between "this server
         // is idle" and "you are not allowed to see this".
-        let banner = active.sessions_restricted.then(|| {
+        let banner = active.server.sessions_restricted.then(|| {
             div()
                 .px_3()
                 .py_2()
@@ -48,6 +48,7 @@ impl AppState {
         // Who is blocking someone, so a blocker can be marked as the root cause
         // rather than looking like any other running query.
         let blockers: std::collections::HashSet<&SessionKey> = active
+            .server
             .sessions
             .iter()
             .flat_map(|s| s.blocked_by.iter())
@@ -55,12 +56,13 @@ impl AppState {
         let blocking_count = blockers.len();
 
         let rows: Vec<gpui::AnyElement> = active
+            .server
             .sessions
             .iter()
             .map(|s| self.render_session_row(s, &blockers, writable, caps, cx))
             .collect();
 
-        let list = if active.sessions.is_empty() {
+        let list = if active.server.sessions.is_empty() {
             div()
                 .flex_1()
                 .flex()
@@ -69,7 +71,7 @@ impl AppState {
                 .p_2()
                 .text_size(size_11)
                 .text_color(theme.text_muted)
-                .child(if active.sessions_loading {
+                .child(if active.server.sessions_loading {
                     "loading…"
                 } else {
                     "Nothing is running on this server."
@@ -89,6 +91,7 @@ impl AppState {
         // lock chain is the reason someone is asking.
         let summary = (blocking_count > 0).then(|| {
             let blocked = active
+                .server
                 .sessions
                 .iter()
                 .filter(|s| !s.blocked_by.is_empty())

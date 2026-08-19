@@ -286,7 +286,7 @@ impl AppState {
         // file), where the chip stays plain text.
         let can_open_server = self.has_server_panel();
         let running = self.running_mutations();
-        let endpoint_hue = if active.server_open {
+        let endpoint_hue = if active.server.open {
             theme.accent
         } else {
             theme.text_muted
@@ -324,7 +324,7 @@ impl AppState {
             .when(can_open_server, |d| {
                 d.cursor_pointer()
                     .hover(|s| s.bg(theme.bg_elevated))
-                    .when(active.server_open, |s| s.bg(theme.bg_elevated))
+                    .when(active.server.open, |s| s.bg(theme.bg_elevated))
                     .tooltip(Tooltip::text(if running > 0 {
                         format!("Server sessions and background work ({running} running)")
                     } else {

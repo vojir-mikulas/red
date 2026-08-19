@@ -37,8 +37,8 @@ impl AppState {
         let theme = cx.theme().clone();
         let size_11 = theme.scale(11.);
 
-        let Some(snap) = &active.metrics else {
-            let message = match (&active.metrics_error, active.metrics_loading) {
+        let Some(snap) = &active.server.metrics else {
+            let message = match (&active.server.metrics_error, active.server.metrics_loading) {
                 (Some(e), _) => e.clone(),
                 (None, true) => "sampling…".to_string(),
                 (None, false) => "No sample yet.".to_string(),
@@ -50,7 +50,7 @@ impl AppState {
                 .justify_center()
                 .p_3()
                 .text_size(size_11)
-                .text_color(if active.metrics_error.is_some() {
+                .text_color(if active.server.metrics_error.is_some() {
                     theme.red
                 } else {
                     theme.text_muted
@@ -68,7 +68,7 @@ impl AppState {
                 }
                 let rows: Vec<gpui::AnyElement> = metrics
                     .into_iter()
-                    .map(|m| self.render_metric(m, snap, active.metrics_prev.as_ref(), cx))
+                    .map(|m| self.render_metric(m, snap, active.server.metrics_prev.as_ref(), cx))
                     .collect();
                 Some(
                     div()
@@ -107,7 +107,7 @@ impl AppState {
                 "as of {when}",
                 when = crate::fmt::fmt_ago_secs(crate::health::now_unix() - snap.taken_at)
             ))
-            .when(active.metrics_loading, |d| {
+            .when(active.server.metrics_loading, |d| {
                 d.child(div().child("refreshing…"))
             });
 

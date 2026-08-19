@@ -39,7 +39,7 @@ impl AppState {
     /// without the panel being open.
     pub(crate) fn running_mutations(&self) -> usize {
         match &self.phase {
-            Phase::Connected(active) => active.mutations.iter().filter(|m| !m.done).count(),
+            Phase::Connected(active) => active.server.mutations.iter().filter(|m| !m.done).count(),
             _ => 0,
         }
     }
@@ -52,7 +52,7 @@ impl AppState {
             return;
         }
         if let Phase::Connected(active) = &mut self.phase {
-            active.mutations_loading = true;
+            active.server.mutations_loading = true;
         }
         self.send_active(Command::ListMutations);
         cx.notify();
@@ -66,8 +66,8 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         if let Some(active) = self.conn_mut(session) {
-            active.mutations = mutations;
-            active.mutations_loading = false;
+            active.server.mutations = mutations;
+            active.server.mutations_loading = false;
         }
         cx.notify();
     }
@@ -102,7 +102,7 @@ impl AppState {
             theme.green,
         );
         let size_11 = theme.scale(11.);
-        let running = active.mutations.iter().filter(|m| !m.done).count();
+        let running = active.server.mutations.iter().filter(|m| !m.done).count();
 
         let header = div()
             .flex_shrink_0()
@@ -139,6 +139,7 @@ impl AppState {
             );
 
         let rows: Vec<gpui::AnyElement> = active
+            .server
             .mutations
             .iter()
             .enumerate()
@@ -221,7 +222,7 @@ impl AppState {
                 .p_3()
                 .text_size(size_11)
                 .text_color(faint)
-                .child(if active.mutations_loading {
+                .child(if active.server.mutations_loading {
                     "Loading…"
                 } else {
                     "No mutations. Updates and deletes appear here while the engine applies them."

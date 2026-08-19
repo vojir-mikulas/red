@@ -167,7 +167,7 @@ impl AppState {
             // Same reason `kv_mode` is read out here: `ActiveConn::new` runs with
             // `AppState` leased and cannot reach a setting itself.
             if let Phase::Connected(active) = &mut self.phase {
-                active.server_refresh = server_refresh;
+                active.server.refresh = server_refresh;
             }
             self.foreground_session = Some(id);
             if is_redis {
