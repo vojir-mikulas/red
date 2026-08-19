@@ -9,6 +9,7 @@
 //! state plus the `AppState` command handlers that drive it).
 
 pub(crate) mod autoscroll;
+mod body;
 mod buffer;
 mod copy;
 mod edit;
