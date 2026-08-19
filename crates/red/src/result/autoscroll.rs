@@ -127,7 +127,7 @@ impl AppState {
             if let crate::app::Phase::Connected(active) = &self.phase
                 && let Some(grid) = active.active_result()
             {
-                grid.clamp_h_offset(gutter);
+                grid.read(cx).clamp_h_offset(gutter);
             }
         }
         if vy != 0.0 {

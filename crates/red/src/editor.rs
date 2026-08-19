@@ -1731,7 +1731,10 @@ impl AppState {
             .filter_map(|tab| {
                 let expr = tab.filter_bar.as_ref()?.expr.clone();
                 let (table, columns) = match &tab.result {
-                    Some(grid) => (grid.browsed_table(), grid.column_names()),
+                    Some(grid) => {
+                        let grid = grid.read(cx);
+                        (grid.browsed_table(), grid.column_names())
+                    }
                     None => (None, Vec::new()),
                 };
                 Some((expr, table, columns))

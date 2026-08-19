@@ -108,6 +108,7 @@ impl AppState {
             return None;
         };
         let grid = active.active_result()?;
+        let grid = grid.read(cx);
         let (schema, table) = grid.table.as_ref()?;
         let cname = grid.columns().get(data_col)?.name.clone();
         let edge = active.schema.read(cx).fk_graph.iter().find(|e| {
@@ -227,6 +228,7 @@ impl AppState {
             return None;
         };
         let grid = active.active_result()?;
+        let grid = grid.read(cx);
         let (schema, table) = grid.table.as_ref()?;
         let cname = grid.columns().get(data_col)?.name.clone();
         let values = active
@@ -242,7 +244,9 @@ impl AppState {
     /// later edit of an enum cell can show the value picker.
     fn ensure_enums_requested(&mut self, cx: &mut Context<Self>) {
         let table = match &self.phase {
-            Phase::Connected(active) => active.active_result().and_then(|g| g.table.clone()),
+            Phase::Connected(active) => active
+                .active_result()
+                .and_then(|g| g.read(cx).table.clone()),
             _ => None,
         };
         let Some((schema, name)) = table else {

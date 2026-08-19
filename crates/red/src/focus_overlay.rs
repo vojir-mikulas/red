@@ -237,7 +237,7 @@ impl AppState {
 ///
 /// The caller's container must be `relative()` — every surface that hosts one
 /// already is, since they all position their own chrome.
-pub(crate) fn badge(hint: char, cx: &mut gpui::App) -> impl IntoElement {
+pub(crate) fn badge(hint: char, cx: &gpui::App) -> impl IntoElement {
     let theme = cx.theme();
     div()
         .absolute()

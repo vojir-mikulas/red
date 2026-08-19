@@ -454,9 +454,9 @@ impl AppState {
     }
 
     /// The focused result's epoch, if there is one to transfer.
-    pub(crate) fn transfer_result_epoch(&self) -> Option<red_service::Epoch> {
+    pub(crate) fn transfer_result_epoch(&self, cx: &App) -> Option<red_service::Epoch> {
         match &self.phase {
-            Phase::Connected(active) => active.active_result().map(|g| g.epoch),
+            Phase::Connected(active) => active.active_result().map(|g| g.read(cx).epoch),
             _ => None,
         }
     }
@@ -493,7 +493,7 @@ impl AppState {
 
     /// `result: transfer into…`: the focused result, filter and sort included.
     pub(crate) fn open_result_transfer(&mut self, cx: &mut Context<Self>) {
-        let Some(epoch) = self.transfer_result_epoch() else {
+        let Some(epoch) = self.transfer_result_epoch(cx) else {
             self.notify(ToastVariant::Info, "No open result to transfer.", cx);
             return;
         };

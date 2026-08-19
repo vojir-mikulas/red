@@ -251,7 +251,7 @@ impl AppState {
                     let generation = tab.watch.as_ref().map_or(0, |w| w.generation) + 1;
                     let mut watch = Watch::new(interval);
                     watch.generation = generation;
-                    let epoch = tab.result.as_ref().map(|g| g.epoch);
+                    let epoch = tab.result.as_ref().map(|g| g.read(cx).epoch);
                     tab.watch = Some(watch);
                     epoch.map(|e| (e, interval, generation))
                 }
@@ -323,7 +323,10 @@ impl AppState {
 
         // Staged edits would be destroyed by a re-open, so the watch holds rather
         // than quietly discarding the user's uncommitted work.
-        let staged = tab.result.as_ref().is_some_and(|g| !g.pending.is_empty());
+        let staged = tab
+            .result
+            .as_ref()
+            .is_some_and(|g| !g.read(cx).pending.is_empty());
         watch.paused = if !visible {
             Some("paused: window in the background")
         } else if staged {
@@ -336,17 +339,19 @@ impl AppState {
 
         let reopen = if watch.paused.is_none() {
             watch.inflight = true;
-            let snapshot = tab.result.as_ref().map(|g| g.watch_snapshot());
-            let total = tab.result.as_ref().map(|g| g.total);
+            let snapshot = tab.result.as_ref().map(|g| g.read(cx).watch_snapshot());
+            let total = tab.result.as_ref().map(|g| g.read(cx).total);
             if let (Some(snapshot), Some(w)) = (snapshot, tab.watch.as_mut()) {
                 w.prev = snapshot;
                 w.prev_total = total;
             }
-            tab.result.as_mut().map(|g| g.reopen_spec())
+            tab.result
+                .clone()
+                .map(|g| g.update(cx, |g, _| g.reopen_spec()))
         } else {
             None
         };
-        let next_epoch_for_arm = tab.result.as_ref().map_or(epoch, |g: &ResultGrid| g.epoch);
+        let next_epoch_for_arm = tab.result.as_ref().map_or(epoch, |g| g.read(cx).epoch);
         // The *watched tab's* namespace, not `send_namespace()`'s focused-tab
         // one: tab 1 watching `sales` must re-open against `sales` even while
         // tab 2 (focused on `staging`) is on screen.
@@ -387,16 +392,13 @@ impl AppState {
         epoch: red_service::Epoch,
         cx: &App,
     ) -> Option<(usize, red_service::SessionId)> {
-        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
-        // change so that change stays local instead of cascading.
-        let _ = &cx;
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
         let ix = active
             .tabs
             .iter()
-            .position(|t| t.result.as_ref().is_some_and(|g| g.epoch == epoch))?;
+            .position(|t| t.result.as_ref().is_some_and(|g| g.read(cx).epoch == epoch))?;
         Some((ix, active.session))
     }
 
@@ -408,21 +410,20 @@ impl AppState {
         epoch: red_service::Epoch,
         cx: &mut Context<Self>,
     ) {
-        // See `row_edit_mode`: taken ahead of the `Entity<ResultGrid>` change.
-        let _ = &cx;
         let Some(active) = self.conn_mut(session) else {
             return;
         };
         let Some(tab) = active
             .tabs
             .iter_mut()
-            .find(|t| t.result.as_ref().is_some_and(|g| g.epoch == epoch))
+            .find(|t| t.result.as_ref().is_some_and(|g| g.read(cx).epoch == epoch))
         else {
             return;
         };
-        let (Some(grid), Some(watch)) = (tab.result.as_ref(), tab.watch.as_mut()) else {
+        let (Some(grid), Some(watch)) = (tab.result.clone(), tab.watch.as_mut()) else {
             return;
         };
+        let grid = grid.read(cx);
         watch.inflight = false;
         watch.errors = 0;
 
@@ -468,7 +469,7 @@ impl AppState {
         let Some(tab) = active
             .tabs
             .iter_mut()
-            .find(|t| t.result.as_ref().is_some_and(|g| g.epoch == epoch))
+            .find(|t| t.result.as_ref().is_some_and(|g| g.read(cx).epoch == epoch))
         else {
             return;
         };

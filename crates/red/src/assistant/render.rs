@@ -1619,7 +1619,7 @@ impl AppState {
         let has_error = active
             .active()
             .and_then(|t| t.result.as_ref())
-            .is_some_and(|r| r.error().is_some());
+            .is_some_and(|r| r.read(cx).error().is_some());
 
         let mut actions = Vec::new();
         if has_error {

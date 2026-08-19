@@ -398,11 +398,8 @@ impl AppState {
 
     /// Total rows of the active tab's open result, if any.
     fn active_result_total(&self, cx: &App) -> Option<usize> {
-        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
-        // taking it now means that change does not cascade through every caller.
-        let _ = &cx;
         match &self.phase {
-            Phase::Connected(active) => active.active_result().map(|g| g.total_rows()),
+            Phase::Connected(active) => active.active_result().map(|g| g.read(cx).total_rows()),
             _ => None,
         }
     }
@@ -592,9 +589,6 @@ impl AppState {
     /// [`EditMode::None`](red_core::EditMode::None) means no update/delete affordances at all -- read-only is
     /// the safe default at every level.
     pub(crate) fn row_edit_mode(&self, cx: &App) -> red_core::EditMode {
-        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
-        // taking it now means that change does not cascade through every caller.
-        let _ = &cx;
         let Phase::Connected(active) = &self.phase else {
             return red_core::EditMode::None;
         };
@@ -604,15 +598,12 @@ impl AppState {
         }
         active
             .active_result()
-            .map(|g| g.edit_mode())
+            .map(|g| g.read(cx).edit_mode())
             .unwrap_or(red_core::EditMode::None)
     }
 
     /// Whether the active result's existing rows can be edited at all.
     pub(crate) fn row_edit_enabled(&self, cx: &App) -> bool {
-        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
-        // taking it now means that change does not cascade through every caller.
-        let _ = &cx;
         !matches!(self.row_edit_mode(cx), red_core::EditMode::None)
     }
 
@@ -635,15 +626,14 @@ impl AppState {
     /// is editable (a single-table keyed browse, non-PK, non-clipped). `None`
     /// otherwise; the entry point and palette gate both consult this.
     pub(crate) fn active_edit_target(&self, cx: &App) -> Option<crate::app::EditContext> {
-        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
-        // taking it now means that change does not cascade through every caller.
-        let _ = &cx;
         if !self.row_edit_enabled(cx) {
             return None;
         }
         let gutter = self.gutter();
         match &self.phase {
-            Phase::Connected(active) => active.active_result().and_then(|g| g.edit_target(gutter)),
+            Phase::Connected(active) => active
+                .active_result()
+                .and_then(|g| g.read(cx).edit_target(gutter)),
             _ => None,
         }
     }
@@ -779,7 +769,7 @@ impl AppState {
                 }
                 // Shape a result into a table without leaving it: the same
                 // wizard, seeded with the result instead of a table list.
-                if self.transfer_result_epoch().is_some() {
+                if self.transfer_result_epoch(cx).is_some() {
                     out.push((
                         item("cmd:transfer-result", "result: transfer into…"),
                         Cmd::TransferResult,
@@ -824,7 +814,7 @@ impl AppState {
                 if self.insert_enabled()
                     && active
                         .active_result()
-                        .is_some_and(|g| g.insertable_browse())
+                        .is_some_and(|g| g.read(cx).insertable_browse())
                 {
                     out.push((
                         item("cmd:add-row", "data: add row").hint("⌥⌘N"),
@@ -1346,9 +1336,10 @@ impl AppState {
             return;
         };
         let source = match &self.phase {
-            Phase::Connected(active) => active
-                .active_result()
-                .map(|g| (g.epoch, g.columns().to_vec())),
+            Phase::Connected(active) => active.active_result().map(|g| {
+                let g = g.read(cx);
+                (g.epoch, g.columns().to_vec())
+            }),
             _ => None,
         };
         let Some((source_epoch, source_cols)) = source else {
@@ -1392,9 +1383,10 @@ impl AppState {
             return;
         };
         let source = match &self.phase {
-            Phase::Connected(active) => active
-                .active_result()
-                .map(|g| (g.epoch, g.columns().to_vec())),
+            Phase::Connected(active) => active.active_result().map(|g| {
+                let g = g.read(cx);
+                (g.epoch, g.columns().to_vec())
+            }),
             _ => None,
         };
         let Some((source_epoch, source_cols)) = source else {

@@ -1550,7 +1550,7 @@ pub(crate) struct QueryTab {
     /// The SQL editor surface, with the RED highlighter installed.
     pub editor: Entity<CodeEditor>,
     /// The open result browsed in the grid: a table preview or an editor run.
-    pub result: Option<ResultGrid>,
+    pub result: Option<Entity<ResultGrid>>,
     /// This tab's result filter bar, when open. Per tab rather than per window
     /// because the bar edits *this* tab's result: a `WHERE` half-typed against one
     /// grid must not follow the user to another tab, where the boxes would
@@ -2143,55 +2143,48 @@ impl ActiveConn {
         epoch: red_service::Epoch,
         cx: &App,
     ) -> Option<String> {
-        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
-        // change so that change stays local instead of cascading.
-        let _ = &cx;
         if !self.config.kind.namespace_caps().settable {
             return None;
         }
         self.tabs
             .iter()
-            .find(|t| t.result.as_ref().is_some_and(|g| g.epoch == epoch))
+            .find(|t| t.result.as_ref().is_some_and(|g| g.read(cx).epoch == epoch))
             .and_then(|t| t.namespace.clone())
             .or_else(|| self.namespace.clone())
     }
 
     /// The focused tab's open result, if any. Folds together "no tab" and "tab
     /// with no result", the common shape at most result call sites.
-    pub(crate) fn active_result(&self) -> Option<&ResultGrid> {
-        self.active().and_then(|t| t.result.as_ref())
-    }
-
-    /// Private on purpose: the inline `&mut` it hands out is exactly the shape
-    /// that cannot survive `result` becoming an entity. Go through
-    /// [`with_active_result`](Self::with_active_result).
-    fn active_result_mut(&mut self) -> Option<&mut ResultGrid> {
-        self.active_mut().and_then(|t| t.result.as_mut())
+    pub(crate) fn active_result(&self) -> Option<Entity<ResultGrid>> {
+        self.active().and_then(|t| t.result.clone())
     }
 
     /// Mutate the focused tab's grid through a closure.
     ///
-    /// The closure shape is the point: it is what `Entity::update` requires, so
-    /// reshaping the call sites while `result` is still a plain struct means the
-    /// eventual type change is a change of *this one body*. See
+    /// The one place that leases the grid entity: call sites were reshaped into
+    /// this closure form *before* `result` became an `Entity<ResultGrid>`, so the
+    /// flip changed this body alone. See
     /// `docs/plans/todo/zed-architecture-inspiration.md` (Stage A.5).
     pub(crate) fn with_active_result<R>(
         &mut self,
         cx: &mut App,
         f: impl FnOnce(&mut ResultGrid) -> R,
     ) -> Option<R> {
-        // Unused until `result` is an entity, when this becomes `update(cx, …)`.
-        let _ = &cx;
-        self.active_result_mut().map(f)
+        let grid = self.active_result()?;
+        Some(grid.update(cx, |grid, _| f(grid)))
     }
 
     /// Find the open result whose grid carries `epoch`, across all tabs; result
     /// events route by epoch so a background tab's query still populates.
-    pub(crate) fn result_by_epoch(&mut self, epoch: red_service::Epoch) -> Option<&mut ResultGrid> {
+    pub(crate) fn result_by_epoch(
+        &self,
+        epoch: red_service::Epoch,
+        cx: &App,
+    ) -> Option<Entity<ResultGrid>> {
         self.tabs
-            .iter_mut()
-            .filter_map(|t| t.result.as_mut())
-            .find(|g| g.epoch == epoch)
+            .iter()
+            .filter_map(|t| t.result.clone())
+            .find(|g| g.read(cx).epoch == epoch)
     }
 
     /// Find the open plan carrying `epoch`, across all tabs; `PlanReady`/

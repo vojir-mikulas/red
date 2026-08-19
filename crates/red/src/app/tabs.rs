@@ -573,7 +573,7 @@ impl AppState {
                     .layout
                     .remap_active_tabs(|i| if i >= index && i > 0 { i - 1 } else { i });
                 if let Some(g) = removed.result {
-                    free_epochs.push(g.epoch);
+                    free_epochs.push(g.read(cx).epoch);
                 }
             }
             active.normalize_panes();

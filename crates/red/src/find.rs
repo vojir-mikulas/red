@@ -142,7 +142,7 @@ impl AppState {
                     let m = match &self.phase {
                         Phase::Connected(active) => active
                             .active_result()
-                            .map(|g| g.find_matches(&term))
+                            .map(|g| g.read(cx).find_matches(&term))
                             .unwrap_or_default(),
                         _ => Vec::new(),
                     };

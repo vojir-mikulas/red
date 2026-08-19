@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use std::rc::Rc;
 
 use flint::prelude::*;
-use gpui::{AnyElement, Context, Hsla, SharedString, div, prelude::*, px};
+use gpui::{AnyElement, App, Context, Hsla, SharedString, div, prelude::*, px};
 use red_core::Value;
 
 use crate::app::{AppState, Phase};
@@ -334,11 +334,12 @@ impl AppState {
 
     /// Whether the row the cell cursor sits on is pinned, so the menu can name
     /// what the click will do.
-    pub(in crate::result) fn cursor_row_pinned(&self) -> bool {
+    pub(in crate::result) fn cursor_row_pinned(&self, cx: &App) -> bool {
         let Phase::Connected(active) = &self.phase else {
             return false;
         };
         active.active_result().is_some_and(|grid| {
+            let grid = grid.read(cx);
             grid.selection
                 .is_some_and(|sel| grid.is_pinned(sel.bounds().0))
         })
@@ -346,9 +347,12 @@ impl AppState {
 
     /// How many rows are pinned on the active result, for the menu that offers
     /// to drop them.
-    pub(in crate::result) fn pinned_row_count(&self) -> usize {
+    pub(in crate::result) fn pinned_row_count(&self, cx: &App) -> usize {
         match &self.phase {
-            Phase::Connected(active) => active.active_result().map(|g| g.pinned_len()).unwrap_or(0),
+            Phase::Connected(active) => active
+                .active_result()
+                .map(|g| g.read(cx).pinned_len())
+                .unwrap_or(0),
             _ => 0,
         }
     }
@@ -377,7 +381,7 @@ impl AppState {
     pub(in crate::result) fn render_pinned_rows(
         &self,
         grid: &ResultGrid,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> Vec<AnyElement> {
         if grid.pinned_rows.is_empty() {
             return Vec::new();

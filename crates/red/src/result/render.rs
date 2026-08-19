@@ -290,7 +290,7 @@ impl AppState {
         let container = div().size_full().relative().flex().flex_col().bg(bg);
 
         let grid = match active.tabs.get(tab_idx).and_then(|t| t.result.as_ref()) {
-            Some(grid) => grid,
+            Some(grid) => grid.read(cx),
             None => {
                 return container.child(
                     div()
@@ -1309,11 +1309,7 @@ impl AppState {
     /// max, plus sum · avg for numerics). Shown only while the toggle is on; the
     /// values come from the grid's per-column `stats` view (loading / ready /
     /// failed), computed entirely by the engine.
-    fn render_stats_bar(
-        &self,
-        grid: &super::ResultGrid,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
+    fn render_stats_bar(&self, grid: &super::ResultGrid, cx: &Context<Self>) -> gpui::AnyElement {
         use super::StatsState;
         let theme = cx.theme();
         let (dim, text, faint, muted, sep) = (
@@ -1437,7 +1433,7 @@ impl AppState {
     fn render_draft_rows(
         &self,
         grid: &super::ResultGrid,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> Option<gpui::AnyElement> {
         if grid.pending.inserts.is_empty() {
             return None;
@@ -2016,7 +2012,7 @@ impl AppState {
         menu = menu.separator().item(
             ContextMenuItem::new(
                 "row-pin",
-                if self.cursor_row_pinned() {
+                if self.cursor_row_pinned(cx) {
                     "Unpin row"
                 } else {
                     "Pin row"
@@ -2069,6 +2065,10 @@ impl AppState {
             Phase::Connected(active) => active.active_result(),
             _ => None,
         };
+        // Read once into a plain reference: the rest of this builder treats the
+        // grid as data, and `Option<&ResultGrid>` stays `Copy` the way the field
+        // borrow used to be.
+        let grid = grid.as_ref().map(|g| g.read(cx));
         let (name, visible_len, hidden) = match grid {
             Some(grid) => (
                 grid.data_col_at(slot)
@@ -2341,7 +2341,7 @@ impl AppState {
     ) -> impl IntoElement + use<> {
         // "Copy to…" needs a ready result as its source; the Stats toggle is
         // always available and carries a leading check while its bar is on.
-        let ready = matches!(&self.phase, Phase::Connected(a) if a.active_result().is_some_and(|g| g.ready));
+        let ready = matches!(&self.phase, Phase::Connected(a) if a.active_result().is_some_and(|g| g.read(cx).ready));
         let stats_label = if self.stats_bar { "✓ Stats" } else { "Stats" };
         let mut menu = ContextMenu::new("result-more-menu").item(
             ContextMenuItem::new("more-stats", stats_label).on_click(cx.listener(
@@ -2363,7 +2363,7 @@ impl AppState {
         }
         // Offered only with rows pinned: the strip is the only thing this entry
         // acts on, and an always-present "Unpin all" would imply pinning lives here.
-        let pinned = self.pinned_row_count();
+        let pinned = self.pinned_row_count(cx);
         if pinned > 0 {
             menu = menu.item(
                 ContextMenuItem::new("more-unpin-all", format!("Unpin all rows ({pinned})"))

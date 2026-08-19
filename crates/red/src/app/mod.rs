@@ -1513,14 +1513,11 @@ impl AppState {
 
     /// True while any open result grid is still running its query.
     fn any_query_running(&self, cx: &App) -> bool {
-        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
-        // change so that change stays local instead of cascading.
-        let _ = &cx;
         matches!(&self.phase, Phase::Connected(active)
             if active
                 .tabs
                 .iter()
-                .any(|t| t.result.as_ref().is_some_and(|g| !g.is_ready())))
+                .any(|t| t.result.as_ref().is_some_and(|g| !g.read(cx).is_ready())))
     }
 
     /// Drive ~10 Hz repaints while a query runs so the live timer counts up.
@@ -1930,15 +1927,23 @@ impl AppState {
                         cx.notify();
                     });
                 }
-                if let Some(active) = self.conn_mut(session) {
-                    let graph = active.schema.read(cx).fk_graph.clone();
-                    for tab in &mut active.tabs {
-                        if let Some(grid) = tab.result.as_mut() {
+                let open = self.conn_for(session).map(|active| {
+                    let grids: Vec<_> = active
+                        .tabs
+                        .iter()
+                        .filter_map(|t| t.result.clone())
+                        .collect();
+                    (active.schema.clone(), grids)
+                });
+                if let Some((schema, grids)) = open {
+                    let graph = schema.read(cx).fk_graph.clone();
+                    for grid in grids {
+                        grid.update(cx, |grid, _| {
                             grid.set_fk_cols(&graph);
                             // A browse may carry an expansion from before the graph
                             // landed; (re)resolve its joins now they're available.
-                            grid.rebuild_joins(&active.schema.read(cx).fk_graph);
-                        }
+                            grid.rebuild_joins(&graph);
+                        });
                     }
                 }
                 cx.notify();
@@ -2209,7 +2214,7 @@ impl AppState {
                 self.watch_rows_landed(session, epoch, cx);
             }
             Event::ResultRunFailed { epoch, seq } => {
-                self.on_result_run_failed(session, epoch, seq);
+                self.on_result_run_failed(session, epoch, seq, cx);
                 self.watch_run_failed(session, epoch, cx);
             }
             Event::CopyRowsLoaded { id, rows } => self.on_copy_rows(id, rows, cx),

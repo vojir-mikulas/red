@@ -365,13 +365,11 @@ impl AppState {
     /// selection focus through the gutter and clamping to the data columns. `None`
     /// when nothing is selected or no result is open.
     fn focused_cell(&self, cx: &App) -> Option<(red_service::Epoch, usize, usize)> {
-        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
-        // change so that change stays local instead of cascading.
-        let _ = &cx;
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
         let grid = active.active_result()?;
+        let grid = grid.read(cx);
         let (row, col) = grid.cursor_cell(self.gutter())?;
         Some((grid.epoch, row, col))
     }
@@ -381,9 +379,6 @@ impl AppState {
     /// value, preview, load, edit gate) goes through this, so a pin holds the view
     /// steady while the cursor roams the grid.
     fn target_cell(&self, cx: &App) -> Option<(red_service::Epoch, usize, usize)> {
-        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
-        // change so that change stays local instead of cascading.
-        let _ = &cx;
         match self.inspector.as_ref().and_then(|i| i.pinned) {
             Some(pinned) => Some(pinned),
             None => self.focused_cell(cx),
@@ -495,13 +490,11 @@ impl AppState {
     /// [`reconcile_preview`](Self::reconcile_preview) copies it only on a genuine
     /// rebuild, so the unchanged-frame path never memcpys a multi-megabyte cell.
     fn preview_target(&self, cx: &App) -> Option<(PreviewKey, SharedString, bool)> {
-        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
-        // change so that change stays local instead of cascading.
-        let _ = &cx;
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
         let grid = active.active_result()?;
+        let grid = grid.read(cx);
         let (epoch, row, col) = self.target_cell(cx)?;
         if epoch != grid.epoch {
             return None; // a pin to a since-replaced result (cleared next reconcile)
@@ -604,9 +597,6 @@ impl AppState {
     /// target. Clones the full value, so call it only when actually opening an edit;
     /// the per-frame "is it editable?" check uses [`Self::inspector_can_edit`].
     fn inspector_edit_context(&self, cx: &App) -> Option<EditContext> {
-        // See the note on `row_edit_mode`: `cx` is taken ahead of the
-        // `Entity<ResultGrid>` change so that change does not cascade.
-        let _ = &cx;
         if !self.row_edit_enabled(cx) {
             return None;
         }
@@ -627,6 +617,7 @@ impl AppState {
             };
             return active
                 .active_result()?
+                .read(cx)
                 .edit_target_full(self.gutter(), full.value.clone());
         }
         self.active_edit_target(cx)
@@ -636,9 +627,6 @@ impl AppState {
     /// footer "Edit" button, evaluated every frame. Unlike `inspector_edit_context`
     /// it never clones the (possibly large) full value.
     fn inspector_can_edit(&self, cx: &App) -> bool {
-        // See the note on `row_edit_mode`: `cx` is taken ahead of the
-        // `Entity<ResultGrid>` change so that change does not cascade.
-        let _ = &cx;
         if !self.row_edit_enabled(cx) {
             return false;
         }
@@ -657,7 +645,7 @@ impl AppState {
                 return false; // no text round-trip for binary
             }
             return matches!(&self.phase, Phase::Connected(active)
-                    if active.active_result().and_then(|g| g.edit_identity(self.gutter())).is_some());
+                    if active.active_result().and_then(|g| g.read(cx).edit_identity(self.gutter())).is_some());
         }
         self.active_edit_target(cx).is_some()
     }
@@ -794,10 +782,8 @@ impl AppState {
     /// value, a small resident value formatted on the spot, a capped stand-in, or
     /// an evicted (off-window) cell.
     fn inspector_cell(&self, active: &ActiveConn, cx: &App) -> Option<InspectorView> {
-        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
-        // change so that change stays local instead of cascading.
-        let _ = &cx;
         let grid = active.active_result()?;
+        let grid = grid.read(cx);
         let (epoch, row, col) = self.target_cell(cx)?;
         if epoch != grid.epoch {
             return None; // a pin to a since-replaced result (cleared next reconcile)

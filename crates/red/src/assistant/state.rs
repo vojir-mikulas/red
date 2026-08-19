@@ -601,7 +601,9 @@ impl AppState {
         // The pipeline maps a file's columns onto a table's, so it needs a table:
         // the one the user is looking at.
         let target = match &self.phase {
-            crate::app::Phase::Connected(a) => a.active_result().and_then(|g| g.import_target()),
+            crate::app::Phase::Connected(a) => {
+                a.active_result().and_then(|g| g.read(cx).import_target())
+            }
             _ => None,
         };
         let Some((target, columns)) = target else {
@@ -646,7 +648,7 @@ impl AppState {
                 }
                 ContextRef::Rows { index } => {
                     let tab = active.tabs.get(*index)?;
-                    let text = tab.result.as_ref()?.selection_text(gutter)?;
+                    let text = tab.result.as_ref()?.read(cx).selection_text(gutter)?;
                     Some(red_service::ContextRefSpec::Rows {
                         label: format!("Selected rows in \"{}\"", tab.title),
                         text,
@@ -2238,7 +2240,7 @@ impl AppState {
         let last_error = active
             .active()
             .and_then(|t| t.result.as_ref())
-            .and_then(|r| r.error())
+            .and_then(|r| r.read(cx).error())
             .map(str::to_string);
         // What the user is looking at, so they can refer to "this tab" / "these
         // results". The tab name goes at any tier; the result's shape (counts +
@@ -2250,7 +2252,7 @@ impl AppState {
         let current_tab = active.active().map(|t| {
             let mut s = format!("\"{}\"", t.title);
             if reads_allowed
-                && let Some(grid) = t.result.as_ref()
+                && let Some(grid) = t.result.as_ref().map(|g| g.read(cx))
                 && let Some((rows, cols)) = grid.status_counts()
             {
                 let names: Vec<String> = (0..cols)

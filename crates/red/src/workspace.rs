@@ -160,7 +160,10 @@ fn capture(active: &ActiveConn, cx: &App) -> StoredWorkspace {
             continue;
         }
         let sql = tab.editor.read(cx).content();
-        let browse = tab.result.as_ref().and_then(|grid| grid.browse_spec());
+        let browse = tab
+            .result
+            .as_ref()
+            .and_then(|grid| grid.read(cx).browse_spec());
         // A blank, unpinned, unbrowsed tab carries nothing worth a restore; a
         // workspace of only those saves as empty and so clears the entry.
         if browse.is_none() && !tab.pinned && sql == EMPTY_QUERY {

@@ -480,7 +480,12 @@ impl AppState {
         let current = match &self.phase {
             Phase::Connected(active) => active
                 .active_result()
-                .and_then(|g| g.pending.cell_override(&key, ctx.data_col).cloned())
+                .and_then(|g| {
+                    g.read(cx)
+                        .pending
+                        .cell_override(&key, ctx.data_col)
+                        .cloned()
+                })
                 .unwrap_or_else(|| ctx.original.clone()),
             _ => ctx.original.clone(),
         };
@@ -502,7 +507,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let (epoch, decl_type, current) = match &self.phase {
-            Phase::Connected(active) => match active.active_result() {
+            Phase::Connected(active) => match active.active_result().as_ref().map(|g| g.read(cx)) {
                 // An engine-computed column takes no value on insert, so it has no
                 // editor (see `ResultGrid::insertable_column`).
                 Some(g) if index < g.pending.inserts.len() && g.insertable_column(data_col) => {
@@ -706,7 +711,7 @@ impl AppState {
         let gutter = self.gutter();
         let row_height = f32::from(self.settings.data.density.row_height());
         let (ncols, locked, total) = match &self.phase {
-            Phase::Connected(active) => match active.active_result() {
+            Phase::Connected(active) => match active.active_result().as_ref().map(|g| g.read(cx)) {
                 Some(g) => (
                     g.columns.len(),
                     (0..g.columns.len())
@@ -780,7 +785,7 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let (ncols, ndrafts, writable) = match &self.phase {
-            Phase::Connected(active) => match active.active_result() {
+            Phase::Connected(active) => match active.active_result().as_ref().map(|g| g.read(cx)) {
                 Some(g) => (
                     g.columns.len(),
                     g.pending.inserts.len(),
@@ -1028,9 +1033,10 @@ impl AppState {
             self.commit_grid_edit(cx);
         }
         let staged = match &self.phase {
-            Phase::Connected(active) => active
-                .active_result()
-                .map(|g| (g.epoch, g.build_edit_batch())),
+            Phase::Connected(active) => active.active_result().map(|g| {
+                let g = g.read(cx);
+                (g.epoch, g.build_edit_batch())
+            }),
             _ => None,
         };
         let Some((epoch, batch)) = staged else { return };
@@ -1070,9 +1076,6 @@ impl AppState {
     /// The "apply to all matching rows" acknowledgement starts off -- the user grants
     /// it in the confirm dialog, if at all.
     pub(crate) fn batch_mode(&self, cx: &App) -> BatchMode {
-        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
-        // taking it now means that change does not cascade through every caller.
-        let _ = &cx;
         match self.row_edit_mode(cx) {
             EditMode::BestEffort => BatchMode::BestEffort {
                 allow_multi_match: false,
@@ -1128,13 +1131,10 @@ impl AppState {
     /// Whether the active result has staged changes (for ⌘↵'s submit-vs-run choice
     /// and the footer controls).
     pub(crate) fn has_pending_changes(&self, cx: &App) -> bool {
-        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
-        // taking it now means that change does not cascade through every caller.
-        let _ = &cx;
         match &self.phase {
             Phase::Connected(active) => active
                 .active_result()
-                .is_some_and(|g| !g.pending.is_empty()),
+                .is_some_and(|g| !g.read(cx).pending.is_empty()),
             _ => false,
         }
     }
@@ -1164,28 +1164,31 @@ impl AppState {
     ) {
         self.submitted_batch = None;
         let mut reload = false;
-        if let Some(grid) = self.result_by_epoch_in(session, epoch) {
-            // A foreign (inline-expanded FK) edit rewrites a referenced row that may
-            // be shared by several base rows, so an in-place patch would leave the
-            // other rows stale; reload so the whole denormalized view re-resolves,
-            // same as a structural (delete/insert) change.
-            let foreign = grid
-                .pending
-                .updates
-                .values()
-                .any(|u| u.cells.values().any(|c| c.foreign.is_some()));
-            let structural = !grid.pending.deletes.is_empty() || !grid.pending.inserts.is_empty();
-            if structural || foreign {
-                reload = true;
-            } else {
-                let updates = std::mem::take(&mut grid.pending.updates);
-                for u in updates.into_values() {
-                    for (col, cell) in u.cells {
-                        grid.patch_cell(u.row, col, cell.value);
+        if let Some(grid) = self.result_by_epoch_in(session, epoch, cx) {
+            grid.update(cx, |grid, _| {
+                // A foreign (inline-expanded FK) edit rewrites a referenced row that may
+                // be shared by several base rows, so an in-place patch would leave the
+                // other rows stale; reload so the whole denormalized view re-resolves,
+                // same as a structural (delete/insert) change.
+                let foreign = grid
+                    .pending
+                    .updates
+                    .values()
+                    .any(|u| u.cells.values().any(|c| c.foreign.is_some()));
+                let structural =
+                    !grid.pending.deletes.is_empty() || !grid.pending.inserts.is_empty();
+                if structural || foreign {
+                    reload = true;
+                } else {
+                    let updates = std::mem::take(&mut grid.pending.updates);
+                    for u in updates.into_values() {
+                        for (col, cell) in u.cells {
+                            grid.patch_cell(u.row, col, cell.value);
+                        }
                     }
                 }
-            }
-            grid.pending = PendingChanges::default();
+                grid.pending = PendingChanges::default();
+            });
         }
         if reload {
             // Reload the tab that *owns this epoch*, not the focused one: a
@@ -1247,19 +1250,21 @@ impl AppState {
             .iter()
             .any(|o| !o.status.unfinished() && matches!(o.verb, "Delete" | "Insert"));
         let mut reload = false;
-        if let Some(grid) = self.result_by_epoch_in(session, epoch) {
-            let foreign = grid
-                .pending
-                .updates
-                .values()
-                .any(|u| u.cells.values().any(|c| c.foreign.is_some()));
-            reload = structural || foreign;
-            if !reload {
-                for (row, col, value) in grid.landed_update_cells(&sources, &done) {
-                    grid.patch_cell(row, col, value);
+        if let Some(grid) = self.result_by_epoch_in(session, epoch, cx) {
+            grid.update(cx, |grid, _| {
+                let foreign = grid
+                    .pending
+                    .updates
+                    .values()
+                    .any(|u| u.cells.values().any(|c| c.foreign.is_some()));
+                reload = structural || foreign;
+                if !reload {
+                    for (row, col, value) in grid.landed_update_cells(&sources, &done) {
+                        grid.patch_cell(row, col, value);
+                    }
                 }
-            }
-            grid.unstage_finished(&sources, &done);
+                grid.unstage_finished(&sources, &done);
+            });
         }
         if reload {
             // Reload the epoch's own tab on its own connection, not the focused
@@ -1320,8 +1325,8 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let reopen = self
-            .result_by_epoch_in(session, epoch)
-            .map(|grid| grid.reopen_spec());
+            .result_by_epoch_in(session, epoch, cx)
+            .map(|grid| grid.update(cx, |grid, _| grid.reopen_spec()));
         self.apply_reopen_in(session, reopen, cx);
     }
 }

@@ -283,7 +283,10 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let total = match &self.phase {
-            Phase::Connected(a) => a.active_result().map(|g| g.total_rows()).unwrap_or(0),
+            Phase::Connected(a) => a
+                .active_result()
+                .map(|g| g.read(cx).total_rows())
+                .unwrap_or(0),
             _ => 0,
         };
         let creating = create.is_some();

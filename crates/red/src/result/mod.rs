@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 
 use flint::prelude::*;
 use gpui::{
-    App, ClipboardItem, Context, PathPromptOptions, Pixels, ScrollHandle, UniformListScrollHandle,
-    point, px,
+    App, AppContext, ClipboardItem, Context, Entity, PathPromptOptions, Pixels, ScrollHandle,
+    UniformListScrollHandle, point, px,
 };
 use red_core::valuefmt::{ClipboardFormat, ClipboardWriter};
 use red_core::{
@@ -1934,7 +1934,7 @@ impl AppState {
                     reason = "guard above ensured a focused tab exists"
                 )]
                 let tab = active.active_mut().unwrap();
-                tab.result = Some(grid);
+                tab.result = Some(cx.new(|_| grid));
                 tab.plan = None;
                 opened
             }
@@ -1998,14 +1998,16 @@ impl AppState {
     ) {
         // Route to the event's session (it may be a backgrounded workspace), then
         // by epoch within it. A late reply for a closed result finds no match.
-        if let Some(active) = self.conn_mut(session) {
-            // Clone the small FK graph so the grid's mutable borrow doesn't collide
-            // with the shared one; mark FK columns now that the column set is known.
+        if let Some(active) = self.conn_for(session) {
+            // Clone the small FK graph so the grid's update doesn't collide with
+            // the shared one; mark FK columns now that the column set is known.
             let graph = active.schema.read(cx).fk_graph.clone();
-            if let Some(grid) = active.result_by_epoch(epoch) {
-                grid.on_ready(columns, total, key, edit);
-                grid.set_fk_cols(&graph);
-                grid.set_joined_cols();
+            if let Some(grid) = active.result_by_epoch(epoch, cx) {
+                grid.update(cx, |grid, _| {
+                    grid.on_ready(columns, total, key, edit);
+                    grid.set_fk_cols(&graph);
+                    grid.set_joined_cols();
+                });
             }
         }
         cx.notify();
@@ -2018,11 +2020,12 @@ impl AppState {
         session: Option<SessionId>,
         epoch: red_service::Epoch,
         seq: u64,
+        cx: &mut Context<Self>,
     ) {
-        if let Some(active) = self.conn_mut(session)
-            && let Some(grid) = active.result_by_epoch(epoch)
+        if let Some(active) = self.conn_for(session)
+            && let Some(grid) = active.result_by_epoch(epoch, cx)
         {
-            grid.buffer.borrow_mut().run_failed(seq);
+            grid.read(cx).buffer.borrow_mut().run_failed(seq);
         }
     }
 
@@ -2038,15 +2041,17 @@ impl AppState {
         seq: u64,
         cx: &mut Context<Self>,
     ) {
-        if let Some(active) = self.conn_mut(session)
-            && let Some(grid) = active.result_by_epoch(epoch)
+        if let Some(active) = self.conn_for(session)
+            && let Some(grid) = active.result_by_epoch(epoch, cx)
         {
-            let total = grid.total;
-            grid.buffer
-                .borrow_mut()
-                .apply_run(fetch, rows, estimated, seq, total);
-            grid.fit_once();
-            grid.refresh_pins();
+            grid.update(cx, |grid, _| {
+                let total = grid.total;
+                grid.buffer
+                    .borrow_mut()
+                    .apply_run(fetch, rows, estimated, seq, total);
+                grid.fit_once();
+                grid.refresh_pins();
+            });
         }
         cx.notify();
     }
@@ -2062,12 +2067,14 @@ impl AppState {
     ) {
         // Route by session then epoch so a background tab's page lands in its own
         // grid; a page for a superseded result finds no match and is dropped.
-        if let Some(active) = self.conn_mut(session)
-            && let Some(grid) = active.result_by_epoch(epoch)
+        if let Some(active) = self.conn_for(session)
+            && let Some(grid) = active.result_by_epoch(epoch, cx)
         {
-            grid.buffer.borrow_mut().insert_page(offset, rows);
-            grid.fit_once();
-            grid.refresh_pins();
+            grid.update(cx, |grid, _| {
+                grid.buffer.borrow_mut().insert_page(offset, rows);
+                grid.fit_once();
+                grid.refresh_pins();
+            });
         }
         cx.notify();
     }
@@ -2290,6 +2297,7 @@ impl AppState {
             return None;
         };
         let grid = active.active_result()?;
+        let grid = grid.read(cx);
         let (schema, table) = grid.table.as_ref()?;
         let (_, col) = grid.cursor_cell(self.gutter())?;
         let cname = grid.columns.get(col)?.name.clone();
@@ -2325,13 +2333,11 @@ impl AppState {
     /// The expansion path of the focused cell when it sits in an inline-expanded
     /// reference column, for the cell menu's "hide this column" action.
     pub(in crate::result) fn focused_joined_path(&self, cx: &App) -> Option<Vec<String>> {
-        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
-        // taking it now means that change does not cascade through every caller.
-        let _ = &cx;
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
         let grid = active.active_result()?;
+        let grid = grid.read(cx);
         let (_, col) = grid.cursor_cell(self.gutter())?;
         grid.expansion_path_at(col)
     }
@@ -2339,10 +2345,7 @@ impl AppState {
     /// Whether the active result currently has any inline-expanded reference columns
     /// (drives the cell menu's "Hide all reference columns" item).
     pub(in crate::result) fn active_has_expansion(&self, cx: &App) -> bool {
-        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
-        // taking it now means that change does not cascade through every caller.
-        let _ = &cx;
-        matches!(&self.phase, Phase::Connected(a) if a.active_result().is_some_and(|g| g.has_expansion()))
+        matches!(&self.phase, Phase::Connected(a) if a.active_result().is_some_and(|g| g.read(cx).has_expansion()))
     }
 
     /// Close the superseded epoch and re-open the active grid from a
@@ -2399,13 +2402,11 @@ impl AppState {
     /// is by far the likeliest cause, so the filter bar shows the engine's message
     /// inline and offers a revert instead of leaving the user with a dead grid.
     pub(crate) fn filter_error(&self, cx: &App) -> Option<String> {
-        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
-        // taking it now means that change does not cascade through every caller.
-        let _ = &cx;
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
         let grid = active.active_result()?;
+        let grid = grid.read(cx);
         grid.filter.as_ref()?;
         grid.error.clone()
     }
@@ -2416,7 +2417,7 @@ impl AppState {
         let last = match &self.phase {
             Phase::Connected(active) => active
                 .active_result()
-                .and_then(|g| g.last_good_filter.clone()),
+                .and_then(|g| g.read(cx).last_good_filter.clone()),
             _ => None,
         };
         self.apply_result_filter(last, cx);
@@ -2425,11 +2426,10 @@ impl AppState {
 
     /// The active result's current filter, for the toolbar chip / filter-bar seed.
     pub(crate) fn active_result_filter(&self, cx: &App) -> Option<ResultFilter> {
-        // `cx` is unused until `QueryTab::result` becomes an `Entity<ResultGrid>`;
-        // taking it now means that change does not cascade through every caller.
-        let _ = &cx;
         match &self.phase {
-            Phase::Connected(active) => active.active_result().and_then(|g| g.filter.clone()),
+            Phase::Connected(active) => active
+                .active_result()
+                .and_then(|g| g.read(cx).filter.clone()),
             _ => None,
         }
     }
@@ -2446,11 +2446,12 @@ impl AppState {
     /// re-submitting re-ran ops whose "touches exactly one row" assertion then
     /// failed — while a "Changes submitted" toast said it had worked.
     pub(crate) fn result_by_epoch_in(
-        &mut self,
+        &self,
         session: Option<red_service::SessionId>,
         epoch: red_service::Epoch,
-    ) -> Option<&mut ResultGrid> {
-        self.conn_mut(session)?.result_by_epoch(epoch)
+        cx: &App,
+    ) -> Option<Entity<ResultGrid>> {
+        self.conn_for(session)?.result_by_epoch(epoch, cx)
     }
 
     /// Cell click: set the selection anchor, or extend it on shift-click. A click
@@ -2516,7 +2517,7 @@ impl AppState {
         let keep = match &self.phase {
             Phase::Connected(active) => active
                 .active_result()
-                .is_some_and(|grid| grid.select_for_menu(row, table_col)),
+                .is_some_and(|grid| grid.read(cx).select_for_menu(row, table_col)),
             _ => false,
         };
         if !keep {
@@ -2723,10 +2724,10 @@ impl AppState {
         stats: ColumnStats,
         cx: &mut Context<Self>,
     ) {
-        if let Some(active) = self.conn_mut(session)
-            && let Some(grid) = active.result_by_epoch(epoch)
+        if let Some(active) = self.conn_for(session)
+            && let Some(grid) = active.result_by_epoch(epoch, cx)
         {
-            grid.apply_stats(&column, stats);
+            grid.update(cx, |grid, _| grid.apply_stats(&column, stats));
         }
         cx.notify();
     }
@@ -2740,10 +2741,10 @@ impl AppState {
         column: String,
         cx: &mut Context<Self>,
     ) {
-        if let Some(active) = self.conn_mut(session)
-            && let Some(grid) = active.result_by_epoch(epoch)
+        if let Some(active) = self.conn_for(session)
+            && let Some(grid) = active.result_by_epoch(epoch, cx)
         {
-            grid.fail_stats(&column);
+            grid.update(cx, |grid, _| grid.fail_stats(&column));
         }
         cx.notify();
     }
@@ -2751,7 +2752,7 @@ impl AppState {
     /// Prompt for a save path, then stream the active tab's result there in `format`.
     pub(crate) fn export_result(&mut self, format: ExportFormat, cx: &mut Context<Self>) {
         let epoch = match &self.phase {
-            Phase::Connected(a) => a.active_result().map(|g| g.epoch),
+            Phase::Connected(a) => a.active_result().map(|g| g.read(cx).epoch),
             _ => None,
         };
         let Some(epoch) = epoch else {
@@ -2789,7 +2790,10 @@ impl AppState {
         cx: &mut Context<Self>,
     ) {
         let total = match &self.phase {
-            Phase::Connected(a) => a.active_result().map(|g| g.total_rows()).unwrap_or(0),
+            Phase::Connected(a) => a
+                .active_result()
+                .map(|g| g.read(cx).total_rows())
+                .unwrap_or(0),
             _ => 0,
         };
         let id = red_service::OpId::new(self.next_export_id);
@@ -3019,7 +3023,7 @@ impl AppState {
     /// any write**. No-op (with a hint) on editor SQL / joins: no single target.
     pub(crate) fn import_into_result(&mut self, cx: &mut Context<Self>) {
         let target = match &self.phase {
-            Phase::Connected(a) => a.active_result().and_then(|g| g.import_target()),
+            Phase::Connected(a) => a.active_result().and_then(|g| g.read(cx).import_target()),
             _ => None,
         };
         let Some((target, target_cols)) = target else {
@@ -3223,7 +3227,8 @@ impl AppState {
         if let Phase::Connected(active) = &self.phase
             && let Some(grid) = active.active_result()
         {
-            grid.go_to_row(one_based.saturating_sub(1), row_height);
+            grid.read(cx)
+                .go_to_row(one_based.saturating_sub(1), row_height);
         }
         cx.notify();
     }
@@ -3233,11 +3238,10 @@ impl AppState {
     /// "Copy as" menu rather than offering a copy that would name the fallback
     /// table and paste `INSERT INTO "exported_table"`.
     pub(crate) fn copy_as_sql_target(&self, cx: &App) -> Option<String> {
-        let _ = cx;
         match &self.phase {
             Phase::Connected(active) => active
                 .active_result()
-                .and_then(|grid| grid.copy_table_name().map(str::to_string)),
+                .and_then(|grid| grid.read(cx).copy_table_name().map(str::to_string)),
             _ => None,
         }
     }
@@ -3260,7 +3264,7 @@ impl AppState {
         let plan = match &self.phase {
             Phase::Connected(active) => active
                 .active_result()
-                .and_then(|g| g.copy_plan(gutter, format)),
+                .and_then(|g| g.read(cx).copy_plan(gutter, format)),
             _ => None,
         };
         match plan {
@@ -3291,10 +3295,13 @@ impl AppState {
                 self.next_copy_id += 1;
                 let (names, table) = match &self.phase {
                     Phase::Connected(active) => match active.active_result() {
-                        Some(grid) => (
-                            grid.selected_column_names(&cols),
-                            grid.copy_table_name().map(str::to_string),
-                        ),
+                        Some(grid) => {
+                            let grid = grid.read(cx);
+                            (
+                                grid.selected_column_names(&cols),
+                                grid.copy_table_name().map(str::to_string),
+                            )
+                        }
                         None => (Vec::new(), None),
                     },
                     _ => (Vec::new(), None),
@@ -3360,6 +3367,7 @@ impl AppState {
         let Some(grid) = active.active_result() else {
             return empty;
         };
+        let grid = grid.read(cx);
         let Some((schema, table)) = grid.table.as_ref() else {
             return empty;
         };
@@ -3408,6 +3416,7 @@ impl AppState {
         let Some(grid) = active.active_result() else {
             return;
         };
+        let grid = grid.read(cx);
         let Some((schema, table)) = grid.table.as_ref() else {
             return;
         };
@@ -3454,6 +3463,7 @@ impl AppState {
         let Some(grid) = active.active_result() else {
             return;
         };
+        let grid = grid.read(cx);
         let Some((row, _)) = grid.cursor_cell(self.gutter()) else {
             return;
         };

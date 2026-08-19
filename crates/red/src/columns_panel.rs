@@ -120,7 +120,7 @@ impl AppState {
 
         let clear_btn = active
             .active_result()
-            .is_some_and(|g| g.has_expansion())
+            .is_some_and(|g| g.read(cx).has_expansion())
             .then(|| {
                 div()
                     .id("columns-clear")
@@ -203,7 +203,10 @@ impl AppState {
     /// focused result isn't a table browse (the panel then shows its empty state).
     fn columns_tree_rows(&self, active: &ActiveConn, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let mut out = Vec::new();
-        let Some((schema, table)) = active.active_result().and_then(|g| g.base_table()).cloned()
+        let Some((schema, table)) = active
+            .active_result()
+            .and_then(|g| g.read(cx).base_table())
+            .cloned()
         else {
             return out;
         };
@@ -267,11 +270,11 @@ impl AppState {
             col_path.push(col.name.clone());
             let target = fk_target(&active.schema.read(cx).fk_graph, schema, table, &col.name);
             let is_fk = target.is_some();
-            let expanded = is_fk && grid.is_tree_expanded(&col_path);
+            let expanded = is_fk && grid.read(cx).is_tree_expanded(&col_path);
             // A reference column (depth >= 1) carries a checkbox to add it; base
             // columns are always shown, so they don't.
             let checkable = depth >= 1;
-            let checked = checkable && grid.is_shown(&col_path);
+            let checked = checkable && grid.read(cx).is_shown(&col_path);
 
             // Chevron (FK nodes only); toggles the subtree open.
             let chevron = if is_fk {

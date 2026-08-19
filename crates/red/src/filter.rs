@@ -525,13 +525,10 @@ impl AppState {
     /// The active result's columns, in order: what `Column` mode's column picker
     /// offers and what a built predicate can name.
     pub(crate) fn filter_columns(&self, cx: &App) -> Vec<ResultColumn> {
-        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
-        // change so that change stays local instead of cascading.
-        let _ = &cx;
         match &self.phase {
             Phase::Connected(active) => active
                 .active_result()
-                .map(|g| g.columns().to_vec())
+                .map(|g| g.read(cx).columns().to_vec())
                 .unwrap_or_default(),
             _ => Vec::new(),
         }
@@ -657,13 +654,11 @@ impl AppState {
     /// The focused cell as a filter target: its column and its value. `None` when
     /// no cell is focused or its row has been evicted from the resident window.
     pub(crate) fn cell_filter_target(&self, cx: &App) -> Option<(ResultColumn, Value)> {
-        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
-        // change so that change stays local instead of cascading.
-        let _ = &cx;
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
         let grid = active.active_result()?;
+        let grid = grid.read(cx);
         let (row, col) = grid.cursor_cell(self.gutter())?;
         let column = grid.columns().get(col)?.clone();
         Some((column, grid.cell_value(row, col)?))
@@ -705,9 +700,6 @@ impl AppState {
     /// Whether the cell menu's "Add to filter" item applies: there is a focused
     /// cell *and* an applied built filter to add to.
     pub(crate) fn can_add_cell_filter_term(&self, cx: &App) -> bool {
-        // See the note on `row_edit_mode`: `cx` is taken ahead of the
-        // `Entity<ResultGrid>` change so that change does not cascade.
-        let _ = &cx;
         self.cell_filter_target(cx).is_some()
             && matches!(self.active_result_filter(cx), Some(ResultFilter::Cmp(_)))
     }
@@ -716,21 +708,17 @@ impl AppState {
     /// writes: `(conn_id, browsed table)`. `None` before a connection is up; a
     /// `None` table is the editor-results bucket (see `filters.rs`).
     fn filter_scope(&self, cx: &App) -> Option<(String, Option<String>)> {
-        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
-        // change so that change stays local instead of cascading.
-        let _ = &cx;
         let Phase::Connected(active) = &self.phase else {
             return None;
         };
-        let table = active.active_result().and_then(|g| g.browsed_table());
+        let table = active
+            .active_result()
+            .and_then(|g| g.read(cx).browsed_table());
         Some((active.conn_id.clone(), table))
     }
 
     /// This result's recent filters, newest-first (the recall dropdown's rows).
     pub(crate) fn recent_filters(&self, cx: &App) -> Vec<crate::filters::RecentFilter> {
-        // See `row_edit_mode`: `cx` is taken ahead of the `Entity<ResultGrid>`
-        // change so that change stays local instead of cascading.
-        let _ = &cx;
         let Some((conn_id, scope)) = self.filter_scope(cx) else {
             return Vec::new();
         };

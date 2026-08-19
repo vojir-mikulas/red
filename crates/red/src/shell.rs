@@ -269,7 +269,9 @@ impl AppState {
 
         // --- status bar: endpoint · db · read-only | rows · cols · UTF-8 · SQL ·
         // engine (the design's information-dense bottom strip) ---
-        let counts = active.active_result().and_then(|g| g.status_counts());
+        let counts = active
+            .active_result()
+            .and_then(|g| g.read(cx).status_counts());
 
         // Endpoint + connection name can be arbitrarily long (a deep SQLite path,
         // a verbose `user@host:port/database`). They sit in a `flex_1 min_w_0`
