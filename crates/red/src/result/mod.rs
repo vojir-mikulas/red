@@ -388,6 +388,11 @@ pub(crate) struct ResultGrid {
     /// Frozen wall-clock time the query took, set once it lands (ready or error).
     /// `None` while still running, so the elapsed time keeps counting up.
     query_elapsed: Option<Duration>,
+    /// Whether this result's column-stats bar is on. Per grid rather than per
+    /// window: the bar reports *this* result's columns, so leaving it on while
+    /// the user reads another tab would show a summary of a result they are not
+    /// looking at. Turning it on requests the selected column's summary.
+    pub(in crate::result) stats_bar: bool,
     /// The column-stats bar's current view (selected column + load state), or
     /// `None` when no column is selected. Only populated while stats mode is on.
     pub(in crate::result) stats: Option<ColumnStatsView>,
@@ -462,6 +467,7 @@ impl ResultGrid {
             epoch: next_epoch(),
             query_started: Instant::now(),
             query_elapsed: None,
+            stats_bar: false,
             stats: None,
             stats_cache: HashMap::new(),
         }
@@ -2653,11 +2659,18 @@ impl AppState {
     /// requests the summary for the currently-selected column; turning it off hides
     /// the bar (the cached summaries stay, so re-toggling is instant).
     pub(crate) fn toggle_stats_bar(&mut self, cx: &mut Context<Self>) {
-        self.stats_bar = !self.stats_bar;
-        if self.stats_bar {
+        let Phase::Connected(active) = &mut self.phase else {
+            return;
+        };
+        let on = active.with_active_result(cx, |grid| {
+            grid.stats_bar = !grid.stats_bar;
+            if !grid.stats_bar {
+                grid.stats = None;
+            }
+            grid.stats_bar
+        });
+        if on == Some(true) {
             self.refresh_column_stats(cx);
-        } else if let Phase::Connected(active) = &mut self.phase {
-            active.with_active_result(cx, |grid| grid.stats = None);
         }
         cx.notify();
     }
@@ -2666,15 +2679,14 @@ impl AppState {
     /// (a cache hit is instant). Called when the bar is on and the selection moves;
     /// a no-op when the bar is off or nothing has changed.
     pub(crate) fn refresh_column_stats(&mut self, cx: &mut Context<Self>) {
-        if !self.stats_bar {
-            return;
-        }
         let gutter = self.gutter();
         let distinct_max = self.settings.data.stats_distinct_max_rows;
         let req = match &mut self.phase {
             Phase::Connected(active) => active
                 .with_active_result(cx, |grid| {
-                    if !(grid.ready && grid.error.is_none()) {
+                    // The bar's own gate now that it is grid state: a selection
+                    // move on a result whose bar is off must not fetch a summary.
+                    if !grid.stats_bar || !(grid.ready && grid.error.is_none()) {
                         return None;
                     }
                     grid.prepare_stats(gutter, distinct_max)

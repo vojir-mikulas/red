@@ -189,10 +189,6 @@ pub struct AppState {
     /// Monotonic id source for assistant conversations, so the backend keeps each
     /// panel's turn history separate.
     pub(crate) next_conversation_id: u64,
-    /// Whether the column-stats bar is on (a session-ephemeral toggle, like the
-    /// filter bar's visibility). When on, selecting a column requests its
-    /// pushed-down aggregate summary; the per-column result lives on the grid.
-    pub(crate) stats_bar: bool,
     /// The mode the filter bar last opened / switched to, so a `WHERE` user isn't
     /// thrown back to `Contains` on every new result. Session-scoped: it seeds the
     /// *next* bar, while an open bar carries its own mode on the tab that owns it
@@ -1380,7 +1376,6 @@ impl AppState {
             ai_login_code,
             focus_login_code: false,
             next_conversation_id: 0,
-            stats_bar: false,
             filter_mode: crate::filter::FilterMode::default(),
             filter_history: crate::filters::FilterHistory::load(),
             find_bar: None,

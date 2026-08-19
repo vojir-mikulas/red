@@ -1240,7 +1240,7 @@ impl AppState {
             )
             // The column-stats bar (a thin summary line) sits just above the footer
             // when the toggle is on.
-            .when(is_focused && self.stats_bar, |c| {
+            .when(is_focused && grid.stats_bar, |c| {
                 c.child(self.render_stats_bar(grid, cx))
             })
             .child(footer);
@@ -2342,7 +2342,8 @@ impl AppState {
         // "Copy to…" needs a ready result as its source; the Stats toggle is
         // always available and carries a leading check while its bar is on.
         let ready = matches!(&self.phase, Phase::Connected(a) if a.active_result().is_some_and(|g| g.read(cx).ready));
-        let stats_label = if self.stats_bar { "✓ Stats" } else { "Stats" };
+        let stats_on = matches!(&self.phase, Phase::Connected(a) if a.active_result().is_some_and(|g| g.read(cx).stats_bar));
+        let stats_label = if stats_on { "✓ Stats" } else { "Stats" };
         let mut menu = ContextMenu::new("result-more-menu").item(
             ContextMenuItem::new("more-stats", stats_label).on_click(cx.listener(
                 |this, _, _, cx| {
