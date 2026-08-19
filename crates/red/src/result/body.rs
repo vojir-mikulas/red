@@ -65,6 +65,8 @@ impl ResultGrid {
             });
 
         div()
+            // A no-op outside test builds (see `InteractiveElement::debug_selector`).
+            .debug_selector(|| "result-grid-pane".to_string())
             .flex_1()
             .min_h(px(0.))
             .bg(bg_app)
@@ -707,5 +709,123 @@ impl ResultGrid {
                 out
             });
         (table, row_height, win)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::PaneId;
+    use red_core::{Column, Value};
+    use red_service::{SessionId, spawn};
+
+    /// A grid with one resident row, staged as the focused pane's the way
+    /// `push_grid_frame` stages it for a real frame.
+    fn grid(cx: &mut gpui::App) -> Entity<ResultGrid> {
+        let handle = spawn();
+        let sender = handle.command_sender(SessionId::new(1));
+        let mut grid = ResultGrid::new(
+            "orders".into(),
+            "SELECT * FROM orders".into(),
+            Some(("main".into(), "orders".into())),
+            sender,
+            100,
+        );
+        grid.columns = vec![
+            Column {
+                name: "id".into(),
+                decl_type: Some("integer".into()),
+            },
+            Column {
+                name: "label".into(),
+                decl_type: Some("text".into()),
+            },
+        ];
+        grid.sync_columns();
+        grid.total = 1;
+        grid.ready = true;
+        grid.buffer
+            .borrow_mut()
+            .insert_page(0, vec![vec![Value::Integer(1), Value::Text("bolt".into())]]);
+        // The props a frame stages. The app handle is deliberately a dead one: every
+        // interaction the view wires reaches the app through `update(..).ok()`, so a
+        // grid can draw without one — which is what makes it testable at all.
+        grid.app = Some(gpui::WeakEntity::new_invalid());
+        grid.pane = Some(PaneId::FIRST);
+        grid.is_focused = true;
+        cx.new(|_| grid)
+    }
+
+    /// The view draws, and fills the box it is given. `render_pane` returns an
+    /// early empty `div` when its props are missing, and a `flex_1` child that
+    /// collapsed would be indistinguishable from that on screen — so the size is
+    /// the assertion that says the grid really rendered.
+    #[gpui::test]
+    fn the_grid_lays_out_in_a_window(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(crate::theme::one_dark());
+            // The body reads the gutter, row height and null display straight off
+            // the settings global rather than from the app — publish one, or the
+            // first frame panics on a missing global.
+            crate::settings::Settings::default().publish(cx);
+        });
+        let window = cx.add_window(|_window, cx| {
+            let grid = grid(cx);
+            Harness { grid }
+        });
+        let viewport = window
+            .update(cx, |_this, window, _cx| window.viewport_size())
+            .expect("the window is live");
+
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+
+        let pane = cx
+            .debug_bounds("result-grid-pane")
+            .expect("the grid view drew");
+        assert_eq!(
+            pane.size, viewport,
+            "the grid fills the pane it is mounted in"
+        );
+    }
+
+    /// Without its per-frame props the view draws nothing rather than panicking or
+    /// drawing a half-configured grid. This is the state every grid is in between
+    /// construction and its first `push_grid_frame`.
+    #[gpui::test]
+    fn an_unstaged_grid_draws_nothing(cx: &mut gpui::TestAppContext) {
+        cx.update(|cx| {
+            cx.set_global(crate::theme::one_dark());
+            crate::settings::Settings::default().publish(cx);
+        });
+        let window = cx.add_window(|_window, cx| {
+            let grid = grid(cx);
+            grid.update(cx, |grid, _| {
+                grid.app = None;
+                grid.pane = None;
+            });
+            Harness { grid }
+        });
+        let cx = &mut gpui::VisualTestContext::from_window(window.into(), cx);
+        cx.run_until_parked();
+        assert!(
+            cx.debug_bounds("result-grid-pane").is_none(),
+            "an unstaged grid draws no pane"
+        );
+    }
+
+    /// Mounts the grid the way the result pane does.
+    struct Harness {
+        grid: Entity<ResultGrid>,
+    }
+
+    impl gpui::Render for Harness {
+        fn render(
+            &mut self,
+            _window: &mut gpui::Window,
+            _cx: &mut Context<Self>,
+        ) -> impl IntoElement {
+            div().size_full().flex().child(self.grid.clone())
+        }
     }
 }
