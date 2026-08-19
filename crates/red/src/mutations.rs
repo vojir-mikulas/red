@@ -17,7 +17,7 @@ use gpui::{App, Context, SharedString, div, prelude::*, px};
 use red_core::{MutationInfo, TableRef};
 use red_service::Command;
 
-use crate::app::{ActiveConn, AppState, Phase};
+use crate::app::{AppState, Phase};
 
 /// How much of a mutation's statement the row shows before clipping. Enough to tell
 /// two edits of the same table apart; the full text is a `KILL`-worthy detail, not a
@@ -96,13 +96,11 @@ impl AppState {
             id,
         });
     }
+}
 
+impl crate::server_panel::ServerPanel {
     /// The Mutations dock panel.
-    pub(crate) fn render_mutations(
-        &self,
-        active: &ActiveConn,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
+    pub(super) fn render_mutations(&self, cx: &Context<Self>) -> impl IntoElement + use<> {
         let theme = cx.theme().clone();
         let (text, muted, faint, border_soft, red, yellow, green) = (
             theme.text,
@@ -114,13 +112,7 @@ impl AppState {
             theme.green,
         );
         let size_11 = theme.scale(11.);
-        let running = active
-            .server
-            .read(cx)
-            .mutations
-            .iter()
-            .filter(|m| !m.done)
-            .count();
+        let running = self.mutations.iter().filter(|m| !m.done).count();
 
         let header = div()
             .flex_shrink_0()
@@ -152,13 +144,18 @@ impl AppState {
                     Button::new("mutations-refresh", "Refresh")
                         .variant(ButtonVariant::Ghost)
                         .size(ButtonSize::Sm)
-                        .on_click(cx.listener(|this, _, _, cx| this.refresh_mutations(cx))),
+                        .on_click({
+                            let app = self.app.clone();
+                            move |_, _, cx: &mut gpui::App| {
+                                if let Some(app) = &app {
+                                    app.update(cx, |this, cx| this.refresh_mutations(cx)).ok();
+                                }
+                            }
+                        }),
                 ),
             );
 
-        let rows: Vec<gpui::AnyElement> = active
-            .server
-            .read(cx)
+        let rows: Vec<gpui::AnyElement> = self
             .mutations
             .iter()
             .enumerate()
@@ -206,15 +203,21 @@ impl AppState {
                                             "Stop further part rewrites. Parts already \
                                              rewritten stay changed.",
                                         )
-                                        .on_click(
-                                            cx.listener(move |this, _, _, _| {
-                                                this.kill_mutation(
-                                                    database.clone(),
-                                                    table.clone(),
-                                                    id.clone(),
-                                                )
-                                            }),
-                                        ),
+                                        .on_click({
+                                            let app = self.app.clone();
+                                            move |_, _, cx: &mut gpui::App| {
+                                                if let Some(app) = &app {
+                                                    app.update(cx, |this, _| {
+                                                        this.kill_mutation(
+                                                            database.clone(),
+                                                            table.clone(),
+                                                            id.clone(),
+                                                        );
+                                                    })
+                                                    .ok();
+                                                }
+                                            }
+                                        }),
                                     ),
                                 )
                             }),
@@ -241,7 +244,7 @@ impl AppState {
                 .p_3()
                 .text_size(size_11)
                 .text_color(faint)
-                .child(if active.server.read(cx).mutations_loading {
+                .child(if self.mutations_loading {
                     "Loading…"
                 } else {
                     "No mutations. Updates and deletes appear here while the engine applies them."

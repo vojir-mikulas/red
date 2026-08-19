@@ -1976,6 +1976,19 @@ impl ActiveConn {
         // The dock asks the shell to seed an editor / move focus / close; the
         // rest (search, collapse, selection, delete, clear) it does itself.
         let history_sub = cx.subscribe(&history_panel, AppState::on_history_event);
+        // The Server dock's fixed context, read before `config` moves into the
+        // struct: its capability gates depend on the engine, and the app handle is
+        // how its buttons reach the actions it triggers but does not own.
+        let server_panel = {
+            let (kind, read_only) = (config.kind, config.read_only);
+            let app = cx.entity().downgrade();
+            cx.new(|_| crate::server_panel::ServerPanel {
+                kind,
+                read_only,
+                app: Some(app),
+                ..Default::default()
+            })
+        };
         Self {
             // Seeded from what the connection dialled, so a config that named a
             // database keeps resolving exactly as before; `None` only on an engine
@@ -2007,7 +2020,7 @@ impl ActiveConn {
             _schema_sub: schema_sub,
             history_w: px(240.),
             history_drag: None,
-            server: cx.new(|_| crate::server_panel::ServerPanel::default()),
+            server: server_panel,
             server_w: px(320.),
             server_drag: None,
             columns_open: false,

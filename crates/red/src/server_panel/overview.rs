@@ -20,7 +20,7 @@ use flint::prelude::*;
 use gpui::{Context, Hsla, div, prelude::*, px};
 use red_core::server::{MetricGroup, MetricValue, ServerMetric, ServerSnapshot};
 
-use crate::app::{ActiveConn, AppState};
+use super::ServerPanel;
 
 /// Where a bar stops being informational and starts being a warning, then a
 /// problem. A connection pool at 80% is worth noticing; at 95% the next client
@@ -28,15 +28,9 @@ use crate::app::{ActiveConn, AppState};
 const WARN_AT: f32 = 0.8;
 const BAD_AT: f32 = 0.95;
 
-impl AppState {
-    pub(super) fn render_overview(
-        &self,
-        active: &ActiveConn,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        // Read once for the frame: holding this across the listeners below would
-        // freeze the context they need.
-        let panel = active.server.read(cx);
+impl ServerPanel {
+    pub(super) fn render_overview(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        let panel = self;
         let theme = cx.theme().clone();
         let size_11 = theme.scale(11.);
 

@@ -13,24 +13,18 @@ use flint::{Button, ButtonSize, ButtonVariant};
 use gpui::{Context, SharedString, div, prelude::*, px};
 use red_core::{KillMode, ServerSession, SessionKey};
 
-use crate::app::{ActiveConn, AppState};
+use super::ServerPanel;
 
 /// How much of a statement a session row shows before clipping. Enough to tell
 /// two queries apart; the full text is one click away in the expanded row.
 const QUERY_CHARS: usize = 220;
 
-impl AppState {
-    pub(super) fn render_sessions(
-        &self,
-        active: &ActiveConn,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        // Read once for the frame: holding this across the listeners below would
-        // freeze the context they need.
-        let panel = active.server.read(cx);
+impl ServerPanel {
+    pub(super) fn render_sessions(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        let panel = self;
         let theme = cx.theme().clone();
-        let caps = active.config.kind.session_caps();
-        let writable = !active.config.read_only;
+        let caps = self.kind.session_caps();
+        let writable = !self.read_only;
         let size_11 = theme.scale(11.);
 
         // A role that cannot see other sessions is a normal, common state on a
@@ -50,9 +44,7 @@ impl AppState {
 
         // Who is blocking someone, so a blocker can be marked as the root cause
         // rather than looking like any other running query.
-        let blockers: std::collections::HashSet<&SessionKey> = active
-            .server
-            .read(cx)
+        let blockers: std::collections::HashSet<&SessionKey> = self
             .sessions
             .iter()
             .flat_map(|s| s.blocked_by.iter())
@@ -93,9 +85,7 @@ impl AppState {
         // The root-cause line: the single most useful sentence in the panel when a
         // lock chain is the reason someone is asking.
         let summary = (blocking_count > 0).then(|| {
-            let blocked = active
-                .server
-                .read(cx)
+            let blocked = self
                 .sessions
                 .iter()
                 .filter(|s| !s.blocked_by.is_empty())
@@ -209,15 +199,21 @@ impl AppState {
                                 )
                                 .variant(ButtonVariant::Ghost)
                                 .size(ButtonSize::Sm)
-                                .on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.confirm_kill_session(
-                                            key_cancel.clone(),
-                                            KillMode::Cancel,
-                                            cx,
-                                        );
-                                    },
-                                )),
+                                .on_click({
+                                    let app = self.app.clone();
+                                    move |_, _, cx: &mut gpui::App| {
+                                        if let Some(app) = &app {
+                                            app.update(cx, |this, cx| {
+                                                this.confirm_kill_session(
+                                                    key_cancel.clone(),
+                                                    KillMode::Cancel,
+                                                    cx,
+                                                );
+                                            })
+                                            .ok();
+                                        }
+                                    }
+                                }),
                             ),
                         )
                     })
@@ -229,15 +225,21 @@ impl AppState {
                             )
                             .variant(ButtonVariant::Ghost)
                             .size(ButtonSize::Sm)
-                            .on_click(cx.listener(
-                                move |this, _, _, cx| {
-                                    this.confirm_kill_session(
-                                        key_term.clone(),
-                                        KillMode::Terminate,
-                                        cx,
-                                    );
-                                },
-                            )),
+                            .on_click({
+                                let app = self.app.clone();
+                                move |_, _, cx: &mut gpui::App| {
+                                    if let Some(app) = &app {
+                                        app.update(cx, |this, cx| {
+                                            this.confirm_kill_session(
+                                                key_term.clone(),
+                                                KillMode::Terminate,
+                                                cx,
+                                            );
+                                        })
+                                        .ok();
+                                    }
+                                }
+                            }),
                         )
                     }),
             )

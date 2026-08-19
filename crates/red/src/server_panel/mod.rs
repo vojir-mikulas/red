@@ -45,6 +45,16 @@ use crate::app::{ActiveConn, AppState, PendingWrite, Phase};
 /// closed, no samples and no refresh, which is the state a fresh connection is in.
 #[derive(Default)]
 pub(crate) struct ServerPanel {
+    /// The engine behind this connection, for the capability gates: which views
+    /// exist, whether sessions can be killed, what the metrics are called. Fixed
+    /// for the connection's life, so it is set once at construction.
+    pub kind: DbKind,
+    /// Whether the connection accepts writes. A read-only one offers no kill.
+    pub read_only: bool,
+    /// The app, for the actions the dock triggers but does not own: refreshing,
+    /// switching view, setting the interval, and the kill ladder — which rides the
+    /// shared confirm modal and must keep doing so.
+    pub app: Option<gpui::WeakEntity<AppState>>,
     /// Whether the dock is shown. Offered on every engine with a server behind it,
     /// which is all of them but SQLite (see `AppState::has_server_panel`).
     pub open: bool,
@@ -413,86 +423,6 @@ impl AppState {
         .detach();
     }
 
-    /// The Server dock.
-    pub(crate) fn render_server_panel(
-        &self,
-        active: &ActiveConn,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement + use<> {
-        let theme = cx.theme().clone();
-        let view = active.server.read(cx).view;
-        let kind = active.config.kind;
-
-        // The view switch, offered only where more than one view exists. On an
-        // engine with a single view the dock is just that panel, with no control
-        // that does nothing.
-        let views: Vec<ServerView> = ServerView::available(kind).collect();
-        let switch = (views.len() > 1).then(|| {
-            let mut row = div().flex().items_center().gap_1();
-            for which in views {
-                let label = which.label();
-                row = row.child(
-                    Button::new(SharedString::from(format!("server-view-{label}")), label)
-                        .variant(if view == which {
-                            ButtonVariant::Secondary
-                        } else {
-                            ButtonVariant::Ghost
-                        })
-                        .size(ButtonSize::Sm)
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.set_server_view(which, cx)),
-                        ),
-                );
-            }
-            row
-        });
-
-        let header = div()
-            .flex_shrink_0()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_3()
-            .h(px(34.))
-            .border_b_1()
-            .border_color(theme.border_soft)
-            .child(
-                div()
-                    .text_size(theme.scale(12.))
-                    .text_color(theme.text)
-                    .child(crate::i18n::tr!("server.title", "Server")),
-            )
-            .children(switch)
-            .child(
-                div()
-                    .ml_auto()
-                    .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(self.render_refresh_pill(active, &theme, cx))
-                    .child(
-                        Button::new("server-refresh", "Refresh")
-                            .variant(ButtonVariant::Ghost)
-                            .size(ButtonSize::Sm)
-                            .on_click(cx.listener(|this, _, _, cx| this.refresh_server_panel(cx))),
-                    ),
-            );
-
-        let body = match view {
-            ServerView::Mutations => self.render_mutations(active, cx).into_any_element(),
-            ServerView::Sessions => self.render_sessions(active, cx),
-            ServerView::Overview => self.render_overview(active, cx),
-        };
-
-        div()
-            .size_full()
-            .flex()
-            .flex_col()
-            .bg(theme.bg_panel)
-            .child(header)
-            .child(div().flex_1().min_h(px(0.)).child(body))
-    }
-
     /// Wrap a shell's work area in the Server dock when it is open.
     ///
     /// One helper rather than the same fifty lines of `SplitPane` wiring in
@@ -509,7 +439,9 @@ impl AppState {
         if !active.server.read(cx).open {
             return body;
         }
-        let pane = self.render_server_panel(active, cx);
+        // The dock is its own view: the shell gives it a pane and a width, and the
+        // panel draws itself from state it owns. A refresh tick repaints it alone.
+        let pane = active.server.clone().into_any_element();
         let view = cx.entity().downgrade();
         let (start, resize, end) = (view.clone(), view.clone(), view);
         flint::SplitPane::new(id, gpui::Axis::Horizontal)
@@ -591,18 +523,112 @@ impl AppState {
                 .into_any_element(),
         )
     }
+}
+
+impl gpui::Render for ServerPanel {
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_dock(cx)
+    }
+}
+
+impl ServerPanel {
+    /// The Server dock.
+    fn render_dock(&self, cx: &Context<Self>) -> gpui::AnyElement {
+        let theme = cx.theme().clone();
+        let view = self.view;
+        let kind = self.kind;
+
+        // The view switch, offered only where more than one view exists. On an
+        // engine with a single view the dock is just that panel, with no control
+        // that does nothing.
+        let views: Vec<ServerView> = ServerView::available(kind).collect();
+        let switch = (views.len() > 1).then(|| {
+            let mut row = div().flex().items_center().gap_1();
+            for which in views {
+                let label = which.label();
+                row = row.child(
+                    Button::new(SharedString::from(format!("server-view-{label}")), label)
+                        .variant(if view == which {
+                            ButtonVariant::Secondary
+                        } else {
+                            ButtonVariant::Ghost
+                        })
+                        .size(ButtonSize::Sm)
+                        .on_click({
+                            let app = self.app.clone();
+                            move |_, _, cx: &mut gpui::App| {
+                                if let Some(app) = &app {
+                                    app.update(cx, |this, cx| this.set_server_view(which, cx))
+                                        .ok();
+                                }
+                            }
+                        }),
+                );
+            }
+            row
+        });
+
+        let header = div()
+            .flex_shrink_0()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .h(px(34.))
+            .border_b_1()
+            .border_color(theme.border_soft)
+            .child(
+                div()
+                    .text_size(theme.scale(12.))
+                    .text_color(theme.text)
+                    .child(crate::i18n::tr!("server.title", "Server")),
+            )
+            .children(switch)
+            .child(
+                div()
+                    .ml_auto()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(self.render_refresh_pill(&theme))
+                    .child(
+                        Button::new("server-refresh", "Refresh")
+                            .variant(ButtonVariant::Ghost)
+                            .size(ButtonSize::Sm)
+                            .on_click({
+                                let app = self.app.clone();
+                                move |_, _, cx: &mut gpui::App| {
+                                    if let Some(app) = &app {
+                                        app.update(cx, |this, cx| this.refresh_server_panel(cx))
+                                            .ok();
+                                    }
+                                }
+                            }),
+                    ),
+            );
+
+        let body = match view {
+            ServerView::Mutations => self.render_mutations(cx).into_any_element(),
+            ServerView::Sessions => self.render_sessions(cx),
+            ServerView::Overview => self.render_overview(cx),
+        };
+
+        div()
+            .size_full()
+            .flex()
+            .flex_col()
+            .bg(theme.bg_panel)
+            .child(header)
+            .child(div().flex_1().min_h(px(0.)).child(body))
+            .into_any_element()
+    }
 
     /// The auto-refresh control: a pill naming the live interval, or a muted
     /// clock when off. The interval is on screen rather than in settings, so
     /// nobody discovers a five-second poll of production by reading a config
     /// file.
-    fn render_refresh_pill(
-        &self,
-        active: &ActiveConn,
-        theme: &flint::Theme,
-        cx: &mut Context<Self>,
-    ) -> gpui::AnyElement {
-        let current = active.server.read(cx).refresh.map(|d| d.as_secs());
+    fn render_refresh_pill(&self, theme: &flint::Theme) -> gpui::AnyElement {
+        let current = self.refresh.map(|d| d.as_secs());
         let label = match current {
             Some(secs) => format!("every {secs}s"),
             None => "auto".to_string(),
@@ -644,7 +670,15 @@ impl AppState {
                 },
             ))
             .child(label)
-            .on_click(cx.listener(move |this, _, _, cx| this.set_server_refresh(next, cx)))
+            .on_click({
+                let app = self.app.clone();
+                move |_, _, cx: &mut gpui::App| {
+                    if let Some(app) = &app {
+                        app.update(cx, |this, cx| this.set_server_refresh(next, cx))
+                            .ok();
+                    }
+                }
+            })
             .into_any_element()
     }
 }
