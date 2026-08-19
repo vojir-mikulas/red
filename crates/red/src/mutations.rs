@@ -13,7 +13,7 @@
 //! there is asynchronous work to track.
 
 use flint::prelude::*;
-use gpui::{Context, SharedString, div, prelude::*, px};
+use gpui::{App, Context, SharedString, div, prelude::*, px};
 use red_core::{MutationInfo, TableRef};
 use red_service::Command;
 
@@ -37,9 +37,15 @@ impl AppState {
     /// How many of the active connection's mutations are still running. Drives the
     /// status-bar indicator, so an edit that outlived its submit stays visible
     /// without the panel being open.
-    pub(crate) fn running_mutations(&self) -> usize {
+    pub(crate) fn running_mutations(&self, cx: &App) -> usize {
         match &self.phase {
-            Phase::Connected(active) => active.server.mutations.iter().filter(|m| !m.done).count(),
+            Phase::Connected(active) => active
+                .server
+                .read(cx)
+                .mutations
+                .iter()
+                .filter(|m| !m.done)
+                .count(),
             _ => 0,
         }
     }
@@ -51,8 +57,11 @@ impl AppState {
         if !self.tracks_mutations() {
             return;
         }
-        if let Phase::Connected(active) = &mut self.phase {
-            active.server.mutations_loading = true;
+        if let Phase::Connected(active) = &self.phase {
+            active.server.update(cx, |panel, cx| {
+                panel.mutations_loading = true;
+                cx.notify();
+            });
         }
         self.send_active(Command::ListMutations);
         cx.notify();
@@ -65,9 +74,12 @@ impl AppState {
         mutations: Vec<MutationInfo>,
         cx: &mut Context<Self>,
     ) {
-        if let Some(active) = self.conn_mut(session) {
-            active.server.mutations = mutations;
-            active.server.mutations_loading = false;
+        if let Some(panel) = self.conn_for(session).map(|a| a.server.clone()) {
+            panel.update(cx, |panel, cx| {
+                panel.mutations = mutations;
+                panel.mutations_loading = false;
+                cx.notify();
+            });
         }
         cx.notify();
     }
@@ -102,7 +114,13 @@ impl AppState {
             theme.green,
         );
         let size_11 = theme.scale(11.);
-        let running = active.server.mutations.iter().filter(|m| !m.done).count();
+        let running = active
+            .server
+            .read(cx)
+            .mutations
+            .iter()
+            .filter(|m| !m.done)
+            .count();
 
         let header = div()
             .flex_shrink_0()
@@ -140,6 +158,7 @@ impl AppState {
 
         let rows: Vec<gpui::AnyElement> = active
             .server
+            .read(cx)
             .mutations
             .iter()
             .enumerate()
@@ -222,7 +241,7 @@ impl AppState {
                 .p_3()
                 .text_size(size_11)
                 .text_color(faint)
-                .child(if active.server.mutations_loading {
+                .child(if active.server.read(cx).mutations_loading {
                     "Loading…"
                 } else {
                     "No mutations. Updates and deletes appear here while the engine applies them."

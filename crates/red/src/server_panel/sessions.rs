@@ -25,6 +25,9 @@ impl AppState {
         active: &ActiveConn,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        // Read once for the frame: holding this across the listeners below would
+        // freeze the context they need.
+        let panel = active.server.read(cx);
         let theme = cx.theme().clone();
         let caps = active.config.kind.session_caps();
         let writable = !active.config.read_only;
@@ -33,7 +36,7 @@ impl AppState {
         // A role that cannot see other sessions is a normal, common state on a
         // locked-down server. Explaining it is the difference between "this server
         // is idle" and "you are not allowed to see this".
-        let banner = active.server.sessions_restricted.then(|| {
+        let banner = panel.sessions_restricted.then(|| {
             div()
                 .px_3()
                 .py_2()
@@ -49,20 +52,20 @@ impl AppState {
         // rather than looking like any other running query.
         let blockers: std::collections::HashSet<&SessionKey> = active
             .server
+            .read(cx)
             .sessions
             .iter()
             .flat_map(|s| s.blocked_by.iter())
             .collect();
         let blocking_count = blockers.len();
 
-        let rows: Vec<gpui::AnyElement> = active
-            .server
+        let rows: Vec<gpui::AnyElement> = panel
             .sessions
             .iter()
             .map(|s| self.render_session_row(s, &blockers, writable, caps, cx))
             .collect();
 
-        let list = if active.server.sessions.is_empty() {
+        let list = if panel.sessions.is_empty() {
             div()
                 .flex_1()
                 .flex()
@@ -71,7 +74,7 @@ impl AppState {
                 .p_2()
                 .text_size(size_11)
                 .text_color(theme.text_muted)
-                .child(if active.server.sessions_loading {
+                .child(if panel.sessions_loading {
                     "loading…"
                 } else {
                     "Nothing is running on this server."
@@ -92,6 +95,7 @@ impl AppState {
         let summary = (blocking_count > 0).then(|| {
             let blocked = active
                 .server
+                .read(cx)
                 .sessions
                 .iter()
                 .filter(|s| !s.blocked_by.is_empty())
@@ -128,7 +132,7 @@ impl AppState {
         blockers: &std::collections::HashSet<&SessionKey>,
         writable: bool,
         caps: red_core::SessionCaps,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let size_11 = theme.scale(11.);

@@ -1878,7 +1878,7 @@ pub(crate) struct ActiveConn {
     /// The Server dock's own state: what it is showing, its samples, its listings
     /// and its refresh cadence. Gathered off `ActiveConn` so the panel can own it —
     /// it is the only thing that reads or writes any of it.
-    pub server: crate::server_panel::ServerPanel,
+    pub server: Entity<crate::server_panel::ServerPanel>,
     pub server_w: Pixels,
     pub server_drag: Option<DragAnchor>,
     /// Whether the Columns panel (inline FK expansion) is shown in the left
@@ -2007,7 +2007,7 @@ impl ActiveConn {
             _schema_sub: schema_sub,
             history_w: px(240.),
             history_drag: None,
-            server: crate::server_panel::ServerPanel::default(),
+            server: cx.new(|_| crate::server_panel::ServerPanel::default()),
             server_w: px(320.),
             server_drag: None,
             columns_open: false,

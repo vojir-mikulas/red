@@ -34,11 +34,14 @@ impl AppState {
         active: &ActiveConn,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        // Read once for the frame: holding this across the listeners below would
+        // freeze the context they need.
+        let panel = active.server.read(cx);
         let theme = cx.theme().clone();
         let size_11 = theme.scale(11.);
 
-        let Some(snap) = &active.server.metrics else {
-            let message = match (&active.server.metrics_error, active.server.metrics_loading) {
+        let Some(snap) = &panel.metrics else {
+            let message = match (&panel.metrics_error, panel.metrics_loading) {
                 (Some(e), _) => e.clone(),
                 (None, true) => "sampling…".to_string(),
                 (None, false) => "No sample yet.".to_string(),
@@ -50,7 +53,7 @@ impl AppState {
                 .justify_center()
                 .p_3()
                 .text_size(size_11)
-                .text_color(if active.server.metrics_error.is_some() {
+                .text_color(if panel.metrics_error.is_some() {
                     theme.red
                 } else {
                     theme.text_muted
@@ -68,7 +71,7 @@ impl AppState {
                 }
                 let rows: Vec<gpui::AnyElement> = metrics
                     .into_iter()
-                    .map(|m| self.render_metric(m, snap, active.server.metrics_prev.as_ref(), cx))
+                    .map(|m| self.render_metric(m, snap, panel.metrics_prev.as_ref(), cx))
                     .collect();
                 Some(
                     div()
@@ -107,7 +110,7 @@ impl AppState {
                 "as of {when}",
                 when = crate::fmt::fmt_ago_secs(crate::health::now_unix() - snap.taken_at)
             ))
-            .when(active.server.metrics_loading, |d| {
+            .when(panel.metrics_loading, |d| {
                 d.child(div().child("refreshing…"))
             });
 
@@ -176,7 +179,7 @@ impl AppState {
         m: &ServerMetric,
         snap: &ServerSnapshot,
         prev: Option<&ServerSnapshot>,
-        cx: &mut Context<Self>,
+        cx: &Context<Self>,
     ) -> gpui::AnyElement {
         let theme = cx.theme().clone();
         let fill = m.value.fraction();
