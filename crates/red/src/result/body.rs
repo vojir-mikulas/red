@@ -34,10 +34,10 @@ impl AppState {
         grid: &ResultGrid,
         tab_idx: usize,
         pane: PaneId,
-        is_focused: bool,
         cell_colors: CellColors,
         cx: &Context<Self>,
     ) -> (flint::Table<()>, Pixels, WindowView) {
+        let is_focused = grid.is_focused;
         let theme = cx.theme();
         let faint = theme.text_faint;
         let (num, cyan, red, accent) = (theme.orange, theme.cyan, theme.red, theme.accent);
@@ -143,11 +143,7 @@ impl AppState {
         // highlight marks "current" on top of this. Keyed by `(ordinal, data col)`.
         // Find/edit overlays belong to the focused pane only; the find bar, the
         // inline editor and the stats/draft chrome are single-instance app state.
-        let find_hits: std::collections::HashSet<(usize, usize)> = is_focused
-            .then_some(self.find_bar.as_ref())
-            .flatten()
-            .map(|b| b.grid_matches.iter().copied().collect())
-            .unwrap_or_default();
+        let find_hits = grid.find_hits.clone();
         let find_tint = Hsla { a: 0.20, ..accent };
         // Watch-mode change flash: the cells a re-run changed, tinted until their
         // flash window expires. Precomputed here into window-local coordinates so
@@ -278,9 +274,7 @@ impl AppState {
             // pane has its own handle so focus never lands on two grids. Absent
             // only on the frame a pane is born (see `PaneUi::grid_focus`), where
             // the grid simply isn't focusable yet.
-            .when_some(active.grid_focus_for(pane).cloned(), |t, handle| {
-                t.focus_handle(handle)
-            })
+            .when_some(grid.grid_focus.clone(), |t, handle| t.focus_handle(handle))
             // Vim motions (hjkl/g/G/0/$/Ctrl-d/Ctrl-u) ride alongside the arrow keys
             // when the user has turned vim navigation on.
             .vim_nav(self.vim_mode())

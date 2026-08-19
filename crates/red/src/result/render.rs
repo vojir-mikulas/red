@@ -280,6 +280,11 @@ impl AppState {
         // `.focus_handle`/`.on_nav` below); the pane draws no focus ring.
         let container = div().size_full().relative().flex().flex_col().bg(bg);
 
+        // Stage this frame's parent-owned inputs on the grid before taking the read
+        // borrow below: once `grid` is a reference read out of `cx`, nothing here can
+        // borrow the context mutably again (and a child view could not pull them
+        // during its own render anyway).
+        self.push_grid_frame(tab_idx, pane, is_focused, cx);
         let grid = match active.tabs.get(tab_idx).and_then(|t| t.result.as_ref()) {
             Some(grid) => grid.read(cx),
             None => {
@@ -495,7 +500,7 @@ impl AppState {
         }
 
         let (table, row_height, win) =
-            self.render_grid_table(active, grid, tab_idx, pane, is_focused, cell_colors, cx);
+            self.render_grid_table(active, grid, tab_idx, pane, cell_colors, cx);
         // Re-derived rather than returned: the footer and scrollbar below read the
         // same three values straight off the grid, and threading them back through
         // the tuple would only widen the seam.

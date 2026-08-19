@@ -389,6 +389,20 @@ pub(crate) struct ResultGrid {
     /// Frozen wall-clock time the query took, set once it lands (ready or error).
     /// `None` while still running, so the elapsed time keeps counting up.
     query_elapsed: Option<Duration>,
+    /// Per-frame inputs the parent pushes before the pane renders. They are the
+    /// props a `Render` impl cannot take as arguments, staged here so the body
+    /// reads them off the grid instead of reaching back into `AppState` — which a
+    /// child view could not do anyway, since the parent is leased while it renders.
+    ///
+    /// Whether this grid is the focused pane's. Find and edit overlays draw only
+    /// on the focused one.
+    pub(in crate::result) is_focused: bool,
+    /// The focus handle for this grid's pane, held by the table so arrow/Home/End
+    /// drive the cell cursor. `None` on the frame a pane is born.
+    pub(in crate::result) grid_focus: Option<gpui::FocusHandle>,
+    /// Cells matching the find bar's term, in `(ordinal, data column)`, tinted by
+    /// the table's cell-background hook. Empty when the bar is closed.
+    pub(in crate::result) find_hits: std::collections::HashSet<(usize, usize)>,
     /// The open inline cell editor over *this* result, when the user is editing a
     /// cell in place. Per grid because the edit targets this result's rows: a
     /// split with two grids can hold two open editors, each committing into its
@@ -489,6 +503,9 @@ impl ResultGrid {
             epoch: next_epoch(),
             query_started: Instant::now(),
             query_elapsed: None,
+            is_focused: false,
+            grid_focus: None,
+            find_hits: std::collections::HashSet::new(),
             grid_edit: None,
             cell_suggest: None,
             cell_suggest_bounds: None,
@@ -2134,6 +2151,36 @@ impl AppState {
     /// `d + gutter`; selection/copy/sort all map through this offset.
     pub(crate) fn gutter(&self) -> usize {
         self.settings.data.row_numbers as usize
+    }
+
+    /// Stage this frame's parent-owned inputs on the grid, before the pane takes a
+    /// read borrow of it. Separate from rendering because a `Render` impl takes no
+    /// arguments: everything the body needs from outside has to be pushed, never
+    /// pulled during the frame.
+    pub(crate) fn push_grid_frame(
+        &self,
+        tab_idx: usize,
+        pane: crate::app::PaneId,
+        is_focused: bool,
+        cx: &mut App,
+    ) {
+        let find_hits: std::collections::HashSet<(usize, usize)> = is_focused
+            .then_some(self.find_bar.as_ref())
+            .flatten()
+            .map(|b| b.grid_matches.iter().copied().collect())
+            .unwrap_or_default();
+        let Phase::Connected(active) = &self.phase else {
+            return;
+        };
+        let focus = active.grid_focus_for(pane).cloned();
+        let Some(grid) = active.tabs.get(tab_idx).and_then(|t| t.result.clone()) else {
+            return;
+        };
+        grid.update(cx, |grid, _| {
+            grid.is_focused = is_focused;
+            grid.grid_focus = focus;
+            grid.find_hits = find_hits;
+        });
     }
 
     /// Read the focused tab's grid. The read twin of [`with_grid`](Self::with_grid),
