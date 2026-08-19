@@ -146,7 +146,7 @@ pub(crate) struct RelationsView {
     epoch: Epoch,
     db: String,
     loading: bool,
-    er: Option<crate::er::ErView>,
+    er: Option<Entity<crate::er::ErView>>,
     references: Vec<red_core::doc::DocReference>,
     /// How many collections the inference sampled, for the footer.
     sampled: usize,
@@ -958,21 +958,6 @@ impl MongoView {
         match self.tabs.get(idx).map(|t| &t.state)? {
             MongoTabState::Collection(c) => Some(&**c),
             MongoTabState::Empty | MongoTabState::Relations(_) => None,
-        }
-    }
-
-    /// The relations diagram shown by the tab at `idx`, if that tab is one.
-    pub(crate) fn relations(&self, idx: usize) -> Option<&crate::er::ErView> {
-        match self.tabs.get(idx).map(|t| &t.state)? {
-            MongoTabState::Relations(r) => r.er.as_ref(),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn relations_mut(&mut self, idx: usize) -> Option<&mut crate::er::ErView> {
-        match self.tabs.get_mut(idx).map(|t| &mut t.state)? {
-            MongoTabState::Relations(r) => r.er.as_mut(),
-            _ => None,
         }
     }
 
@@ -2449,7 +2434,8 @@ impl AppState {
             .map(|r| (r.from_coll.clone(), r.field.clone(), r.to_coll.clone()))
             .collect();
         relations.sampled = collections.len();
-        relations.er = Some(crate::er::ErView::from_references(db, &collections, &edges));
+        let er = crate::er::ErView::from_references(db, &collections, &edges);
+        relations.er = Some(cx.new(|_| er));
         relations.references = references;
         relations.loading = false;
         relations.error = None;

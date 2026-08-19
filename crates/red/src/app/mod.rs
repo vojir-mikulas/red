@@ -1881,7 +1881,7 @@ impl AppState {
                     // Any open diagram sized this table's box from what was resident
                     // at build time; now that its columns are here, resize and
                     // re-stack so the box fits them.
-                    self.er_table_described(&schema, &table, ncols);
+                    self.er_table_described(&schema, &table, ncols, cx);
                     self.refresh_completions(cx);
                     // Repaint views that read the catalog (the schema tree and the
                     // Columns panel's lazily-expanded FK nodes) so a freshly-arrived

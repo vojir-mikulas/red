@@ -39,8 +39,9 @@ use std::rc::Rc;
 use flint::prelude::*;
 use flint::{Button, ButtonSize, ButtonVariant};
 use gpui::{
-    AnyElement, App, Context, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent,
-    PathBuilder, Pixels, Point, ScrollDelta, ScrollWheelEvent, Window, canvas, div, prelude::*, px,
+    AnyElement, App, Context, Entity, Hsla, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, PathBuilder, Pixels, Point, ScrollDelta, ScrollWheelEvent, Window, canvas, div,
+    prelude::*, px,
 };
 use red_core::ObjectKind;
 
@@ -101,18 +102,6 @@ struct Rect {
     y: f32,
     w: f32,
     h: f32,
-}
-
-/// Which diagram a handler acts on.
-///
-/// The canvas is shared by two shells: the SQL one draws declared foreign keys in
-/// a query tab, the MongoDB one draws *inferred* references in a Mongo tab. An
-/// enum rather than a bare index, because the two index different tab lists and a
-/// swap would silently drive the wrong diagram.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ErSlot {
-    SqlTab(usize),
-    DocTab(usize),
 }
 
 /// One table box on the canvas. `pos`/`size` are world-space (before pan/zoom).
@@ -178,6 +167,13 @@ pub(crate) struct ErView {
     /// Viewport rect (window space), captured each frame by a `canvas` overlay so
     /// zoom can anchor on the cursor / centre and Fit can measure.
     viewport: Rc<RefCell<Option<Rect>>>,
+    /// The connection's catalog, for the column lists inside the boxes. Held rather
+    /// than passed: a `Render` impl takes no arguments, and gpui leases the parent
+    /// while a child draws, so nothing can be pulled from the app mid-frame.
+    schema: Option<Entity<crate::schema::SchemaState>>,
+    /// The app, for the one thing the canvas cannot do itself: ask the backend to
+    /// describe a table whose columns scrolled into view.
+    app: Option<gpui::WeakEntity<AppState>>,
 }
 
 impl ErView {
@@ -302,7 +298,22 @@ impl ErView {
             hand_placed: false,
             requested: RefCell::new(HashSet::new()),
             viewport: Rc::new(RefCell::new(None)),
+            schema: None,
+            app: None,
         }
+    }
+
+    /// Hand the canvas the two handles it needs to draw and fetch on its own. Set
+    /// once, when the diagram's tab is built; a diagram without them still draws,
+    /// it just shows no column lists and asks for no details.
+    pub(crate) fn with_context(
+        mut self,
+        schema: Option<Entity<crate::schema::SchemaState>>,
+        app: gpui::WeakEntity<AppState>,
+    ) -> Self {
+        self.schema = schema;
+        self.app = Some(app);
+        self
     }
 
     /// Build a diagram from **inferred** relationships: one box per collection,
@@ -962,7 +973,7 @@ impl AppState {
         if let Some(i) = active
             .tabs
             .iter()
-            .position(|t| t.er().is_some_and(|er| er.namespace == namespace))
+            .position(|t| t.er().is_some_and(|er| er.read(cx).namespace == namespace))
         {
             self.set_active_tab(i, cx);
             return;
@@ -976,9 +987,10 @@ impl AppState {
         let Phase::Connected(active) = &self.phase else {
             return;
         };
-        tab.view = Some(crate::app::TabView::Er(ErView::build(
-            active, namespace, cx,
-        )));
+        let schema = Some(active.schema.clone());
+        let app = cx.entity().downgrade();
+        let er = ErView::build(active, namespace, cx).with_context(schema, app);
+        tab.view = Some(crate::app::TabView::Er(cx.new(|_| er)));
         self.push_tab(tab, cx);
         cx.notify();
     }
@@ -1015,79 +1027,83 @@ impl AppState {
         })
     }
 
-    /// The ER view `at` names, if it is there.
-    fn er_mut(&mut self, at: ErSlot) -> Option<&mut ErView> {
-        let Phase::Connected(active) = &mut self.phase else {
-            return None;
-        };
-        match at {
-            ErSlot::SqlTab(i) => active.tabs.get_mut(i)?.er_mut(),
-            ErSlot::DocTab(i) => active.doc_view.as_mut()?.relations_mut(i),
-        }
-    }
-
-    /// The same by shared reference, for the render half.
-    fn er_at<'a>(&self, active: &'a crate::app::ActiveConn, at: ErSlot) -> Option<&'a ErView> {
-        match at {
-            ErSlot::SqlTab(i) => active.tabs.get(i).and_then(|t| t.er()),
-            ErSlot::DocTab(i) => active.doc_view.as_ref().and_then(|v| v.relations(i)),
-        }
-    }
-
     /// Resize a box and re-stack the diagrams that contain `schema.table`, once its
     /// columns land. Without this the layout keeps the spacing it was built with,
     /// which on a schema larger than the detail prefetch cap means every box past the
     /// cap is one header tall and its columns clip when they finally arrive.
-    pub(crate) fn er_table_described(&mut self, schema: &str, table: &str, ncols: usize) {
-        if let Phase::Connected(active) = &mut self.phase {
-            for tab in &mut active.tabs {
-                if let Some(er) = tab.er_mut() {
-                    er.remeasure(schema, table, ncols);
-                }
-            }
-        }
-    }
-
-    /// Zoom the diagram around its centre (the +/− buttons).
-    fn er_zoom(&mut self, at: ErSlot, factor: f32, cx: &mut Context<Self>) {
-        if let Some(er) = self.er_mut(at) {
-            let c = er.center();
-            er.zoom_at(factor, c);
-            cx.notify();
-        }
-    }
-
-    /// Reset zoom to 100% around the centre.
-    fn er_reset_zoom(&mut self, at: ErSlot, cx: &mut Context<Self>) {
-        if let Some(er) = self.er_mut(at) {
-            let c = er.center();
-            let factor = 1.0 / er.zoom;
-            er.zoom_at(factor, c);
-            cx.notify();
-        }
-    }
-
-    /// Fit the whole diagram into view.
-    fn er_fit(&mut self, at: ErSlot, cx: &mut Context<Self>) {
-        if let Some(er) = self.er_mut(at) {
-            er.fit();
-            cx.notify();
-        }
-    }
-
-    /// Render the ER diagram overlay: a header (title · counts · zoom · close) over a
-    /// pannable/zoomable canvas of boxes and FK connectors. `active` is the connection
-    /// whose `er` is `Some` (the caller guarantees it).
-    pub(crate) fn render_er(
-        &self,
-        active: &ActiveConn,
-        at: ErSlot,
+    pub(crate) fn er_table_described(
+        &mut self,
+        schema: &str,
+        table: &str,
+        ncols: usize,
         cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let theme = cx.theme();
-        let Some(er) = self.er_at(active, at) else {
-            return div().into_any_element();
+    ) {
+        let Phase::Connected(active) = &self.phase else {
+            return;
         };
+        let diagrams: Vec<_> = active.tabs.iter().filter_map(|t| t.er()).collect();
+        for er in diagrams {
+            er.update(cx, |er, cx| {
+                er.remeasure(schema, table, ncols);
+                cx.notify();
+            });
+        }
+    }
+}
+
+impl gpui::Render for ErView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_canvas(cx)
+    }
+}
+
+impl ErView {
+    /// Zoom about the diagram's centre by `factor` (the toolbar's -/+).
+    fn zoom_step(&mut self, factor: f32, cx: &mut Context<Self>) {
+        let c = self.center();
+        self.zoom_at(factor, c);
+        cx.notify();
+    }
+
+    /// Back to 1:1, about the centre.
+    fn reset_zoom(&mut self, cx: &mut Context<Self>) {
+        let c = self.center();
+        let factor = 1.0 / self.zoom;
+        self.zoom_at(factor, c);
+        cx.notify();
+    }
+
+    /// Ask the backend to describe the tables whose boxes are on screen but whose
+    /// columns are not resident yet. Driven by the canvas's own paint, which is why
+    /// it lives here rather than on the app.
+    pub(crate) fn fetch_visible_details(&self, cx: &mut Context<Self>) {
+        let Some(schema) = self.schema.clone() else {
+            return;
+        };
+        let wanted = self.missing_details(&schema.read(cx).details);
+        if wanted.is_empty() {
+            return;
+        }
+        let Some(app) = self.app.clone() else {
+            return;
+        };
+        for (schema, table) in wanted {
+            app.update(cx, |this, _| {
+                this.send_active(red_service::Command::DescribeTable { schema, table });
+            })
+            .ok();
+        }
+        cx.notify();
+    }
+
+    fn render_canvas(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        // The body was written against an `&ErView` resolved out of the app; it is
+        // the receiver now, and this keeps that reading intact.
+        let er = self;
+        // The catalog, read once for the frame: the boxes list columns from it and
+        // the connectors anchor on them.
+        let details = self.schema.as_ref().map(|s| &s.read(cx).details);
         let z = er.zoom;
         let pan = er.pan;
         let sx = move |wx: f32| wx * z + pan.x;
@@ -1133,27 +1149,34 @@ impl AppState {
                         Button::new("er-zoom-out", "−")
                             .size(ButtonSize::Sm)
                             .variant(ButtonVariant::Secondary)
-                            .on_click(cx.listener(move |this, _, _, cx| this.er_zoom(at, 0.9, cx))),
+                            .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
+                                this.zoom_step(0.9, cx)
+                            })),
                     )
                     .child(
                         Button::new("er-zoom-pct", pct)
                             .size(ButtonSize::Sm)
                             .variant(ButtonVariant::Secondary)
                             .on_click(
-                                cx.listener(move |this, _, _, cx| this.er_reset_zoom(at, cx)),
+                                cx.listener(move |this: &mut Self, _, _, cx| this.reset_zoom(cx)),
                             ),
                     )
                     .child(
                         Button::new("er-zoom-in", "+")
                             .size(ButtonSize::Sm)
                             .variant(ButtonVariant::Secondary)
-                            .on_click(cx.listener(move |this, _, _, cx| this.er_zoom(at, 1.1, cx))),
+                            .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
+                                this.zoom_step(1.1, cx)
+                            })),
                     )
                     .child(
                         Button::new("er-fit", "Fit")
                             .size(ButtonSize::Sm)
                             .variant(ButtonVariant::Secondary)
-                            .on_click(cx.listener(move |this, _, _, cx| this.er_fit(at, cx))),
+                            .on_click(cx.listener(move |this: &mut Self, _, _, cx| {
+                                this.fit();
+                                cx.notify();
+                            })),
                     ),
             );
 
@@ -1176,8 +1199,8 @@ impl AppState {
                 let key_a = (a.schema.clone(), a.table.clone());
                 let key_b = (b.schema.clone(), b.table.clone());
                 (
-                    anchor_offset(a, &e.from_col, active.schema.read(cx).details.get(&key_a)),
-                    anchor_offset(b, &e.to_col, active.schema.read(cx).details.get(&key_b)),
+                    anchor_offset(a, &e.from_col, details.as_ref().and_then(|d| d.get(&key_a))),
+                    anchor_offset(b, &e.to_col, details.as_ref().and_then(|d| d.get(&key_b))),
                 )
             } else {
                 (a.h / 2., b.h / 2.)
@@ -1234,11 +1257,9 @@ impl AppState {
             let (left, top) = (sx(node.pos.x), sy(node.pos.y));
             let (w, h) = (node.w * z, node.h * z);
             let selected = er.selected == Some(i);
-            let detail = active
-                .schema
-                .read(cx)
-                .details
-                .get(&(node.schema.clone(), node.table.clone()));
+            let detail = details
+                .as_ref()
+                .and_then(|d| d.get(&(node.schema.clone(), node.table.clone())));
 
             let mut inner = div().flex().flex_col().size_full();
             if show_label {
@@ -1361,15 +1382,17 @@ impl AppState {
                             // its own tab. The diagram stays open beside it now that
                             // it's a tab rather than an overlay in the way.
                             if ev.click_count >= 2 {
-                                this.open_table_browse(
-                                    schema_name.clone(),
-                                    table_name.clone(),
-                                    None,
-                                    cx,
-                                );
+                                if let Some(app) = this.app.clone() {
+                                    let (schema, table) = (schema_name.clone(), table_name.clone());
+                                    app.update(cx, |this, cx| {
+                                        this.open_table_browse(schema, table, None, cx);
+                                    })
+                                    .ok();
+                                }
                                 return;
                             }
-                            if let Some(er) = this.er_mut(at) {
+                            {
+                                let er = &mut *this;
                                 er.selected = Some(i);
                                 er.hand_placed = true;
                                 er.drag = Some(Drag::Node {
@@ -1419,18 +1442,18 @@ impl AppState {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, ev: &MouseDownEvent, _, cx| {
-                    if let Some(er) = this.er_mut(at) {
-                        er.selected = None;
-                        er.drag = Some(Drag::Pan {
-                            last: pos_of(ev.position),
-                        });
-                        cx.notify();
-                    }
+                    let er = &mut *this;
+                    er.selected = None;
+                    er.drag = Some(Drag::Pan {
+                        last: pos_of(ev.position),
+                    });
+                    cx.notify();
                 }),
             )
             .on_mouse_move(cx.listener(move |this, ev: &MouseMoveEvent, _, cx| {
                 let p = pos_of(ev.position);
-                if let Some(er) = this.er_mut(at) {
+                {
+                    let er = &mut *this;
                     match &mut er.drag {
                         Some(Drag::Pan { last }) => {
                             er.pan.x += p.x - last.x;
@@ -1455,9 +1478,7 @@ impl AppState {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(move |this, _: &MouseUpEvent, _, cx| {
-                    if let Some(er) = this.er_mut(at)
-                        && er.drag.take().is_some()
-                    {
+                    if this.drag.take().is_some() {
                         cx.notify();
                     }
                 }),
@@ -1467,7 +1488,8 @@ impl AppState {
             // feel smooth and coarse mouse-wheel notches still move meaningfully.
             .on_scroll_wheel(cx.listener(move |this, ev: &ScrollWheelEvent, _, cx| {
                 let p = pos_of(ev.position);
-                if let Some(er) = this.er_mut(at) {
+                {
+                    let er = &mut *this;
                     let dy = match ev.delta {
                         ScrollDelta::Pixels(d) => f32::from(d.y),
                         ScrollDelta::Lines(d) => d.y * 20.,
@@ -1495,29 +1517,6 @@ impl AppState {
             .child(header)
             .child(viewport)
             .into_any_element()
-    }
-
-    /// Ask the backend to describe the tables now visible in tab `tab_idx`'s diagram
-    /// whose columns aren't resident yet.
-    ///
-    /// Called after the frame is built, not during it: `render_er` takes `&self` and
-    /// this needs `&mut`. Nothing is lost by being a frame late, since the boxes it
-    /// fills in were already going to be drawn empty on this frame.
-    pub(crate) fn er_fetch_visible_details(&mut self, at: ErSlot, cx: &mut Context<Self>) {
-        let Phase::Connected(active) = &self.phase else {
-            return;
-        };
-        let Some(er) = self.er_at(active, at) else {
-            return;
-        };
-        let wanted = er.missing_details(&active.schema.read(cx).details);
-        if wanted.is_empty() {
-            return;
-        }
-        for (schema, table) in wanted {
-            self.send_active(red_service::Command::DescribeTable { schema, table });
-        }
-        cx.notify();
     }
 }
 

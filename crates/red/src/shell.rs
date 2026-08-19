@@ -2008,25 +2008,20 @@ impl AppState {
             return self.wrap_pane(body, active, pane, is_focused, is_split, &theme, cx);
         }
 
-        if active.tabs.get(tab_idx).is_some_and(|t| t.is_er()) {
-            let canvas = self.render_er(active, crate::er::ErSlot::SqlTab(tab_idx), cx);
+        if let Some(canvas) = active.tabs.get(tab_idx).and_then(|t| t.er()) {
             let body = div()
                 .size_full()
                 .flex()
                 .flex_col()
                 .bg(theme.bg_app)
                 .child(self.render_sql_tab_strip(active, pane, cx))
-                .child(div().flex_1().min_h(px(0.)).child(canvas))
+                .child(div().flex_1().min_h(px(0.)).child(canvas.clone()))
                 .into_any_element();
-            // The visible-table describe wants `&mut self`, so it can't run inside the
-            // frame it belongs to. Deferring also means it reads the viewport rect the
-            // `canvas` in this very frame captured, rather than the previous one's.
-            let view = cx.entity().downgrade();
+            // The visible-table describe cannot run inside the frame it belongs to.
+            // Deferring also means it reads the viewport rect the canvas captured in
+            // this very frame, rather than the previous one's.
             cx.defer(move |cx| {
-                view.update(cx, |this, cx| {
-                    this.er_fetch_visible_details(crate::er::ErSlot::SqlTab(tab_idx), cx)
-                })
-                .ok();
+                canvas.update(cx, |er, cx| er.fetch_visible_details(cx));
             });
             return self.wrap_pane(body, active, pane, is_focused, is_split, &theme, cx);
         }

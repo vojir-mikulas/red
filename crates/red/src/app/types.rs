@@ -1535,7 +1535,7 @@ pub(crate) const EMPTY_QUERY: &str = "-- Write SQL, Ctrl+Enter to run\n";
 /// that ask "is this a query tab" need no change.
 pub(crate) enum TabView {
     /// The read-only ER diagram (see [`crate::er`]).
-    Er(crate::er::ErView),
+    Er(Entity<crate::er::ErView>),
     /// One object's `CREATE` statement (see [`crate::ddl`]).
     Ddl(crate::ddl::DdlView),
     /// The connection's health report (see [`crate::health`]).
@@ -1702,16 +1702,11 @@ impl QueryTab {
         matches!(self.view, Some(TabView::Er(_)))
     }
 
-    pub(crate) fn er(&self) -> Option<&crate::er::ErView> {
+    /// This tab's diagram, if it is one. A handle rather than a borrow: the canvas
+    /// is a view, so callers `read`/`update` it like any other entity.
+    pub(crate) fn er(&self) -> Option<Entity<crate::er::ErView>> {
         match &self.view {
-            Some(TabView::Er(er)) => Some(er),
-            _ => None,
-        }
-    }
-
-    pub(crate) fn er_mut(&mut self) -> Option<&mut crate::er::ErView> {
-        match &mut self.view {
-            Some(TabView::Er(er)) => Some(er),
+            Some(TabView::Er(er)) => Some(er.clone()),
             _ => None,
         }
     }

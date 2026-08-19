@@ -594,11 +594,8 @@ impl AppState {
     /// with a footer saying how strong the inference actually was.
     fn render_doc_relations(
         &self,
-        active: &ActiveConn,
-        tab_idx: usize,
         relations: &super::RelationsView,
         theme: &Theme,
-        cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         if relations.loading {
             return doc_centered_hint("Sampling collections for references\u{2026}", theme);
@@ -626,12 +623,16 @@ impl AppState {
                 )
             }
         );
-        let canvas = self.render_er(active, crate::er::ErSlot::DocTab(tab_idx), cx);
         div()
             .flex()
             .flex_col()
             .size_full()
-            .child(div().flex_1().min_h(px(0.)).child(canvas))
+            .children(
+                relations
+                    .er
+                    .clone()
+                    .map(|canvas| div().flex_1().min_h(px(0.)).child(canvas)),
+            )
             .child(
                 div()
                     .flex_shrink_0()
@@ -1014,9 +1015,7 @@ impl AppState {
                 cx,
             ),
             None => match v.relations_at(tab_idx) {
-                Some(relations) => {
-                    self.render_doc_relations(active, tab_idx, relations, &theme, cx)
-                }
+                Some(relations) => self.render_doc_relations(relations, &theme),
                 None => render_doc_empty(&theme),
             },
         };
