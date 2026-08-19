@@ -400,6 +400,21 @@ pub(crate) struct ResultGrid {
     /// The focus handle for this grid's pane, held by the table so arrow/Home/End
     /// drive the cell cursor. `None` on the frame a pane is born.
     pub(in crate::result) grid_focus: Option<gpui::FocusHandle>,
+    /// A handle to the app, for the interactions the grid draws but does not own
+    /// (selection, sorting, the cell menu, autoscroll). They run at event time, so
+    /// reaching the app through it is safe — unlike during render, when gpui has
+    /// the parent leased.
+    pub(in crate::result) app: Option<gpui::WeakEntity<crate::app::AppState>>,
+    /// Which pane this grid draws in, for the focus badge and for aiming an action
+    /// at the right split before it resolves.
+    pub(in crate::result) pane: Option<crate::app::PaneId>,
+    /// The hold-Alt focus hint for this grid's body, when hints are showing.
+    pub(in crate::result) focus_hint: Option<char>,
+    /// The watch's flash map, shared with the [`Watch`](watch::Watch) on this
+    /// grid's tab when one is armed. Shared rather than pushed because the map is
+    /// written by ticks and read every frame; see `Watch::changed`. Re-attached on
+    /// every re-open, since a tick builds a new grid.
+    pub(in crate::result) watch_flash: Option<std::rc::Rc<std::cell::RefCell<watch::FlashMap>>>,
     /// Cells matching the find bar's term, in `(ordinal, data column)`, tinted by
     /// the table's cell-background hook. Empty when the bar is closed.
     pub(in crate::result) find_hits: std::collections::HashSet<(usize, usize)>,
@@ -504,7 +519,11 @@ impl ResultGrid {
             query_started: Instant::now(),
             query_elapsed: None,
             is_focused: false,
+            app: None,
+            pane: None,
+            focus_hint: None,
             grid_focus: None,
+            watch_flash: None,
             find_hits: std::collections::HashSet::new(),
             grid_edit: None,
             cell_suggest: None,
@@ -1984,6 +2003,9 @@ impl AppState {
                     reason = "guard above ensured a focused tab exists"
                 )]
                 let tab = active.active_mut().unwrap();
+                // A watch survives the re-open that its own tick triggered, so the
+                // fresh grid picks the flash map back up here.
+                grid.watch_flash = tab.watch.as_ref().map(|w| w.flash());
                 tab.result = Some(cx.new(|_| grid));
                 tab.plan = None;
                 opened
@@ -2162,7 +2184,7 @@ impl AppState {
         tab_idx: usize,
         pane: crate::app::PaneId,
         is_focused: bool,
-        cx: &mut App,
+        cx: &mut Context<Self>,
     ) {
         let find_hits: std::collections::HashSet<(usize, usize)> = is_focused
             .then_some(self.find_bar.as_ref())
@@ -2176,10 +2198,18 @@ impl AppState {
         let Some(grid) = active.tabs.get(tab_idx).and_then(|t| t.result.clone()) else {
             return;
         };
+        let hint = self.focus_hint(crate::focus::FocusTargetId::Body {
+            pane,
+            area: crate::focus::BodyArea::Grid,
+        });
+        let app = Some(cx.entity().downgrade());
         grid.update(cx, |grid, _| {
             grid.is_focused = is_focused;
             grid.grid_focus = focus;
             grid.find_hits = find_hits;
+            grid.app = app;
+            grid.pane = Some(pane);
+            grid.focus_hint = hint;
         });
     }
 

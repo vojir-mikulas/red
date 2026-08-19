@@ -13,31 +13,137 @@ use flint::TextInput;
 use flint::prelude::*;
 use std::rc::Rc;
 
-use gpui::{Entity, Hsla, Pixels, SharedString, div, prelude::*, px};
+use gpui::{Entity, Hsla, Pixels, SharedString, WeakEntity, div, prelude::*, px};
 
 use super::buffer::CellKind;
 use super::edit::EditSlot;
 use super::render::{CellColors, group_digits, render_cell};
 use super::{ResultGrid, gutter_width};
-use crate::app::{ActiveConn, AppState, Pane, PaneId, Phase};
+use crate::app::{AppState, Pane, PaneId, Phase};
 use crate::gridwindow::WindowView;
 
-impl AppState {
-    /// Build the result pane's table: the header columns plus the windowed row
-    /// renderer. Returns the row height and the resolved scroll window alongside
-    /// it, because the scrollbar below the table is positioned from them and
-    /// `prepare_window` must run exactly once per frame.
-    #[allow(clippy::too_many_arguments)]
-    pub(in crate::result) fn render_grid_table(
+impl gpui::Render for ResultGrid {
+    fn render(&mut self, _window: &mut gpui::Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.render_pane(cx)
+    }
+}
+
+impl ResultGrid {
+    /// The grid pane: the table, the viewport probe, the scrollbar and the focus
+    /// badge. Everything it needs from outside was staged on the grid before this
+    /// frame (see `AppState::push_grid_frame`) — gpui leases the parent while a
+    /// child view renders, so nothing here may read `AppState`, only the handle it
+    /// hands to closures that run later.
+    fn render_pane(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let (Some(view), Some(pane)) = (self.app.clone(), self.pane) else {
+            // Only reachable before the first frame stages the props (or in a
+            // test-built grid that is never shown).
+            return div().into_any_element();
+        };
+        let bg_app = cx.theme().bg_app;
+        let (table, row_height, win) = self.render_table(&view, pane, cx);
+        let total = self.total;
+
+        let scrub_scroll = self.scroll.clone();
+        let scrub_window = self.window_base.clone();
+        let scrub_view = view.clone();
+        let rh = f32::from(row_height);
+        let scrollbar = flint::Scrollbar::new("result-scrollbar", &self.scrollbar)
+            // Position is computed over the whole result (not the f32-bounded
+            // window the list lays out), so the thumb is honest at 50M rows.
+            .fraction(win.fraction)
+            .thumb(win.thumb)
+            .on_scrub(move |fraction, _, cx| {
+                let target = (fraction as f64 * total.saturating_sub(1) as f64).round() as usize;
+                super::place_window(&scrub_window, &scrub_scroll, total, target, rh);
+                scrub_view
+                    .update(cx, |this, cx| {
+                        this.set_split_focus(pane, cx);
+                        cx.notify();
+                    })
+                    .ok();
+            });
+
+        div()
+            .flex_1()
+            .min_h(px(0.))
+            .bg(bg_app)
+            .relative()
+            // Middle-click hold-to-autoscroll (a joystick, not a drag): press
+            // starts (or, pressed again, cancels) a session targeting this pane's
+            // grid; any other click also cancels it, mirroring a browser's
+            // middle-click autoscroll.
+            .on_mouse_down(gpui::MouseButton::Middle, {
+                let view = view.clone();
+                let scroll = self.scroll.clone();
+                let h_scroll = self.h_scroll.clone();
+                move |ev, _, cx| {
+                    view.update(cx, |this, cx| {
+                        this.toggle_autoscroll(ev.position, &scroll, &h_scroll, cx)
+                    })
+                    .ok();
+                }
+            })
+            .on_mouse_down(gpui::MouseButton::Left, {
+                let view = view.clone();
+                move |_, _, cx| {
+                    view.update(cx, |this, cx| this.cancel_autoscroll(cx)).ok();
+                }
+            })
+            .on_mouse_down(gpui::MouseButton::Right, {
+                let view = view.clone();
+                move |_, _, cx| {
+                    view.update(cx, |this, cx| this.cancel_autoscroll(cx)).ok();
+                }
+            })
+            .on_mouse_move({
+                let view = view.clone();
+                move |ev, _, cx| {
+                    view.update(cx, |this, cx| this.autoscroll_move(ev.position, cx))
+                        .ok();
+                }
+            })
+            .child(table)
+            // The grid's own width, for the horizontal scroll maths: with a frozen
+            // band the rows sit in no scrolling container, so the handle's bounds
+            // are never filled in and this is the only measurement of the viewport
+            // there is.
+            .child(
+                gpui::canvas(|_, _, _| (), {
+                    let measured = self.viewport_w.clone();
+                    move |bounds: gpui::Bounds<Pixels>, _, _, _| {
+                        measured.set(f32::from(bounds.size.width));
+                    }
+                })
+                .absolute()
+                .size_full(),
+            )
+            .child(scrollbar)
+            .children(
+                self.focus_hint
+                    .map(|h| crate::focus_overlay::badge(h, cx).into_any_element()),
+            )
+            .into_any_element()
+    }
+}
+
+impl ResultGrid {
+    /// Build this grid's table: the header columns plus the windowed row renderer.
+    /// Returns the row height and the resolved scroll window alongside it, because
+    /// the scrollbar is positioned from them and `prepare_window` re-anchors the
+    /// scroll offset, so it must run exactly once per frame.
+    fn render_table(
         &self,
-        active: &ActiveConn,
-        grid: &ResultGrid,
-        tab_idx: usize,
+        view: &WeakEntity<AppState>,
         pane: PaneId,
-        cell_colors: CellColors,
         cx: &Context<Self>,
     ) -> (flint::Table<()>, Pixels, WindowView) {
+        // The body was written against a `&ResultGrid` borrowed from the app; it is
+        // now the receiver, and this binding keeps that reading intact — including
+        // the `|grid|` closure parameters below, which mean something else.
+        let grid = self;
         let is_focused = grid.is_focused;
+        let view = view.clone();
         let theme = cx.theme();
         let faint = theme.text_faint;
         let (num, cyan, red, accent) = (theme.orange, theme.cyan, theme.red, theme.accent);
@@ -46,14 +152,22 @@ impl AppState {
         let caret_icon = theme.scale(9.);
         let cell_size = theme.font_size;
         let mono_family = theme.mono_family.clone();
-        let view = cx.entity().downgrade();
+        let cell_colors = CellColors {
+            text: theme.text,
+            muted: theme.text_muted,
+            num,
+            cyan,
+            faint,
+            accent,
+        };
 
         // An optional leading row-number gutter, then one fixed-width, sortable
         // column per result column. Each header carries the engine's declared type
         // as a dim subtitle, like the design's typed headers (`email` + `text`).
         // The gutter occupies table column 0 when shown, so a data column's table
         // index is `data + gutter` (see the handlers in `mod.rs`).
-        let show_gutter = self.settings.data.row_numbers;
+        let settings = crate::settings::Settings::global(cx);
+        let show_gutter = settings.data.row_numbers;
         let gutter = show_gutter as usize;
         let mut columns: Vec<Column> = Vec::with_capacity(grid.columns.len() + gutter);
         if show_gutter {
@@ -111,8 +225,8 @@ impl AppState {
         // Resolve (and possibly re-center) the virtual-scroll window for this
         // frame; everything below works in list-local coordinates offset by
         // `base`, so the list only ever lays out `win.len` rows.
-        let row_height = self.settings.data.density.row_height();
-        let null_display: SharedString = self.settings.data.null_display.clone().into();
+        let row_height = settings.data.density.row_height();
+        let null_display: SharedString = settings.data.null_display.clone().into();
         let win = grid.prepare_window(row_height);
         let base = win.base;
         // Nothing else bounds the horizontal offset once a band is frozen (see
@@ -151,11 +265,11 @@ impl AppState {
         //
         // Under `reduce_motion` the tint still appears, it just does not fade:
         // motion is the accessibility hazard, colour is the information.
-        let watch_hits: std::collections::HashSet<(usize, usize)> = active
-            .tabs
-            .get(tab_idx)
-            .and_then(|t| t.watch.as_ref())
-            .map(|w| {
+        let watch_hits: std::collections::HashSet<(usize, usize)> = grid
+            .watch_flash
+            .as_ref()
+            .map(|flash| {
+                let flash = flash.borrow();
                 let now = std::time::Instant::now();
                 // Only the *visible* rows (plus a screen of margin so a flash on
                 // a row scrolled just off-screen resolves cleanly), not the whole
@@ -174,7 +288,7 @@ impl AppState {
                     .filter_map(|abs| {
                         let key = grid.watch_row_key(abs);
                         let hits: Vec<(usize, usize)> = (0..grid.columns.len())
-                            .filter(|&c| w.is_flashing(&key, c, now))
+                            .filter(|&c| super::watch::is_flashing_in(&flash, &key, c, now))
                             .map(|c| (abs, c))
                             .collect();
                         (!hits.is_empty()).then_some(hits)
@@ -258,7 +372,7 @@ impl AppState {
             // table's horizontal track, so they stay column-aligned as the grid
             // scrolls sideways and hold still as it scrolls down. Grid state, not
             // app state, so both split panes show their own.
-            .pinned_rows(self.render_pinned_rows(grid, cx))
+            .pinned_rows(grid.render_pinned_rows(cx))
             // The row-number gutter is frozen whenever it is shown: an ordinal
             // that scrolls away with its row leaves the grid with no fixed
             // reference at all. Pinned columns extend the same band.
@@ -277,7 +391,7 @@ impl AppState {
             .when_some(grid.grid_focus.clone(), |t, handle| t.focus_handle(handle))
             // Vim motions (hjkl/g/G/0/$/Ctrl-d/Ctrl-u) ride alongside the arrow keys
             // when the user has turned vim navigation on.
-            .vim_nav(self.vim_mode())
+            .vim_nav(settings.keymap.vim_mode)
             .on_nav(move |nav, extend, _window, cx| {
                 nav_view
                     .update(cx, |this, cx| this.result_cursor_move(nav, extend, cx))

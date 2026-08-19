@@ -246,20 +246,14 @@ impl AppState {
         .then(|| self.render_namespace_fix(active, cx))
         .flatten();
         let theme = cx.theme();
-        let (bg, bg_app, border, border_soft) = (
-            theme.bg_panel,
-            theme.bg_app,
-            theme.border,
-            theme.border_soft,
-        );
+        let (bg, border, border_soft) = (theme.bg_panel, theme.border, theme.border_soft);
         let (muted, faint, dim, text) = (
             theme.text_muted,
             theme.text_faint,
             theme.text_dim,
             theme.text,
         );
-        let (num, cyan, red, accent) = (theme.orange, theme.cyan, theme.red, theme.accent);
-        // The surface an open inline editor sits on (see the `inline` branch in
+        let (red, accent) = (theme.red, theme.accent);
         // Scaled chrome sizes snapshotted here (Pixels is Copy) so the result
         // pane's status/empty/error text tracks the UI font size even inside the
         // `'static` row closures below.
@@ -268,14 +262,6 @@ impl AppState {
         // cells follow the mono font, both rendered at the configured base size.
         let ui_family = theme.font_family.clone();
         let mono_family = theme.mono_family.clone();
-        let cell_colors = CellColors {
-            text,
-            muted,
-            num,
-            cyan,
-            faint,
-            accent,
-        };
         // The focus + cell-cursor keys live on the `Table` itself (see its
         // `.focus_handle`/`.on_nav` below); the pane draws no focus ring.
         let container = div().size_full().relative().flex().flex_col().bg(bg);
@@ -285,7 +271,8 @@ impl AppState {
         // borrow the context mutably again (and a child view could not pull them
         // during its own render anyway).
         self.push_grid_frame(tab_idx, pane, is_focused, cx);
-        let grid = match active.tabs.get(tab_idx).and_then(|t| t.result.as_ref()) {
+        let grid_entity = active.tabs.get(tab_idx).and_then(|t| t.result.clone());
+        let grid = match grid_entity.as_ref() {
             Some(grid) => grid.read(cx),
             None => {
                 return container.child(
@@ -499,13 +486,7 @@ impl AppState {
                 .children(find_bar);
         }
 
-        let (table, row_height, win) =
-            self.render_grid_table(active, grid, tab_idx, pane, cell_colors, cx);
-        // Re-derived rather than returned: the footer and scrollbar below read the
-        // same three values straight off the grid, and threading them back through
-        // the tuple would only widen the seam.
         let data_cols: Vec<usize> = grid.visible.clone();
-        let total = grid.total;
         let ncols = grid.columns.len();
 
         // Footer: a strong row count, the column count, and the result's label
@@ -591,99 +572,20 @@ impl AppState {
         // position; a scrub jumps the viewport, and the buffer's `ensure` turns
         // the far jump into one key-space seek (keyed results) or one OFFSET page
         // (fallback).
-        let scrub_scroll = grid.scroll.clone();
-        let scrub_window = grid.window_base.clone();
-        let scrub_view = view.clone();
-        let rh = f32::from(row_height);
-        let scrollbar = Scrollbar::new("result-scrollbar", &grid.scrollbar)
-            // Position is computed over the whole result (not the f32-bounded
-            // window the list lays out), so the thumb is honest at 50M rows.
-            .fraction(win.fraction)
-            .thumb(win.thumb)
-            .on_scrub(move |fraction, _, cx| {
-                let target = (fraction as f64 * total.saturating_sub(1) as f64).round() as usize;
-                super::place_window(&scrub_window, &scrub_scroll, total, target, rh);
-                scrub_view
-                    .update(cx, |this, cx| {
-                        this.set_split_focus(pane, cx);
-                        cx.notify();
-                    })
-                    .ok();
-            });
 
+        // The grid body is its own view: it renders from state staged on the grid
+        // (see `push_grid_frame`), and the pane just mounts it between the bars and
+        // the drafts.
         let grid_pane = container
             .child(toolbar)
-            // The filter bar sits between the toolbar and the grid when
-            // open; narrowing re-opens the result so the grid below just repaints.
-            // The find bar sits alongside it and only highlights loaded
-            // rows. Both are built at the top of this function (single-instance
-            // overlays, so they render in the focused pane only).
+            // The filter bar sits between the toolbar and the grid when open;
+            // narrowing re-opens the result so the grid below just repaints. The
+            // find bar sits alongside it and only highlights loaded rows. Both are
+            // built at the top of this function (single-instance overlays, so they
+            // render in the focused pane only).
             .children(filter_bar)
             .children(find_bar)
-            .child(
-                div()
-                    .flex_1()
-                    .min_h(px(0.))
-                    .bg(bg_app)
-                    .relative()
-                    // Middle-click hold-to-autoscroll (a joystick, not a drag):
-                    // press starts (or, pressed again, cancels) a session
-                    // targeting this pane's grid; any other click also cancels
-                    // it, mirroring a browser's middle-click autoscroll.
-                    .on_mouse_down(MouseButton::Middle, {
-                        let view = view.clone();
-                        let scroll = grid.scroll.clone();
-                        let h_scroll = grid.h_scroll.clone();
-                        move |ev, _, cx| {
-                            view.update(cx, |this, cx| {
-                                this.toggle_autoscroll(ev.position, &scroll, &h_scroll, cx)
-                            })
-                            .ok();
-                        }
-                    })
-                    .on_mouse_down(MouseButton::Left, {
-                        let view = view.clone();
-                        move |_, _, cx| {
-                            view.update(cx, |this, cx| this.cancel_autoscroll(cx)).ok();
-                        }
-                    })
-                    .on_mouse_down(MouseButton::Right, {
-                        let view = view.clone();
-                        move |_, _, cx| {
-                            view.update(cx, |this, cx| this.cancel_autoscroll(cx)).ok();
-                        }
-                    })
-                    .on_mouse_move({
-                        let view = view.clone();
-                        move |ev, _, cx| {
-                            view.update(cx, |this, cx| this.autoscroll_move(ev.position, cx))
-                                .ok();
-                        }
-                    })
-                    .child(table)
-                    // The grid's own width, for the horizontal scroll maths: with
-                    // a frozen band the rows sit in no scrolling container, so the
-                    // handle's bounds are never filled in and this is the only
-                    // measurement of the viewport there is.
-                    .child(
-                        gpui::canvas(|_, _, _| (), {
-                            let measured = grid.viewport_w.clone();
-                            move |bounds: gpui::Bounds<Pixels>, _, _, _| {
-                                measured.set(f32::from(bounds.size.width));
-                            }
-                        })
-                        .absolute()
-                        .size_full(),
-                    )
-                    .child(scrollbar)
-                    .children(
-                        self.focus_hint(crate::focus::FocusTargetId::Body {
-                            pane,
-                            area: crate::focus::BodyArea::Grid,
-                        })
-                        .map(|h| crate::focus_overlay::badge(h, cx)),
-                    ),
-            )
+            .children(grid_entity.clone())
             // Draft (insert) rows pinned below the grid.
             .when_some(
                 is_focused

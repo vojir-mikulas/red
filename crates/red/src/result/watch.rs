@@ -19,7 +19,9 @@
 //! shifts when a tab to its left closes, and a watch that fires against the wrong
 //! tab is worse than one that stops.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{App, AsyncApp, Context, WeakEntity};
@@ -38,6 +40,22 @@ pub(crate) const FLASH: Duration = Duration::from_millis(1_200);
 /// information, and an uncapped map on a wide grid is an allocation per cell per
 /// tick. Past this the tick reports "fully refreshed" and highlights nothing.
 const MAX_CHANGED: usize = 5_000;
+
+/// `(row identity, data column)` → when it changed. Shared between a [`Watch`] and
+/// the grid drawing its flashes; see [`Watch::changed`].
+pub(crate) type FlashMap = HashMap<(WatchKey, usize), std::time::Instant>;
+
+/// Whether `(row, col)` is still inside its flash window, read straight off the
+/// shared map — the grid has the map but not the `Watch` that owns it.
+pub(crate) fn is_flashing_in(
+    map: &FlashMap,
+    key: &WatchKey,
+    col: usize,
+    now: std::time::Instant,
+) -> bool {
+    map.get(&(key.clone(), col))
+        .is_some_and(|at| now.duration_since(*at) < FLASH)
+}
 
 /// The intervals the watch menu offers. `None` is off.
 pub(crate) const CHOICES: [Option<u64>; 6] = [None, Some(2), Some(5), Some(10), Some(30), Some(60)];
@@ -62,7 +80,13 @@ pub(crate) struct Watch {
     /// compared when the rows land.
     prev: HashMap<WatchKey, Vec<u64>>,
     /// `(row identity, data column)` → when it changed, for the fade.
-    pub changed: HashMap<(WatchKey, usize), std::time::Instant>,
+    ///
+    /// Shared with the grid that draws the flash rather than copied to it. A tick
+    /// re-opens the result, and a re-open builds a *new* `ResultGrid`, so the watch
+    /// cannot live on the grid; and this map is capped at [`MAX_CHANGED`], so
+    /// cloning it per frame is exactly the per-frame cost the row renderer was
+    /// tuned to avoid. A handle costs a refcount bump.
+    pub changed: Rc<RefCell<FlashMap>>,
     /// True when the last tick changed more cells than [`MAX_CHANGED`].
     pub churned: bool,
     /// Total row count before the last tick, for the delta chip.
@@ -90,23 +114,23 @@ impl Watch {
             errors: 0,
             paused: None,
             prev: HashMap::new(),
-            changed: HashMap::new(),
+            changed: Rc::new(RefCell::new(FlashMap::new())),
             churned: false,
             prev_total: None,
             last_delta: None,
         }
     }
 
-    /// Whether `(row, col)` is still inside its flash window.
-    pub(crate) fn is_flashing(&self, key: &WatchKey, col: usize, now: std::time::Instant) -> bool {
-        self.changed
-            .get(&(key.clone(), col))
-            .is_some_and(|at| now.duration_since(*at) < FLASH)
+    /// The shared flash map, for the grid that draws it.
+    pub(crate) fn flash(&self) -> Rc<RefCell<FlashMap>> {
+        self.changed.clone()
     }
 
     /// Drop flashes that have faded, so the map does not grow across ticks.
     fn expire(&mut self, now: std::time::Instant) {
-        self.changed.retain(|_, at| now.duration_since(*at) < FLASH);
+        self.changed
+            .borrow_mut()
+            .retain(|_, at| now.duration_since(*at) < FLASH);
     }
 }
 
@@ -252,10 +276,19 @@ impl AppState {
                     let mut watch = Watch::new(interval);
                     watch.generation = generation;
                     let epoch = tab.result.as_ref().map(|g| g.read(cx).epoch);
+                    // Hand the grid on screen the flash map now; every later
+                    // re-open re-attaches it (see `open_result_filtered`).
+                    let flash = watch.flash();
+                    if let Some(grid) = tab.result.clone() {
+                        grid.update(cx, |grid, _| grid.watch_flash = Some(flash));
+                    }
                     tab.watch = Some(watch);
                     epoch.map(|e| (e, interval, generation))
                 }
                 None => {
+                    if let Some(grid) = tab.result.clone() {
+                        grid.update(cx, |grid, _| grid.watch_flash = None);
+                    }
                     // Bumping the generation on the way out is what stops the
                     // already-armed timer.
                     if let Some(w) = &mut tab.watch {
@@ -440,14 +473,14 @@ impl AppState {
                 if before.get(col) != Some(hash) {
                     changed += 1;
                     if changed <= MAX_CHANGED {
-                        watch.changed.insert((id.clone(), col), now);
+                        watch.changed.borrow_mut().insert((id.clone(), col), now);
                     }
                 }
             }
         }
         watch.churned = changed > MAX_CHANGED;
         if watch.churned {
-            watch.changed.clear();
+            watch.changed.borrow_mut().clear();
         }
         watch.last_delta = watch
             .prev_total

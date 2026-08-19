@@ -365,9 +365,35 @@ impl AppState {
         cx.notify();
     }
 
-    /// The pinned-row strip: one element per pinned row that is currently
-    /// *off screen*, handed to the grid's `Table` to draw between the header and
-    /// the scrolling rows.
+    /// Unpin the row at absolute ordinal `abs` (the grid gutter's pin glyph).
+    pub(in crate::result) fn unpin_row_at(&mut self, abs: usize, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase {
+            active.with_active_result(cx, |grid| {
+                if let Some(ix) = grid.pinned_rows.iter().position(|p| p.ordinal == Some(abs)) {
+                    grid.pinned_rows.remove(ix);
+                }
+            });
+        }
+        cx.notify();
+    }
+
+    /// Unpin the strip's `index`-th row (its gutter control).
+    fn unpin_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        if let Phase::Connected(active) = &mut self.phase {
+            active.with_active_result(cx, |grid| {
+                if index < grid.pinned_rows.len() {
+                    grid.pinned_rows.remove(index);
+                }
+            });
+        }
+        cx.notify();
+    }
+}
+
+impl ResultGrid {
+    /// The pinned-row strip: one element per pinned row that is currently *off
+    /// screen*, handed to this grid's `Table` to draw between the header and the
+    /// scrolling rows.
     ///
     /// Only off-screen rows, because a pin is a promise that the row stays
     /// reachable, not that it is drawn twice: a row you can already see needs no
@@ -378,15 +404,17 @@ impl AppState {
     /// Laid out against the same display order and per-column widths as the grid,
     /// so the cells sit under the header cells they belong to; the table's
     /// horizontal track carries the strip sideways for free.
-    pub(in crate::result) fn render_pinned_rows(
-        &self,
-        grid: &ResultGrid,
-        cx: &Context<Self>,
-    ) -> Vec<AnyElement> {
+    pub(in crate::result) fn render_pinned_rows(&self, cx: &Context<Self>) -> Vec<AnyElement> {
+        let grid = self;
         if grid.pinned_rows.is_empty() {
             return Vec::new();
         }
-        let showing = grid.offscreen_pins(f32::from(self.settings.data.density.row_height()));
+        let showing = grid.offscreen_pins(f32::from(
+            crate::settings::Settings::global(cx)
+                .data
+                .density
+                .row_height(),
+        ));
         if showing.is_empty() {
             return Vec::new();
         }
@@ -415,9 +443,16 @@ impl AppState {
             a: 0.16,
             ..theme.red
         };
-        let null_display: SharedString = self.settings.data.null_display.clone().into();
-        let row_height = self.settings.data.density.row_height();
-        let show_gutter = self.settings.data.row_numbers;
+        let null_display: SharedString = crate::settings::Settings::global(cx)
+            .data
+            .null_display
+            .clone()
+            .into();
+        let row_height = crate::settings::Settings::global(cx)
+            .data
+            .density
+            .row_height();
+        let show_gutter = crate::settings::Settings::global(cx).data.row_numbers;
         let gutter = show_gutter as usize;
         let gutter_px = gutter_width(grid.total);
         let icon_size = theme.scale(12.);
@@ -485,7 +520,14 @@ impl AppState {
                             Some(ord) => super::group_digits(ord + 1),
                             None => "·".to_string(),
                         }))
-                        .on_click(cx.listener(move |this, _, _, cx| this.unpin_row(index, cx)))
+                        .on_click({
+                            let view = grid.app.clone();
+                            move |_, _, cx: &mut App| {
+                                if let Some(view) = &view {
+                                    view.update(cx, |this, cx| this.unpin_row(index, cx)).ok();
+                                }
+                            }
+                        })
                         .into_any_element(),
                 );
             }
@@ -532,10 +574,17 @@ impl AppState {
                         .when(dirty, |d| d.bg(dirty_tint))
                         .child(content)
                         .when_some(target, |d, (ord, table_col)| {
-                            d.cursor_pointer()
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.result_select(ord, table_col, false, cx);
-                                }))
+                            d.cursor_pointer().on_click({
+                                let view = grid.app.clone();
+                                move |_, _, cx: &mut App| {
+                                    if let Some(view) = &view {
+                                        view.update(cx, |this, cx| {
+                                            this.result_select(ord, table_col, false, cx);
+                                        })
+                                        .ok();
+                                    }
+                                }
+                            })
                         })
                         .into_any_element(),
                 );
@@ -560,30 +609,6 @@ impl AppState {
             );
         }
         rows
-    }
-
-    /// Unpin the row at absolute ordinal `abs` (the grid gutter's pin glyph).
-    pub(in crate::result) fn unpin_row_at(&mut self, abs: usize, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase {
-            active.with_active_result(cx, |grid| {
-                if let Some(ix) = grid.pinned_rows.iter().position(|p| p.ordinal == Some(abs)) {
-                    grid.pinned_rows.remove(ix);
-                }
-            });
-        }
-        cx.notify();
-    }
-
-    /// Unpin the strip's `index`-th row (its gutter control).
-    fn unpin_row(&mut self, index: usize, cx: &mut Context<Self>) {
-        if let Phase::Connected(active) = &mut self.phase {
-            active.with_active_result(cx, |grid| {
-                if index < grid.pinned_rows.len() {
-                    grid.pinned_rows.remove(index);
-                }
-            });
-        }
-        cx.notify();
     }
 }
 
