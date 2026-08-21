@@ -13,7 +13,7 @@ use red_core::{CmpOp, ExportFormat, Value};
 
 use super::buffer::{CellKind, DisplayCell};
 use super::edit::EditSlot;
-use super::{DATA_COL_WIDTH, DRAFT_ZONE_ROWS, gutter_width};
+use super::{DATA_COL_WIDTH, DRAFT_ZONE_ROWS, HeaderStyle, gutter_width};
 use crate::app::{ActiveConn, AppState, Phase};
 
 /// Group a number's digits in threes (`1234567` → `1,234,567`) so large row
@@ -1445,9 +1445,10 @@ impl AppState {
                 ContextMenuItem::new("header-fit", "Fit this column").on_click(cx.listener(
                     move |this, _, _, cx| {
                         this.header_menu = None;
+                        let style = HeaderStyle::new(&this.settings);
                         this.with_grid(cx, |grid| {
                             if let Some(dc) = grid.data_col_at(slot) {
-                                grid.auto_fit(dc);
+                                grid.auto_fit(dc, style);
                             }
                         });
                         cx.notify();
@@ -1458,7 +1459,8 @@ impl AppState {
                 ContextMenuItem::new("header-fit-all", "Fit all columns").on_click(cx.listener(
                     |this, _, _, cx| {
                         this.header_menu = None;
-                        this.with_grid(cx, |grid| grid.auto_fit_all());
+                        let style = HeaderStyle::new(&this.settings);
+                        this.with_grid(cx, |grid| grid.auto_fit_all(style));
                         cx.notify();
                     },
                 )),

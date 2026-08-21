@@ -18,7 +18,7 @@ use gpui::{Entity, Hsla, Pixels, SharedString, WeakEntity, div, prelude::*, px};
 use super::buffer::CellKind;
 use super::edit::EditSlot;
 use super::render::{CellColors, group_digits, render_cell};
-use super::{ResultGrid, gutter_width};
+use super::{HeaderStyle, ResultGrid, gutter_width};
 use crate::app::{AppState, Pane, PaneId, Phase};
 use crate::gridwindow::WindowView;
 
@@ -165,7 +165,8 @@ impl ResultGrid {
 
         // An optional leading row-number gutter, then one fixed-width, sortable
         // column per result column. Each header carries the engine's declared type
-        // as a dim subtitle, like the design's typed headers (`email` + `text`).
+        // as a dim subtitle, like the design's typed headers (`email` + `text`),
+        // unless `data.column_types` is off and the name gets the whole cell.
         // The gutter occupies table column 0 when shown, so a data column's table
         // index is `data + gutter` (see the handlers in `mod.rs`).
         let settings = crate::settings::Settings::global(cx);
@@ -192,7 +193,8 @@ impl ResultGrid {
                 .width(px(grid.width_of(dc)))
                 .sortable()
                 .resizable();
-            if let Some(t) = &c.decl_type
+            if settings.data.column_types
+                && let Some(t) = &c.decl_type
                 && !t.is_empty()
             {
                 col = col.subtitle(t.to_lowercase());
@@ -490,10 +492,11 @@ impl ResultGrid {
                         let Some(slot) = table_col.checked_sub(gutter) else {
                             return;
                         };
+                        let style = HeaderStyle::new(&this.settings);
                         if let Phase::Connected(active) = &mut this.phase {
                             active.with_active_result(cx, |grid| {
                                 if let Some(dc) = grid.data_col_at(slot) {
-                                    grid.auto_fit(dc);
+                                    grid.auto_fit(dc, style);
                                 }
                             });
                         }

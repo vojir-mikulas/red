@@ -208,6 +208,20 @@ impl AppState {
                 self.assistant = None;
             }
         }
+        if before.data.column_types != self.settings.data.column_types
+            || before.appearance.ui_font_size != self.settings.appearance.ui_font_size
+        {
+            // Both of these change what a header costs to draw after the columns
+            // were fitted, and the column *name* is the part that gives up the room
+            // — an ellipsis where a name should be. Widen any column that no longer
+            // fits its header; nothing shrinks, so a dragged width survives.
+            let style = crate::result::HeaderStyle::new(&self.settings);
+            if let Phase::Connected(active) = &self.phase {
+                for grid in active.tabs.iter().filter_map(|t| t.result.clone()) {
+                    grid.update(cx, |grid, _| grid.ensure_header_fits(style));
+                }
+            }
+        }
         if before.data.row_numbers != self.settings.data.row_numbers {
             // The gutter is column `0` in the grid's coordinate system, so flipping
             // it shifts the data-column offset; clear the selection (stored in

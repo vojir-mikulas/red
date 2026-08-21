@@ -457,6 +457,10 @@ pub struct DataSettings {
     /// Show the leading row-number gutter. SQL results only; the key list and the
     /// document grid have no gutter to show.
     pub row_numbers: bool,
+    /// Show the engine's declared type beside each column name in the result
+    /// header. Off gives the name the whole header cell, which is what a narrow
+    /// column wants. SQL results only: no other grid types its headers.
+    pub column_types: bool,
     /// What a SQL `NULL` renders as (e.g. `∅`, `NULL`, or blank). SQL results
     /// only: a missing BSON field renders as an empty cell and a Redis value is
     /// never null.
@@ -487,6 +491,7 @@ impl Default for DataSettings {
         Self {
             density: Density::default(),
             row_numbers: true,
+            column_types: true,
             null_display: "NULL".to_string(),
             max_cell_chars: 4096,
             page_size: 200,

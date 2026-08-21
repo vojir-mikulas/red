@@ -165,6 +165,10 @@ settings-data-row_numbers =
     .label = [Röw ñúmbérs]
     .help = [Shöw thé léádíñg röw-ñúmbér gúttér íñ SQL résúlts.]
 
+settings-data-column_types =
+    .label = [Çölúmñ typés]
+    .help = [Shöw thé déçláréd typé bésídé éáçh çölúmñ ñámé íñ SQL résúlt héádérs. Öff gívés thé whölé héádér tö thé ñámé.]
+
 settings-group-performance = [Pérförmáñçé]
 
 settings-data-page_size =

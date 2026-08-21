@@ -636,6 +636,19 @@ static DEFS: &[SettingDef] = &[
         warn: None,
     },
     SettingDef {
+        key: "data.column_types",
+        tab: SettingsTab::Data,
+        group: "Display",
+        en_label: "Column types",
+        en_help: "Show the declared type beside each column name in SQL result headers. Off \
+               gives the whole header to the name.",
+        applies: Applies::Sql,
+        control: Control::Toggle,
+        get: |s| Value::Bool(s.data.column_types),
+        set: |s, v| s.data.column_types = v.as_bool(),
+        warn: None,
+    },
+    SettingDef {
         key: "data.page_size",
         tab: SettingsTab::Data,
         group: "Performance",

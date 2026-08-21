@@ -129,6 +129,10 @@ null_display = "NULL"
 # Show the leading row-number gutter. SQL results only.
 row_numbers = true
 
+# Show the declared type beside each column name in SQL result headers. Off gives
+# the whole header cell to the name, which is what a narrow column wants.
+column_types = true
+
 # Result size past which the column-stats bar withholds count(distinct) until you
 # ask for it, so selecting a column never silently starts a full scan. SQL only.
 stats_distinct_max_rows = 1000000

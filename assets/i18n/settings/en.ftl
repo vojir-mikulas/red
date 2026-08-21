@@ -165,6 +165,10 @@ settings-data-row_numbers =
     .label = Row numbers
     .help = Show the leading row-number gutter in SQL results.
 
+settings-data-column_types =
+    .label = Column types
+    .help = Show the declared type beside each column name in SQL result headers. Off gives the whole header to the name.
+
 settings-group-performance = Performance
 
 settings-data-page_size =

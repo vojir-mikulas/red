@@ -93,9 +93,66 @@ pub(in crate::result) const AUTO_FIT_MAX: f32 = 520.0;
 /// once. Being a few pixels generous is invisible; being slow is not.
 const CHAR_W: f32 = 7.2;
 
-/// Horizontal padding a cell adds around its text (`px_2p5` each side, plus the
-/// sort caret's room in the header).
+/// Horizontal padding a cell adds around its text (`px_2p5` each side, plus a
+/// little slack). Headers do their own arithmetic — see [`header_width`]
+/// (ResultGrid::header_width) — because they draw more than text.
 const CELL_PADDING: f32 = 26.0;
+
+/// A monospace advance, as a fraction of the font size. Both fonts RED ships
+/// (IBM Plex Mono, JetBrains Mono) are exactly `0.6em`, as is every other mono
+/// face a user is likely to pick, so the header can be sized from the character
+/// count without a font-system round trip.
+///
+/// Used for the *header* rather than for cells: a cell estimated a few pixels
+/// short truncates a value the user was going to open in the inspector anyway,
+/// while a header estimated short truncates the column *name*, which is the one
+/// string in the grid that has to stay readable. Cells keep the cheaper
+/// average-case [`CHAR_W`].
+const MONO_ADVANCE: f32 = 0.6;
+
+/// Font size of the header's type subtitle. Fixed in Flint's header, so it does
+/// not follow the cell font the way the column name does.
+const TYPE_SIZE: f32 = 10.0;
+
+/// The gap Flint's header row puts between the name and the subtitle.
+const TYPE_GAP: f32 = 4.0;
+
+/// The header cell's own horizontal padding (`px_2p5` each side), and the room
+/// the sort caret takes when the column is sorted.
+///
+/// The caret is reserved on *every* column, sorted or not: it appears on a click,
+/// and a column that reflowed the moment it was sorted would move the data under
+/// the pointer that just asked to see it ordered.
+const HEADER_PADDING: f32 = 20.0;
+const SORT_CARET: f32 = 14.0;
+
+/// What the header will cost to draw, as the column fit sees it: the cell font
+/// the name is drawn in, and whether the declared type rides beside it.
+///
+/// Passed to the fit rather than read from the settings global inside it, because
+/// the fit runs while the grid entity is leased and the settings live on the app.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct HeaderStyle {
+    /// The grid's cell font size (`appearance.ui_font_size`), which the header
+    /// title inherits.
+    pub font_size: f32,
+    /// `data.column_types`: whether the declared type is drawn as a subtitle.
+    pub show_types: bool,
+}
+
+impl HeaderStyle {
+    pub(crate) fn new(settings: &crate::settings::Settings) -> Self {
+        Self {
+            font_size: settings.appearance.ui_font_size,
+            show_types: settings.data.column_types,
+        }
+    }
+
+    #[cfg(test)]
+    fn with_types(self, show_types: bool) -> Self {
+        Self { show_types, ..self }
+    }
+}
 
 /// The most of the grid's width the frozen band may take. Past this a pin is
 /// refused: the point of freezing a column is to read it against the ones that
@@ -1229,37 +1286,68 @@ impl ResultGrid {
         }
     }
 
-    /// Size `data_col` to the widest value currently loaded, bounded by
-    /// [`AUTO_FIT_MAX`].
+    /// Width the header alone needs: the column name, the declared-type subtitle
+    /// beside it when types are shown, the sort caret's room, and the padding.
+    ///
+    /// The header is a flex row of *name, type, caret*, and the name is the part
+    /// told to shrink — so a width covering only the name leaves the name an
+    /// ellipsis with the type fully drawn beside it, which is exactly backwards.
+    /// Sizing against the whole row is what keeps the name readable.
+    pub(in crate::result) fn header_width(&self, data_col: usize, style: HeaderStyle) -> f32 {
+        let Some(column) = self.columns.get(data_col) else {
+            return flint::MIN_COLUMN_WIDTH;
+        };
+        let name = column.name.chars().count() as f32 * style.font_size * MONO_ADVANCE;
+        let subtitle = match &column.decl_type {
+            Some(t) if style.show_types && !t.is_empty() => {
+                TYPE_GAP + t.chars().count() as f32 * TYPE_SIZE * MONO_ADVANCE
+            }
+            _ => 0.0,
+        };
+        HEADER_PADDING + name + subtitle + SORT_CARET
+    }
+
+    /// Size `data_col` to the wider of its header and the widest value currently
+    /// loaded, bounded by [`AUTO_FIT_MAX`].
     ///
     /// Measures only the *resident* rows. The alternative is asking the engine
     /// for `max(length(col))` over the whole table, which is a full scan on a
     /// large result: the streaming invariant that keeps RED fast is exactly the
     /// reason auto-fit is allowed to be approximate. The header is included so a
     /// long column name is never clipped by a fit over short values.
-    pub(in crate::result) fn auto_fit(&mut self, data_col: usize) {
-        let header = self
-            .columns
-            .get(data_col)
-            .map(|c| c.name.chars().count())
-            .unwrap_or(0);
-        let widest = {
-            let buffer = self.buffer.borrow();
-            buffer.widest_cell(data_col).max(header)
-        };
-        let fitted =
-            (widest as f32 * CHAR_W + CELL_PADDING).clamp(flint::MIN_COLUMN_WIDTH, AUTO_FIT_MAX);
+    pub(in crate::result) fn auto_fit(&mut self, data_col: usize, style: HeaderStyle) {
+        let header = self.header_width(data_col, style);
+        let widest = self.buffer.borrow().widest_cell(data_col);
+        let content = widest as f32 * CHAR_W + CELL_PADDING;
+        let fitted = content
+            .max(header)
+            .clamp(flint::MIN_COLUMN_WIDTH, AUTO_FIT_MAX);
         self.set_width(data_col, fitted);
     }
 
     /// Size the columns to their content the first time a result has rows, and
     /// only then. See [`fitted`](Self::fitted) for why this is once-only.
-    pub(in crate::result) fn fit_once(&mut self) {
+    pub(in crate::result) fn fit_once(&mut self, style: HeaderStyle) {
         if self.fitted || self.columns.is_empty() {
             return;
         }
         self.fitted = true;
-        self.auto_fit_all();
+        self.auto_fit_all(style);
+    }
+
+    /// Widen any column too narrow to show its own header, leaving every other
+    /// width alone.
+    ///
+    /// Run when the type subtitle is switched on: it takes room the fit never
+    /// budgeted for, and the name is what gives that room up. Only ever grows, so
+    /// a width the user dragged is kept.
+    pub(crate) fn ensure_header_fits(&mut self, style: HeaderStyle) {
+        for col in 0..self.columns.len() {
+            let need = self.header_width(col, style).min(AUTO_FIT_MAX);
+            if self.width_of(col) < need {
+                self.set_width(col, need);
+            }
+        }
     }
 
     /// Put every column back to the default width, undoing both drags and fits.
@@ -1269,9 +1357,9 @@ impl ResultGrid {
     }
 
     /// Auto-fit every column at once (the header menu's "Fit all columns").
-    pub(in crate::result) fn auto_fit_all(&mut self) {
+    pub(in crate::result) fn auto_fit_all(&mut self, style: HeaderStyle) {
         for col in 0..self.columns.len() {
-            self.auto_fit(col);
+            self.auto_fit(col, style);
         }
     }
 
@@ -2113,6 +2201,10 @@ impl AppState {
         seq: u64,
         cx: &mut Context<Self>,
     ) {
+        // Read before the grid is leased: the fit has to budget for the whole
+        // header, subtitle included, or the name it shares the cell with ends up
+        // an ellipsis.
+        let style = HeaderStyle::new(&self.settings);
         if let Some(active) = self.conn_for(session)
             && let Some(grid) = active.result_by_epoch(epoch, cx)
         {
@@ -2121,7 +2213,7 @@ impl AppState {
                 grid.buffer
                     .borrow_mut()
                     .apply_run(fetch, rows, estimated, seq, total);
-                grid.fit_once();
+                grid.fit_once(style);
                 grid.refresh_pins();
             });
         }
@@ -2139,12 +2231,13 @@ impl AppState {
     ) {
         // Route by session then epoch so a background tab's page lands in its own
         // grid; a page for a superseded result finds no match and is dropped.
+        let style = HeaderStyle::new(&self.settings);
         if let Some(active) = self.conn_for(session)
             && let Some(grid) = active.result_by_epoch(epoch, cx)
         {
             grid.update(cx, |grid, _| {
                 grid.buffer.borrow_mut().insert_page(offset, rows);
-                grid.fit_once();
+                grid.fit_once(style);
                 grid.refresh_pins();
             });
         }
@@ -4117,13 +4210,18 @@ mod width_tests {
         assert_eq!(grid.width_of(0), flint::MIN_COLUMN_WIDTH);
     }
 
+    /// The default header style, at the default UI font size.
+    fn style(show_types: bool) -> HeaderStyle {
+        HeaderStyle::new(&crate::settings::Settings::default()).with_types(show_types)
+    }
+
     /// Auto-fit never exceeds the cap, however long the widest sampled value is:
     /// one 4 KB JSON cell must not size a column past any window.
     #[test]
     fn auto_fit_is_capped() {
         let mut g = grid(1);
         g.columns[0].name = "x".repeat(4000);
-        g.auto_fit(0);
+        g.auto_fit(0, style(true));
         assert_eq!(g.width_of(0), AUTO_FIT_MAX);
     }
 
@@ -4133,8 +4231,52 @@ mod width_tests {
     fn auto_fit_respects_the_minimum() {
         let mut g = grid(1);
         g.columns[0].name = String::new();
-        g.auto_fit(0);
+        g.auto_fit(0, style(true));
         assert_eq!(g.width_of(0), flint::MIN_COLUMN_WIDTH);
+    }
+
+    /// The fit budgets for the type subtitle, not just the name: the header draws
+    /// both, and it is the *name* that shrinks when they don't both fit.
+    ///
+    /// Checked against the arithmetic the header itself does — padding, the name
+    /// at the cell font's mono advance, the subtitle at its own size, the caret —
+    /// so an estimate that stops covering what Flint draws fails here rather than
+    /// as an ellipsis on screen.
+    #[test]
+    fn auto_fit_leaves_room_for_the_type_subtitle() {
+        let name = "created_at";
+        let decl = "timestamp with time zone";
+        let fit = |show_types| {
+            let mut g = grid(1);
+            g.columns[0].name = name.into();
+            g.columns[0].decl_type = Some(decl.into());
+            g.auto_fit(0, style(show_types));
+            g.width_of(0)
+        };
+
+        let size = crate::settings::Settings::default().appearance.ui_font_size;
+        let bare = HEADER_PADDING + name.len() as f32 * size * MONO_ADVANCE + SORT_CARET;
+        let subtitle = TYPE_GAP + decl.len() as f32 * TYPE_SIZE * MONO_ADVANCE;
+        assert_eq!(fit(false), bare, "the name has to fit on its own");
+        assert_eq!(
+            fit(true),
+            bare + subtitle,
+            "the subtitle has to be paid for"
+        );
+    }
+
+    /// Switching the subtitle on widens what no longer fits and leaves the rest
+    /// alone, so the toggle can't silently undo a dragged width.
+    #[test]
+    fn ensure_header_fits_only_grows() {
+        let mut g = grid(2);
+        g.columns[0].name = "a_rather_long_column_name".into();
+        g.columns[0].decl_type = Some("character varying".into());
+        g.set_width(0, flint::MIN_COLUMN_WIDTH);
+        g.set_width(1, 400.0);
+        g.ensure_header_fits(style(true));
+        assert_eq!(g.width_of(0), g.header_width(0, style(true)));
+        assert_eq!(g.width_of(1), 400.0, "a wide column is left alone");
     }
 
     /// The automatic fit happens once. A later page holding a longer value must
@@ -4142,9 +4284,9 @@ mod width_tests {
     #[test]
     fn auto_fit_runs_only_once() {
         let mut grid = grid(1);
-        grid.fit_once();
+        grid.fit_once(style(true));
         grid.set_width(0, 300.0);
-        grid.fit_once();
+        grid.fit_once(style(true));
         assert_eq!(grid.width_of(0), 300.0, "a second fit must not reflow");
     }
 
